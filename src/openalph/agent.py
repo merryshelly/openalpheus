@@ -28,6 +28,7 @@ class Agent:
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
         self._current_task: asyncio.Task | None = None
+        self._on_tool_call = None  # async callback(name, input, result, is_error)
 
     async def handle_input(self, text: str) -> str:
         """Process a user message and return the assistant's response.
@@ -93,7 +94,7 @@ class Agent:
                 # Track total tool calls
                 self.total_tool_calls += len(response.tool_calls)
 
-                # Append tool results to history (truncated)
+                # Append tool results to history (truncated) and notify
                 for tc, result in zip(response.tool_calls, results):
                     truncated_content = truncate_result(result.content, self.config.truncation_limit)
                     self.history.append({
@@ -102,6 +103,10 @@ class Agent:
                         "content": truncated_content,
                         "is_error": result.is_error,
                     })
+                    if self._on_tool_call:
+                        await self._on_tool_call(
+                            tc.name, tc.input, truncated_content, result.is_error
+                        )
 
             # Hit max iterations - return limit message
             return "[Tool call limit reached. Please summarize your progress.]"

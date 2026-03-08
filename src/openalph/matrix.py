@@ -87,6 +87,21 @@ class MatrixBot:
         """
         await self.client.room_typing(room_id, typing_state=state)
 
+    async def send_notice(self, room_id: str, text: str):
+        """Send a notice (tool visibility) to a room.
+
+        Notices are visually distinct from regular messages in most clients.
+        """
+        content = {
+            "msgtype": "m.notice",
+            "body": text,
+        }
+        await self.client.room_send(
+            room_id,
+            "m.room.message",
+            content,
+        )
+
     async def send(self, room_id: str, text: str):
         """Send a text message to a room.
 
@@ -228,6 +243,31 @@ class MatrixBot:
             # Regular message: process through agent
             await self._set_typing(room_id, True)
 
+            # Wire tool visibility for this turn
+            async def _tool_notice(name, input_data, result, is_error):
+                # Format a concise one-line summary
+                status = "❌" if is_error else "✅"
+                # Truncate input for display
+                if name == "shell":
+                    detail = input_data.get("command", "")[:80]
+                elif name == "file_read":
+                    detail = input_data.get("path", "")
+                elif name in ("file_write", "file_edit"):
+                    detail = input_data.get("path", "")
+                elif name == "web_search":
+                    detail = input_data.get("query", "")[:60]
+                elif name == "web_fetch":
+                    detail = input_data.get("url", "")[:60]
+                elif name == "subagent":
+                    detail = input_data.get("task", "")[:60]
+                else:
+                    detail = str(input_data)[:60]
+                result_len = len(result)
+                line = f"{status} `{name}`: {detail} → {result_len} chars"
+                await self.send_notice(room_id, line)
+
+            self.agent._on_tool_call = _tool_notice
+
             try:
                 response = await self.agent.handle_input(body)
                 await self.send(room_id, response)
@@ -236,6 +276,7 @@ class MatrixBot:
                 logger.exception("Agent error processing message")
                 await self.send(room_id, f"Error: {e}")
             finally:
+                self.agent._on_tool_call = None
                 await self._set_typing(room_id, False)
 
         finally:
