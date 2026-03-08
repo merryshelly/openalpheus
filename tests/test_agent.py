@@ -55,7 +55,7 @@ class TestAgentInit:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        assert agent.history == []
+        assert agent.history("_default") == []
 
     def test_init_zero_tokens(self, tmp_path):
         config = make_config(tmp_path)
@@ -94,11 +94,11 @@ class TestHandleInput:
             mock.return_value = make_response("Response 2")
             await agent.handle_input("Message 2")
 
-        assert len(agent.history) == 4
-        assert agent.history[0] == {"role": "user", "content": "Message 1"}
-        assert agent.history[1] == {"role": "assistant", "content": "Response 1"}
-        assert agent.history[2] == {"role": "user", "content": "Message 2"}
-        assert agent.history[3] == {"role": "assistant", "content": "Response 2"}
+        assert len(agent.history("_default")) == 4
+        assert agent.history("_default")[0] == {"role": "user", "content": "Message 1"}
+        assert agent.history("_default")[1] == {"role": "assistant", "content": "Response 1"}
+        assert agent.history("_default")[2] == {"role": "user", "content": "Message 2"}
+        assert agent.history("_default")[3] == {"role": "assistant", "content": "Response 2"}
 
     @pytest.mark.asyncio
     async def test_system_prompt_passed_to_provider(self, tmp_path):

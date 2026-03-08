@@ -208,8 +208,8 @@ class MatrixBot:
                 role = "user"
             else:
                 role = "assistant"
-            self.agent.history.append({"role": role, "content": event.body})
-            logger.debug("History: [%s] %s", role, event.body[:80])
+            self.agent.history(room.room_id).append({"role": role, "content": event.body})
+            logger.debug("History [%s]: [%s] %s", room.room_id, role, event.body[:80])
             return
 
         # Skip own messages
@@ -227,8 +227,13 @@ class MatrixBot:
                 await self._cancel_current()
                 return
 
+            if body == "/reset":
+                self.agent.reset_room(room_id)
+                await self.send(room_id, "🔄 Session reset. History cleared.")
+                return
+
             if body == "/status":
-                status = self.agent.status()
+                status = self.agent.status(room_id)
                 # Format status message
                 ctx = status['context_tokens']
                 ctx_max = status['context_max']
@@ -273,7 +278,7 @@ class MatrixBot:
             self.agent._on_tool_call = _tool_notice
 
             try:
-                response = await self.agent.handle_input(body)
+                response = await self.agent.handle_input(body, room_id)
                 await self.send(room_id, response)
             except AgentOverflowError as e:
                 logger.warning("Context overflow in %s: %s", room_id, e)
@@ -310,8 +315,10 @@ class MatrixBot:
         # Initial sync: populates rooms and loads timeline history via callback
         await self.client.sync(timeout=self.config.sync_timeout)
         self._synced = True
-        logger.info("Initial sync complete, loaded %d history messages",
-                     len(self.agent.history))
+        total = sum(len(h) for h in self.agent._rooms.values())
+        rooms = len(self.agent._rooms)
+        logger.info("Initial sync complete, loaded %d messages across %d rooms",
+                     total, rooms)
 
         # Sync loop
         delay = self.config.retry_base

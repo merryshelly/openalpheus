@@ -162,7 +162,7 @@ class TestMessageRouting:
 
         await bot._handle_room_message(room, event)
 
-        agent.handle_input.assert_awaited_once_with("Hello")
+        agent.handle_input.assert_awaited_once_with("Hello", "!test:matrix.local")
 
 
 # --- Commands ---

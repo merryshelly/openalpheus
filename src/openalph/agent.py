@@ -33,7 +33,7 @@ class Agent:
         # This reads workspace files (SOUL.md, OPERATOR.md, etc.) and builds a
         # skills index, all determined by the workspace directory in config.
         self.system_prompt = assemble_prompt(config.workspace)
-        self.history: list[dict] = []
+        self._rooms: dict[str, list[dict]] = {}  # room_id → history
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_tool_calls = 0
@@ -42,21 +42,36 @@ class Agent:
         self._current_task: asyncio.Task | None = None
         self._on_tool_call = None  # async callback(name, input, result, is_error)
 
-    async def handle_input(self, text: str) -> str:
+    def history(self, room_id: str) -> list[dict]:
+        """Get or create history for a room."""
+        if room_id not in self._rooms:
+            self._rooms[room_id] = []
+        return self._rooms[room_id]
+
+    def reset_room(self, room_id: str):
+        """Clear history for a room."""
+        self._rooms[room_id] = []
+
+    async def handle_input(self, text: str, room_id: str = "_default") -> str:
         """Process a user message and return the assistant's response.
 
-        Appends the user message to history, calls the LLM, appends the
-        assistant response, and accumulates token usage. The full history
+        Appends the user message to room history, calls the LLM, appends the
+        assistant response, and accumulates token usage. The full room history
         is passed on every call so the model has conversation context.
+
+        Args:
+            text: User message
+            room_id: Room identifier for per-room history isolation
         """
         self._current_task = asyncio.current_task()
+        history = self.history(room_id)
         try:
-            self.history.append({"role": "user", "content": text})
+            history.append({"role": "user", "content": text})
 
             # Tool loop: continue calling LLM until we get a text response
             for iteration in range(self.config.max_iterations):
                 # Check for context overflow before calling the API
-                context_tokens = self._estimate_context_tokens()
+                context_tokens = self._estimate_context_tokens(room_id)
                 available = self.config.model_max_tokens - self.config.max_tokens
                 if context_tokens > available:
                     raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
@@ -64,13 +79,11 @@ class Agent:
                 # Pass tools=None if no tools discovered (backward compatibility)
                 tools_arg = self.tools if self.tools else None
 
-                # Pass a snapshot of history, not the live list. The mock test suite
-                # inspects call_args after the fact — if we pass the mutable list,
-                # it will reflect later mutations (appended assistant response).
+                # Pass a snapshot of history, not the live list.
                 response = await complete(
                     config=self.config,
                     system=self.system_prompt,
-                    messages=list(self.history),
+                    messages=list(history),
                     tools=tools_arg,
                 )
 
@@ -80,11 +93,11 @@ class Agent:
                 # Check if response has tool calls
                 if not response.tool_calls:
                     # Text response - append to history and return
-                    self.history.append({"role": "assistant", "content": response.content})
+                    history.append({"role": "assistant", "content": response.content})
                     return response.content
 
                 # Tool use - append assistant message with tool_calls to history
-                self.history.append({
+                history.append({
                     "role": "assistant",
                     "content": response.content,
                     "tool_calls": response.tool_calls,
@@ -115,7 +128,7 @@ class Agent:
                 # Append tool results to history (truncated) and notify
                 for tc, result in zip(response.tool_calls, results):
                     truncated_content = truncate_result(result.content, self.config.truncation_limit)
-                    self.history.append({
+                    history.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": truncated_content,
@@ -136,13 +149,13 @@ class Agent:
         if self._current_task:
             self._current_task.cancel()
 
-    def _estimate_context_tokens(self) -> int:
-        """Estimate current context size in tokens.
+    def _estimate_context_tokens(self, room_id: str = "_default") -> int:
+        """Estimate current context size in tokens for a room.
 
-        Includes system prompt + full history. Uses 1 token ≈ 4 chars.
+        Includes system prompt + room history. Uses 1 token ≈ 4 chars.
         """
         total_chars = len(self.system_prompt)
-        for msg in self.history:
+        for msg in self.history(room_id):
             content = msg.get("content", "")
             if content:
                 total_chars += len(content)
@@ -151,15 +164,15 @@ class Agent:
                 total_chars += len(str(tc.input))
         return total_chars // 4
 
-    def status(self) -> dict:
+    def status(self, room_id: str = "_default") -> dict:
         """Snapshot of agent state for operator visibility."""
-        context_tokens = self._estimate_context_tokens()
+        context_tokens = self._estimate_context_tokens(room_id)
         model_max = self.config.model_max_tokens
         context_pct = round(context_tokens / model_max * 100) if model_max else 0
         return {
             "name": self.config.name,
             "model": self.config.model,
-            "turns": sum(1 for m in self.history if m["role"] == "user"),
+            "turns": sum(1 for m in self.history(room_id) if m["role"] == "user"),
             "context_tokens": context_tokens,
             "context_max": model_max,
             "context_pct": context_pct,
