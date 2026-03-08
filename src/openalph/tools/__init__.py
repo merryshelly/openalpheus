@@ -344,8 +344,57 @@ async def execute_tool(
         This is a stub that dispatches to tool-specific modules.
         Full implementation will be in Phase 2.
     """
-    # Stub implementation - actual execution in tool modules
-    return ToolResult(
-        content=f"Tool '{name}' execution not yet implemented",
-        is_error=True
-    )
+    if name == "shell":
+        from .shell import run_shell
+        return await run_shell(
+            command=input["command"],
+            cwd=input.get("cwd"),
+            env=input.get("env"),
+            timeout=tool_config.get("default_timeout", 30),
+            max_output=tool_config.get("max_output", 50000),
+        )
+    elif name == "file_read":
+        from .file import read_file
+        return await read_file(
+            path=input["path"],
+            offset=input.get("offset"),
+            limit=input.get("limit"),
+        )
+    elif name == "file_write":
+        from .file import write_file
+        return await write_file(
+            path=input["path"],
+            content=input["content"],
+        )
+    elif name == "file_edit":
+        from .file import edit_file
+        return await edit_file(
+            path=input["path"],
+            old_text=input["old_text"],
+            new_text=input["new_text"],
+        )
+    elif name == "web_search":
+        from .web import web_search
+        return await web_search(
+            query=input["query"],
+            count=input.get("count", 5),
+            api_key=tool_config.get("api_key", ""),
+            endpoint=tool_config.get("endpoint", ""),
+        )
+    elif name == "web_fetch":
+        from .web import web_fetch
+        return await web_fetch(
+            url=input["url"],
+            max_chars=input.get("max_chars"),
+        )
+    elif name == "subagent":
+        from .subagent import run_subagent
+        return await run_subagent(
+            task=input["task"],
+            agent_config=agent_config,
+        )
+    else:
+        return ToolResult(
+            content=f"Unknown tool: {name}",
+            is_error=True,
+        )
