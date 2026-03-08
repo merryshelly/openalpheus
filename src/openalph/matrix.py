@@ -55,6 +55,7 @@ class MatrixBot:
         self.config = config
         self.client = AsyncClient(config.homeserver, config.user_id, config.device_id)
         self._running = False
+        self._synced = False
         self._current_room = None
 
     def _estimate_tokens(self, text: str) -> int:
@@ -175,6 +176,7 @@ class MatrixBot:
         """Handle a room message event.
 
         Routes messages:
+        - Skip events from initial sync (loaded as history, not responded to)
         - Skip own messages
         - /stop → cancel current work
         - /status → post agent status
@@ -184,6 +186,16 @@ class MatrixBot:
             room: Matrix room object
             event: Room message event
         """
+        # During initial sync, load messages as history context, don't respond
+        if not self._synced:
+            if event.sender != self.config.user_id:
+                role = "user"
+            else:
+                role = "assistant"
+            self.agent.history.append({"role": role, "content": event.body})
+            logger.debug("History: [%s] %s", role, event.body[:80])
+            return
+
         # Skip own messages
         if event.sender == self.config.user_id:
             return
@@ -239,16 +251,17 @@ class MatrixBot:
         await self._login()
         self._running = True
 
-        # Register event callbacks
+        # Register event callbacks before initial sync so history events
+        # are captured. _synced=False tells the handler to load them as
+        # context instead of responding.
         self.client.add_event_callback(self._handle_room_message, RoomMessageText)
         self.client.add_event_callback(self._handle_invite, InviteMemberEvent)
 
-        # Initial sync to get rooms
+        # Initial sync: populates rooms and loads timeline history via callback
         await self.client.sync(timeout=self.config.sync_timeout)
-
-        # TODO: Load history for each joined room
-        # This would require room_messages() calls and pagination
-        # For MVP, history is loaded on-demand or skipped
+        self._synced = True
+        logger.info("Initial sync complete, loaded %d history messages",
+                     len(self.agent.history))
 
         # Sync loop
         delay = self.config.retry_base

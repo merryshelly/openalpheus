@@ -130,6 +130,7 @@ class TestMessageRouting:
         bot.client.room_send = AsyncMock()
         bot._set_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
 
         event = make_room_message("@merry:matrix.local", "my own message")
         room = MagicMock()
@@ -153,6 +154,7 @@ class TestMessageRouting:
         bot.client.room_send = AsyncMock()
         bot._set_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -182,6 +184,7 @@ class TestCommands:
         bot.client.room_send = AsyncMock()
         bot._set_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
         bot._cancel_current = AsyncMock()
 
         event = make_room_message("@sb:matrix.local", "/stop")
@@ -215,6 +218,7 @@ class TestCommands:
         bot.client.room_send = AsyncMock()
         bot._set_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
 
         event = make_room_message("@sb:matrix.local", "/status")
         room = MagicMock()
@@ -248,6 +252,7 @@ class TestTypingIndicator:
         bot.client.room_send = AsyncMock()
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -278,6 +283,7 @@ class TestTypingIndicator:
         bot.client.room_send = AsyncMock()
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -409,6 +415,7 @@ class TestErrorHandling:
         bot.client.room_send = AsyncMock()
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
 
         event = make_room_message("@sb:matrix.local", "Do something")
         room = MagicMock()
@@ -433,6 +440,7 @@ class TestErrorHandling:
         bot.client.room_send = AsyncMock()
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
+        bot._synced = True
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
