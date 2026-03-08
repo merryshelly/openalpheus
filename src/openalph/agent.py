@@ -5,9 +5,11 @@ stateful conversation agent. Keeps a running history and token counts
 so the operator can check usage without external tooling.
 """
 
+import asyncio
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
 from openalph.provider import complete
+from openalph.tools import discover_tools, execute_tool, truncate_result
 
 
 class Agent:
@@ -22,6 +24,9 @@ class Agent:
         self.history: list[dict] = []
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.total_tool_calls = 0
+        # Discover tools from workspace/tools/ directory
+        self.tools = discover_tools(config.workspace)
 
     async def handle_input(self, text: str) -> str:
         """Process a user message and return the assistant's response.
@@ -32,20 +37,71 @@ class Agent:
         """
         self.history.append({"role": "user", "content": text})
 
-        # Pass a snapshot of history, not the live list. The mock test suite
-        # inspects call_args after the fact — if we pass the mutable list,
-        # it will reflect later mutations (appended assistant response).
-        response = await complete(
-            config=self.config,
-            system=self.system_prompt,
-            messages=list(self.history),
-        )
+        # Tool loop: continue calling LLM until we get a text response
+        for iteration in range(self.config.max_iterations):
+            # Pass tools=None if no tools discovered (backward compatibility)
+            tools_arg = self.tools if self.tools else None
 
-        self.history.append({"role": "assistant", "content": response.content})
-        self.total_input_tokens += response.usage.input_tokens
-        self.total_output_tokens += response.usage.output_tokens
+            # Pass a snapshot of history, not the live list. The mock test suite
+            # inspects call_args after the fact — if we pass the mutable list,
+            # it will reflect later mutations (appended assistant response).
+            response = await complete(
+                config=self.config,
+                system=self.system_prompt,
+                messages=list(self.history),
+                tools=tools_arg,
+            )
 
-        return response.content
+            self.total_input_tokens += response.usage.input_tokens
+            self.total_output_tokens += response.usage.output_tokens
+
+            # Check if response has tool calls
+            if not response.tool_calls:
+                # Text response - append to history and return
+                self.history.append({"role": "assistant", "content": response.content})
+                return response.content
+
+            # Tool use - append assistant message with tool_calls to history
+            self.history.append({
+                "role": "assistant",
+                "content": response.content,
+                "tool_calls": response.tool_calls,
+            })
+
+            # Execute tool calls in parallel
+            tool_coros = []
+            for tc in response.tool_calls:
+                # Find the tool config for this tool
+                tool_config = {}
+                for t in self.tools:
+                    if t.name == tc.name:
+                        tool_config = t.config
+                        break
+
+                tool_coros.append(execute_tool(
+                    name=tc.name,
+                    input=tc.input,
+                    tool_config=tool_config,
+                    agent_config=self.config,
+                ))
+
+            results = await asyncio.gather(*tool_coros)
+
+            # Track total tool calls
+            self.total_tool_calls += len(response.tool_calls)
+
+            # Append tool results to history (truncated)
+            for tc, result in zip(response.tool_calls, results):
+                truncated_content = truncate_result(result.content, self.config.truncation_limit)
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": truncated_content,
+                    "is_error": result.is_error,
+                })
+
+        # Hit max iterations - return limit message
+        return "[Tool call limit reached. Please summarize your progress.]"
 
     def status(self) -> dict:
         """Snapshot of agent state for operator visibility."""
@@ -56,4 +112,5 @@ class Agent:
             "turns": sum(1 for m in self.history if m["role"] == "user"),
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
+            "total_tool_calls": self.total_tool_calls,
         }

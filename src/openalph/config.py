@@ -32,6 +32,8 @@ class AgentConfig:
     api_key: str  # resolved value (not the reference)
     base_url: str | None
     workspace: Path
+    max_iterations: int = 25
+    truncation_limit: int = 50000
 
 
 def load_config(path: Path) -> AgentConfig:
@@ -83,6 +85,16 @@ def load_config(path: Path) -> AgentConfig:
     max_tokens = agent_section.get("max_tokens", 8192)
     if not isinstance(max_tokens, int) or max_tokens <= 0:
         raise ConfigError("max_tokens must be a positive integer")
+    
+    # max_iterations defaults to 25 if not specified
+    max_iterations = agent_section.get("max_iterations", 25)
+    if not isinstance(max_iterations, int) or max_iterations <= 0:
+        raise ConfigError("max_iterations must be a positive integer")
+    
+    # truncation_limit defaults to 50000 if not specified
+    truncation_limit = agent_section.get("truncation_limit", 50000)
+    if not isinstance(truncation_limit, int) or truncation_limit <= 0:
+        raise ConfigError("truncation_limit must be a positive integer")
     
     # Validate and extract provider fields
     try:
@@ -162,5 +174,7 @@ def load_config(path: Path) -> AgentConfig:
         provider=provider_type,
         api_key=api_key,
         base_url=base_url,
-        workspace=workspace_path
+        workspace=workspace_path,
+        max_iterations=max_iterations,
+        truncation_limit=truncation_limit
     )
