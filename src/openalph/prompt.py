@@ -38,5 +38,10 @@ def assemble_prompt(workspace: Path) -> str:
             for skill_name in sorted(skill_files):
                 prompt_parts.append(f"- {skill_name}")
     
+    # Inject runtime context (workspace path, available tools)
+    prompt_parts.append("## Runtime")
+    prompt_parts.append(f"Workspace: {workspace.resolve()}")
+    prompt_parts.append("Use this as the working directory for shell commands (pass as cwd).")
+
     # Join all parts with newlines and return
     return "\n".join(prompt_parts) if prompt_parts else ""
