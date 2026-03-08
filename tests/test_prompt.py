@@ -7,7 +7,7 @@ Reads known workspace files in a defined order, adds headers,
 scans skills/ directory to build a brief index.
 Only known files are included — no arbitrary .md files.
 
-File order: SOUL.md, IDENTITY.md, AGENTS.md, USER.md, TOOLS.md, MEMORY.md, HEARTBEAT.md
+File order: SOUL.md, OPERATOR.md, SAFETY.md, OPERATIONS.md, ENVIRONMENT.md, WAKE.md
 """
 
 import pytest
@@ -22,8 +22,8 @@ class TestAssemblePrompt:
 
     def test_reads_standard_files(self, tmp_path):
         (tmp_path / "SOUL.md").write_text("I am a test agent.")
-        (tmp_path / "AGENTS.md").write_text("Safety rules here.")
-        (tmp_path / "USER.md").write_text("About the operator.")
+        (tmp_path / "SAFETY.md").write_text("Safety rules here.")
+        (tmp_path / "OPERATOR.md").write_text("About the operator.")
 
         prompt = assemble_prompt(tmp_path)
 
@@ -38,29 +38,26 @@ class TestAssemblePrompt:
         prompt = assemble_prompt(tmp_path)
 
         assert "Just the soul." in prompt
-        # No placeholder text, no errors
 
     def test_file_order(self, tmp_path):
         """Files appear in a defined, stable order."""
         (tmp_path / "SOUL.md").write_text("SOUL_MARKER")
-        (tmp_path / "IDENTITY.md").write_text("IDENTITY_MARKER")
-        (tmp_path / "AGENTS.md").write_text("AGENTS_MARKER")
-        (tmp_path / "USER.md").write_text("USER_MARKER")
-        (tmp_path / "TOOLS.md").write_text("TOOLS_MARKER")
-        (tmp_path / "MEMORY.md").write_text("MEMORY_MARKER")
-        (tmp_path / "HEARTBEAT.md").write_text("HEARTBEAT_MARKER")
+        (tmp_path / "OPERATOR.md").write_text("OPERATOR_MARKER")
+        (tmp_path / "SAFETY.md").write_text("SAFETY_MARKER")
+        (tmp_path / "OPERATIONS.md").write_text("OPERATIONS_MARKER")
+        (tmp_path / "ENVIRONMENT.md").write_text("ENVIRONMENT_MARKER")
+        (tmp_path / "WAKE.md").write_text("WAKE_MARKER")
 
         prompt = assemble_prompt(tmp_path)
 
         soul = prompt.index("SOUL_MARKER")
-        identity = prompt.index("IDENTITY_MARKER")
-        agents = prompt.index("AGENTS_MARKER")
-        user = prompt.index("USER_MARKER")
-        tools = prompt.index("TOOLS_MARKER")
-        memory = prompt.index("MEMORY_MARKER")
-        heartbeat = prompt.index("HEARTBEAT_MARKER")
+        operator = prompt.index("OPERATOR_MARKER")
+        safety = prompt.index("SAFETY_MARKER")
+        operations = prompt.index("OPERATIONS_MARKER")
+        environment = prompt.index("ENVIRONMENT_MARKER")
+        wake = prompt.index("WAKE_MARKER")
 
-        assert soul < identity < agents < user < tools < memory < heartbeat
+        assert soul < operator < safety < operations < environment < wake
 
     def test_files_have_headers(self, tmp_path):
         """Each file's content is preceded by a header identifying it."""
@@ -82,17 +79,19 @@ class TestAssemblePrompt:
         (tmp_path / "random.txt").write_text("Should not appear.")
         (tmp_path / "NOTES.md").write_text("Also should not appear.")
         (tmp_path / "README.md").write_text("Nope.")
+        (tmp_path / "MEMORY.md").write_text("Not a known file anymore.")
 
         prompt = assemble_prompt(tmp_path)
 
         assert "Should not appear" not in prompt
         assert "Also should not appear" not in prompt
         assert "Nope" not in prompt
+        assert "Not a known file anymore" not in prompt
 
-    def test_all_seven_files(self, tmp_path):
-        """All 7 workspace files are included when present."""
-        files = ["SOUL.md", "IDENTITY.md", "AGENTS.md", "USER.md",
-                 "TOOLS.md", "MEMORY.md", "HEARTBEAT.md"]
+    def test_all_six_files(self, tmp_path):
+        """All 6 workspace files are included when present."""
+        files = ["SOUL.md", "OPERATOR.md", "SAFETY.md",
+                 "OPERATIONS.md", "ENVIRONMENT.md", "WAKE.md"]
         for f in files:
             (tmp_path / f).write_text(f"Content of {f}")
 
