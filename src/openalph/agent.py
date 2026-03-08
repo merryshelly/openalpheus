@@ -118,6 +118,7 @@ class Agent:
                         input=tc.input,
                         tool_config=tool_config,
                         agent_config=self.config,
+                        tools=self.tools,
                     ))
 
                 results = await asyncio.gather(*tool_coros)

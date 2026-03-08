@@ -326,7 +326,8 @@ async def execute_tool(
     name: str,
     input: dict,
     tool_config: dict,
-    agent_config: Any
+    agent_config: Any,
+    tools: list[ToolDef] | None = None,
 ) -> ToolResult:
     """Dispatch to the named tool executor.
     
@@ -399,7 +400,11 @@ async def execute_tool(
         from .subagent import run_subagent
         return await run_subagent(
             task=input["task"],
-            agent_config=agent_config,
+            config=agent_config,
+            tools=tools,
+            system_prompt=input.get("system_prompt"),
+            model=input.get("model"),
+            max_tokens=input.get("max_tokens"),
         )
     else:
         return ToolResult(

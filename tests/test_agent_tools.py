@@ -199,7 +199,7 @@ class TestParallelExecution:
 
         call_count = 0
 
-        async def mock_execute(name, input, tool_config, agent_config):
+        async def mock_execute(name, input, tool_config, agent_config, tools=None):
             nonlocal call_count
             call_count += 1
             cmd = input.get("command", "")
@@ -231,7 +231,7 @@ class TestParallelExecution:
             text_response("Both done"),
         ]
 
-        async def mock_execute(name, input, tool_config, agent_config):
+        async def mock_execute(name, input, tool_config, agent_config, tools=None):
             cmd = input.get("command", "")
             return ToolResult(content=f"result_{cmd[-1]}")
 

@@ -38,10 +38,25 @@ def assemble_prompt(workspace: Path) -> str:
             for skill_name in sorted(skill_files):
                 prompt_parts.append(f"- {skill_name}")
     
-    # Inject runtime context (workspace path, available tools)
-    prompt_parts.append("## Runtime")
-    prompt_parts.append(f"Workspace: {workspace.resolve()}")
-    prompt_parts.append("Use this as the working directory for shell commands (pass as cwd).")
+    # Inject tool usage note if tools directory exists with any .toml files
+    tools_dir = workspace / "tools"
+    if tools_dir.exists() and any(tools_dir.glob("*.toml")):
+        prompt_parts.append("## Tools")
+        prompt_parts.append(
+            "Your operator sees a brief notice when you call a tool "
+            "(tool name, success/failure, result size) — but **not** the actual "
+            "content returned. Tool results are only visible to you. When you read "
+            "a file, run a command, or get any tool result that the operator needs "
+            "to see, include the relevant content in your response."
+        )
+
+    # Inject runtime workspace path only if not already mentioned in loaded files
+    workspace_str = str(workspace.resolve())
+    already_mentioned = any(workspace_str in part for part in prompt_parts)
+    if not already_mentioned:
+        prompt_parts.append("## Runtime")
+        prompt_parts.append(f"Workspace: {workspace_str}")
+        prompt_parts.append("Use this as the working directory for shell commands (pass as cwd).")
 
     # Join all parts with newlines and return
     return "\n".join(prompt_parts) if prompt_parts else ""

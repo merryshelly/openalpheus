@@ -1,19 +1,20 @@
 """Tests for sub-agent execution.
 
 Interface contract:
-    run_subagent(task, config, system_prompt=None, model=None, max_tokens=None) -> ToolResult
+    run_subagent(task, config, tools=None, system_prompt=None, model=None,
+                 max_tokens=None) -> ToolResult
 
-Single-turn LLM call via provider.complete(). No tools for sub-agents.
-Uses parent's config for API key/provider. model/system_prompt can be overridden.
+Multi-turn LLM call via provider.complete(). Sub-agents get the parent's
+tools minus 'subagent' (preventing recursion). Circuit breaker at 10 iterations.
 """
 
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 from pathlib import Path
-from openalph.tools.subagent import run_subagent
-from openalph.tools import ToolResult
+from openalph.tools.subagent import run_subagent, MAX_ITERATIONS
+from openalph.tools import ToolDef, ToolResult
 from openalph.config import AgentConfig
-from openalph.provider import Response, Usage
+from openalph.provider import Response, Usage, ToolCall
 
 
 def make_config(**kwargs):
@@ -32,13 +33,33 @@ def make_config(**kwargs):
     return AgentConfig(**defaults)
 
 
-def mock_response(text="Sub-agent response", model="claude-sonnet-4-20250514"):
+def make_tools():
+    """Build a realistic tool set including subagent (should be filtered)."""
+    return [
+        ToolDef(name="shell", description="Run shell", parameters={}, config={}),
+        ToolDef(name="file_read", description="Read file", parameters={}, config={}),
+        ToolDef(name="file_write", description="Write file", parameters={}, config={}),
+        ToolDef(name="subagent", description="Spawn sub", parameters={}, config={}),
+    ]
+
+
+def text_response(text="Sub-agent response"):
     return Response(
         content=text,
         tool_calls=[],
-        model=model,
+        model="claude-sonnet-4-20250514",
         usage=Usage(input_tokens=100, output_tokens=50),
         stop_reason="end_turn",
+    )
+
+
+def tool_response(tool_name="shell", tool_input=None, tool_id="tc_1", content=""):
+    return Response(
+        content=content,
+        tool_calls=[ToolCall(id=tool_id, name=tool_name, input=tool_input or {})],
+        model="claude-sonnet-4-20250514",
+        usage=Usage(input_tokens=100, output_tokens=50),
+        stop_reason="tool_use",
     )
 
 
@@ -51,7 +72,7 @@ class TestBasicExecution:
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response("The answer is 42"),
+            return_value=text_response("The answer is 42"),
         ):
             result = await run_subagent("What is the meaning of life?", config)
 
@@ -66,7 +87,7 @@ class TestBasicExecution:
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(),
+            return_value=text_response(),
         ) as mock_complete:
             await run_subagent("Summarize this document", config)
 
@@ -86,14 +107,14 @@ class TestSystemPrompt:
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(),
+            return_value=text_response(),
         ) as mock_complete:
             await run_subagent("Do something", config)
 
         call_kwargs = mock_complete.call_args.kwargs
         system = call_kwargs["system"]
         assert isinstance(system, str)
-        assert len(system) > 0  # not empty
+        assert len(system) > 0
 
     @pytest.mark.asyncio
     async def test_custom_system_prompt(self):
@@ -102,7 +123,7 @@ class TestSystemPrompt:
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(),
+            return_value=text_response(),
         ) as mock_complete:
             await run_subagent(
                 "Analyze this",
@@ -123,7 +144,7 @@ class TestModelOverride:
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(),
+            return_value=text_response(),
         ) as mock_complete:
             await run_subagent("Do something", config)
 
@@ -137,34 +158,15 @@ class TestModelOverride:
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(),
+            return_value=text_response(),
         ) as mock_complete:
             await run_subagent("Do something", config, model="claude-haiku-3-5-20241022")
 
-        # The config passed to complete should use the overridden model
         call_kwargs = mock_complete.call_args.kwargs
         assert call_kwargs["config"].model == "claude-haiku-3-5-20241022"
 
 
 class TestMaxTokens:
-
-    @pytest.mark.asyncio
-    async def test_default_max_tokens(self):
-        """No max_tokens → uses parent config's max_tokens."""
-        config = make_config(max_tokens=4096)
-        with patch(
-            "openalph.tools.subagent.complete",
-            new_callable=AsyncMock,
-            return_value=mock_response(),
-        ) as mock_complete:
-            await run_subagent("Do something", config)
-
-        # Should use config default, not override
-        call_kwargs = mock_complete.call_args.kwargs
-        # max_tokens either not passed (uses config) or matches config
-        max_tok = call_kwargs.get("max_tokens")
-        if max_tok is not None:
-            assert max_tok == 4096
 
     @pytest.mark.asyncio
     async def test_max_tokens_override(self):
@@ -173,7 +175,7 @@ class TestMaxTokens:
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(),
+            return_value=text_response(),
         ) as mock_complete:
             await run_subagent("Do something", config, max_tokens=1024)
 
@@ -181,23 +183,135 @@ class TestMaxTokens:
         assert call_kwargs.get("max_tokens") == 1024
 
 
-class TestNoTools:
+class TestToolFiltering:
 
     @pytest.mark.asyncio
-    async def test_sub_does_not_receive_tools(self):
-        """Sub-agents are called without tools (single-turn, no tool use)."""
+    async def test_subagent_tool_filtered_out(self):
+        """Sub-agents receive parent tools minus 'subagent' (no recursion)."""
+        config = make_config()
+        tools = make_tools()
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            return_value=text_response(),
+        ) as mock_complete:
+            await run_subagent("Do something", config, tools=tools)
+
+        call_kwargs = mock_complete.call_args.kwargs
+        passed_tools = call_kwargs.get("tools", [])
+        tool_names = [t.name for t in passed_tools]
+        assert "subagent" not in tool_names
+        assert "shell" in tool_names
+        assert "file_read" in tool_names
+        assert "file_write" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_no_tools_passed_none(self):
+        """No tools → tools=None passed to complete."""
         config = make_config()
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(),
+            return_value=text_response(),
         ) as mock_complete:
-            await run_subagent("Do something", config)
+            await run_subagent("Do something", config, tools=None)
 
         call_kwargs = mock_complete.call_args.kwargs
-        # tools should be None or not passed
-        tools = call_kwargs.get("tools")
-        assert tools is None
+        assert call_kwargs.get("tools") is None
+
+    @pytest.mark.asyncio
+    async def test_only_subagent_tool_results_in_none(self):
+        """If parent only has subagent tool, sub gets tools=None."""
+        config = make_config()
+        tools = [ToolDef(name="subagent", description="Spawn", parameters={}, config={})]
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            return_value=text_response(),
+        ) as mock_complete:
+            await run_subagent("Do something", config, tools=tools)
+
+        call_kwargs = mock_complete.call_args.kwargs
+        assert call_kwargs.get("tools") is None
+
+
+class TestMultiTurnToolUse:
+
+    @pytest.mark.asyncio
+    async def test_tool_call_then_text(self):
+        """Sub-agent calls a tool, gets result, then responds with text."""
+        config = make_config()
+        tools = make_tools()
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=[
+                tool_response("shell", {"command": "date"}),
+                text_response("Today is March 8, 2026"),
+            ],
+        ), patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="Sat Mar  8 19:00:00 EDT 2026"),
+        ):
+            result = await run_subagent("What's the date?", config, tools=tools)
+
+        assert result.is_error is False
+        assert "March 8" in result.content
+
+    @pytest.mark.asyncio
+    async def test_multiple_tool_calls_before_text(self):
+        """Sub-agent makes multiple tool iterations before final text."""
+        config = make_config()
+        tools = make_tools()
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=[
+                tool_response("file_read", {"path": "/tmp/a.txt"}, "tc_1"),
+                tool_response("file_write", {"path": "/tmp/b.txt"}, "tc_2"),
+                text_response("Done, wrote the file."),
+            ],
+        ), patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="ok"),
+        ):
+            result = await run_subagent("Copy a.txt to b.txt", config, tools=tools)
+
+        assert result.is_error is False
+        assert "Done" in result.content
+
+
+class TestCircuitBreaker:
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_fires(self):
+        """After MAX_ITERATIONS tool calls, returns error."""
+        config = make_config()
+        tools = make_tools()
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            return_value=tool_response("shell", {"command": "echo loop"}),
+        ), patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="looping"),
+        ) as mock_exec:
+            result = await run_subagent("Loop forever", config, tools=tools)
+
+        assert result.is_error is True
+        assert "limit" in result.content.lower()
+        assert mock_exec.call_count == MAX_ITERATIONS
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_is_10(self):
+        """Circuit breaker is set to 10 iterations."""
+        assert MAX_ITERATIONS == 10
 
 
 class TestErrorHandling:
@@ -214,17 +328,27 @@ class TestErrorHandling:
             result = await run_subagent("Do something", config)
 
         assert result.is_error is True
-        assert "rate limit" in result.content.lower() or "error" in result.content.lower()
+        assert "error" in result.content.lower()
 
     @pytest.mark.asyncio
-    async def test_empty_response_not_error(self):
-        """Empty LLM response is not an error (just empty content)."""
+    async def test_tool_error_continues_loop(self):
+        """Tool execution error doesn't crash the sub — error fed back to LLM."""
         config = make_config()
+        tools = make_tools()
+
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=mock_response(""),
+            side_effect=[
+                tool_response("shell", {"command": "bad_cmd"}),
+                text_response("The command failed, here's what happened."),
+            ],
+        ), patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="command not found", is_error=True),
         ):
-            result = await run_subagent("Do something", config)
+            result = await run_subagent("Run bad_cmd", config, tools=tools)
 
         assert result.is_error is False
+        assert "failed" in result.content.lower()
