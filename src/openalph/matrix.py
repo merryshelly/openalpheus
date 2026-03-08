@@ -10,7 +10,7 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 
 import asyncio
 import logging
-from nio import AsyncClient
+from nio import AsyncClient, InviteMemberEvent, RoomMessageText
 
 from openalph.config import MatrixConfig
 
@@ -160,6 +160,17 @@ class MatrixBot:
         # Load into agent
         self.agent.history = history
 
+    async def _handle_invite(self, room, event):
+        """Auto-join rooms on invite.
+
+        Args:
+            room: Matrix room object (invited room)
+            event: InviteMemberEvent
+        """
+        if event.state_key == self.config.user_id:
+            logger.info("Invited to %s by %s — joining", room.room_id, event.sender)
+            await self.client.join(room.room_id)
+
     async def _handle_room_message(self, room, event):
         """Handle a room message event.
 
@@ -227,6 +238,10 @@ class MatrixBot:
         """
         await self._login()
         self._running = True
+
+        # Register event callbacks
+        self.client.add_event_callback(self._handle_room_message, RoomMessageText)
+        self.client.add_event_callback(self._handle_invite, InviteMemberEvent)
 
         # Initial sync to get rooms
         await self.client.sync(timeout=self.config.sync_timeout)

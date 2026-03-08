@@ -1,0 +1,20 @@
+# Smoke test config — @merry-dev:matrix.local on conduwuit
+# Uses Anthropic Haiku for cheap testing
+
+[agent]
+name = "merry-dev"
+model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+
+[provider]
+type = "anthropic"
+api_key_cmd = "op read 'op://shelly/Anthropic API Key - scripts/credential'"
+
+[workspace]
+path = "/tmp/openalph-smoke-test"
+
+[matrix]
+homeserver = "http://10.0.20.109:8448"
+user_id = "@merry-dev:matrix.local"
+device_id = "32MohZ34Rp"
+password_cmd = "op read 'op://shelly/continuwuity matrix merry-dev/password'"
