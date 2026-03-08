@@ -48,6 +48,7 @@ def make_agent_config(**kwargs):
         max_iterations=25,
         truncation_limit=50000,
         model_max_tokens=200000,
+        matrix=None,
     )
     defaults.update(kwargs)
     return AgentConfig(**defaults)

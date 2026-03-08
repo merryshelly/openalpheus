@@ -23,6 +23,20 @@ class ConfigError(Exception):
 
 
 @dataclass
+class MatrixConfig:
+    """Configuration for Matrix integration."""
+    homeserver: str
+    user_id: str
+    device_id: str
+    password: str | None
+    access_token: str | None
+    context_reserve: int
+    sync_timeout: int
+    retry_base: int
+    retry_max: int
+
+
+@dataclass
 class AgentConfig:
     """Configuration for an OpenAlph agent."""
     name: str
@@ -32,6 +46,8 @@ class AgentConfig:
     api_key: str  # resolved value (not the reference)
     base_url: str | None
     workspace: Path
+    model_max_tokens: int = 200000
+    matrix: MatrixConfig | None = None
     max_iterations: int = 25
     truncation_limit: int = 50000
 
@@ -85,7 +101,12 @@ def load_config(path: Path) -> AgentConfig:
     max_tokens = agent_section.get("max_tokens", 8192)
     if not isinstance(max_tokens, int) or max_tokens <= 0:
         raise ConfigError("max_tokens must be a positive integer")
-    
+
+    # model_max_tokens defaults to 200000 if not specified
+    model_max_tokens = agent_section.get("model_max_tokens", 200000)
+    if not isinstance(model_max_tokens, int) or model_max_tokens <= 0:
+        raise ConfigError("model_max_tokens must be a positive integer")
+
     # max_iterations defaults to 25 if not specified
     max_iterations = agent_section.get("max_iterations", 25)
     if not isinstance(max_iterations, int) or max_iterations <= 0:
@@ -165,16 +186,153 @@ def load_config(path: Path) -> AgentConfig:
         workspace_path = Path(workspace_path_str)
     except KeyError:
         raise ConfigError("Missing required field: workspace.path")
-    
+
+    # Parse optional [matrix] section
+    matrix = _parse_matrix_config(toml_data)
+
     # Return resolved configuration
     return AgentConfig(
         name=name,
         model=model,
         max_tokens=max_tokens,
+        model_max_tokens=model_max_tokens,
         provider=provider_type,
         api_key=api_key,
         base_url=base_url,
         workspace=workspace_path,
+        matrix=matrix,
         max_iterations=max_iterations,
         truncation_limit=truncation_limit
+    )
+
+
+def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:
+    """Parse the [matrix] section from TOML data.
+
+    Returns None if [matrix] section is not present.
+    Raises ConfigError if required fields are missing or invalid.
+    """
+    if "matrix" not in toml_data:
+        return None
+
+    matrix_section = toml_data["matrix"]
+
+    # Required fields
+    try:
+        homeserver = matrix_section["homeserver"]
+        if not homeserver or not isinstance(homeserver, str):
+            raise ConfigError("matrix.homeserver must be a non-empty string")
+    except KeyError:
+        raise ConfigError("Missing required field: matrix.homeserver")
+
+    try:
+        user_id = matrix_section["user_id"]
+        if not user_id or not isinstance(user_id, str):
+            raise ConfigError("matrix.user_id must be a non-empty string")
+    except KeyError:
+        raise ConfigError("Missing required field: matrix.user_id")
+
+    # Optional fields with defaults
+    device_id = matrix_section.get("device_id", "OPENALPH")
+    if not isinstance(device_id, str):
+        raise ConfigError("matrix.device_id must be a string")
+
+    context_reserve = matrix_section.get("context_reserve", 16384)
+    if not isinstance(context_reserve, int) or context_reserve <= 0:
+        raise ConfigError("matrix.context_reserve must be a positive integer")
+
+    # Parse [matrix.sync] subsection with defaults
+    sync_section = matrix_section.get("sync", {})
+    sync_timeout = sync_section.get("timeout", 30000)
+    if not isinstance(sync_timeout, int) or sync_timeout <= 0:
+        raise ConfigError("matrix.sync.timeout must be a positive integer")
+
+    retry_base = sync_section.get("retry_base", 5)
+    if not isinstance(retry_base, int) or retry_base <= 0:
+        raise ConfigError("matrix.sync.retry_base must be a positive integer")
+
+    retry_max = sync_section.get("retry_max", 300)
+    if not isinstance(retry_max, int) or retry_max <= 0:
+        raise ConfigError("matrix.sync.retry_max must be a positive integer")
+
+    # Resolve password with precedence: password > password_env > password_cmd
+    password = None
+
+    if "password" in matrix_section:
+        password = matrix_section["password"]
+        if not isinstance(password, str):
+            raise ConfigError("matrix.password must be a string")
+
+    if password is None and "password_env" in matrix_section:
+        env_var_name = matrix_section["password_env"]
+        if not env_var_name or not isinstance(env_var_name, str):
+            raise ConfigError("matrix.password_env must be a non-empty string")
+        password = os.environ.get(env_var_name)
+        if password is None:
+            raise ConfigError(f"Environment variable {env_var_name} is not set")
+
+    if password is None and "password_cmd" in matrix_section:
+        cmd = matrix_section["password_cmd"]
+        if not cmd or not isinstance(cmd, str):
+            raise ConfigError("matrix.password_cmd must be a non-empty string")
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            password = result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            raise ConfigError(f"matrix.password_cmd failed with exit code {e.returncode}")
+
+    # Resolve access_token with precedence: access_token > access_token_env > access_token_cmd
+    access_token = None
+
+    if "access_token" in matrix_section:
+        access_token = matrix_section["access_token"]
+        if not isinstance(access_token, str):
+            raise ConfigError("matrix.access_token must be a string")
+
+    if access_token is None and "access_token_env" in matrix_section:
+        env_var_name = matrix_section["access_token_env"]
+        if not env_var_name or not isinstance(env_var_name, str):
+            raise ConfigError("matrix.access_token_env must be a non-empty string")
+        access_token = os.environ.get(env_var_name)
+        if access_token is None:
+            raise ConfigError(f"Environment variable {env_var_name} is not set")
+
+    if access_token is None and "access_token_cmd" in matrix_section:
+        cmd = matrix_section["access_token_cmd"]
+        if not cmd or not isinstance(cmd, str):
+            raise ConfigError("matrix.access_token_cmd must be a non-empty string")
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            access_token = result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            raise ConfigError(f"matrix.access_token_cmd failed with exit code {e.returncode}")
+
+    # Must have either password or access_token
+    if password is None and access_token is None:
+        raise ConfigError("Matrix authentication required: one of password/password_env/password_cmd or access_token/access_token_env/access_token_cmd must be set")
+
+    return MatrixConfig(
+        homeserver=homeserver,
+        user_id=user_id,
+        device_id=device_id,
+        password=password,
+        access_token=access_token,
+        context_reserve=context_reserve,
+        sync_timeout=sync_timeout,
+        retry_base=retry_base,
+        retry_max=retry_max
     )

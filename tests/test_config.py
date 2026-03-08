@@ -333,11 +333,15 @@ class TestAgentConfig:
             name="merry",
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
+            model_max_tokens=200000,
             provider="anthropic",
             api_key="sk-test",
             base_url=None,
             workspace=Path("/tmp/test"),
+            matrix=None,
         )
         assert config.name == "merry"
         assert config.max_tokens == 8192
+        assert config.model_max_tokens == 200000
         assert config.workspace == Path("/tmp/test")
+        assert config.matrix is None
