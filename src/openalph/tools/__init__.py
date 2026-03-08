@@ -3,6 +3,7 @@
 Tool registry, discovery, schema generation, and result truncation.
 """
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -344,6 +345,13 @@ async def execute_tool(
         This is a stub that dispatches to tool-specific modules.
         Full implementation will be in Phase 2.
     """
+    # Resolve relative paths for file tools against workspace
+    if name in ("file_read", "file_write", "file_edit") and "path" in input:
+        file_path = input["path"]
+        if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
+            input = dict(input)  # Don't mutate original
+            input["path"] = str(agent_config.workspace / file_path)
+
     if name == "shell":
         from .shell import run_shell
         return await run_shell(
