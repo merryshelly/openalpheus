@@ -1,0 +1,47 @@
+# Example: Anthropic agent
+[agent]
+name = "merry"
+model = "claude-sonnet-4-20250514"
+max_tokens = 8192
+
+[provider]
+type = "anthropic"
+# Exactly one of: api_key, api_key_env, api_key_cmd
+# api_key = "sk-ant-..."                          # direct (not recommended)
+api_key_cmd = "op read op://shelly/anthropic/api-key"  # shell command
+# api_key_env = "ANTHROPIC_API_KEY"               # env var
+
+[workspace]
+path = "/home/merry/.openalph/workspace"
+
+# ---
+
+# Example: OpenRouter agent
+# [agent]
+# name = "babson"
+# model = "moonshotai/kimi-k2.5"
+# max_tokens = 8192
+#
+# [provider]
+# type = "openai"
+# api_key_env = "OPENROUTER_API_KEY"
+# base_url = "https://openrouter.ai/api/v1"
+#
+# [workspace]
+# path = "/home/babson/.openalph/workspace"
+
+# ---
+
+# Example: Ollama agent (local)
+# [agent]
+# name = "coldharbor"
+# model = "qwen3:235b-a22b"
+# max_tokens = 4096
+#
+# [provider]
+# type = "openai"
+# api_key = "ollama"
+# base_url = "http://100.90.3.4:11434/v1"
+#
+# [workspace]
+# path = "/home/coldharbor/.openalph/workspace"

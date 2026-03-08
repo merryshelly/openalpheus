@@ -1,0 +1,199 @@
+"""Tests for the agent conversation loop.
+
+Interface contract:
+    Agent(config: AgentConfig) — initializes with config, assembles system prompt, empty history
+    Agent.handle_input(text: str) -> str — sends message, returns response content
+    Agent.history — list of {"role": ..., "content": ...} dicts
+    Agent.total_input_tokens / total_output_tokens — cumulative usage
+    Agent.status() -> dict — model, turns, token counts
+"""
+
+import pytest
+from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from openalph.agent import Agent
+from openalph.config import AgentConfig
+from openalph.provider import Response, Usage
+
+
+def make_config(workspace, **kwargs):
+    defaults = dict(
+        name="test",
+        model="test-model",
+        max_tokens=8192,
+        provider="anthropic",
+        api_key="sk-test",
+        base_url=None,
+    )
+    defaults.update(kwargs)
+    defaults["workspace"] = workspace
+    return AgentConfig(**defaults)
+
+
+def make_response(content="Hello", input_tokens=10, output_tokens=5):
+    return Response(
+        content=content,
+        model="test-model",
+        usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+        stop_reason="end_turn",
+    )
+
+
+# --- Initialization ---
+
+
+class TestAgentInit:
+
+    def test_init_assembles_prompt(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("I am test agent.")
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        assert "I am test agent." in agent.system_prompt
+
+    def test_init_empty_history(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        assert agent.history == []
+
+    def test_init_zero_tokens(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        assert agent.total_input_tokens == 0
+        assert agent.total_output_tokens == 0
+
+
+# --- Conversation ---
+
+
+class TestHandleInput:
+
+    @pytest.mark.asyncio
+    async def test_returns_response_content(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("Test soul.")
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            mock.return_value = make_response("Hi there!")
+            result = await agent.handle_input("Hello")
+
+        assert result == "Hi there!"
+
+    @pytest.mark.asyncio
+    async def test_history_accumulates(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            mock.return_value = make_response("Response 1")
+            await agent.handle_input("Message 1")
+
+            mock.return_value = make_response("Response 2")
+            await agent.handle_input("Message 2")
+
+        assert len(agent.history) == 4
+        assert agent.history[0] == {"role": "user", "content": "Message 1"}
+        assert agent.history[1] == {"role": "assistant", "content": "Response 1"}
+        assert agent.history[2] == {"role": "user", "content": "Message 2"}
+        assert agent.history[3] == {"role": "assistant", "content": "Response 2"}
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_passed_to_provider(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("I am the soul.")
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            mock.return_value = make_response("OK")
+            await agent.handle_input("Hi")
+
+        kw = mock.call_args.kwargs
+        assert "I am the soul." in kw["system"]
+
+    @pytest.mark.asyncio
+    async def test_config_passed_to_provider(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            mock.return_value = make_response("OK")
+            await agent.handle_input("Hi")
+
+        kw = mock.call_args.kwargs
+        assert kw["config"] is config
+
+    @pytest.mark.asyncio
+    async def test_full_history_passed_to_provider(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            mock.return_value = make_response("First")
+            await agent.handle_input("Hello")
+
+            mock.return_value = make_response("Second")
+            await agent.handle_input("Follow-up")
+
+        # Second call should include full history + new message
+        second_call = mock.call_args_list[1]
+        messages = second_call.kwargs["messages"]
+        assert len(messages) == 3
+        assert messages[0]["content"] == "Hello"
+        assert messages[1]["content"] == "First"
+        assert messages[2]["content"] == "Follow-up"
+
+
+# --- Token tracking ---
+
+
+class TestTokenTracking:
+
+    @pytest.mark.asyncio
+    async def test_tokens_accumulate(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            mock.return_value = make_response("A", input_tokens=100, output_tokens=50)
+            await agent.handle_input("First")
+
+            mock.return_value = make_response("B", input_tokens=200, output_tokens=80)
+            await agent.handle_input("Second")
+
+        assert agent.total_input_tokens == 300
+        assert agent.total_output_tokens == 130
+
+
+# --- Status ---
+
+
+class TestStatus:
+
+    def test_status_initial(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        status = agent.status()
+        assert status["model"] == "test-model"
+        assert status["turns"] == 0
+        assert status["total_input_tokens"] == 0
+        assert status["total_output_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_status_after_conversation(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            mock.return_value = make_response("Hi", input_tokens=50, output_tokens=20)
+            await agent.handle_input("Hello")
+
+        status = agent.status()
+        assert status["turns"] == 1
+        assert status["total_input_tokens"] == 50
+        assert status["total_output_tokens"] == 20
+        assert status["model"] == "test-model"
+        assert "name" in status
