@@ -12,6 +12,18 @@ from openalph.provider import complete
 from openalph.tools import discover_tools, execute_tool, truncate_result
 
 
+class ContextOverflowError(Exception):
+    """Raised when conversation context exceeds model capacity."""
+
+    def __init__(self, current_tokens: int, max_tokens: int):
+        self.current_tokens = current_tokens
+        self.max_tokens = max_tokens
+        super().__init__(
+            f"Context overflow: ~{current_tokens:,} tokens exceeds model capacity "
+            f"({max_tokens:,}). Start a new room."
+        )
+
+
 class Agent:
     """A single-conversation agent backed by an LLM provider."""
 
@@ -43,6 +55,12 @@ class Agent:
 
             # Tool loop: continue calling LLM until we get a text response
             for iteration in range(self.config.max_iterations):
+                # Check for context overflow before calling the API
+                context_tokens = self._estimate_context_tokens()
+                available = self.config.model_max_tokens - self.config.max_tokens
+                if context_tokens > available:
+                    raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
+
                 # Pass tools=None if no tools discovered (backward compatibility)
                 tools_arg = self.tools if self.tools else None
 
@@ -118,13 +136,33 @@ class Agent:
         if self._current_task:
             self._current_task.cancel()
 
+    def _estimate_context_tokens(self) -> int:
+        """Estimate current context size in tokens.
+
+        Includes system prompt + full history. Uses 1 token ≈ 4 chars.
+        """
+        total_chars = len(self.system_prompt)
+        for msg in self.history:
+            content = msg.get("content", "")
+            if content:
+                total_chars += len(content)
+            # Tool calls have input dicts — estimate their JSON size
+            for tc in msg.get("tool_calls", []):
+                total_chars += len(str(tc.input))
+        return total_chars // 4
+
     def status(self) -> dict:
         """Snapshot of agent state for operator visibility."""
+        context_tokens = self._estimate_context_tokens()
+        model_max = self.config.model_max_tokens
+        context_pct = round(context_tokens / model_max * 100) if model_max else 0
         return {
             "name": self.config.name,
             "model": self.config.model,
-            # Each turn is one user message + one assistant response.
             "turns": sum(1 for m in self.history if m["role"] == "user"),
+            "context_tokens": context_tokens,
+            "context_max": model_max,
+            "context_pct": context_pct,
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tool_calls": self.total_tool_calls,

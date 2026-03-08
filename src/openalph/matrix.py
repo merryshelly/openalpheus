@@ -12,6 +12,7 @@ import asyncio
 import logging
 from nio import AsyncClient, InviteMemberEvent, RoomMessageText
 
+from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.config import MatrixConfig
 
 logger = logging.getLogger(__name__)
@@ -229,12 +230,15 @@ class MatrixBot:
             if body == "/status":
                 status = self.agent.status()
                 # Format status message
+                ctx = status['context_tokens']
+                ctx_max = status['context_max']
+                ctx_pct = status['context_pct']
                 lines = [
                     f"**{status['name']}**",
                     f"Model: {status['model']}",
+                    f"Context: ~{ctx:,} / {ctx_max:,} tokens ({ctx_pct}%)",
                     f"Turns: {status['turns']}",
-                    f"Input tokens: {status['total_input_tokens']}",
-                    f"Output tokens: {status['total_output_tokens']}",
+                    f"Cumulative: {status['total_input_tokens']:,} in / {status['total_output_tokens']:,} out",
                     f"Tool calls: {status['total_tool_calls']}",
                 ]
                 await self.send(room_id, "\n".join(lines))
@@ -271,6 +275,11 @@ class MatrixBot:
             try:
                 response = await self.agent.handle_input(body)
                 await self.send(room_id, response)
+            except AgentOverflowError as e:
+                logger.warning("Context overflow in %s: %s", room_id, e)
+                await self.send(room_id,
+                    f"⚠️ **Context overflow** — ~{e.current_tokens:,} / "
+                    f"{e.max_tokens:,} tokens. Start a new room to continue.")
             except Exception as e:
                 # Agent error: send error message, don't crash
                 logger.exception("Agent error processing message")
