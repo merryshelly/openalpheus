@@ -33,7 +33,7 @@ src/openalph/
 ├── matrix.py         # Matrix client, sync loop, lazy room activation, /stop, /status
 └── tools/
     ├── __init__.py   # Registry, discovery (workspace/tools/*.toml), dispatch, truncation
-    ├── shell.py      # Stateless subprocess (explicit cwd/env/timeout)
+    ├── shell.py      # Stateless subprocess (explicit cwd/env/timeout, defaults to agent home)
     ├── file.py       # read/write/edit with path resolution
     ├── web.py        # search (Brave) + fetch (HTML→text)
     └── subagent.py   # Multi-turn sub-agent with parent's tools (minus subagent, preventing recursion)
