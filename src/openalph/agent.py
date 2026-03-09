@@ -6,10 +6,18 @@ so the operator can check usage without external tooling.
 """
 
 import asyncio
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
 from openalph.provider import complete
 from openalph.tools import discover_tools, execute_tool, truncate_result
+
+logger = logging.getLogger(__name__)
 
 
 class ContextOverflowError(Exception):
@@ -41,6 +49,7 @@ class Agent:
         self.tools = discover_tools(config.workspace)
         self._current_task: asyncio.Task | None = None
         self._on_tool_call = None  # async callback(name, input, result, is_error)
+        self._on_tool_intent = None  # async callback(tool_calls, content) — fires before tool execution
 
     def history(self, room_id: str) -> list[dict]:
         """Get or create history for a room."""
@@ -48,9 +57,43 @@ class Agent:
             self._rooms[room_id] = []
         return self._rooms[room_id]
 
-    def reset_room(self, room_id: str):
-        """Clear history for a room."""
-        self._rooms[room_id] = []
+    def _log_turn(
+        self,
+        room_id: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        tool_calls: list[dict] | None,
+        latency_ms: float,
+        content_preview: str,
+    ) -> None:
+        """Write a JSONL entry for this LLM turn.
+
+        Failures are logged but do not crash the agent.
+        """
+        try:
+            log_dir = Path(self.config.workspace) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            log_file = log_dir / f"{self.config.name}-{date_str}.jsonl"
+
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "room_id": room_id,
+                "direction": "outbound",
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "tool_calls": tool_calls or [],
+                "latency_ms": latency_ms,
+                "content_preview": content_preview[:200] if content_preview else "",
+            }
+
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to write JSONL log: {e}")
 
     async def handle_input(self, text: str, room_id: str = "_default") -> str:
         """Process a user message and return the assistant's response.
@@ -79,6 +122,9 @@ class Agent:
                 # Pass tools=None if no tools discovered (backward compatibility)
                 tools_arg = self.tools if self.tools else None
 
+                # Record start time for latency measurement
+                start_time = time.monotonic()
+
                 # Pass a snapshot of history, not the live list.
                 response = await complete(
                     config=self.config,
@@ -87,12 +133,23 @@ class Agent:
                     tools=tools_arg,
                 )
 
+                latency_ms = (time.monotonic() - start_time) * 1000
+
                 self.total_input_tokens += response.usage.input_tokens
                 self.total_output_tokens += response.usage.output_tokens
 
                 # Check if response has tool calls
                 if not response.tool_calls:
-                    # Text response - append to history and return
+                    # Text response - log and return
+                    self._log_turn(
+                        room_id=room_id,
+                        model=self.config.model,
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
+                        tool_calls=None,
+                        latency_ms=latency_ms,
+                        content_preview=response.content,
+                    )
                     history.append({"role": "assistant", "content": response.content})
                     return response.content
 
@@ -102,6 +159,10 @@ class Agent:
                     "content": response.content,
                     "tool_calls": response.tool_calls,
                 })
+
+                # Emit tool intent before execution (for session logging / observability)
+                if self._on_tool_intent:
+                    await self._on_tool_intent(response.tool_calls, response.content)
 
                 # Execute tool calls in parallel
                 tool_coros = []
@@ -125,6 +186,26 @@ class Agent:
 
                 # Track total tool calls
                 self.total_tool_calls += len(response.tool_calls)
+
+                # Build tool_calls log entry with is_error from results
+                logged_tool_calls = []
+                for tc, result in zip(response.tool_calls, results):
+                    logged_tool_calls.append({
+                        "name": tc.name,
+                        "input": tc.input,
+                        "is_error": result.is_error,
+                    })
+
+                # Log this tool-use turn
+                self._log_turn(
+                    room_id=room_id,
+                    model=self.config.model,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    tool_calls=logged_tool_calls,
+                    latency_ms=latency_ms,
+                    content_preview=response.content,
+                )
 
                 # Append tool results to history (truncated) and notify
                 for tc, result in zip(response.tool_calls, results):

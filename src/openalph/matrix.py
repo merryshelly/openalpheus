@@ -4,7 +4,7 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 - Login (password or access token)
 - Message routing (skip own messages, commands, regular messages)
 - Typing indicator management
-- History loading with context overflow detection
+- Lazy room activation (history loaded on first live message)
 - Graceful error handling
 """
 
@@ -14,26 +14,9 @@ from nio import AsyncClient, InviteMemberEvent, RoomMessageText
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.config import MatrixConfig
+from openalph.session import SessionLog
 
 logger = logging.getLogger(__name__)
-
-
-class ContextOverflowError(Exception):
-    """Raised when room history exceeds model context capacity.
-
-    This is a hard error, not a graceful degradation.
-    Operator must switch to a larger model or start a new room.
-    """
-
-    def __init__(self, room_id: str, history_tokens: int, max_tokens: int):
-        self.room_id = room_id
-        self.history_tokens = history_tokens
-        self.max_tokens = max_tokens
-        super().__init__(
-            f"Room {room_id}: history ({history_tokens} tokens) exceeds "
-            f"model capacity ({max_tokens} - {max_tokens - history_tokens} reserve). "
-            f"Switch to a larger model or start a new room."
-        )
 
 
 class MatrixBot:
@@ -55,9 +38,11 @@ class MatrixBot:
         self.agent = agent
         self.config = config
         self.client = AsyncClient(config.homeserver, config.user_id, config.device_id)
+        self.session_log = SessionLog(agent.config.workspace, config.user_id)
         self._running = False
         self._synced = False
         self._current_room = None
+        self._active_rooms = set()
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -136,46 +121,85 @@ class MatrixBot:
             await self.send(self._current_room, "Cancelled.")
             await self._set_typing(self._current_room, False)
 
-    def _load_history_into_agent(self, messages: list, room_id: str):
-        """Load room messages into agent history.
+    async def _activate_room(self, room_id: str, room_name: str = ""):
+        """Load session history on first message (lazy wake).
 
-        Converts Matrix events to agent message format.
-        Raises ContextOverflowError if history exceeds model capacity.
-
-        Args:
-            messages: List of Matrix room message events
-            room_id: Matrix room ID
-
-        Raises:
-            ContextOverflowError: If history tokens exceed available capacity
+        New architecture: reads local JSONL instead of paginating Matrix history.
+        If entries exist, does gap-fill from last known event. If new room, starts fresh.
         """
-        # Calculate available capacity
-        model_max = self.agent.config.model_max_tokens
-        reserve = self.config.context_reserve
-        system_tokens = self._estimate_tokens(self.agent.system_prompt)
-        available = model_max - reserve - system_tokens
+        session_log = getattr(self, 'session_log', None)
 
-        # Convert messages to agent format and estimate tokens
-        history = []
-        total_tokens = 0
+        if session_log:
+            existing = session_log.read(room_id)
 
-        for msg in messages:
-            # Determine role based on sender
-            if msg.sender == self.config.user_id:
-                role = "assistant"
+            if existing:
+                # Gap-fill: fetch Matrix messages since the last known event
+                last_id = session_log.last_event_id(room_id)
+                if last_id:
+                    try:
+                        # Fetch recent messages to check for gaps
+                        response = await self.client.room_messages(room_id, start="", limit=100)
+                        recent = list(response.chunk)
+                        # Recent messages come in reverse order (newest first)
+                        # Find the cutoff: append only events after last_id
+                        known_ids = {e.get("event_id") for e in existing if e.get("event_id")}
+                        for msg in reversed(recent):
+                            if not hasattr(msg, 'body'):
+                                continue
+                            ev_id = getattr(msg, 'event_id', None)
+                            if ev_id and ev_id not in known_ids and msg.sender != self.config.user_id:
+                                session_log.append(
+                                    role="user",
+                                    sender=msg.sender,
+                                    room=room_id,
+                                    event_id=ev_id,
+                                    content=msg.body,
+                                )
+                        session_log.append(
+                            role="system",
+                            sender=self.agent_user_id if hasattr(self, 'agent_user_id') else self.config.user_id,
+                            room=room_id,
+                            event="session_resume",
+                            detail=f"Resumed session with {len(existing)} prior entries",
+                        )
+                    except Exception as e:
+                        logger.warning("Gap-fill failed for %s: %s", room_id, e)
+
+                # Restore context from session log
+                history = self.agent.history(room_id)
+                history.clear()
+                history.extend(session_log.build_context(room_id))
             else:
-                role = "user"
+                # New room: start fresh, log session start
+                session_log.append(
+                    role="system",
+                    sender=self.config.user_id,
+                    room=room_id,
+                    event="session_start",
+                    detail="New room, starting fresh",
+                )
+        else:
+            # Fallback: paginate Matrix history (legacy path for tests without session_log)
+            all_messages = []
+            response = await self.client.room_messages(room_id, start="", limit=100)
+            all_messages.extend(response.chunk)
+            while response.end:
+                response = await self.client.room_messages(room_id, start=response.end, limit=100)
+                all_messages.extend(response.chunk)
 
-            content = msg.body
-            history.append({"role": role, "content": content})
-            total_tokens += self._estimate_tokens(content)
+            all_messages.reverse()
 
-        # Check for overflow
-        if total_tokens > available:
-            raise ContextOverflowError(room_id, total_tokens, model_max)
+            history = self.agent.history(room_id)
+            for msg in all_messages:
+                if not hasattr(msg, 'body'):
+                    continue
+                if msg.sender == self.config.user_id:
+                    role = "assistant"
+                else:
+                    role = "user"
+                history.append({"role": role, "content": msg.body})
 
-        # Load into agent
-        self.agent.history = history
+        self._active_rooms.add(room_id)
 
     async def _handle_invite(self, room, event):
         """Auto-join rooms on invite.
@@ -192,24 +216,18 @@ class MatrixBot:
         """Handle a room message event.
 
         Routes messages:
-        - Skip events from initial sync (loaded as history, not responded to)
+        - Skip events from initial sync (lazy wake: no hydration)
         - Skip own messages
         - /stop → cancel current work
         - /status → post agent status
-        - Otherwise → process through agent
+        - Otherwise → activate room if needed, process through agent
 
         Args:
             room: Matrix room object
             event: Room message event
         """
-        # During initial sync, load messages as history context, don't respond
+        # During initial sync, don't hydrate rooms — lazy wake on first live message
         if not self._synced:
-            if event.sender != self.config.user_id:
-                role = "user"
-            else:
-                role = "assistant"
-            self.agent.history(room.room_id).append({"role": role, "content": event.body})
-            logger.debug("History [%s]: [%s] %s", room.room_id, role, event.body[:80])
             return
 
         # Skip own messages
@@ -225,11 +243,6 @@ class MatrixBot:
 
             if body == "/stop":
                 await self._cancel_current()
-                return
-
-            if body == "/reset":
-                self.agent.reset_room(room_id)
-                await self.send(room_id, "🔄 Session reset. History cleared.")
                 return
 
             if body == "/status":
@@ -249,36 +262,77 @@ class MatrixBot:
                 await self.send(room_id, "\n".join(lines))
                 return
 
+            # Lazy wake: activate room on first live message
+            if room_id not in self._active_rooms:
+                room_name = getattr(room, 'name', '') or getattr(room, 'display_name', '') or room_id
+                await self._activate_room(room_id, room_name=room_name)
+
+            # Append user message to session log
+            session_log = getattr(self, 'session_log', None)
+            if session_log:
+                session_log.append(
+                    role="user",
+                    sender=event.sender,
+                    room=room_id,
+                    event_id=getattr(event, 'event_id', None),
+                    content=body,
+                )
+
             # Regular message: process through agent
             await self._set_typing(room_id, True)
 
             # Wire tool visibility for this turn
             async def _tool_notice(name, input_data, result, is_error):
-                # Format a concise one-line summary
-                status = "❌" if is_error else "✅"
-                # Truncate input for display
-                if name == "shell":
-                    detail = input_data.get("command", "")[:80]
-                elif name == "file_read":
-                    detail = input_data.get("path", "")
-                elif name in ("file_write", "file_edit"):
-                    detail = input_data.get("path", "")
-                elif name == "web_search":
-                    detail = input_data.get("query", "")[:60]
-                elif name == "web_fetch":
-                    detail = input_data.get("url", "")[:60]
-                elif name == "subagent":
-                    detail = input_data.get("task", "")[:60]
-                else:
-                    detail = str(input_data)[:60]
-                result_len = len(result)
-                line = f"{status} `{name}`: {detail} → {result_len} chars"
-                await self.send_notice(room_id, line)
+                # Send abbreviated notice to Matrix room
+                notice_body = f"🔧 {name}: {str(result)[:200]}"
+                try:
+                    await self.send_notice(room_id, notice_body)
+                except Exception:
+                    pass
+                # Append tool result to session log
+                _sl = getattr(self, 'session_log', None)
+                if _sl:
+                    _sl.append(
+                        role="tool",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        call_id=name,  # use name as call_id approximation (actual id comes from tc.id)
+                        name=name,
+                        output=result,
+                        is_error=is_error,
+                    )
+
+            # Wire tool intent logging (fires before tool execution)
+            async def _tool_intent(tool_calls, content):
+                _sl = getattr(self, 'session_log', None)
+                if _sl:
+                    _sl.append(
+                        role="assistant",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        content=content or "",
+                        tool_calls=[
+                            {"call_id": tc.id, "name": tc.name, "input": tc.input}
+                            for tc in tool_calls
+                        ],
+                    )
 
             self.agent._on_tool_call = _tool_notice
+            self.agent._on_tool_intent = _tool_intent
 
             try:
                 response = await self.agent.handle_input(body, room_id)
+                # Append assistant response to session log
+                if session_log:
+                    session_log.append(
+                        role="assistant",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        content=response,
+                    )
                 await self.send(room_id, response)
             except AgentOverflowError as e:
                 logger.warning("Context overflow in %s: %s", room_id, e)
@@ -291,6 +345,7 @@ class MatrixBot:
                 await self.send(room_id, f"Error: {e}")
             finally:
                 self.agent._on_tool_call = None
+                self.agent._on_tool_intent = None
                 await self._set_typing(room_id, False)
 
         finally:
@@ -300,8 +355,7 @@ class MatrixBot:
         """Start the Matrix bot.
 
         1. Login
-        2. Load room history
-        3. Start sync loop
+        2. Start sync loop (rooms hydrate on first message via lazy wake)
         """
         await self._login()
         self._running = True
@@ -315,10 +369,7 @@ class MatrixBot:
         # Initial sync: populates rooms and loads timeline history via callback
         await self.client.sync(timeout=self.config.sync_timeout)
         self._synced = True
-        total = sum(len(h) for h in self.agent._rooms.values())
-        rooms = len(self.agent._rooms)
-        logger.info("Initial sync complete, loaded %d messages across %d rooms",
-                     total, rooms)
+        logger.info("Initial sync complete (lazy wake: rooms will hydrate on first message)")
 
         # Sync loop
         delay = self.config.retry_base

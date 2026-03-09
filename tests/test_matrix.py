@@ -13,7 +13,7 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 from pathlib import Path
-from openalph.matrix import MatrixBot, ContextOverflowError
+from openalph.matrix import MatrixBot
 from openalph.config import AgentConfig, MatrixConfig
 
 
@@ -155,6 +155,7 @@ class TestMessageRouting:
         bot._set_typing = AsyncMock()
         bot._current_room = None
         bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -256,6 +257,7 @@ class TestTypingIndicator:
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
         bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -287,6 +289,7 @@ class TestTypingIndicator:
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
         bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -302,101 +305,6 @@ class TestTypingIndicator:
             arg is False
             for arg in list(last_call.args) + list(last_call.kwargs.values())
         )
-
-
-# --- Context Overflow ---
-
-
-class TestContextOverflow:
-
-    def test_context_overflow_error_attributes(self):
-        """ContextOverflowError carries room_id, token counts."""
-        err = ContextOverflowError("!room:local", 180000, 200000)
-        assert err.room_id == "!room:local"
-        assert err.history_tokens == 180000
-        assert err.max_tokens == 200000
-        assert "180000" in str(err)
-
-    def test_context_overflow_is_exception(self):
-        """ContextOverflowError is a proper exception."""
-        with pytest.raises(ContextOverflowError):
-            raise ContextOverflowError("!room:local", 180000, 200000)
-
-
-# --- History Loading ---
-
-
-class TestHistoryLoading:
-
-    @pytest.mark.asyncio
-    async def test_room_history_loaded_as_agent_context(self):
-        """Room messages are converted to agent history format."""
-        config = make_matrix_config(user_id="@merry:matrix.local")
-        agent_config = make_agent_config(model_max_tokens=200000)
-        agent = MagicMock()
-        agent.config = agent_config
-        agent.system_prompt = "x" * 100  # short prompt
-        agent.history = []
-
-        messages = [
-            make_room_message("@sb:matrix.local", "Hello"),
-            make_room_message("@merry:matrix.local", "Hi there!"),
-            make_room_message("@sb:matrix.local", "How are you?"),
-        ]
-
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot._estimate_tokens = lambda text: len(text) // 4
-
-        bot._load_history_into_agent(messages, "!test:matrix.local")
-
-        assert len(agent.history) == 3
-        assert agent.history[0] == {"role": "user", "content": "Hello"}
-        assert agent.history[1] == {"role": "assistant", "content": "Hi there!"}
-        assert agent.history[2] == {"role": "user", "content": "How are you?"}
-
-    @pytest.mark.asyncio
-    async def test_overflow_raises_error(self):
-        """History exceeding model capacity raises ContextOverflowError."""
-        config = make_matrix_config(user_id="@merry:matrix.local", context_reserve=1000)
-        agent_config = make_agent_config(model_max_tokens=2000)
-        agent = MagicMock()
-        agent.config = agent_config
-        agent.system_prompt = "x" * 100
-        agent.history = []
-
-        # Create messages that exceed capacity
-        messages = [
-            make_room_message("@sb:matrix.local", "x" * 50000),
-        ]
-
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot._estimate_tokens = lambda text: len(text) // 4
-
-        with pytest.raises(ContextOverflowError):
-            bot._load_history_into_agent(messages, "!test:matrix.local")
-
-    @pytest.mark.asyncio
-    async def test_empty_room_no_error(self):
-        """Empty room → empty history, no error."""
-        config = make_matrix_config(user_id="@merry:matrix.local")
-        agent_config = make_agent_config(model_max_tokens=200000)
-        agent = MagicMock()
-        agent.config = agent_config
-        agent.system_prompt = "test"
-        agent.history = []
-
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot._estimate_tokens = lambda text: len(text) // 4
-
-        bot._load_history_into_agent([], "!test:matrix.local")
-
-        assert agent.history == []
 
 
 # --- Error Handling ---
@@ -419,6 +327,7 @@ class TestErrorHandling:
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
         bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
 
         event = make_room_message("@sb:matrix.local", "Do something")
         room = MagicMock()
@@ -444,6 +353,7 @@ class TestErrorHandling:
         bot.client.room_typing = AsyncMock()
         bot._current_room = None
         bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()

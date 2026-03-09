@@ -1,18 +1,19 @@
 # OpenAlph
 
-Purpose-built multi-agent AI platform. Matrix rooms as sessions, one process per agent.
+Purpose-built multi-agent AI platform. Matrix as transport, local state as persistence, one process per agent.
 
 Named for the pistol shrimp (genus *Alpheus*) — tiny crustacean, outsized impact.
 
 ## Status
 
-Phase 1: In Development
+Phase 3.6: Session Persistence (in progress)
 
 ## Architecture
 
 - **Process model:** One process per agent, managed by systemd
-- **Interface:** Matrix (room = session = context = persistence)
+- **Communication:** Matrix (conduwuit) — rooms as sessions, membership as ACL
+- **Persistence:** Local JSONL per session — canonical source of agent context state
 - **Providers:** Anthropic SDK + OpenAI SDK (OpenRouter, Ollama)
-- **Isolation:** Unix users per agent
+- **Isolation:** Unix users per agent (Phase 4)
 - **Language:** Python
 - **License:** MIT

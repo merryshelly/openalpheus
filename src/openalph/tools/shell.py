@@ -5,6 +5,7 @@ Stateless subprocess execution. Each call is independent.
 
 import asyncio
 import os
+import signal
 from typing import Any
 
 from . import ToolResult, truncate_result
@@ -42,6 +43,7 @@ async def run_shell(
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=process_env,
+            start_new_session=True,
         )
 
         try:
@@ -49,8 +51,13 @@ async def run_shell(
                 proc.communicate(), timeout=timeout
             )
         except asyncio.TimeoutError:
-            # Kill the process on timeout
-            proc.kill()
+            # Kill the entire process group (shell + children) on timeout.
+            # Without this, create_subprocess_shell children (e.g. sleep)
+            # survive as orphans and hold pipes open, hanging the event loop.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
             try:
                 await proc.wait()
             except Exception:
