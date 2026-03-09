@@ -189,6 +189,14 @@ class TestPlanSetupSharedDir:
         assert len(main_chgrp) >= 1
         assert main_chgrp[0].group == OPENALPH_GROUP
 
+    def test_subdirs_mode_2770(self, ops):
+        """beads/ and docs/ must also be 2770 for group write."""
+        chmod_ops = [op for op in ops if op.kind == "chmod"]
+        beads_chmod = [op for op in chmod_ops if op.path == SHARED_DIR / "beads"]
+        docs_chmod = [op for op in chmod_ops if op.path == SHARED_DIR / "docs"]
+        assert len(beads_chmod) >= 1 and beads_chmod[0].mode == "2770"
+        assert len(docs_chmod) >= 1 and docs_chmod[0].mode == "2770"
+
     def test_every_op_has_description(self, ops):
         for op in ops:
             assert op.description, f"Missing description on {op.kind} op"
@@ -322,6 +330,18 @@ class TestPlanCreateAgent:
         assert len(home_chown) >= 1
         assert home_chown[0].user == "oa-watson"
         assert home_chown[0].group == OPENALPH_GROUP
+
+    def test_chown_is_recursive(self, ops):
+        """chown must be recursive so scaffold dirs get correct ownership."""
+        chown_ops = [op for op in ops if op.kind == "chown" and op.path == Path("/home/oa-watson")]
+        assert len(chown_ops) >= 1
+        assert chown_ops[0].recursive is True
+
+    def test_chown_after_mkdirs(self, ops):
+        """chown must come after all mkdirs to cover scaffold dirs."""
+        chown_idx = next(i for i, op in enumerate(ops) if op.kind == "chown")
+        last_mkdir_idx = max(i for i, op in enumerate(ops) if op.kind == "mkdir" and (Path("/home/oa-watson") in op.path.parents or op.path == Path("/home/oa-watson")))
+        assert chown_idx > last_mkdir_idx
 
     # --- Description ---
 

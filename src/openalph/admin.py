@@ -52,6 +52,8 @@ class Operation:
     # systemctl
     action: Optional[str] = None
     unit: Optional[str] = None
+    # chown recursive
+    recursive: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +123,9 @@ def plan_setup_shared_dir() -> list[Operation]:
         Operation(kind="chmod", path=SHARED_DIR, mode="2770", description=f"Set mode 2770 on {SHARED_DIR}"),
         Operation(kind="chgrp", path=SHARED_DIR, group=OPENALPH_GROUP, description=f"Set group {OPENALPH_GROUP} on {SHARED_DIR}"),
         Operation(kind="mkdir", path=SHARED_DIR / "beads", description="Create beads subdir"),
+        Operation(kind="chmod", path=SHARED_DIR / "beads", mode="2770", description="Set mode 2770 on beads subdir"),
         Operation(kind="mkdir", path=SHARED_DIR / "docs", description="Create docs subdir"),
+        Operation(kind="chmod", path=SHARED_DIR / "docs", mode="2770", description="Set mode 2770 on docs subdir"),
     ]
     return ops
 
@@ -144,13 +148,13 @@ def plan_create_agent(name: str) -> list[Operation]:
         description=f"Create user {username}",
     ))
 
-    # Set home permissions
-    ops.append(Operation(kind="chmod", path=home, mode="750", description=f"chmod 750 {home}"))
-    ops.append(Operation(kind="chown", path=home, user=username, group=OPENALPH_GROUP, description=f"chown {username}:{OPENALPH_GROUP} {home}"))
-
-    # Scaffold workspace dirs
+    # Scaffold workspace dirs (before chown so recursive chown covers them)
     for subdir in ["workspace", "workspace/memory", "workspace/skills", ".config", ".cache"]:
         ops.append(Operation(kind="mkdir", path=home / subdir, description=f"Create {home / subdir}"))
+
+    # Set home permissions + recursive ownership (after mkdirs)
+    ops.append(Operation(kind="chmod", path=home, mode="750", description=f"chmod 750 {home}"))
+    ops.append(Operation(kind="chown", path=home, user=username, group=OPENALPH_GROUP, recursive=True, description=f"chown -R {username}:{OPENALPH_GROUP} {home}"))
 
     # Config dir
     ops.append(Operation(kind="mkdir", path=CONFIG_DIR, description=f"Create config dir {CONFIG_DIR}"))
@@ -188,7 +192,11 @@ def execute_plan(ops: list[Operation]) -> None:
             elif op.kind == "chgrp":
                 subprocess.run(["chgrp", op.group, str(op.path)], check=True)
             elif op.kind == "chown":
-                subprocess.run(["chown", f"{op.user}:{op.group}", str(op.path)], check=True)
+                cmd = ["chown"]
+                if op.recursive:
+                    cmd.append("-R")
+                cmd.extend([f"{op.user}:{op.group}", str(op.path)])
+                subprocess.run(cmd, check=True)
             elif op.kind == "useradd":
                 result = subprocess.run(
                     ["useradd", "-g", op.group, "-s", op.shell, "-d", str(op.home), "-m", op.username],
