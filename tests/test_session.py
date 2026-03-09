@@ -535,3 +535,140 @@ class TestMatrixBotIntegration:
         final = entries[3]
         assert final["role"] == "assistant"
         assert final["content"] == "System has been up 3 days."
+
+
+class TestRehydrationRoundTrip:
+    """End-to-end: write tool-use conversation to JSONL, rehydrate, verify
+    the result passes through provider serialization without error.
+
+    These tests catch serialization boundary bugs:
+    - dict vs ToolCall objects (tc.id / tc.name / tc.input attribute access)
+    - call_id mismatch between intent and tool result entries
+    """
+
+    def _write_tool_conversation(self, sl, room_id):
+        """Write a realistic tool-use conversation to session log."""
+        # User message
+        sl.append(role="user", sender=USER, room=room_id,
+                  event_id="$msg1", content="Check uptime")
+
+        # Assistant intent (with tool_calls — what intent logging produces)
+        sl.append(role="assistant", sender=AGENT_USER, room=room_id,
+                  event_id=None, content="",
+                  tool_calls=[{"call_id": "toolu_01ABC", "name": "shell",
+                               "input": {"command": "uptime"}}])
+
+        # Tool result (must use the same call_id as the intent)
+        sl.append(role="tool", sender=AGENT_USER, room=room_id,
+                  event_id=None, call_id="toolu_01ABC", name="shell",
+                  output="up 5 days", truncated=False)
+
+        # Final assistant response
+        sl.append(role="assistant", sender=AGENT_USER, room=room_id,
+                  event_id="$msg2", content="System has been up 5 days.")
+
+    def test_rehydrated_tool_calls_are_toolcall_objects(self, tmp_path):
+        """build_context returns ToolCall objects, not raw dicts."""
+        from openalph.provider import ToolCall
+
+        sl = make_session_log(tmp_path)
+        self._write_tool_conversation(sl, ROOM_ID)
+        ctx = sl.build_context(ROOM_ID)
+
+        # Find the assistant turn with tool_calls
+        intent_turns = [m for m in ctx if m["role"] == "assistant" and m.get("tool_calls")]
+        assert len(intent_turns) == 1
+        tc = intent_turns[0]["tool_calls"][0]
+        assert isinstance(tc, ToolCall), f"Expected ToolCall, got {type(tc)}"
+        assert tc.id == "toolu_01ABC"
+        assert tc.name == "shell"
+        assert tc.input == {"command": "uptime"}
+
+    def test_tool_result_call_id_matches_intent(self, tmp_path):
+        """tool_call_id on tool results must match the id in tool_calls."""
+        sl = make_session_log(tmp_path)
+        self._write_tool_conversation(sl, ROOM_ID)
+        ctx = sl.build_context(ROOM_ID)
+
+        intent = [m for m in ctx if m["role"] == "assistant" and m.get("tool_calls")][0]
+        tool_result = [m for m in ctx if m["role"] == "tool"][0]
+
+        assert tool_result["tool_call_id"] == intent["tool_calls"][0].id
+
+    def test_rehydrated_context_survives_anthropic_serialization(self, tmp_path):
+        """Full round-trip: JSONL → build_context → Anthropic message format."""
+        from openalph.provider import _convert_messages_for_anthropic
+
+        sl = make_session_log(tmp_path)
+        self._write_tool_conversation(sl, ROOM_ID)
+        ctx = sl.build_context(ROOM_ID)
+
+        # This is what blows up if ToolCall rehydration is broken
+        converted = _convert_messages_for_anthropic(ctx)
+
+        # Verify structure: user → assistant(tool_use) → user(tool_result) → assistant
+        assert converted[0]["role"] == "user"
+        assert converted[1]["role"] == "assistant"
+        # Anthropic format puts tool_use in content blocks
+        tool_use_blocks = [b for b in converted[1]["content"] if b["type"] == "tool_use"]
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["id"] == "toolu_01ABC"
+        assert tool_use_blocks[0]["name"] == "shell"
+        # Tool result becomes a user message with tool_result content block
+        assert converted[2]["role"] == "user"
+        tool_result_blocks = [b for b in converted[2]["content"] if b["type"] == "tool_result"]
+        assert len(tool_result_blocks) == 1
+        assert tool_result_blocks[0]["tool_use_id"] == "toolu_01ABC"
+
+    def test_rehydrated_context_survives_openai_serialization(self, tmp_path):
+        """Full round-trip: JSONL → build_context → OpenAI message format."""
+        from openalph.provider import _convert_messages_for_openai
+
+        sl = make_session_log(tmp_path)
+        self._write_tool_conversation(sl, ROOM_ID)
+        ctx = sl.build_context(ROOM_ID)
+
+        converted = _convert_messages_for_openai(ctx)
+
+        # Find assistant turn with tool_calls
+        assistant_tc = [m for m in converted if m["role"] == "assistant" and m.get("tool_calls")]
+        assert len(assistant_tc) == 1
+        otc = assistant_tc[0]["tool_calls"][0]
+        assert otc["id"] == "toolu_01ABC"
+        assert otc["function"]["name"] == "shell"
+
+        # Find tool result
+        tool_msgs = [m for m in converted if m["role"] == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "toolu_01ABC"
+
+    def test_multi_tool_call_round_trip(self, tmp_path):
+        """Multiple parallel tool calls in one turn survive round-trip."""
+        from openalph.provider import _convert_messages_for_anthropic
+
+        sl = make_session_log(tmp_path)
+        sl.append(role="user", sender=USER, room=ROOM_ID,
+                  event_id="$m1", content="Check both")
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID,
+                  event_id=None, content="",
+                  tool_calls=[
+                      {"call_id": "toolu_A", "name": "shell", "input": {"command": "uptime"}},
+                      {"call_id": "toolu_B", "name": "web_fetch", "input": {"url": "http://example.com"}},
+                  ])
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID,
+                  event_id=None, call_id="toolu_A", name="shell",
+                  output="up 5 days", truncated=False)
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID,
+                  event_id=None, call_id="toolu_B", name="web_fetch",
+                  output="<html>...</html>", truncated=False)
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID,
+                  event_id="$m2", content="Both checked.")
+
+        ctx = sl.build_context(ROOM_ID)
+        # Should not raise
+        converted = _convert_messages_for_anthropic(ctx)
+
+        tool_uses = [b for msg in converted for b in (msg.get("content") or [])
+                     if isinstance(b, dict) and b.get("type") == "tool_use"]
+        assert len(tool_uses) == 2
+        assert {tu["id"] for tu in tool_uses} == {"toolu_A", "toolu_B"}
