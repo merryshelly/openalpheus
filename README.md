@@ -19,7 +19,7 @@ Live on conduwuit (`@merry-dev:matrix.local`).
 - **Providers:** Anthropic SDK + OpenAI SDK (OpenRouter, Ollama)
 - **Isolation:** Unix users per agent (Phase 4)
 - **Language:** Python 3.11+
-- **License:** MIT
+- **License:** AGPL-3.0
 
 ## Source Tree
 

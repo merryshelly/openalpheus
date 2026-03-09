@@ -2,7 +2,7 @@
 name = "openalph"
 version = "0.1.0"
 description = "Purpose-built multi-agent AI platform"
-license = "MIT"
+license = "AGPL-3.0"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.49",
