@@ -346,13 +346,20 @@ class TestBuildContext:
         assert ctx == []
 
     def test_build_context_assistant_with_tool_calls(self, tmp_path):
+        """tool_calls rehydrated as ToolCall objects (not raw dicts)."""
         sl = make_session_log(tmp_path)
-        tool_calls = [{"call_id": "c1", "name": "shell", "input": {}}]
+        tool_calls = [{"call_id": "c1", "name": "shell", "input": {"command": "uptime"}}]
         sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id="$e1",
                   content="", tool_calls=tool_calls)
 
         ctx = sl.build_context(ROOM_ID)
-        assert ctx[0]["tool_calls"] == tool_calls
+        rehydrated = ctx[0]["tool_calls"]
+        assert len(rehydrated) == 1
+        tc = rehydrated[0]
+        # Must be ToolCall objects so provider code can do tc.id, tc.name, tc.input
+        assert tc.id == "c1"
+        assert tc.name == "shell"
+        assert tc.input == {"command": "uptime"}
 
     def test_build_context_assistant_no_tool_calls(self, tmp_path):
         sl = make_session_log(tmp_path)

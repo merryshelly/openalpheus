@@ -15,6 +15,8 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from openalph.provider import ToolCall
+
 logger = logging.getLogger(__name__)
 
 # Max tool output before overflow to separate file (64KB)
@@ -203,7 +205,17 @@ class SessionLog:
                     "content": entry.get("content", ""),
                 }
                 if entry.get("tool_calls"):
-                    msg["tool_calls"] = entry["tool_calls"]
+                    # Rehydrate dicts back to ToolCall objects so the
+                    # provider serialisation path (tc.id, tc.name, tc.input)
+                    # works unchanged.
+                    msg["tool_calls"] = [
+                        ToolCall(
+                            id=tc.get("call_id") or tc.get("id", ""),
+                            name=tc.get("name", ""),
+                            input=tc.get("input", {}),
+                        )
+                        for tc in entry["tool_calls"]
+                    ]
                 context.append(msg)
 
             elif role == "tool":
