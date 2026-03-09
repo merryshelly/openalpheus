@@ -10,7 +10,7 @@ api_key_cmd (shell command). Precedence: api_key > api_key_env > api_key_cmd.
 
 import pytest
 from pathlib import Path
-from openalph.config import AgentConfig, load_config, ConfigError
+from openalph.config import AgentConfig, load_config, load_agent_config, ConfigError, CONFIG_DIR
 
 
 # --- Valid configs ---
@@ -321,6 +321,55 @@ api_key = "sk-test"
 """)
         with pytest.raises(ConfigError, match="workspace"):
             load_config(tmp_path / "agent.toml")
+
+
+# --- Dataclass ---
+
+
+# --- Agent config discovery (Phase 4.4) ---
+
+VALID_AGENT_TOML = """\
+[agent]
+name = "watson"
+model = "test-model"
+
+[provider]
+type = "anthropic"
+api_key = "sk-test-key"
+
+[workspace]
+path = "/home/oa-watson/workspace"
+"""
+
+
+class TestLoadAgentConfig:
+    """Config discovery from /etc/openalph/agents/<name>.toml."""
+
+    def test_discovers_and_loads(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / "agents"
+        config_dir.mkdir()
+        (config_dir / "watson.toml").write_text(VALID_AGENT_TOML)
+        monkeypatch.setattr("openalph.config.CONFIG_DIR", config_dir)
+        config = load_agent_config("watson")
+        assert config.name == "watson"
+
+    def test_missing_config_raises(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / "agents"
+        config_dir.mkdir()
+        monkeypatch.setattr("openalph.config.CONFIG_DIR", config_dir)
+        with pytest.raises(ConfigError):
+            load_agent_config("nonexistent")
+
+    def test_invalid_toml_raises(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / "agents"
+        config_dir.mkdir()
+        (config_dir / "bad.toml").write_text("not valid toml {{{")
+        monkeypatch.setattr("openalph.config.CONFIG_DIR", config_dir)
+        with pytest.raises(ConfigError):
+            load_agent_config("bad")
+
+    def test_config_dir_constant(self):
+        assert CONFIG_DIR == Path("/etc/openalph/agents")
 
 
 # --- Dataclass ---

@@ -17,7 +17,7 @@ dev = [
 ]
 
 [project.scripts]
-openalph = "openalph.__main__:main"
+openalph = "openalph.cli:main"
 
 [build-system]
 requires = ["setuptools>=75"]

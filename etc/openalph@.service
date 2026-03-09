@@ -1,0 +1,27 @@
+[Unit]
+Description=OpenAlph Agent - %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oa-%i
+Group=openalph
+WorkingDirectory=/home/oa-%i
+ExecStart=/usr/local/bin/openalph /etc/openalph/agents/%i.toml
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/oa-%i
+BindReadOnlyPaths=/srv/openalph/shared /etc/openalph
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

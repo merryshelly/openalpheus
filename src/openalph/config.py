@@ -22,6 +22,10 @@ class ConfigError(Exception):
     pass
 
 
+# System-wide config directory for per-agent TOML files
+CONFIG_DIR = Path("/etc/openalph/agents")
+
+
 @dataclass
 class MatrixConfig:
     """Configuration for Matrix integration."""
@@ -204,6 +208,25 @@ def load_config(path: Path) -> AgentConfig:
         max_iterations=max_iterations,
         truncation_limit=truncation_limit
     )
+
+
+def load_agent_config(name: str) -> AgentConfig:
+    """Load configuration for a named agent from the system config directory.
+
+    Resolves /etc/openalph/agents/<name>.toml and loads it via load_config().
+
+    Args:
+        name: Agent name (e.g., "watson"). Used as-is for path construction;
+              name validation is the caller's responsibility (CLI or admin layer).
+
+    Returns:
+        AgentConfig with all fields resolved and validated
+
+    Raises:
+        ConfigError: If config file is missing, invalid, or cannot be loaded
+    """
+    config_path = CONFIG_DIR / f"{name}.toml"
+    return load_config(config_path)
 
 
 def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:
