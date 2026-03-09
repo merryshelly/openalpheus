@@ -147,6 +147,84 @@ password_cmd = "echo cmd_secret"
         assert config.matrix.password == "cmd_secret"
 
 
+class TestMatrixRoomsConfig:
+    """Tests for [matrix.rooms] per-room override parsing."""
+
+    def test_rooms_parsed(self, tmp_path):
+        """[matrix.rooms] section loads into MatrixConfig.rooms."""
+        config_file = write_config(tmp_path, MINIMAL_AGENT_TOML + """
+[matrix]
+homeserver = "https://matrix.local"
+user_id = "@watson:matrix.local"
+password = "secret"
+
+[matrix.rooms]
+"!abc123:matrix.local" = { require_mention = false }
+"!def456:matrix.local" = { require_mention = true }
+""")
+        config = load_config(config_file)
+        assert config.matrix.rooms is not None
+        assert config.matrix.rooms["!abc123:matrix.local"]["require_mention"] is False
+        assert config.matrix.rooms["!def456:matrix.local"]["require_mention"] is True
+
+    def test_rooms_empty(self, tmp_path):
+        """No [matrix.rooms] → rooms is None."""
+        config_file = write_config(tmp_path, MINIMAL_AGENT_TOML + """
+[matrix]
+homeserver = "https://matrix.local"
+user_id = "@watson:matrix.local"
+password = "secret"
+""")
+        config = load_config(config_file)
+        assert config.matrix.rooms is None
+
+    def test_rooms_empty_section(self, tmp_path):
+        """Empty [matrix.rooms] section → rooms is empty dict."""
+        config_file = write_config(tmp_path, MINIMAL_AGENT_TOML + """
+[matrix]
+homeserver = "https://matrix.local"
+user_id = "@watson:matrix.local"
+password = "secret"
+
+[matrix.rooms]
+""")
+        config = load_config(config_file)
+        # TOML parser produces {} for empty section, which is truthy
+        # Config should handle both None and {} gracefully
+        assert config.matrix.rooms is not None or config.matrix.rooms == {}
+
+    def test_rooms_require_mention_bool(self, tmp_path):
+        """require_mention value is parsed as boolean."""
+        config_file = write_config(tmp_path, MINIMAL_AGENT_TOML + """
+[matrix]
+homeserver = "https://matrix.local"
+user_id = "@watson:matrix.local"
+password = "secret"
+
+[matrix.rooms]
+"!room:matrix.local" = { require_mention = true }
+""")
+        config = load_config(config_file)
+        val = config.matrix.rooms["!room:matrix.local"]["require_mention"]
+        assert isinstance(val, bool)
+        assert val is True
+
+    def test_rooms_unknown_keys_allowed(self, tmp_path):
+        """Unknown keys in room config don't cause errors (forward compat)."""
+        config_file = write_config(tmp_path, MINIMAL_AGENT_TOML + """
+[matrix]
+homeserver = "https://matrix.local"
+user_id = "@watson:matrix.local"
+password = "secret"
+
+[matrix.rooms]
+"!room:matrix.local" = { require_mention = true, future_setting = "value" }
+""")
+        config = load_config(config_file)
+        assert config.matrix.rooms["!room:matrix.local"]["require_mention"] is True
+        assert config.matrix.rooms["!room:matrix.local"]["future_setting"] == "value"
+
+
 class TestModelMaxTokens:
 
     def test_model_max_tokens_parsed(self, tmp_path):

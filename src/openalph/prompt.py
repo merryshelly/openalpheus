@@ -50,6 +50,18 @@ def assemble_prompt(workspace: Path) -> str:
             "to see, include the relevant content in your response."
         )
 
+    # Shared-room behavior guidance (harmless in DMs, essential in shared rooms)
+    prompt_parts.append("## Shared Room Behavior")
+    prompt_parts.append(
+        "IMPORTANT: You share rooms with other agents. Each agent is a separate entity.\n\n"
+        "Rules:\n"
+        "1. You are ONE agent. Only write YOUR OWN words. NEVER write words, dialogue, or responses attributed to another agent or user.\n"
+        "2. If asked to interact with another agent (e.g. 'give each other a compliment'), only provide YOUR part. The other agent will provide theirs.\n"
+        "3. Do not simulate, predict, or write both sides of a conversation.\n"
+        "4. If the message doesn't need your input, say nothing — silence is valid.\n"
+        "5. Keep responses focused on what was asked of you specifically."
+    )
+
     # Inject runtime workspace path only if not already mentioned in loaded files
     workspace_str = str(workspace.resolve())
     already_mentioned = any(workspace_str in part for part in prompt_parts)

@@ -38,6 +38,8 @@ class MatrixConfig:
     sync_timeout: int
     retry_base: int
     retry_max: int
+    rooms: dict[str, dict] | None = None  # per-room overrides
+    rooms: dict | None = None  # Room-specific overrides, e.g., {"!room:server": {"require_mention": True}}
 
 
 @dataclass
@@ -348,6 +350,12 @@ def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:
     if password is None and access_token is None:
         raise ConfigError("Matrix authentication required: one of password/password_env/password_cmd or access_token/access_token_env/access_token_cmd must be set")
 
+    # Parse optional [matrix.rooms] section
+    rooms_section = matrix_section.get("rooms")
+    rooms = None
+    if rooms_section is not None and isinstance(rooms_section, dict):
+        rooms = dict(rooms_section)  # shallow copy
+
     return MatrixConfig(
         homeserver=homeserver,
         user_id=user_id,
@@ -357,5 +365,6 @@ def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:
         context_reserve=context_reserve,
         sync_timeout=sync_timeout,
         retry_base=retry_base,
-        retry_max=retry_max
+        retry_max=retry_max,
+        rooms=rooms
     )

@@ -15,6 +15,7 @@ from nio import AsyncClient, InviteMemberEvent, RoomMessageText
 from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.config import MatrixConfig
 from openalph.session import SessionLog
+from openalph.mention import mentions_me, is_gated, MentionCheckResult
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,9 @@ class MatrixBot:
             room: Matrix room object
             event: Room message event
         """
+        logger.debug("Event received: room=%s sender=%s body=%r synced=%s",
+                      room.room_id, event.sender, getattr(event, 'body', '')[:50], self._synced)
+
         # During initial sync, don't hydrate rooms — lazy wake on first live message
         if not self._synced:
             return
@@ -262,21 +266,58 @@ class MatrixBot:
                 await self.send(room_id, "\n".join(lines))
                 return
 
+            # --- Mention gating ---
+            gated = is_gated(self.config, room)
+
+            if gated:
+                event_source = getattr(event, 'source', {}) or {}
+                mention = mentions_me(self.config.user_id, event_source, body)
+
+                # Always buffer to session log
+                session_log = getattr(self, 'session_log', None)
+                if session_log:
+                    session_log.append(
+                        role="user",
+                        sender=event.sender,
+                        room=room_id,
+                        event_id=getattr(event, 'event_id', None),
+                        content=body,
+                        mentioned=mention.mentioned,
+                    )
+
+                if not mention.mentioned:
+                    logger.debug("Gated room %s: not mentioned (%s), skipping",
+                                 room_id, mention.method)
+                    return
+
+                logger.info("Gated room %s: mentioned via %s, processing",
+                             room_id, mention.method)
+
+                # Context hydration: reload history from session_log to include
+                # all buffered non-mentioned messages since last response
+                if room_id in self._active_rooms and self.session_log:
+                    history = self.agent.history(room_id)
+                    history.clear()
+                    history.extend(self.session_log.build_context(room_id))
+                    logger.info("Hydrated context for %s: %d entries", room_id, len(history))
+            # --- End mention gating ---
+
             # Lazy wake: activate room on first live message
             if room_id not in self._active_rooms:
                 room_name = getattr(room, 'name', '') or getattr(room, 'display_name', '') or room_id
                 await self._activate_room(room_id, room_name=room_name)
 
-            # Append user message to session log
-            session_log = getattr(self, 'session_log', None)
-            if session_log:
-                session_log.append(
-                    role="user",
-                    sender=event.sender,
-                    room=room_id,
-                    event_id=getattr(event, 'event_id', None),
-                    content=body,
-                )
+            # Append user message to session log (only for ungated rooms — gated already buffered above)
+            if not gated:
+                session_log = getattr(self, 'session_log', None)
+                if session_log:
+                    session_log.append(
+                        role="user",
+                        sender=event.sender,
+                        room=room_id,
+                        event_id=getattr(event, 'event_id', None),
+                        content=body,
+                    )
 
             # Regular message: process through agent
             await self._set_typing(room_id, True)

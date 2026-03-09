@@ -79,7 +79,7 @@ def cmd_status(args):
     for agent in agents:
         subprocess.run(
             ["systemctl", "status", f"openalph@{agent}.service"],
-            check=True,
+            check=False,
         )
 
 
@@ -96,11 +96,21 @@ def cmd_logs(args):
     cmd = ["journalctl", "-u", f"openalph@{args.agent}.service"]
     if args.follow:
         cmd.append("-f")
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_new_agent(args):
-    create_agent(args.name, dry_run=args.dry_run)
+    ops = create_agent(args.name, dry_run=args.dry_run)
+    if args.dry_run:
+        print("Dry run — planned operations:")
+        for i, op in enumerate(ops, 1):
+            print(f"  {i}. [{op.kind}] {op.description}")
+        print(f"\n{len(ops)} operations planned. Run without --dry-run to execute.")
+    else:
+        print(f"Agent '{args.name}' created successfully ({len(ops)} operations).")
 
 
 def cmd_run(args):
