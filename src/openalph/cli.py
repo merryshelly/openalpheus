@@ -59,6 +59,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = sub.add_parser("monitor")
     p.add_argument("agent")
 
+    # showprompt
+    p = sub.add_parser("showprompt", help="Display the full assembled system prompt")
+    p.add_argument("agent")
+
+    # chat
+    p = sub.add_parser("chat", help="Interactive CLI session with an agent")
+    p.add_argument("agent")
+    p.add_argument("--room", default=None, help="Custom room ID for session isolation")
+
     return parser.parse_args(argv)
 
 
@@ -162,6 +171,118 @@ def cmd_monitor(args):
     print("not yet implemented")
 
 
+def cmd_showprompt(args):
+    """Display the full assembled system prompt and available tools for an agent."""
+    from openalph.prompt import assemble_prompt
+    from openalph.tools import discover_tools
+
+    try:
+        config = load_agent_config(args.agent)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    prompt = assemble_prompt(config.workspace)
+    if prompt:
+        print(prompt)
+    else:
+        print("(empty prompt — no workspace files found)", file=sys.stderr)
+
+    # Show tools available via API tool parameter
+    tools = discover_tools(config.workspace)
+    if tools:
+        print("\n## Available Tools (passed via API, not in prompt)\n")
+        for tool in tools:
+            params = ", ".join(tool.parameters.get("properties", {}).keys())
+            print(f"- **{tool.name}**: {tool.description}")
+            if params:
+                print(f"  Parameters: {params}")
+    else:
+        print("\n(no tools configured)", file=sys.stderr)
+
+
+def cmd_chat(args):
+    """Interactive CLI session with an agent."""
+    from openalph.agent import Agent, ContextOverflowError
+
+    # Suppress library noise (httpx, anthropic, etc.) — tool notices handle
+    # user-facing feedback. Only show errors unless -v was passed.
+    if not args.verbose:
+        logging.getLogger().setLevel(logging.ERROR)
+
+    try:
+        config = load_agent_config(args.agent)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    agent = Agent(config)
+    room_id = args.room or "_cli"
+
+    # Wire tool notices to stderr
+    async def tool_notice(call_id, name, input_data, result, is_error):
+        status = "error" if is_error else "ok"
+        preview = str(result)[:80].replace('\n', ' ')
+        print(f"🔧 {name}: ({status}) {preview}", file=sys.stderr, flush=True)
+
+    async def chat_loop():
+        import readline  # enables arrow keys, history
+
+        print(f"{config.name} ready (model: {config.model}). "
+              f"Type /help for commands, Ctrl+D to exit.", file=sys.stderr)
+
+        while True:
+            try:
+                line = input(f"\n{config.name}> ")
+            except (EOFError, KeyboardInterrupt):
+                print("\nGoodbye.", file=sys.stderr)
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            # Commands
+            if line == "/quit" or line == "/exit":
+                print("Goodbye.", file=sys.stderr)
+                break
+
+            if line == "/help":
+                print("/status        — agent status", file=sys.stderr)
+                print("/quit          — exit", file=sys.stderr)
+                print("--room <name>  — use at launch for separate sessions", file=sys.stderr)
+                print("", file=sys.stderr)
+                print("Sessions are in-memory only — history is lost on exit.", file=sys.stderr)
+                continue
+
+            if line == "/status":
+                s = agent.status(room_id)
+                print(f"{s['name']} ({s['model']}) — "
+                      f"{s['turns']} turns, ~{s['context_tokens']:,} tokens "
+                      f"({s['context_pct']}%), "
+                      f"{s['total_tool_calls']} tool calls", file=sys.stderr)
+                continue
+
+            # Regular message
+            agent._on_tool_call = tool_notice
+
+            try:
+                response = await agent.handle_input(line, room_id)
+                print(f"\n{response}")
+            except ContextOverflowError as e:
+                print(f"\n⚠️ Context overflow — ~{e.current_tokens:,} / "
+                      f"{e.max_tokens:,} tokens. Restart with --room for a fresh session.",
+                      file=sys.stderr)
+            except asyncio.CancelledError:
+                print("\nCancelled.", file=sys.stderr)
+            except Exception as e:
+                print(f"\nError: {e}", file=sys.stderr)
+            finally:
+                agent._on_tool_call = None
+
+    asyncio.run(chat_loop())
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
 
@@ -180,6 +301,8 @@ def main(argv=None) -> int:
         "new-agent": cmd_new_agent,
         "run": cmd_run,
         "monitor": cmd_monitor,
+        "chat": cmd_chat,
+        "showprompt": cmd_showprompt,
     }
 
     handler = dispatch[args.command]

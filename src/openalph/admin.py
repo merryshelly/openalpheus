@@ -20,6 +20,30 @@ OPENALPH_GROUP = "openalph"
 
 _RESERVED_NAMES = {"root", "nobody", "daemon", "bin", "sys"}
 
+OPERATIONS_TEMPLATE = """\
+# OPERATIONS.md
+
+## Tools
+
+Your operator sees a brief notice when you call a tool (tool name, success/failure,
+result size) — but **not** the actual content returned. Tool results are only visible
+to you. When you read a file, run a command, or get any tool result that the operator
+needs to see, include the relevant content in your response.
+
+## Shared Room Behavior
+
+You may share rooms with other agents. Each agent is a separate entity.
+
+Rules:
+1. You are ONE agent. Only write YOUR OWN words. NEVER write words, dialogue, or
+   responses attributed to another agent or user.
+2. If asked to interact with another agent, only provide YOUR part. The other agent
+   will provide theirs.
+3. Do not simulate, predict, or write both sides of a conversation.
+4. If the message doesn't need your input, say nothing — silence is valid.
+5. Keep responses focused on what was asked of you specifically.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -149,8 +173,16 @@ def plan_create_agent(name: str) -> list[Operation]:
     ))
 
     # Scaffold workspace dirs (before chown so recursive chown covers them)
-    for subdir in ["workspace", "workspace/memory", "workspace/skills", ".config", ".cache"]:
+    for subdir in ["workspace", "workspace/memory", "workspace/skills", "workspace/tools", ".config", ".cache"]:
         ops.append(Operation(kind="mkdir", path=home / subdir, description=f"Create {home / subdir}"))
+
+    # Write default OPERATIONS.md template
+    ops.append(Operation(
+        kind="write_file",
+        path=home / "workspace" / "OPERATIONS.md",
+        content=OPERATIONS_TEMPLATE,
+        description=f"Write OPERATIONS.md template to workspace",
+    ))
 
     # Set home permissions + recursive ownership (after mkdirs)
     ops.append(Operation(kind="chmod", path=home, mode="750", description=f"chmod 750 {home}"))

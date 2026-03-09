@@ -57,7 +57,7 @@ class TestAssemblePrompt:
         environment = prompt.index("ENVIRONMENT_MARKER")
         wake = prompt.index("WAKE_MARKER")
 
-        assert soul < operator < safety < operations < environment < wake
+        assert safety < soul < operator < wake < environment < operations
 
     def test_files_have_headers(self, tmp_path):
         """Each file's content is preceded by a header identifying it."""

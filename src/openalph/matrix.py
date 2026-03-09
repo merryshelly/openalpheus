@@ -249,6 +249,23 @@ class MatrixBot:
                 await self._cancel_current()
                 return
 
+            if body == "/showprompt":
+                parts = [self.agent.system_prompt]
+                # Append tool list
+                if self.agent.tools:
+                    parts.append("\n## Available Tools (passed via API, not in prompt)\n")
+                    for tool in self.agent.tools:
+                        params = ", ".join(tool.parameters.get("properties", {}).keys())
+                        line = f"- **{tool.name}**: {tool.description}"
+                        if params:
+                            line += f"\n  Parameters: {params}"
+                        parts.append(line)
+                output = "\n".join(parts)
+                if len(output) > 15000:
+                    output = output[:15000] + "\n\n... (truncated)"
+                await self.send(room_id, f"```\n{output}\n```")
+                return
+
             if body == "/status":
                 status = self.agent.status(room_id)
                 # Format status message
