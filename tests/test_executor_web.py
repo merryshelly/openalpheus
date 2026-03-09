@@ -1,240 +1,290 @@
-"""Tests for web operations: search and fetch.
+"""Tests for web tools (search + fetch).
 
-Interface contract:
-    web_search(query, count=5, api_key="", endpoint="") -> ToolResult
-    web_fetch(url, max_chars=None) -> ToolResult
-
-Testing seam: implementations must define these mockable internal functions:
-    _call_search_api(query, count, api_key, endpoint) -> dict
-    _fetch_url(url) -> str
-
-Tests mock these internal functions to avoid real network calls.
+Tests mock httpx.AsyncClient to avoid real network calls while testing
+the actual formatting, parsing, error handling, and truncation logic.
 """
 
+import json
 import pytest
-from unittest.mock import patch, AsyncMock
-from openalph.tools.web import web_search, web_fetch
+from unittest.mock import patch, AsyncMock, MagicMock
+from openalph.tools.web import web_search, web_fetch, _strip_html_tags
 from openalph.tools import ToolResult
 
 
-# --- Fixtures ---
+def mock_httpx_response(status_code=200, json_data=None, text=""):
+    """Create a mock httpx response."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = text
+    resp.json.return_value = json_data or {}
+    resp.raise_for_status = MagicMock()
+    if status_code >= 400:
+        import httpx
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            f"HTTP {status_code}", request=MagicMock(), response=resp
+        )
+    return resp
 
 
-MOCK_SEARCH_RESPONSE = {
-    "web": {
-        "results": [
-            {
-                "title": "Python Documentation",
-                "url": "https://docs.python.org",
-                "description": "Official Python documentation and tutorials.",
-            },
-            {
-                "title": "Real Python",
-                "url": "https://realpython.com",
-                "description": "Python tutorials and articles for all levels.",
-            },
-            {
-                "title": "Python Package Index",
-                "url": "https://pypi.org",
-                "description": "Repository of software for Python.",
-            },
-        ]
-    }
-}
-
-MOCK_HTML = """
-<html>
-<head><title>Test Page</title></head>
-<body>
-<h1>Hello World</h1>
-<p>This is a test paragraph with some content.</p>
-<p>Another paragraph here.</p>
-<script>var x = 'ignore this';</script>
-<nav>Navigation stuff to ignore</nav>
-</body>
-</html>
-"""
-
-
-# --- web_search ---
+def brave_results(*items):
+    """Build a Brave-format search response."""
+    results = []
+    for title, url, snippet in items:
+        results.append({"title": title, "url": url, "description": snippet})
+    return {"web": {"results": results}}
 
 
 class TestWebSearch:
 
     @pytest.mark.asyncio
     async def test_returns_formatted_results(self):
-        """Search returns formatted results with title, url, snippet."""
-        with patch(
-            "openalph.tools.web._call_search_api",
-            new_callable=AsyncMock,
-            return_value=MOCK_SEARCH_RESPONSE,
-        ):
-            result = await web_search("python tutorials")
+        """Search results are formatted with title, URL, snippet."""
+        data = brave_results(("Test Page", "https://test.com", "A test snippet"))
+        mock_resp = mock_httpx_response(json_data=data)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_search("test", api_key="fake-key")
 
         assert result.is_error is False
-        assert isinstance(result, ToolResult)
-        # Results should contain titles and URLs from mock
-        assert "Python Documentation" in result.content
-        assert "https://docs.python.org" in result.content
+        assert "Test Page" in result.content
+        assert "https://test.com" in result.content
+        assert "A test snippet" in result.content
 
     @pytest.mark.asyncio
-    async def test_passes_query_to_api(self):
-        """Query string is passed to the search API."""
-        with patch(
-            "openalph.tools.web._call_search_api",
-            new_callable=AsyncMock,
-            return_value=MOCK_SEARCH_RESPONSE,
-        ) as mock_api:
-            await web_search("test query", count=3, api_key="key", endpoint="ep")
+    async def test_passes_query_and_count(self):
+        """Query and count are sent as params."""
+        data = brave_results(("R", "https://r.com", "r"))
+        mock_resp = mock_httpx_response(json_data=data)
 
-        mock_api.assert_awaited_once_with("test query", 3, "key", "ep")
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            await web_search("Grace Hopper", count=3, api_key="fake-key")
+
+        call_kwargs = client.get.call_args
+        assert call_kwargs.kwargs["params"]["q"] == "Grace Hopper"
+        assert call_kwargs.kwargs["params"]["count"] == 3
 
     @pytest.mark.asyncio
-    async def test_count_parameter(self):
-        """count parameter is forwarded to the API."""
-        with patch(
-            "openalph.tools.web._call_search_api",
-            new_callable=AsyncMock,
-            return_value=MOCK_SEARCH_RESPONSE,
-        ) as mock_api:
-            await web_search("test", count=10)
-
-        args = mock_api.call_args
-        assert args[0][1] == 10  # count is second positional arg
+    async def test_no_api_key_returns_error(self):
+        """Missing API key returns error without making a request."""
+        result = await web_search("test", api_key="")
+        assert result.is_error is True
+        assert "no api key" in result.content.lower()
 
     @pytest.mark.asyncio
     async def test_api_error_returns_tool_error(self):
-        """API failure → is_error=True."""
-        with patch(
-            "openalph.tools.web._call_search_api",
-            new_callable=AsyncMock,
-            side_effect=Exception("API rate limit exceeded"),
-        ):
-            result = await web_search("test")
+        """HTTP error from API returns is_error=True."""
+        mock_resp = mock_httpx_response(status_code=429)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_search("test", api_key="fake-key")
 
         assert result.is_error is True
-        assert "rate limit" in result.content.lower() or "error" in result.content.lower()
 
     @pytest.mark.asyncio
     async def test_empty_results(self):
-        """Empty search results → not an error, just empty content."""
-        with patch(
-            "openalph.tools.web._call_search_api",
-            new_callable=AsyncMock,
-            return_value={"web": {"results": []}},
-        ):
-            result = await web_search("obscure query no results")
+        """No results → informative message, not an error."""
+        data = {"web": {"results": []}}
+        mock_resp = mock_httpx_response(json_data=data)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_search("test", api_key="fake-key")
 
         assert result.is_error is False
+        assert "no results" in result.content.lower()
 
     @pytest.mark.asyncio
     async def test_multiple_results_formatted(self):
-        """Multiple results are each formatted with title/url/snippet."""
-        with patch(
-            "openalph.tools.web._call_search_api",
-            new_callable=AsyncMock,
-            return_value=MOCK_SEARCH_RESPONSE,
-        ):
-            result = await web_search("python")
+        """Multiple results are all included and separated."""
+        data = brave_results(
+            ("Page A", "https://a.com", "Snippet A"),
+            ("Page B", "https://b.com", "Snippet B"),
+        )
+        mock_resp = mock_httpx_response(json_data=data)
 
-        # All three mock results should appear
-        assert "Python Documentation" in result.content
-        assert "Real Python" in result.content
-        assert "Python Package Index" in result.content
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
 
+            result = await web_search("test", api_key="fake-key")
 
-# --- web_fetch ---
+        assert "Page A" in result.content
+        assert "Page B" in result.content
+        assert "Snippet A" in result.content
+        assert "Snippet B" in result.content
+
+    @pytest.mark.asyncio
+    async def test_html_stripped_from_snippets(self):
+        """HTML tags in Brave snippets are cleaned."""
+        data = brave_results(
+            ("Page", "https://x.com", "This is <strong>bold</strong> text"),
+        )
+        mock_resp = mock_httpx_response(json_data=data)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_search("test", api_key="fake-key")
+
+        assert "<strong>" not in result.content
+        assert "bold" in result.content
 
 
 class TestWebFetch:
 
     @pytest.mark.asyncio
     async def test_returns_readable_content(self):
-        """Fetched HTML is converted to readable text."""
-        with patch(
-            "openalph.tools.web._fetch_url",
-            new_callable=AsyncMock,
-            return_value=MOCK_HTML,
-        ):
-            result = await web_fetch("https://example.com")
+        """HTML is stripped to readable text."""
+        html = "<html><body><p>Hello world</p></body></html>"
+        mock_resp = mock_httpx_response(text=html)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com")
 
         assert result.is_error is False
-        assert isinstance(result, ToolResult)
-        # Should contain the meaningful content
-        assert "Hello World" in result.content
-        assert "test paragraph" in result.content
+        assert "Hello world" in result.content
+        assert "<p>" not in result.content
 
     @pytest.mark.asyncio
     async def test_strips_scripts_and_nav(self):
-        """Script and navigation content should be stripped or minimized."""
-        with patch(
-            "openalph.tools.web._fetch_url",
-            new_callable=AsyncMock,
-            return_value=MOCK_HTML,
-        ):
-            result = await web_fetch("https://example.com")
+        """Script, style, and nav tags are removed with content."""
+        html = "<html><body><script>evil()</script><nav>menu</nav><p>Content</p></body></html>"
+        mock_resp = mock_httpx_response(text=html)
 
-        # Script content should not appear
-        assert "ignore this" not in result.content
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com")
+
+        assert "evil" not in result.content
+        assert "menu" not in result.content
+        assert "Content" in result.content
 
     @pytest.mark.asyncio
     async def test_max_chars_truncates(self):
-        """max_chars parameter limits output length."""
-        long_html = "<html><body>" + "<p>Content. </p>" * 10000 + "</body></html>"
-        with patch(
-            "openalph.tools.web._fetch_url",
-            new_callable=AsyncMock,
-            return_value=long_html,
-        ):
-            result = await web_fetch("https://example.com", max_chars=500)
+        """Content longer than max_chars is truncated with marker."""
+        long_text = "A" * 1000
+        mock_resp = mock_httpx_response(text=long_text)
 
-        assert len(result.content) <= 600  # some overhead OK
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com", max_chars=200)
+
+        assert "[truncated" in result.content
+        # Result should be roughly max_chars + marker length
+        assert len(result.content) < 300
 
     @pytest.mark.asyncio
     async def test_max_chars_none_returns_full(self):
-        """max_chars=None returns full content."""
-        with patch(
-            "openalph.tools.web._fetch_url",
-            new_callable=AsyncMock,
-            return_value=MOCK_HTML,
-        ):
-            result = await web_fetch("https://example.com", max_chars=None)
+        """No max_chars → full content returned."""
+        text = "X" * 500
+        mock_resp = mock_httpx_response(text=text)
 
-        assert result.is_error is False
-        assert "Hello World" in result.content
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com")
+
+        assert len(result.content) == 500
 
     @pytest.mark.asyncio
     async def test_fetch_error_returns_tool_error(self):
-        """Network/HTTP error → is_error=True."""
-        with patch(
-            "openalph.tools.web._fetch_url",
-            new_callable=AsyncMock,
-            side_effect=Exception("Connection refused"),
-        ):
-            result = await web_fetch("https://unreachable.example.com")
+        """HTTP error returns is_error=True."""
+        mock_resp = mock_httpx_response(status_code=404)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com/nope")
 
         assert result.is_error is True
 
     @pytest.mark.asyncio
-    async def test_passes_url_to_fetcher(self):
-        """URL is passed through to the fetch function."""
-        with patch(
-            "openalph.tools.web._fetch_url",
-            new_callable=AsyncMock,
-            return_value="<html><body>OK</body></html>",
-        ) as mock_fetch:
-            await web_fetch("https://specific-url.example.com/page")
-
-        mock_fetch.assert_awaited_once_with("https://specific-url.example.com/page")
-
-    @pytest.mark.asyncio
     async def test_plain_text_passed_through(self):
-        """Non-HTML content (plain text) is returned as-is."""
-        with patch(
-            "openalph.tools.web._fetch_url",
-            new_callable=AsyncMock,
-            return_value="Just plain text, no HTML tags here.",
-        ):
-            result = await web_fetch("https://example.com/plain.txt")
+        """Non-HTML content passes through unchanged."""
+        text = "Just plain text, no HTML here."
+        mock_resp = mock_httpx_response(text=text)
 
-        assert "Just plain text" in result.content
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com/file.txt")
+
+        assert result.content == text
+
+
+class TestHtmlStripping:
+    """Unit tests for _strip_html_tags — no mocking needed."""
+
+    def test_basic_tags(self):
+        assert _strip_html_tags("<p>Hello</p>") == "Hello"
+
+    def test_script_removed(self):
+        assert "alert" not in _strip_html_tags("<script>alert('x')</script>Content")
+
+    def test_style_removed(self):
+        assert "color" not in _strip_html_tags("<style>.x{color:red}</style>Content")
+
+    def test_entities_decoded(self):
+        assert _strip_html_tags("&amp; &lt; &gt;") == "& < >"
+
+    def test_whitespace_collapsed(self):
+        result = _strip_html_tags("  lots   of    spaces  ")
+        assert result == "lots of spaces"

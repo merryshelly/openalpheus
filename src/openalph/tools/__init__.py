@@ -384,10 +384,22 @@ async def execute_tool(
         )
     elif name == "web_search":
         from .web import web_search
+        # Resolve api_key: direct value or via api_key_cmd
+        api_key = tool_config.get("api_key", "")
+        if not api_key and "api_key_cmd" in tool_config:
+            import subprocess
+            try:
+                result = subprocess.run(
+                    tool_config["api_key_cmd"], shell=True,
+                    capture_output=True, text=True, timeout=10,
+                )
+                api_key = result.stdout.strip()
+            except Exception:
+                pass
         return await web_search(
             query=input["query"],
             count=input.get("count", 5),
-            api_key=tool_config.get("api_key", ""),
+            api_key=api_key,
             endpoint=tool_config.get("endpoint", ""),
         )
     elif name == "web_fetch":
