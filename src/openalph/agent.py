@@ -48,7 +48,7 @@ class Agent:
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
         self._current_task: asyncio.Task | None = None
-        self._on_tool_call = None  # async callback(name, input, result, is_error)
+        self._on_tool_call = None  # async callback(call_id, name, input, result, is_error)
         self._on_tool_intent = None  # async callback(tool_calls, content) — fires before tool execution
 
     def history(self, room_id: str) -> list[dict]:
@@ -218,7 +218,7 @@ class Agent:
                     })
                     if self._on_tool_call:
                         await self._on_tool_call(
-                            tc.name, tc.input, truncated_content, result.is_error
+                            tc.id, tc.name, tc.input, truncated_content, result.is_error
                         )
 
             # Hit max iterations - return limit message

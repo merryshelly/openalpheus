@@ -470,7 +470,7 @@ class TestMatrixBotIntegration:
         # Simulate agent calling _on_tool_call
         async def fake_handle_input(body, room_id):
             if bot.agent._on_tool_call:
-                await bot.agent._on_tool_call("shell", {"command": "uptime"}, "up 3 days", False)
+                await bot.agent._on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)
             return "Done"
 
         agent.handle_input = fake_handle_input
@@ -505,7 +505,7 @@ class TestMatrixBotIntegration:
                 tc.input = {"command": "uptime"}
                 await bot.agent._on_tool_intent([tc], "Let me check...")
             if bot.agent._on_tool_call:
-                await bot.agent._on_tool_call("shell", {"command": "uptime"}, "up 3 days", False)
+                await bot.agent._on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)
             return "System has been up 3 days."
 
         agent.handle_input = fake_handle_input

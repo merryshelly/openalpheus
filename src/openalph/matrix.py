@@ -282,7 +282,7 @@ class MatrixBot:
             await self._set_typing(room_id, True)
 
             # Wire tool visibility for this turn
-            async def _tool_notice(name, input_data, result, is_error):
+            async def _tool_notice(call_id, name, input_data, result, is_error):
                 # Send abbreviated notice to Matrix room
                 notice_body = f"🔧 {name}: {str(result)[:200]}"
                 try:
@@ -297,7 +297,7 @@ class MatrixBot:
                         sender=self.config.user_id,
                         room=room_id,
                         event_id=None,
-                        call_id=name,  # use name as call_id approximation (actual id comes from tc.id)
+                        call_id=call_id,
                         name=name,
                         output=result,
                         is_error=is_error,
