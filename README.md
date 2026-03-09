@@ -36,7 +36,7 @@ src/openalph/
     ├── shell.py      # Stateless subprocess (explicit cwd/env/timeout)
     ├── file.py       # read/write/edit with path resolution
     ├── web.py        # search (Brave) + fetch (HTML→text)
-    └── subagent.py   # Blocking single-turn LLM call, no tools
+    └── subagent.py   # Multi-turn sub-agent with parent's tools (minus subagent, preventing recursion)
 ```
 
 ## How to Run
