@@ -367,9 +367,13 @@ class MatrixBot:
         self.client.add_event_callback(self._handle_invite, InviteMemberEvent)
 
         # Initial sync: populates rooms and loads timeline history via callback
+        import time as _time
+        _sync_start = _time.monotonic()
         await self.client.sync(timeout=self.config.sync_timeout)
+        _sync_ms = (_time.monotonic() - _sync_start) * 1000
         self._synced = True
-        logger.info("Initial sync complete (lazy wake: rooms will hydrate on first message)")
+        joined = len(self.client.rooms) if hasattr(self.client, 'rooms') else '?'
+        logger.info("Initial sync complete in %.0fms (%s rooms joined, lazy wake active)", _sync_ms, joined)
 
         # Sync loop
         delay = self.config.retry_base
