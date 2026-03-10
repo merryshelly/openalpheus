@@ -176,6 +176,27 @@ class TestGapFillPagination:
         assert len(gap_fill_appends) == 0
 
     @pytest.mark.asyncio
+    async def test_gap_fill_first_call_uses_none_start_token(self):
+        """Gap-fill must call room_messages with start=None (not '') on the first call."""
+        bot, session_log = _make_bot_with_session_log(["$known1"])
+
+        overlap_page = MagicMock()
+        overlap_page.chunk = [
+            make_room_message("@sb:local", "known msg", "$known1"),
+        ]
+        overlap_page.end = "token_p2"
+        bot.client.room_messages = AsyncMock(return_value=overlap_page)
+
+        room = make_room("!room:local")
+        event = make_room_message("@sb:local", "trigger")
+        await bot._handle_room_message(room, event)
+
+        first_call_kwargs = bot.client.room_messages.call_args_list[0].kwargs
+        assert first_call_kwargs.get("start") is None, (
+            f"Expected start=None on first gap-fill call, got {first_call_kwargs.get('start')!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_gap_fill_no_overlap_logs_warning(self, caplog):
         """When no overlap is found, a warning is logged."""
         bot, session_log = _make_bot_with_session_log(["$old1"])

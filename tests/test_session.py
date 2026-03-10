@@ -668,3 +668,51 @@ class TestRehydrationRoundTrip:
                      if isinstance(b, dict) and b.get("type") == "tool_use"]
         assert len(tool_uses) == 2
         assert {tu["id"] for tu in tool_uses} == {"toolu_A", "toolu_B"}
+
+
+class TestSafeCallId:
+    """Tests for _safe_call_id() path traversal prevention."""
+
+    def test_normal_call_id_passes_through(self, tmp_path):
+        """Normal call_ids with safe chars are unchanged."""
+        sl = SessionLog(tmp_path, "@agent:matrix.local")
+        assert sl._safe_call_id("toolu_abc123") == "toolu_abc123"
+        assert sl._safe_call_id("call-XYZ_99") == "call-XYZ_99"
+
+    def test_path_traversal_is_sanitized(self, tmp_path):
+        """Path traversal attempts are sanitized to safe filenames."""
+        sl = SessionLog(tmp_path, "@agent:matrix.local")
+        result = sl._safe_call_id("../../../etc/passwd")
+        assert "/" not in result
+        assert ".." not in result
+        # Dots and slashes replaced with underscores; only safe chars remain
+        import re
+        assert re.fullmatch(r'[a-zA-Z0-9_-]+', result)
+
+    def test_empty_string_falls_back_to_unknown(self, tmp_path):
+        """Empty string call_id falls back to 'unknown'."""
+        sl = SessionLog(tmp_path, "@agent:matrix.local")
+        assert sl._safe_call_id("") == "unknown"
+
+    def test_overflow_file_written_within_overflow_dir(self, tmp_path):
+        """Overflow file for a path-traversal call_id stays inside overflow/."""
+        sl = SessionLog(tmp_path, "@agent:matrix.local")
+        big_output = "x" * (64 * 1024 + 1)
+        sl.append(
+            role="tool",
+            sender="@agent:matrix.local",
+            room="!room:matrix.local",
+            event_id=None,
+            call_id="../../../etc/cron.d/evil",
+            name="shell",
+            output=big_output,
+        )
+        overflow_dir = tmp_path / "sessions" / "overflow"
+        # Only files within overflow/ should exist — no escape
+        written = list(overflow_dir.iterdir())
+        assert len(written) == 1
+        # The written file must be directly inside overflow/, not a traversal
+        assert written[0].parent == overflow_dir
+        # Its name must not contain slashes or dots-dots
+        assert "/" not in written[0].name
+        assert ".." not in written[0].name

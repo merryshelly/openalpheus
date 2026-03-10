@@ -11,6 +11,7 @@ Where room-id-safe strips '!' and replaces ':' with '_'.
 
 import json
 import os
+import re
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,9 +54,18 @@ class SessionLog:
         """Deterministic path for a room's session JSONL file."""
         return self._sessions_dir / f"{self._room_id_safe(room_id)}.jsonl"
 
+    def _safe_call_id(self, call_id: str) -> str:
+        """Sanitize call_id for use as filename.
+
+        Strips anything except alphanumeric, underscore, and hyphen to prevent
+        path traversal attacks from a malicious model returning e.g.
+        '../../../etc/cron.d/evil' as a call_id.
+        """
+        return re.sub(r'[^a-zA-Z0-9_-]', '_', call_id) or "unknown"
+
     def _overflow_path(self, call_id: str) -> Path:
         """Path for overflow file for a tool call."""
-        return self._sessions_dir / "overflow" / f"{call_id}.txt"
+        return self._sessions_dir / "overflow" / f"{self._safe_call_id(call_id)}.txt"
 
     def _now_ts(self) -> str:
         """ISO 8601 UTC timestamp."""
@@ -88,7 +98,7 @@ class SessionLog:
                 call_id = kwargs.get("call_id", "unknown")
                 overflow_dir = self._sessions_dir / "overflow"
                 overflow_dir.mkdir(parents=True, exist_ok=True)
-                overflow_file = overflow_dir / f"{call_id}.txt"
+                overflow_file = overflow_dir / f"{self._safe_call_id(call_id)}.txt"
                 overflow_file.write_text(output, encoding="utf-8")
                 kwargs["output"] = output[:OVERFLOW_THRESHOLD]
                 kwargs["truncated"] = True

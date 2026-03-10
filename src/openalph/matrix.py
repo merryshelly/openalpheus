@@ -14,6 +14,7 @@ from pathlib import Path
 from nio import (
     AsyncClient,
     InviteMemberEvent,
+    MessageDirection,
     RoomMessageText,
     LoginResponse,
     RoomSendError,
@@ -262,12 +263,13 @@ class MatrixBot:
                         GAP_FILL_MAX = 500  # safety cap to avoid infinite paging
                         known_ids = {e.get("event_id") for e in existing if e.get("event_id")}
                         new_messages = []
-                        start_token = ""  # empty = start from current position
+                        start_token = None  # None = start from current position
                         found_overlap = False
 
                         while len(new_messages) < GAP_FILL_MAX:
                             response = await self.client.room_messages(
-                                room_id, start=start_token, limit=100
+                                room_id, start=start_token, limit=100,
+                                direction=MessageDirection.back,
                             )
                             if not response.chunk:
                                 break  # no more history
@@ -328,10 +330,14 @@ class MatrixBot:
             # Fallback: paginate Matrix history (legacy path for tests without session_log)
             LEGACY_HISTORY_MAX = 500  # safety cap to avoid OOM on large rooms
             all_messages = []
-            response = await self.client.room_messages(room_id, start="", limit=100)
+            response = await self.client.room_messages(
+                room_id, start=None, limit=100, direction=MessageDirection.back,
+            )
             all_messages.extend(response.chunk)
             while response.end and len(all_messages) < LEGACY_HISTORY_MAX:
-                response = await self.client.room_messages(room_id, start=response.end, limit=100)
+                response = await self.client.room_messages(
+                    room_id, start=response.end, limit=100, direction=MessageDirection.back,
+                )
                 if not response.chunk:
                     break
                 all_messages.extend(response.chunk)

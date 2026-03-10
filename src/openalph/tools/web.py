@@ -119,11 +119,17 @@ async def web_fetch(url: str, max_chars: int | None = None) -> ToolResult:
             verify=_ssl_context,
             headers={"User-Agent": USER_AGENT},
         ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            raw_bytes = resp.content
-            if len(raw_bytes) > MAX_RESPONSE_BYTES:
-                raw_bytes = raw_bytes[:MAX_RESPONSE_BYTES]
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_RESPONSE_BYTES:
+                        chunks.append(chunk[: MAX_RESPONSE_BYTES - (total - len(chunk))])
+                        break
+                    chunks.append(chunk)
+                raw_bytes = b"".join(chunks)
             content = raw_bytes.decode("utf-8", errors="replace")
 
         # Strip HTML if it looks like HTML
