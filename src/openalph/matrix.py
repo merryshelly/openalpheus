@@ -687,8 +687,8 @@ class MatrixBot:
                         line += f"\n  Parameters: {params}"
                     parts.append(line)
             output = "\n".join(parts)
-            if len(output) > 15000:
-                output = output[:15000] + "\n\n... (truncated)"
+            if len(output) > 65000:
+                output = output[:65000] + "\n\n... (truncated)"
             await self.send(room_id, f"```\n{output}\n```")
             return
 
