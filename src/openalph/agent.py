@@ -6,8 +6,10 @@ so the operator can check usage without external tooling.
 """
 
 import asyncio
+import base64
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +20,102 @@ from openalph.provider import complete
 from openalph.tools import discover_tools, execute_tool, truncate_result
 
 logger = logging.getLogger(__name__)
+
+# Supported image MIME types for vision support
+VISION_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+# Media tag regex: [media: <path> (<mime>, <size>)]
+MEDIA_TAG_RE = re.compile(r'\[media:\s*(\S+)\s+\(([^,]+),\s*([^)]+)\)\]')
+
+# Approximate tokens per raw image byte (base64 decoded)
+IMAGE_TOKENS_PER_BYTE = 1 / 750
+
+
+def _build_user_content(text: str, config: AgentConfig) -> str | list[dict]:
+    """Build user message content, expanding image media tags when vision is enabled.
+
+    Returns plain text string when no image expansion needed.
+    Returns list of content blocks when images are present and vision is enabled.
+    """
+    # If vision is disabled, return text unchanged
+    if not config.vision:
+        return text
+
+    # Find all media tags
+    matches = list(MEDIA_TAG_RE.finditer(text))
+    if not matches:
+        return text
+
+    content_blocks = []
+    last_end = 0
+    images_found = False
+
+    for match in matches:
+        path_str = match.group(1)
+        mime_type = match.group(2)
+
+        # Add text before this tag
+        if match.start() > last_end:
+            text_before = text[last_end:match.start()]
+            if text_before.strip():
+                content_blocks.append({"type": "text", "text": text_before})
+
+        # Check if this is a supported image type
+        if mime_type in VISION_MIME_TYPES:
+            # Resolve path relative to workspace
+            image_path = config.workspace / path_str
+            try:
+                image_bytes = image_path.read_bytes()
+                if image_bytes:
+                    base64_data = base64.b64encode(image_bytes).decode("ascii")
+                    content_blocks.append({
+                        "type": "image",
+                        "media_type": mime_type,
+                        "data": base64_data,
+                    })
+                    images_found = True
+                else:
+                    # Empty file - leave tag as text
+                    content_blocks.append({"type": "text", "text": match.group(0)})
+            except FileNotFoundError:
+                logger.warning(f"Image file not found: {image_path}")
+                content_blocks.append({"type": "text", "text": match.group(0)})
+            except OSError as e:
+                logger.warning(f"Failed to read image file {image_path}: {e}")
+                content_blocks.append({"type": "text", "text": match.group(0)})
+        else:
+            # Not a supported image type - leave as text
+            content_blocks.append({"type": "text", "text": match.group(0)})
+
+        last_end = match.end()
+
+    # Add any remaining text after the last tag
+    if last_end < len(text):
+        text_after = text[last_end:]
+        if text_after.strip():
+            content_blocks.append({"type": "text", "text": text_after})
+
+    # If no images were expanded, return original text
+    if not images_found:
+        return text
+
+    # Merge consecutive text blocks for efficiency
+    merged_blocks = []
+    current_text = ""
+
+    for block in content_blocks:
+        if block["type"] == "text":
+            current_text += block["text"]
+        else:
+            if current_text:
+                merged_blocks.append({"type": "text", "text": current_text})
+                current_text = ""
+            merged_blocks.append(block)
+
+    if current_text:
+        merged_blocks.append({"type": "text", "text": current_text})
+
+    return merged_blocks
 
 
 class ContextOverflowError(Exception):
@@ -113,13 +211,17 @@ class Agent:
             self._current_task = asyncio.current_task()
             history = self.history(room_id)
             try:
+                # Build user content (may expand image media tags if vision enabled)
+                content = _build_user_content(text, self.config)
+
                 # Check for context overflow before appending user message
-                context_tokens = self._estimate_context_tokens(room_id) + len(text) // 4
+                content_tokens = self._estimate_content_tokens(content)
+                context_tokens = self._estimate_context_tokens(room_id) + content_tokens
                 available = self.config.model_max_tokens - self.config.max_tokens
                 if context_tokens > available:
                     raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
 
-                history.append({"role": "user", "content": text})
+                history.append({"role": "user", "content": content})
 
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
@@ -251,16 +353,52 @@ class Agent:
             task.cancel()
         return task
 
-    def _estimate_context_tokens(self, room_id: str = "_default") -> int:
+    def _estimate_content_tokens(self, content: str | list[dict]) -> int:
+        """Estimate tokens for a single content (string or list of blocks).
+
+        Text: 1 token ≈ 4 chars.
+        Images: base64 decoded size * 3/4 / 750.
+        """
+        if isinstance(content, str):
+            return len(content) // 4
+
+        if isinstance(content, list):
+            total = 0
+            for block in content:
+                if block.get("type") == "text":
+                    total += len(block.get("text", "")) // 4
+                elif block.get("type") == "image":
+                    # Estimate from base64 data length
+                    base64_len = len(block.get("data", ""))
+                    # base64 expands by 4/3, so decoded size = encoded * 3/4
+                    decoded_bytes = base64_len * 3 // 4
+                    total += int(decoded_bytes * IMAGE_TOKENS_PER_BYTE)
+            return total
+
+        return 0
+
+    def _estimate_context_tokens(self, room_id: str = "_default", history: list[dict] | None = None) -> int:
         """Estimate current context size in tokens for a room.
 
         Includes system prompt + room history. Uses 1 token ≈ 4 chars.
+        If history is provided, use that instead of looking up by room_id.
         """
         total_chars = len(self.system_prompt)
-        for msg in self.history(room_id):
+        msgs = history if history is not None else self.history(room_id)
+        for msg in msgs:
             content = msg.get("content", "")
-            if content:
+            if isinstance(content, str):
                 total_chars += len(content)
+            elif isinstance(content, list):
+                # List of content blocks
+                for block in content:
+                    if block.get("type") == "text":
+                        total_chars += len(block.get("text", ""))
+                    elif block.get("type") == "image":
+                        # Estimate from base64 data length
+                        base64_len = len(block.get("data", ""))
+                        decoded_bytes = base64_len * 3 // 4
+                        total_chars += int(decoded_bytes * IMAGE_TOKENS_PER_BYTE * 4)
             # Tool calls have input dicts — estimate their JSON size
             for tc in msg.get("tool_calls", []):
                 total_chars += len(str(tc.input))

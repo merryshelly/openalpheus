@@ -52,14 +52,16 @@ class ToolCall:
 @dataclass
 class Response:
     content: str
-    model: str
-    usage: Usage
-    stop_reason: str
+    model: str = ""
+    usage: Usage = None
+    stop_reason: str = ""
     tool_calls: list[ToolCall] = None
 
     def __post_init__(self):
         if self.tool_calls is None:
             self.tool_calls = []
+        if self.usage is None:
+            self.usage = Usage(input_tokens=0, output_tokens=0)
 
 
 def _convert_tools_for_provider(tools: list | None, provider: str) -> list[dict] | None:
@@ -119,11 +121,32 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
     result = []
     for msg in messages:
         role = msg.get("role")
-        
+
         if role == "user":
-            # Simple user message - pass through
-            result.append(msg)
-        
+            # User message may have list content (text + image blocks)
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Convert image blocks to Anthropic wire format
+                converted_blocks = []
+                for block in content:
+                    if block.get("type") == "image":
+                        # Convert to Anthropic image source format
+                        converted_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": block.get("media_type", "image/jpeg"),
+                                "data": block.get("data", ""),
+                            },
+                        })
+                    else:
+                        # Text blocks pass through unchanged
+                        converted_blocks.append(block)
+                result.append({"role": "user", "content": converted_blocks})
+            else:
+                # Simple user message - pass through
+                result.append(msg)
+
         elif role == "assistant":
             # Assistant message may have tool_calls
             tool_calls = msg.get("tool_calls", [])
@@ -180,8 +203,33 @@ def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
     result = []
     for msg in messages:
         role = msg.get("role")
-        
-        if role == "assistant":
+
+        if role == "user":
+            # User message may have list content (text + image blocks)
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Convert image blocks to OpenAI wire format
+                converted_blocks = []
+                for block in content:
+                    if block.get("type") == "image":
+                        # Convert to OpenAI image_url format
+                        media_type = block.get("media_type", "image/jpeg")
+                        data = block.get("data", "")
+                        converted_blocks.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{data}",
+                            },
+                        })
+                    else:
+                        # Text blocks pass through unchanged
+                        converted_blocks.append(block)
+                result.append({"role": "user", "content": converted_blocks})
+            else:
+                # Simple user message - pass through
+                result.append(msg)
+
+        elif role == "assistant":
             # Assistant message may have tool_calls
             tool_calls = msg.get("tool_calls", [])
             content = msg.get("content", "")

@@ -55,6 +55,7 @@ class AgentConfig:
     matrix: MatrixConfig | None = None
     max_iterations: int = 25
     truncation_limit: int = 50000
+    vision: bool = False
 
 
 def load_config(path: Path) -> AgentConfig:
@@ -82,10 +83,29 @@ def load_config(path: Path) -> AgentConfig:
     # Extract sections
     try:
         agent_section = toml_data["agent"]
-        provider_section = toml_data["provider"]
-        workspace_section = toml_data["workspace"]
     except KeyError as e:
         raise ConfigError(f"Missing required section: {e}")
+
+    # Support both inline format (agent.provider, agent.api_key, agent.workspace.path)
+    # and separate section format ([provider], [workspace])
+    provider_section = toml_data.get("provider", {})
+    workspace_section = toml_data.get("workspace", {})
+
+    # If provider section is missing, check for inline provider settings in agent section
+    if not provider_section:
+        if "provider" in agent_section:
+            # Inline format: agent.provider, agent.api_key, etc.
+            provider_section = {
+                "type": agent_section.get("provider"),
+                "api_key": agent_section.get("api_key"),
+                "base_url": agent_section.get("base_url"),
+            }
+
+    # If workspace section is missing, check for inline workspace settings in agent section
+    if not workspace_section:
+        agent_workspace = agent_section.get("workspace", {})
+        if isinstance(agent_workspace, dict) and "path" in agent_workspace:
+            workspace_section = agent_workspace
     
     # Validate and extract agent fields
     try:
@@ -121,7 +141,12 @@ def load_config(path: Path) -> AgentConfig:
     truncation_limit = agent_section.get("truncation_limit", 50000)
     if not isinstance(truncation_limit, int) or truncation_limit <= 0:
         raise ConfigError("truncation_limit must be a positive integer")
-    
+
+    # vision defaults to False if not specified
+    vision = agent_section.get("vision", False)
+    if not isinstance(vision, bool):
+        raise ConfigError("vision must be a boolean")
+
     # Validate and extract provider fields
     try:
         provider_type = provider_section["type"]
@@ -210,7 +235,8 @@ def load_config(path: Path) -> AgentConfig:
         workspace=workspace_path,
         matrix=matrix,
         max_iterations=max_iterations,
-        truncation_limit=truncation_limit
+        truncation_limit=truncation_limit,
+        vision=vision,
     )
 
 
