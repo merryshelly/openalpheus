@@ -14,7 +14,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 from openalph.config import AgentConfig
-from openalph.provider import complete, Response, Usage
+from openalph.provider import complete, Response, Usage, _convert_messages_for_anthropic
 
 
 def make_config(provider="anthropic", **kwargs):
@@ -382,3 +382,66 @@ class TestDataclasses:
         )
         assert u.cache_read_tokens == 80
         assert u.cache_creation_tokens == 20
+
+
+class TestConvertMessagesForAnthropic:
+    """Tests for _convert_messages_for_anthropic tool result merging."""
+
+    def test_single_tool_result(self):
+        """Single tool result converts to user message with tool_result block."""
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "calling tool"},
+            {"role": "tool", "tool_call_id": "tc1", "content": "result1"},
+        ]
+        result = _convert_messages_for_anthropic(messages)
+        assert result[-1] == {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tc1", "content": "result1"}],
+        }
+
+    def test_consecutive_tool_results_merged(self):
+        """Multiple consecutive tool results merge into one user message."""
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "calling tools"},
+            {"role": "tool", "tool_call_id": "tc1", "content": "result1"},
+            {"role": "tool", "tool_call_id": "tc2", "content": "result2"},
+            {"role": "tool", "tool_call_id": "tc3", "content": "result3"},
+        ]
+        result = _convert_messages_for_anthropic(messages)
+        # Should be: user, assistant, user (merged 3 tool results)
+        assert len(result) == 3
+        merged_user = result[2]
+        assert merged_user["role"] == "user"
+        assert len(merged_user["content"]) == 3
+        assert merged_user["content"][0]["tool_use_id"] == "tc1"
+        assert merged_user["content"][1]["tool_use_id"] == "tc2"
+        assert merged_user["content"][2]["tool_use_id"] == "tc3"
+
+    def test_non_consecutive_tool_results_not_merged(self):
+        """Tool results separated by assistant message stay separate."""
+        messages = [
+            {"role": "tool", "tool_call_id": "tc1", "content": "result1"},
+            {"role": "assistant", "content": "thinking"},
+            {"role": "tool", "tool_call_id": "tc2", "content": "result2"},
+        ]
+        result = _convert_messages_for_anthropic(messages)
+        assert len(result) == 3
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+        assert result[2]["role"] == "user"
+
+    def test_plain_text_user_not_merged_with_tool_result(self):
+        """Plain text user messages adjacent to tool results are NOT merged."""
+        messages = [
+            {"role": "tool", "tool_call_id": "tc1", "content": "result1"},
+            {"role": "user", "content": "follow up question"},
+        ]
+        result = _convert_messages_for_anthropic(messages)
+        # tool result has list content, plain user has string content -> no merge
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert isinstance(result[0]["content"], list)
+        assert result[1]["role"] == "user"
+        assert result[1]["content"] == "follow up question"

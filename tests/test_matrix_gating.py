@@ -117,8 +117,6 @@ def make_bot(tmp_path, rooms=None):
     })
     agent.history = MagicMock(return_value=[])
     agent.cancel = MagicMock()
-    agent._on_tool_call = None
-    agent._on_tool_intent = None
     
     with patch("openalph.matrix.AsyncClient"):
         bot = MatrixBot(agent, matrix_config)

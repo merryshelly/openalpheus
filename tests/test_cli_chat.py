@@ -94,7 +94,6 @@ def mock_agent():
         "total_output_tokens": 700,
         "total_tool_calls": 3,
     }
-    agent._on_tool_call = None
     return agent
 
 
@@ -197,7 +196,7 @@ class TestChatCommands:
 class TestChatMessages:
     def test_sends_to_agent(self, chat_env):
         run_chat(["hello world"], chat_env)
-        chat_env["agent"].handle_input.assert_called_once_with("hello world", "_cli")
+        chat_env["agent"].handle_input.assert_called_once(); assert chat_env["agent"].handle_input.call_args[0] == ("hello world", "_cli")
 
     def test_response_on_stdout(self, chat_env):
         stdout, stderr = run_chat(["hello"], chat_env)
@@ -211,9 +210,9 @@ class TestChatMessages:
         """Tool notices go to stderr, not stdout."""
         agent = chat_env["agent"]
 
-        async def handle_with_tool(text, room_id):
-            if agent._on_tool_call:
-                await agent._on_tool_call(
+        async def handle_with_tool(text, room_id, *, on_tool_call=None, on_tool_intent=None):
+            if on_tool_call:
+                await on_tool_call(
                     "call-1", "shell", {"command": "ls"}, "/tmp\n/var", False
                 )
             return "Here are the files."
@@ -231,9 +230,9 @@ class TestChatMessages:
         """Tool errors show 'error' status in notice."""
         agent = chat_env["agent"]
 
-        async def handle_with_error(text, room_id):
-            if agent._on_tool_call:
-                await agent._on_tool_call(
+        async def handle_with_error(text, room_id, *, on_tool_call=None, on_tool_intent=None):
+            if on_tool_call:
+                await on_tool_call(
                     "call-2", "shell", {"command": "bad"}, "command not found", True
                 )
             return "That command failed."
@@ -264,11 +263,11 @@ class TestChatSession:
     def test_custom_room_id(self, chat_env):
         args = make_args(room="debug-room")
         run_chat(["hello"], chat_env, args=args)
-        chat_env["agent"].handle_input.assert_called_once_with("hello", "debug-room")
+        chat_env["agent"].handle_input.assert_called_once(); assert chat_env["agent"].handle_input.call_args[0] == ("hello", "debug-room")
 
     def test_default_room_id(self, chat_env):
         run_chat(["hello"], chat_env)
-        chat_env["agent"].handle_input.assert_called_once_with("hello", "_cli")
+        chat_env["agent"].handle_input.assert_called_once(); assert chat_env["agent"].handle_input.call_args[0] == ("hello", "_cli")
 
 
 # ---------------------------------------------------------------------------

@@ -558,11 +558,12 @@ class MatrixBot:
                         ],
                     )
 
-            self.agent._on_tool_call = _tool_notice
-            self.agent._on_tool_intent = _tool_intent
-
             try:
-                response = await self.agent.handle_input(body, room_id)
+                response = await self.agent.handle_input(
+                    body, room_id,
+                    on_tool_call=_tool_notice,
+                    on_tool_intent=_tool_intent,
+                )
                 # Append assistant response to session log
                 if session_log:
                     session_log.append(
@@ -583,8 +584,6 @@ class MatrixBot:
                 logger.exception("Agent error processing message in %s", room_id)
                 await self.send(room_id, "⚠️ Internal error — check agent logs for details.")
             finally:
-                self.agent._on_tool_call = None
-                self.agent._on_tool_intent = None
                 await self._set_typing(room_id, False)
 
         finally:

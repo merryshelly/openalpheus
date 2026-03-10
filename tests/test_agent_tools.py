@@ -577,3 +577,107 @@ class TestToolsPassedToProvider:
         call_kwargs = mock_complete.call_args.kwargs
         tools = call_kwargs.get("tools")
         assert tools is None or tools == []
+
+
+# --- Callback parameter tests ---
+
+
+class TestCallbackParameters:
+    """Tests for on_tool_call and on_tool_intent passed to handle_input."""
+
+    @pytest.mark.asyncio
+    async def test_on_tool_call_invoked(self, tmp_path):
+        """on_tool_call callback passed to handle_input is invoked for each tool result."""
+        config = make_config(workspace=tmp_path)
+
+        tc = ToolCall(id="call_1", name="shell", input={"command": "ls"})
+
+        with patch("openalph.agent.assemble_prompt", return_value="prompt"), \
+             patch("openalph.agent.discover_tools", return_value=[SHELL_TOOL]), \
+             patch("openalph.agent.complete", new_callable=AsyncMock,
+                   side_effect=[
+                       tool_use_response([tc], text="Running..."),
+                       text_response("Done"),
+                   ]), \
+             patch("openalph.agent.execute_tool", new_callable=AsyncMock,
+                   return_value=ToolResult(content="file.txt", is_error=False)):
+            agent = Agent(config)
+            callback = AsyncMock()
+            await agent.handle_input("list files", on_tool_call=callback)
+
+        callback.assert_called_once_with("call_1", "shell", {"command": "ls"}, "file.txt", False)
+
+    @pytest.mark.asyncio
+    async def test_on_tool_intent_invoked(self, tmp_path):
+        """on_tool_intent callback is invoked before tool execution."""
+        config = make_config(workspace=tmp_path)
+
+        tc = ToolCall(id="call_1", name="shell", input={"command": "ls"})
+
+        with patch("openalph.agent.assemble_prompt", return_value="prompt"), \
+             patch("openalph.agent.discover_tools", return_value=[SHELL_TOOL]), \
+             patch("openalph.agent.complete", new_callable=AsyncMock,
+                   side_effect=[
+                       tool_use_response([tc], text="Let me check"),
+                       text_response("Done"),
+                   ]), \
+             patch("openalph.agent.execute_tool", new_callable=AsyncMock,
+                   return_value=ToolResult(content="ok", is_error=False)):
+            agent = Agent(config)
+            intent_cb = AsyncMock()
+            await agent.handle_input("check", on_tool_intent=intent_cb)
+
+        intent_cb.assert_called_once_with([tc], "Let me check")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_callbacks_isolated(self, tmp_path):
+        """Two concurrent handle_input calls with different callbacks don't interfere."""
+        import asyncio
+        config = make_config(workspace=tmp_path)
+
+        tc_a = ToolCall(id="call_a", name="shell", input={"command": "echo A"})
+        tc_b = ToolCall(id="call_b", name="shell", input={"command": "echo B"})
+
+        call_count = 0
+
+        async def fake_complete(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            idx = call_count
+            if idx == 1:
+                # Room A first call — tool use, but add delay so B starts
+                return tool_use_response([tc_a], text="A running")
+            elif idx == 2:
+                # Room B first call — tool use
+                return tool_use_response([tc_b], text="B running")
+            else:
+                # Final text responses
+                return text_response("Done")
+
+        async def fake_execute(*, name, input, tool_config, agent_config, tools):
+            # Add a delay to simulate real tool execution and allow interleaving
+            await asyncio.sleep(0.01)
+            return ToolResult(content=f"result-{input['command']}", is_error=False)
+
+        with patch("openalph.agent.assemble_prompt", return_value="prompt"), \
+             patch("openalph.agent.discover_tools", return_value=[SHELL_TOOL]), \
+             patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=fake_complete), \
+             patch("openalph.agent.execute_tool", new_callable=AsyncMock, side_effect=fake_execute):
+            agent = Agent(config)
+
+            cb_a = AsyncMock()
+            cb_b = AsyncMock()
+
+            result_a, result_b = await asyncio.gather(
+                agent.handle_input("do A", room_id="room_a", on_tool_call=cb_a),
+                agent.handle_input("do B", room_id="room_b", on_tool_call=cb_b),
+            )
+
+        # Each callback should only receive its own tool results
+        cb_a.assert_called_once()
+        assert cb_a.call_args[0][0] == "call_a"  # call_id
+        assert cb_a.call_args[0][1] == "shell"
+
+        cb_b.assert_called_once()
+        assert cb_b.call_args[0][0] == "call_b"  # call_id
+        assert cb_b.call_args[0][1] == "shell"

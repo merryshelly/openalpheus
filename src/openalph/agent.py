@@ -49,8 +49,7 @@ class Agent:
         self.tools = discover_tools(config.workspace)
         self._current_task: asyncio.Task | None = None
         self._room_locks: dict[str, asyncio.Lock] = {}
-        self._on_tool_call = None  # async callback(call_id, name, input, result, is_error)
-        self._on_tool_intent = None  # async callback(tool_calls, content) — fires before tool execution
+
 
     def history(self, room_id: str) -> list[dict]:
         """Get or create history for a room."""
@@ -96,7 +95,8 @@ class Agent:
         except Exception as e:
             logger.warning(f"Failed to write JSONL log: {e}")
 
-    async def handle_input(self, text: str, room_id: str = "_default") -> str:
+    async def handle_input(self, text: str, room_id: str = "_default", *,
+                           on_tool_call=None, on_tool_intent=None) -> str:
         """Process a user message and return the assistant's response.
 
         Appends the user message to room history, calls the LLM, appends the
@@ -165,8 +165,8 @@ class Agent:
                     })
 
                     # Emit tool intent before execution (for session logging / observability)
-                    if self._on_tool_intent:
-                        await self._on_tool_intent(response.tool_calls, response.content)
+                    if on_tool_intent:
+                        await on_tool_intent(response.tool_calls, response.content)
 
                     # Execute tool calls in parallel
                     tool_coros = []
@@ -220,8 +220,8 @@ class Agent:
                             "content": truncated_content,
                             "is_error": result.is_error,
                         })
-                        if self._on_tool_call:
-                            await self._on_tool_call(
+                        if on_tool_call:
+                            await on_tool_call(
                                 tc.id, tc.name, tc.input, truncated_content, result.is_error
                             )
 

@@ -51,7 +51,6 @@ def _make_bot_with_session_log(known_event_ids):
     agent._rooms = {}
     agent.handle_input = AsyncMock(return_value="response")
     agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
-    agent._on_tool_call = None
     agent.cancel = MagicMock()
 
     bot = MatrixBot.__new__(MatrixBot)

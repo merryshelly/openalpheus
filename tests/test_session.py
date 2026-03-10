@@ -467,15 +467,13 @@ class TestMatrixBotIntegration:
         bot, agent = make_bot_with_session_log(tmp_path)
         bot._active_rooms.add(ROOM_ID)
 
-        # Simulate agent calling _on_tool_call
-        async def fake_handle_input(body, room_id):
-            if bot.agent._on_tool_call:
-                await bot.agent._on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)
+        # Simulate agent calling on_tool_call
+        async def fake_handle_input(body, room_id, *, on_tool_call=None, on_tool_intent=None):
+            if on_tool_call:
+                await on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)
             return "Done"
 
         agent.handle_input = fake_handle_input
-        # Make _on_tool_call accessible on the bot's agent mock
-        agent._on_tool_call = None
 
         event = make_room_message(USER, "Run uptime")
         room = MagicMock()
@@ -496,21 +494,19 @@ class TestMatrixBotIntegration:
         bot._active_rooms.add(ROOM_ID)
 
         # Simulate agent emitting tool intent then returning
-        async def fake_handle_input(body, room_id):
-            if bot.agent._on_tool_intent:
+        async def fake_handle_input(body, room_id, *, on_tool_call=None, on_tool_intent=None):
+            if on_tool_intent:
                 # Simulate ToolCall objects
                 tc = MagicMock()
                 tc.id = "call_1"
                 tc.name = "shell"
                 tc.input = {"command": "uptime"}
-                await bot.agent._on_tool_intent([tc], "Let me check...")
-            if bot.agent._on_tool_call:
-                await bot.agent._on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)
+                await on_tool_intent([tc], "Let me check...")
+            if on_tool_call:
+                await on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)
             return "System has been up 3 days."
 
         agent.handle_input = fake_handle_input
-        agent._on_tool_call = None
-        agent._on_tool_intent = None
 
         event = make_room_message(USER, "How long has it been up?")
         room = MagicMock()

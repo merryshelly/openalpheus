@@ -161,7 +161,18 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
             # Unknown role - pass through
             result.append(msg)
     
-    return result
+    # Merge consecutive user messages with list content (tool results from parallel calls)
+    merged = []
+    for msg in result:
+        if (merged
+                and merged[-1]["role"] == "user"
+                and msg["role"] == "user"
+                and isinstance(merged[-1].get("content"), list)
+                and isinstance(msg.get("content"), list)):
+            merged[-1]["content"].extend(msg["content"])
+        else:
+            merged.append(msg)
+    return merged
 
 
 def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:

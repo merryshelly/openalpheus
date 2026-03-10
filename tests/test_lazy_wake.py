@@ -87,7 +87,6 @@ class TestResetRemoval:
         agent._rooms = {}
         agent.handle_input = AsyncMock(return_value="I don't understand /reset")
         agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -107,7 +106,8 @@ class TestResetRemoval:
 
         # Should go through agent.handle_input as a regular message,
         # not be intercepted as a command
-        agent.handle_input.assert_awaited_once_with("/reset", "!test:matrix.local")
+        agent.handle_input.assert_awaited_once()
+        assert agent.handle_input.await_args[0] == ("/reset", "!test:matrix.local")
 
     def test_agent_has_no_reset_room_method(self):
         """Agent class should not have a reset_room method."""
@@ -166,7 +166,6 @@ class TestLazyWake:
         agent._rooms = {}
         agent.handle_input = AsyncMock(return_value="Hello!")
         agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -207,7 +206,6 @@ class TestLazyWake:
         agent._rooms = {}
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -246,7 +244,6 @@ class TestLazyWake:
         agent._rooms = {}
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -291,7 +288,6 @@ class TestHistoryLoadOnActivation:
         agent._rooms = real_rooms
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: real_rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -336,7 +332,6 @@ class TestHistoryLoadOnActivation:
         agent._rooms = real_rooms
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: real_rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -379,7 +374,6 @@ class TestHistoryLoadOnActivation:
         agent._rooms = {}
         agent.handle_input = AsyncMock(side_effect=AgentOverflowError(200000, 200000))
         agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -436,7 +430,6 @@ class TestHistoryPagination:
         agent._rooms = real_rooms
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: real_rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -489,7 +482,6 @@ class TestHistoryPagination:
         agent._rooms = {}
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -525,7 +517,6 @@ class TestHistoryPagination:
         agent._rooms = real_rooms
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: real_rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)
@@ -566,7 +557,6 @@ class TestHistoryPagination:
         agent._rooms = real_rooms
         agent.handle_input = AsyncMock(return_value="response")
         agent.history = MagicMock(side_effect=lambda rid: real_rooms.setdefault(rid, []))
-        agent._on_tool_call = None
         agent.cancel = MagicMock()
 
         bot = MatrixBot.__new__(MatrixBot)

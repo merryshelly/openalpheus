@@ -264,10 +264,8 @@ def cmd_chat(args):
                 continue
 
             # Regular message
-            agent._on_tool_call = tool_notice
-
             try:
-                response = await agent.handle_input(line, room_id)
+                response = await agent.handle_input(line, room_id, on_tool_call=tool_notice)
                 print(f"\n{response}")
             except ContextOverflowError as e:
                 print(f"\n⚠️ Context overflow — ~{e.current_tokens:,} / "
@@ -278,7 +276,7 @@ def cmd_chat(args):
             except Exception as e:
                 print(f"\nError: {e}", file=sys.stderr)
             finally:
-                agent._on_tool_call = None
+                pass
 
     asyncio.run(chat_loop())
 
