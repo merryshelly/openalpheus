@@ -96,5 +96,9 @@ def is_gated(config, room) -> bool:
             return override["require_mention"]
     
     # 2. Auto-detect from member count
-    member_count = len(room.users) if hasattr(room, 'users') else 0
+    joined = getattr(room, 'joined_count', None)
+    if isinstance(joined, int) and joined > 0:
+        member_count = joined
+    else:
+        member_count = len(room.users) if hasattr(room, 'users') else 0
     return member_count >= 3
