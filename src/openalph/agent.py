@@ -113,11 +113,17 @@ class Agent:
             self._current_task = asyncio.current_task()
             history = self.history(room_id)
             try:
+                # Check for context overflow before appending user message
+                context_tokens = self._estimate_context_tokens(room_id) + len(text) // 4
+                available = self.config.model_max_tokens - self.config.max_tokens
+                if context_tokens > available:
+                    raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
+
                 history.append({"role": "user", "content": text})
 
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
-                    # Check for context overflow before calling the API
+                    # Check for context overflow before calling the API (tool results may push over)
                     context_tokens = self._estimate_context_tokens(room_id)
                     available = self.config.model_max_tokens - self.config.max_tokens
                     if context_tokens > available:
@@ -166,7 +172,10 @@ class Agent:
 
                     # Emit tool intent before execution (for session logging / observability)
                     if on_tool_intent:
-                        await on_tool_intent(response.tool_calls, response.content)
+                        try:
+                            await on_tool_intent(response.tool_calls, response.content)
+                        except Exception as e:
+                            logger.warning("Tool intent callback failed: %s", e)
 
                     # Execute tool calls in parallel
                     tool_coros = []
@@ -221,9 +230,12 @@ class Agent:
                             "is_error": result.is_error,
                         })
                         if on_tool_call:
-                            await on_tool_call(
-                                tc.id, tc.name, tc.input, truncated_content, result.is_error
-                            )
+                            try:
+                                await on_tool_call(
+                                    tc.id, tc.name, tc.input, truncated_content, result.is_error
+                                )
+                            except Exception as e:
+                                logger.warning("Tool call callback failed: %s", e)
 
                 # Hit max iterations - return limit message
                 return "[Tool call limit reached. Please summarize your progress.]"

@@ -681,3 +681,55 @@ class TestCallbackParameters:
         cb_b.assert_called_once()
         assert cb_b.call_args[0][0] == "call_b"  # call_id
         assert cb_b.call_args[0][1] == "shell"
+
+
+# --- Fix 2: Callback errors don't kill message processing ---
+
+
+class TestCallbackErrorResilience:
+
+    @pytest.mark.asyncio
+    async def test_on_tool_intent_error_does_not_kill_processing(self, tmp_path):
+        """If on_tool_intent raises, handle_input still returns a response."""
+        (tmp_path / "tools").mkdir(exist_ok=True)
+        config = make_config(workspace=tmp_path)
+        agent = Agent(config)
+
+        tc = ToolCall(id="tc_1", name="read_file", input={"path": "/tmp/x"})
+        tool_resp = tool_use_response([tc], text="Let me check")
+        text_resp = text_response("Done!")
+
+        async def exploding_intent(tool_calls, content):
+            raise RuntimeError("intent callback boom")
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock_complete, \
+             patch("openalph.agent.execute_tool", new_callable=AsyncMock) as mock_exec:
+            mock_complete.side_effect = [tool_resp, text_resp]
+            mock_exec.return_value = ToolResult(content="file contents", is_error=False)
+
+            result = await agent.handle_input("hello", on_tool_intent=exploding_intent)
+
+        assert result == "Done!"
+
+    @pytest.mark.asyncio
+    async def test_on_tool_call_error_does_not_kill_processing(self, tmp_path):
+        """If on_tool_call raises, handle_input still returns a response."""
+        (tmp_path / "tools").mkdir(exist_ok=True)
+        config = make_config(workspace=tmp_path)
+        agent = Agent(config)
+
+        tc = ToolCall(id="tc_1", name="read_file", input={"path": "/tmp/x"})
+        tool_resp = tool_use_response([tc], text="Let me check")
+        text_resp = text_response("Done!")
+
+        async def exploding_call(*args, **kwargs):
+            raise RuntimeError("call callback boom")
+
+        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock_complete, \
+             patch("openalph.agent.execute_tool", new_callable=AsyncMock) as mock_exec:
+            mock_complete.side_effect = [tool_resp, text_resp]
+            mock_exec.return_value = ToolResult(content="file contents", is_error=False)
+
+            result = await agent.handle_input("hello", on_tool_call=exploding_call)
+
+        assert result == "Done!"

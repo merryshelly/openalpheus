@@ -58,7 +58,7 @@ class TestParseInterval:
         assert parse_interval("") is None
 
     def test_zero_minutes(self):
-        assert parse_interval("0m") == 0
+        assert parse_interval("0m") is None
 
     def test_whitespace_stripped(self):
         assert parse_interval("  15m  ") == 900
@@ -354,3 +354,32 @@ class TestHeartbeatShutdown:
         await hb.start("!room1:matrix.local", 3600)
         await hb.shutdown()
         await hb.shutdown()  # Should not raise
+
+
+# --- Fix 1: Zero interval rejection ---
+
+
+class TestZeroIntervalRejection:
+
+    def test_parse_interval_zero_minutes(self):
+        assert parse_interval("0m") is None
+
+    def test_parse_interval_zero_hours(self):
+        assert parse_interval("0h") is None
+
+    def test_parse_interval_zero_seconds(self):
+        assert parse_interval("0s") is None
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_zero_interval(self, tmp_path):
+        callback = AsyncMock()
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", callback)
+        with pytest.raises(ValueError, match="must be positive"):
+            await hb.start("!room:test", 0)
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_negative_interval(self, tmp_path):
+        callback = AsyncMock()
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", callback)
+        with pytest.raises(ValueError, match="must be positive"):
+            await hb.start("!room:test", -5)

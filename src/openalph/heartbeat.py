@@ -39,6 +39,9 @@ class HeartbeatManager:
 
     async def start(self, room_id: str, interval_seconds: int | float) -> None:
         """Start or replace a heartbeat for a room. Persists to disk."""
+        if interval_seconds <= 0:
+            raise ValueError(f"interval_seconds must be positive, got {interval_seconds}")
+
         # Cancel existing task if present
         if room_id in self._tasks:
             self._tasks[room_id].cancel()
@@ -205,8 +208,8 @@ def parse_interval(s: str) -> int | None:
     except ValueError:
         return None
 
-    # Reject negatives
-    if num < 0:
+    # Reject negatives and zero
+    if num <= 0:
         return None
 
     # Parse unit

@@ -9,6 +9,7 @@ api_key_cmd (shell command). Precedence: api_key > api_key_env > api_key_cmd.
 """
 
 import pytest
+import subprocess
 from pathlib import Path
 from openalph.config import AgentConfig, load_config, load_agent_config, ConfigError, CONFIG_DIR
 
@@ -394,3 +395,79 @@ class TestAgentConfig:
         assert config.model_max_tokens == 200000
         assert config.workspace == Path("/tmp/test")
         assert config.matrix is None
+
+
+# --- Fix 4: Subprocess timeout on cmd resolution ---
+
+
+class TestSubprocessTimeout:
+
+    def test_api_key_cmd_timeout_raises_config_error(self, tmp_path):
+        """When api_key_cmd hangs, ConfigError is raised."""
+        from unittest.mock import patch as _patch
+        (tmp_path / "agent.toml").write_text("""
+[agent]
+name = "test"
+model = "test-model"
+
+[provider]
+type = "anthropic"
+api_key_cmd = "sleep 999"
+
+[workspace]
+path = "/tmp/test"
+""")
+        with _patch("openalph.config.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="sleep 999", timeout=10)
+            with pytest.raises(ConfigError, match="timed out"):
+                load_config(tmp_path / "agent.toml")
+
+    def test_password_cmd_timeout_raises_config_error(self, tmp_path):
+        """When matrix.password_cmd hangs, ConfigError is raised."""
+        from unittest.mock import patch as _patch
+        (tmp_path / "agent.toml").write_text("""
+[agent]
+name = "test"
+model = "test-model"
+
+[provider]
+type = "anthropic"
+api_key = "sk-test"
+
+[workspace]
+path = "/tmp/test"
+
+[matrix]
+homeserver = "https://matrix.test"
+user_id = "@bot:matrix.test"
+password_cmd = "sleep 999"
+""")
+        with _patch("openalph.config.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="sleep 999", timeout=10)
+            with pytest.raises(ConfigError, match="timed out"):
+                load_config(tmp_path / "agent.toml")
+
+    def test_access_token_cmd_timeout_raises_config_error(self, tmp_path):
+        """When matrix.access_token_cmd hangs, ConfigError is raised."""
+        from unittest.mock import patch as _patch
+        (tmp_path / "agent.toml").write_text("""
+[agent]
+name = "test"
+model = "test-model"
+
+[provider]
+type = "anthropic"
+api_key = "sk-test"
+
+[workspace]
+path = "/tmp/test"
+
+[matrix]
+homeserver = "https://matrix.test"
+user_id = "@bot:matrix.test"
+access_token_cmd = "sleep 999"
+""")
+        with _patch("openalph.config.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="sleep 999", timeout=10)
+            with pytest.raises(ConfigError, match="timed out"):
+                load_config(tmp_path / "agent.toml")

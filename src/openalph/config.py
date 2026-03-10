@@ -163,11 +163,14 @@ def load_config(path: Path) -> AgentConfig:
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                timeout=10,
             )
             api_key = result.stdout.strip()
             if not api_key:
                 raise ConfigError("api_key_cmd produced empty output")
+        except subprocess.TimeoutExpired:
+            raise ConfigError("api_key_cmd timed out after 10 seconds")
         except subprocess.CalledProcessError as e:
             raise ConfigError(f"api_key_cmd failed with exit code {e.returncode}")
     
@@ -306,9 +309,12 @@ def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                timeout=10,
             )
             password = result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            raise ConfigError("matrix.password_cmd timed out after 10 seconds")
         except subprocess.CalledProcessError as e:
             raise ConfigError(f"matrix.password_cmd failed with exit code {e.returncode}")
 
@@ -339,9 +345,12 @@ def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                timeout=10,
             )
             access_token = result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            raise ConfigError("matrix.access_token_cmd timed out after 10 seconds")
         except subprocess.CalledProcessError as e:
             raise ConfigError(f"matrix.access_token_cmd failed with exit code {e.returncode}")
 

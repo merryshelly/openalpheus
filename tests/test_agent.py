@@ -197,3 +197,34 @@ class TestStatus:
         assert status["total_output_tokens"] == 20
         assert status["model"] == "test-model"
         assert "name" in status
+
+
+# --- Fix 3: Context overflow check before user message appended ---
+
+
+class TestContextOverflowPreAppend:
+
+    @pytest.mark.asyncio
+    async def test_overflow_rejects_without_appending(self, tmp_path):
+        """When context is near-full, a large user message triggers
+        ContextOverflowError WITHOUT the message being added to history."""
+        from openalph.agent import ContextOverflowError
+        config = make_config(tmp_path, model_max_tokens=1000, max_tokens=200)
+        agent = Agent(config)
+
+        # Pre-fill history to near capacity (800 available tokens = 3200 chars)
+        # System prompt is empty-ish, so fill history close to limit
+        agent._rooms["_default"] = [
+            {"role": "user", "content": "x" * 3000},
+            {"role": "assistant", "content": "y" * 100},
+        ]
+
+        big_message = "z" * 2000  # would push well over
+
+        with pytest.raises(ContextOverflowError):
+            with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+                await agent.handle_input(big_message)
+
+        # The big message must NOT be in history
+        contents = [m.get("content", "") for m in agent.history("_default")]
+        assert big_message not in contents
