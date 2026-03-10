@@ -38,8 +38,7 @@ class MatrixConfig:
     sync_timeout: int
     retry_base: int
     retry_max: int
-    rooms: dict[str, dict] | None = None  # per-room overrides
-    rooms: dict | None = None  # Room-specific overrides, e.g., {"!room:server": {"require_mention": True}}
+    rooms: dict[str, dict] | None = None  # Per-room overrides, e.g., {"!room:server": {"require_mention": True}}
 
 
 @dataclass

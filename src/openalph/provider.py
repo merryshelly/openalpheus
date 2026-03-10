@@ -11,6 +11,28 @@ import anthropic
 import openai
 from openalph.config import AgentConfig
 
+# Client cache: reuse HTTP clients for connection pooling.
+# Keyed by (provider, api_key, base_url) so different configs get different clients.
+_client_cache: dict[tuple, object] = {}
+
+
+def _get_client(config: AgentConfig):
+    """Get or create a cached provider client."""
+    if config.provider == "anthropic":
+        key = ("anthropic", config.api_key, None)
+        if key not in _client_cache:
+            _client_cache[key] = anthropic.AsyncAnthropic(api_key=config.api_key)
+        return _client_cache[key]
+    elif config.provider == "openai":
+        key = ("openai", config.api_key, config.base_url)
+        if key not in _client_cache:
+            _client_cache[key] = openai.AsyncOpenAI(
+                api_key=config.api_key, base_url=config.base_url
+            )
+        return _client_cache[key]
+    else:
+        raise ValueError(f"Unsupported provider: {config.provider}")
+
 
 @dataclass
 class Usage:
@@ -284,7 +306,7 @@ async def complete(
     
     if config.provider == "anthropic":
         # Anthropic path: use their specific API shape
-        client = anthropic.AsyncAnthropic(api_key=config.api_key)
+        client = _get_client(config)
         
         # Build API call kwargs
         api_kwargs = {
@@ -303,7 +325,7 @@ async def complete(
     
     elif config.provider == "openai":
         # OpenAI path: prepend system message and use their API shape
-        client = openai.AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+        client = _get_client(config)
         
         # Prepend system message to messages list
         messages_with_system = [{"role": "system", "content": system}] + provider_messages

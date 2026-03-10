@@ -515,6 +515,94 @@ class TestHistoryPagination:
         # Only one call to room_messages (initial, finds nothing)
         assert bot.client.room_messages.await_count == 1
 
+    @pytest.mark.asyncio
+    async def test_legacy_fallback_caps_at_limit(self):
+        """Legacy fallback stops paging at 500 messages to prevent OOM."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+
+        real_rooms = {}
+        agent = MagicMock()
+        agent._rooms = real_rooms
+        agent.handle_input = AsyncMock(return_value="response")
+        agent.history = MagicMock(side_effect=lambda rid: real_rooms.setdefault(rid, []))
+        agent._on_tool_call = None
+        agent.cancel = MagicMock()
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = set()
+        bot.session_log = None  # force legacy path
+
+        # Each call returns 100 messages with a truthy end token (simulates infinite pages)
+        def make_infinite_page():
+            page = MagicMock()
+            page.chunk = [make_room_message("@sb:local", f"msg", f"$evt") for _ in range(100)]
+            page.end = "infinite_token"
+            return page
+
+        bot.client.room_messages = AsyncMock(side_effect=lambda *a, **kw: make_infinite_page())
+
+        room = make_room("!room:local")
+        event = make_room_message("@sb:local", "New message")
+
+        await bot._handle_room_message(room, event)
+
+        # 1 initial call + at most 5 pages (500 messages reached after 5 more = 6 total calls)
+        assert bot.client.room_messages.await_count <= 6
+
+    @pytest.mark.asyncio
+    async def test_legacy_fallback_stops_on_empty_chunk(self):
+        """Legacy fallback stops early when server returns empty chunk."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+
+        real_rooms = {}
+        agent = MagicMock()
+        agent._rooms = real_rooms
+        agent.handle_input = AsyncMock(return_value="response")
+        agent.history = MagicMock(side_effect=lambda rid: real_rooms.setdefault(rid, []))
+        agent._on_tool_call = None
+        agent.cancel = MagicMock()
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = set()
+        bot.session_log = None  # force legacy path
+
+        # First call returns messages + pagination token
+        page1 = MagicMock()
+        page1.chunk = [make_room_message("@sb:local", "Old message", "$h1")]
+        page1.end = "token_page2"
+
+        # Second call returns empty chunk (server signals no more data)
+        page2 = MagicMock()
+        page2.chunk = []
+        page2.end = "token_page3"  # truthy end but empty chunk — should stop
+
+        bot.client.room_messages = AsyncMock(side_effect=[page1, page2])
+
+        room = make_room("!room:local")
+        event = make_room_message("@sb:local", "New message")
+
+        await bot._handle_room_message(room, event)
+
+        # Should stop after second call (empty chunk breaks the loop)
+        assert bot.client.room_messages.await_count == 2
+        # The old message should still be in history
+        history = real_rooms.get("!room:local", [])
+        assert any(m["content"] == "Old message" for m in history)
+
 
 # --- Commands Still Work ---
 

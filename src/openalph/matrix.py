@@ -11,7 +11,7 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 import asyncio
 import logging
 from pathlib import Path
-from nio import AsyncClient, InviteMemberEvent, RoomMessageText
+from nio import AsyncClient, InviteMemberEvent, RoomMessageText, LoginResponse
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.config import MatrixConfig
@@ -69,7 +69,9 @@ class MatrixBot:
             self.client.access_token = self.config.access_token
         else:
             # Password login
-            await self.client.login(self.config.password)
+            response = await self.client.login(self.config.password)
+            if not isinstance(response, LoginResponse):
+                raise RuntimeError(f"Matrix login failed: {response}")
 
     async def _set_typing(self, room_id: str, state: bool):
         """Set typing indicator for a room.
@@ -121,8 +123,18 @@ class MatrixBot:
         - Kill tool subprocesses
         - Send cancellation notice to room
         """
+        task = None
         if hasattr(self.agent, "cancel"):
-            self.agent.cancel()
+            task = self.agent.cancel()
+
+        # Wait for the cancelled task to actually finish
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass  # Task may raise other errors during cancellation
 
         if self._current_room:
             await self.send(self._current_room, "Cancelled.")
@@ -160,9 +172,17 @@ class MatrixBot:
                     content=response,
                 )
             await self.send(room_id, response)
+        except AgentOverflowError as e:
+            logger.warning("Context overflow in %s — auto-stopping heartbeat", room_id)
+            await self.heartbeat.stop(room_id)
+            await self.send(
+                room_id,
+                "⚠️ **Context overflow** — heartbeat auto-stopped for this room. "
+                "Start a new room to continue.",
+            )
         except Exception as e:
             logger.exception("Heartbeat processing error in %s", room_id)
-            await self.send(room_id, f"Heartbeat error: {e}")
+            await self.send(room_id, "⚠️ Heartbeat error — check agent logs for details.")
         finally:
             await self._set_typing(room_id, False)
 
@@ -182,24 +202,50 @@ class MatrixBot:
                 last_id = session_log.last_event_id(room_id)
                 if last_id:
                     try:
-                        # Fetch recent messages to check for gaps
-                        response = await self.client.room_messages(room_id, start="", limit=100)
-                        recent = list(response.chunk)
-                        # Recent messages come in reverse order (newest first)
-                        # Find the cutoff: append only events after last_id
+                        # Gap-fill: page backward through recent Matrix messages until
+                        # we find overlap with known session history (or hit the cap).
+                        GAP_FILL_MAX = 500  # safety cap to avoid infinite paging
                         known_ids = {e.get("event_id") for e in existing if e.get("event_id")}
-                        for msg in reversed(recent):
-                            if not hasattr(msg, 'body'):
-                                continue
+                        new_messages = []
+                        start_token = ""  # empty = start from current position
+                        found_overlap = False
+
+                        while len(new_messages) < GAP_FILL_MAX:
+                            response = await self.client.room_messages(
+                                room_id, start=start_token, limit=100
+                            )
+                            if not response.chunk:
+                                break  # no more history
+
+                            for msg in response.chunk:  # newest-first order
+                                ev_id = getattr(msg, 'event_id', None)
+                                if ev_id and ev_id in known_ids:
+                                    found_overlap = True
+                                    break
+                                if hasattr(msg, 'body') and msg.sender != self.config.user_id:
+                                    new_messages.append(msg)
+
+                            if found_overlap or not response.end:
+                                break
+                            start_token = response.end
+
+                        if not found_overlap and new_messages:
+                            logger.warning(
+                                "Gap-fill for %s: no overlap found after %d messages — "
+                                "some history may be missing",
+                                room_id, len(new_messages),
+                            )
+
+                        # Append in chronological order (we collected newest-first)
+                        for msg in reversed(new_messages):
                             ev_id = getattr(msg, 'event_id', None)
-                            if ev_id and ev_id not in known_ids and msg.sender != self.config.user_id:
-                                session_log.append(
-                                    role="user",
-                                    sender=msg.sender,
-                                    room=room_id,
-                                    event_id=ev_id,
-                                    content=msg.body,
-                                )
+                            session_log.append(
+                                role="user",
+                                sender=msg.sender,
+                                room=room_id,
+                                event_id=ev_id,
+                                content=msg.body,
+                            )
                         session_log.append(
                             role="system",
                             sender=self.agent_user_id if hasattr(self, 'agent_user_id') else self.config.user_id,
@@ -225,12 +271,17 @@ class MatrixBot:
                 )
         else:
             # Fallback: paginate Matrix history (legacy path for tests without session_log)
+            LEGACY_HISTORY_MAX = 500  # safety cap to avoid OOM on large rooms
             all_messages = []
             response = await self.client.room_messages(room_id, start="", limit=100)
             all_messages.extend(response.chunk)
-            while response.end:
+            while response.end and len(all_messages) < LEGACY_HISTORY_MAX:
                 response = await self.client.room_messages(room_id, start=response.end, limit=100)
+                if not response.chunk:
+                    break
                 all_messages.extend(response.chunk)
+            if len(all_messages) >= LEGACY_HISTORY_MAX:
+                logger.warning("Legacy history load for %s capped at %d messages", room_id, LEGACY_HISTORY_MAX)
 
             all_messages.reverse()
 
@@ -473,9 +524,9 @@ class MatrixBot:
                     f"⚠️ **Context overflow** — ~{e.current_tokens:,} / "
                     f"{e.max_tokens:,} tokens. Start a new room to continue.")
             except Exception as e:
-                # Agent error: send error message, don't crash
-                logger.exception("Agent error processing message")
-                await self.send(room_id, f"Error: {e}")
+                # Agent error: send generic message to avoid leaking exception details
+                logger.exception("Agent error processing message in %s", room_id)
+                await self.send(room_id, "⚠️ Internal error — check agent logs for details.")
             finally:
                 self.agent._on_tool_call = None
                 self.agent._on_tool_intent = None

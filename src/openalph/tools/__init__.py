@@ -353,6 +353,18 @@ async def execute_tool(
             input = dict(input)  # Don't mutate original
             input["path"] = str(agent_config.workspace / file_path)
 
+        # Path containment: ensure resolved path is within workspace
+        if hasattr(agent_config, "workspace"):
+            resolved = Path(input["path"]).resolve()
+            workspace = Path(agent_config.workspace).resolve()
+            try:
+                resolved.relative_to(workspace)
+            except ValueError:
+                return ToolResult(
+                    content=f"Error: Path escapes workspace boundary: {input['path']}",
+                    is_error=True,
+                )
+
     if name == "shell":
         from .shell import run_shell
         return await run_shell(

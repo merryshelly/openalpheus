@@ -72,6 +72,7 @@ class TestLogin:
     @pytest.mark.asyncio
     async def test_login_with_password(self):
         """MatrixBot logs in with password when provided."""
+        from nio import LoginResponse
         config = make_matrix_config(password="secret", access_token=None)
         agent = MagicMock()
         agent.system_prompt = "test"
@@ -79,7 +80,9 @@ class TestLogin:
 
         with patch("openalph.matrix.AsyncClient") as MockClient:
             client = MockClient.return_value
-            client.login = AsyncMock(return_value=MagicMock(transport_response=MagicMock(status=200)))
+            client.login = AsyncMock(return_value=LoginResponse(
+                access_token="syt_test", device_id="TEST", user_id="@merry:matrix.local"
+            ))
             client.joined_rooms = AsyncMock(return_value=MagicMock(rooms=[]))
             client.sync = AsyncMock()
             client.close = AsyncMock()
@@ -109,6 +112,46 @@ class TestLogin:
 
         # Should set token directly, not call login()
         assert client.access_token == "syt_test_token"
+
+    @pytest.mark.asyncio
+    async def test_login_failure_raises(self):
+        """MatrixBot raises RuntimeError when password login returns a non-LoginResponse."""
+        from nio import LoginResponse
+        config = make_matrix_config(password="bad-password", access_token=None)
+        agent = MagicMock()
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        # Return a MagicMock that is NOT a LoginResponse instance
+        bot.client.login = AsyncMock(return_value=MagicMock(spec=object))
+
+        with pytest.raises(RuntimeError, match="Matrix login failed"):
+            await bot._login()
+
+    @pytest.mark.asyncio
+    async def test_login_success_no_error(self):
+        """MatrixBot completes _login without error when login returns a LoginResponse."""
+        from nio import LoginResponse
+        config = make_matrix_config(password="correct-password", access_token=None)
+        agent = MagicMock()
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+
+        # Construct a real LoginResponse (dataclass from nio)
+        mock_response = LoginResponse(
+            access_token="syt_test_token",
+            device_id="TEST_DEVICE",
+            user_id="@merry:matrix.local",
+        )
+        bot.client.login = AsyncMock(return_value=mock_response)
+
+        # Should complete without raising
+        await bot._login()
 
 
 # --- Message Routing ---
@@ -391,3 +434,64 @@ class TestReconnection:
             delay = min(delay * 2, bot.config.retry_max)
 
         assert delay == 10
+
+
+# --- Error Message Sanitization ---
+
+
+class TestErrorSanitization:
+
+    @pytest.mark.asyncio
+    async def test_agent_error_does_not_leak_details(self):
+        """Agent exception details must not be sent to the room."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        sensitive_msg = "Failed to connect to api.anthropic.com with key sk-ant-abc123"
+        agent.handle_input = AsyncMock(side_effect=Exception(sensitive_msg))
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Do something")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        bot.client.room_send.assert_awaited_once()
+        sent_content = bot.client.room_send.call_args[0][2]
+        sent_body = sent_content["body"]
+        assert sensitive_msg not in sent_body
+        assert "Internal error" in sent_body
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_error_does_not_leak_details(self):
+        """Heartbeat exception details must not be sent to the room."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        sensitive_msg = "Failed to connect to api.anthropic.com with key sk-ant-abc123"
+        agent.handle_input = AsyncMock(side_effect=Exception(sensitive_msg))
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot._set_typing = AsyncMock()
+        bot._active_rooms = {"!test:matrix.local"}
+        bot.session_log = None
+
+        await bot._inject_heartbeat("!test:matrix.local")
+
+        bot.client.room_send.assert_awaited_once()
+        sent_content = bot.client.room_send.call_args[0][2]
+        sent_body = sent_content["body"]
+        assert sensitive_msg not in sent_body
+        assert "Heartbeat error" in sent_body

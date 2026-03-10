@@ -48,6 +48,7 @@ class Agent:
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
         self._current_task: asyncio.Task | None = None
+        self._room_locks: dict[str, asyncio.Lock] = {}
         self._on_tool_call = None  # async callback(call_id, name, input, result, is_error)
         self._on_tool_intent = None  # async callback(tool_calls, content) — fires before tool execution
 
@@ -106,130 +107,135 @@ class Agent:
             text: User message
             room_id: Room identifier for per-room history isolation
         """
-        self._current_task = asyncio.current_task()
-        history = self.history(room_id)
-        try:
-            history.append({"role": "user", "content": text})
+        if room_id not in self._room_locks:
+            self._room_locks[room_id] = asyncio.Lock()
+        async with self._room_locks[room_id]:
+            self._current_task = asyncio.current_task()
+            history = self.history(room_id)
+            try:
+                history.append({"role": "user", "content": text})
 
-            # Tool loop: continue calling LLM until we get a text response
-            for iteration in range(self.config.max_iterations):
-                # Check for context overflow before calling the API
-                context_tokens = self._estimate_context_tokens(room_id)
-                available = self.config.model_max_tokens - self.config.max_tokens
-                if context_tokens > available:
-                    raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
+                # Tool loop: continue calling LLM until we get a text response
+                for iteration in range(self.config.max_iterations):
+                    # Check for context overflow before calling the API
+                    context_tokens = self._estimate_context_tokens(room_id)
+                    available = self.config.model_max_tokens - self.config.max_tokens
+                    if context_tokens > available:
+                        raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
 
-                # Pass tools=None if no tools discovered (backward compatibility)
-                tools_arg = self.tools if self.tools else None
+                    # Pass tools=None if no tools discovered (backward compatibility)
+                    tools_arg = self.tools if self.tools else None
 
-                # Record start time for latency measurement
-                start_time = time.monotonic()
+                    # Record start time for latency measurement
+                    start_time = time.monotonic()
 
-                # Pass a snapshot of history, not the live list.
-                response = await complete(
-                    config=self.config,
-                    system=self.system_prompt,
-                    messages=list(history),
-                    tools=tools_arg,
-                )
+                    # Pass a snapshot of history, not the live list.
+                    response = await complete(
+                        config=self.config,
+                        system=self.system_prompt,
+                        messages=list(history),
+                        tools=tools_arg,
+                    )
 
-                latency_ms = (time.monotonic() - start_time) * 1000
+                    latency_ms = (time.monotonic() - start_time) * 1000
 
-                self.total_input_tokens += response.usage.input_tokens
-                self.total_output_tokens += response.usage.output_tokens
+                    self.total_input_tokens += response.usage.input_tokens
+                    self.total_output_tokens += response.usage.output_tokens
 
-                # Check if response has tool calls
-                if not response.tool_calls:
-                    # Text response - log and return
+                    # Check if response has tool calls
+                    if not response.tool_calls:
+                        # Text response - log and return
+                        self._log_turn(
+                            room_id=room_id,
+                            model=self.config.model,
+                            input_tokens=response.usage.input_tokens,
+                            output_tokens=response.usage.output_tokens,
+                            tool_calls=None,
+                            latency_ms=latency_ms,
+                            content_preview=response.content,
+                        )
+                        history.append({"role": "assistant", "content": response.content})
+                        return response.content
+
+                    # Tool use - append assistant message with tool_calls to history
+                    history.append({
+                        "role": "assistant",
+                        "content": response.content,
+                        "tool_calls": response.tool_calls,
+                    })
+
+                    # Emit tool intent before execution (for session logging / observability)
+                    if self._on_tool_intent:
+                        await self._on_tool_intent(response.tool_calls, response.content)
+
+                    # Execute tool calls in parallel
+                    tool_coros = []
+                    for tc in response.tool_calls:
+                        # Find the tool config for this tool
+                        tool_config = {}
+                        for t in self.tools:
+                            if t.name == tc.name:
+                                tool_config = t.config
+                                break
+
+                        tool_coros.append(execute_tool(
+                            name=tc.name,
+                            input=tc.input,
+                            tool_config=tool_config,
+                            agent_config=self.config,
+                            tools=self.tools,
+                        ))
+
+                    results = await asyncio.gather(*tool_coros)
+
+                    # Track total tool calls
+                    self.total_tool_calls += len(response.tool_calls)
+
+                    # Build tool_calls log entry with is_error from results
+                    logged_tool_calls = []
+                    for tc, result in zip(response.tool_calls, results):
+                        logged_tool_calls.append({
+                            "name": tc.name,
+                            "input": tc.input,
+                            "is_error": result.is_error,
+                        })
+
+                    # Log this tool-use turn
                     self._log_turn(
                         room_id=room_id,
                         model=self.config.model,
                         input_tokens=response.usage.input_tokens,
                         output_tokens=response.usage.output_tokens,
-                        tool_calls=None,
+                        tool_calls=logged_tool_calls,
                         latency_ms=latency_ms,
                         content_preview=response.content,
                     )
-                    history.append({"role": "assistant", "content": response.content})
-                    return response.content
 
-                # Tool use - append assistant message with tool_calls to history
-                history.append({
-                    "role": "assistant",
-                    "content": response.content,
-                    "tool_calls": response.tool_calls,
-                })
+                    # Append tool results to history (truncated) and notify
+                    for tc, result in zip(response.tool_calls, results):
+                        truncated_content = truncate_result(result.content, self.config.truncation_limit)
+                        history.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": truncated_content,
+                            "is_error": result.is_error,
+                        })
+                        if self._on_tool_call:
+                            await self._on_tool_call(
+                                tc.id, tc.name, tc.input, truncated_content, result.is_error
+                            )
 
-                # Emit tool intent before execution (for session logging / observability)
-                if self._on_tool_intent:
-                    await self._on_tool_intent(response.tool_calls, response.content)
+                # Hit max iterations - return limit message
+                return "[Tool call limit reached. Please summarize your progress.]"
+            finally:
+                self._current_task = None
 
-                # Execute tool calls in parallel
-                tool_coros = []
-                for tc in response.tool_calls:
-                    # Find the tool config for this tool
-                    tool_config = {}
-                    for t in self.tools:
-                        if t.name == tc.name:
-                            tool_config = t.config
-                            break
-
-                    tool_coros.append(execute_tool(
-                        name=tc.name,
-                        input=tc.input,
-                        tool_config=tool_config,
-                        agent_config=self.config,
-                        tools=self.tools,
-                    ))
-
-                results = await asyncio.gather(*tool_coros)
-
-                # Track total tool calls
-                self.total_tool_calls += len(response.tool_calls)
-
-                # Build tool_calls log entry with is_error from results
-                logged_tool_calls = []
-                for tc, result in zip(response.tool_calls, results):
-                    logged_tool_calls.append({
-                        "name": tc.name,
-                        "input": tc.input,
-                        "is_error": result.is_error,
-                    })
-
-                # Log this tool-use turn
-                self._log_turn(
-                    room_id=room_id,
-                    model=self.config.model,
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    tool_calls=logged_tool_calls,
-                    latency_ms=latency_ms,
-                    content_preview=response.content,
-                )
-
-                # Append tool results to history (truncated) and notify
-                for tc, result in zip(response.tool_calls, results):
-                    truncated_content = truncate_result(result.content, self.config.truncation_limit)
-                    history.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": truncated_content,
-                        "is_error": result.is_error,
-                    })
-                    if self._on_tool_call:
-                        await self._on_tool_call(
-                            tc.id, tc.name, tc.input, truncated_content, result.is_error
-                        )
-
-            # Hit max iterations - return limit message
-            return "[Tool call limit reached. Please summarize your progress.]"
-        finally:
-            self._current_task = None
-
-    def cancel(self):
-        """Cancel current processing."""
-        if self._current_task:
-            self._current_task.cancel()
+    def cancel(self) -> asyncio.Task | None:
+        """Cancel current processing and return the task for awaiting."""
+        task = self._current_task
+        if task:
+            task.cancel()
+        return task
 
     def _estimate_context_tokens(self, room_id: str = "_default") -> int:
         """Estimate current context size in tokens for a room.

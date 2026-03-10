@@ -17,6 +17,7 @@ from openalph.tools import ToolResult
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 REQUEST_TIMEOUT = 15.0
 USER_AGENT = "OpenAlph/0.1 (https://codeberg.org/merryshelly/openalph)"
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2MB cap to prevent OOM on large responses
 
 # Use the system SSL context so httpx picks up system CA certs
 _ssl_context = ssl.create_default_context()
@@ -120,7 +121,10 @@ async def web_fetch(url: str, max_chars: int | None = None) -> ToolResult:
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
-            content = resp.text
+            raw_bytes = resp.content
+            if len(raw_bytes) > MAX_RESPONSE_BYTES:
+                raw_bytes = raw_bytes[:MAX_RESPONSE_BYTES]
+            content = raw_bytes.decode("utf-8", errors="replace")
 
         # Strip HTML if it looks like HTML
         if "<html" in content.lower() or "<body" in content.lower():

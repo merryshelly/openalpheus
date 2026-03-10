@@ -7,15 +7,17 @@ the actual formatting, parsing, error handling, and truncation logic.
 import json
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
-from openalph.tools.web import web_search, web_fetch, _strip_html_tags
+from openalph.tools.web import web_search, web_fetch, _strip_html_tags, MAX_RESPONSE_BYTES
 from openalph.tools import ToolResult
 
 
-def mock_httpx_response(status_code=200, json_data=None, text=""):
+def mock_httpx_response(status_code=200, json_data=None, text="", content=None):
     """Create a mock httpx response."""
     resp = MagicMock()
     resp.status_code = status_code
     resp.text = text
+    # content is the raw bytes; default to UTF-8 encoding of text
+    resp.content = content if content is not None else text.encode("utf-8")
     resp.json.return_value = json_data or {}
     resp.raise_for_status = MagicMock()
     if status_code >= 400:
@@ -267,6 +269,46 @@ class TestWebFetch:
 
             result = await web_fetch("https://test.com/file.txt")
 
+        assert result.content == text
+
+    @pytest.mark.asyncio
+    async def test_web_fetch_caps_large_response(self):
+        """Responses larger than MAX_RESPONSE_BYTES are truncated before decoding."""
+        # Build a response body just over the 2MB cap
+        big_content = b"X" * (MAX_RESPONSE_BYTES + 512)
+        mock_resp = mock_httpx_response(content=big_content)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com/huge")
+
+        assert result.is_error is False
+        # Decoded result must not exceed the cap (allow for minor whitespace collapse)
+        assert len(result.content.encode("utf-8")) <= MAX_RESPONSE_BYTES
+        # Must not contain more bytes than we capped at
+        assert len(result.content) <= MAX_RESPONSE_BYTES
+
+    @pytest.mark.asyncio
+    async def test_web_fetch_normal_response_unchanged(self):
+        """Responses well under MAX_RESPONSE_BYTES pass through without truncation."""
+        text = "Normal sized response content."
+        mock_resp = mock_httpx_response(text=text)
+
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            client = AsyncMock()
+            client.get.return_value = mock_resp
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = client
+
+            result = await web_fetch("https://test.com/small")
+
+        assert result.is_error is False
         assert result.content == text
 
 
