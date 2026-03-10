@@ -237,8 +237,10 @@ class Agent:
                             except Exception as e:
                                 logger.warning("Tool call callback failed: %s", e)
 
-                # Hit max iterations - return limit message
-                return "[Tool call limit reached. Please summarize your progress.]"
+                # Hit max iterations - append limit message to maintain history consistency
+                limit_msg = "[Tool call limit reached. Please summarize your progress.]"
+                history.append({"role": "assistant", "content": limit_msg})
+                return limit_msg
             finally:
                 self._current_task = None
 

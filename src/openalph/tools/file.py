@@ -120,6 +120,9 @@ async def edit_file(path: str, old_text: str, new_text: str) -> ToolResult:
         
         if not os.path.isfile(path):
             return ToolResult(content=f"Error: Path is not a file: {path}", is_error=True)
+
+        if _is_binary(path):
+            return ToolResult(content=f"Error: Binary file cannot be edited: {path}", is_error=True)
         
         with open(path, 'r', encoding='utf-8') as f:
             content = f.read()

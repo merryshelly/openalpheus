@@ -3,12 +3,15 @@
 Tool registry, discovery, schema generation, and result truncation.
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import tomllib
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -394,9 +397,16 @@ async def execute_tool(
                     tool_config["api_key_cmd"], shell=True,
                     capture_output=True, text=True, timeout=10,
                 )
+                if result.returncode != 0:
+                    logger.warning(
+                        "api_key_cmd returned exit code %d: %s",
+                        result.returncode, result.stderr.strip(),
+                    )
                 api_key = result.stdout.strip()
-            except Exception:
-                pass
+            except subprocess.TimeoutExpired:
+                logger.warning("api_key_cmd timed out after 10 seconds")
+            except Exception as e:
+                logger.warning("api_key_cmd failed: %s", e)
         return await web_search(
             query=input["query"],
             count=input.get("count", 5),
