@@ -11,7 +11,13 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 import asyncio
 import logging
 from pathlib import Path
-from nio import AsyncClient, InviteMemberEvent, RoomMessageText, LoginResponse
+from nio import (
+    AsyncClient,
+    InviteMemberEvent,
+    RoomMessageText,
+    LoginResponse,
+    RoomSendError,
+)
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.config import MatrixConfig
@@ -82,20 +88,71 @@ class MatrixBot:
         """
         await self.client.room_typing(room_id, typing_state=state)
 
+    async def _room_send_with_retry(
+        self,
+        room_id: str,
+        content: dict,
+        *,
+        max_attempts: int = 3,
+        base_delay: float = 1.0,
+    ):
+        """Send a message to a room with retry on transient failures.
+
+        Retries on RoomSendError responses and network exceptions with
+        exponential backoff. Raises on permanent failures or exhaustion.
+
+        Args:
+            room_id: Matrix room ID
+            content: Message content dict (must include msgtype)
+            max_attempts: Maximum send attempts (default 3)
+            base_delay: Initial backoff delay in seconds (doubles each retry)
+        """
+        delay = base_delay
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self.client.room_send(
+                    room_id,
+                    "m.room.message",
+                    content,
+                )
+                if isinstance(response, RoomSendError):
+                    raise RuntimeError(
+                        f"Matrix send failed: {response.status_code} "
+                        f"{response.message}"
+                    )
+                return response
+            except Exception as exc:
+                last_error = exc
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Send to %s failed (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        room_id,
+                        attempt,
+                        max_attempts,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+
+        raise RuntimeError(
+            f"Failed to send to {room_id} after {max_attempts} attempts"
+        ) from last_error
+
     async def send_notice(self, room_id: str, text: str):
         """Send a notice (tool visibility) to a room.
 
         Notices are visually distinct from regular messages in most clients.
+        Retries on transient failures with exponential backoff.
         """
         content = {
             "msgtype": "m.notice",
             "body": text,
         }
-        await self.client.room_send(
-            room_id,
-            "m.room.message",
-            content,
-        )
+        await self._room_send_with_retry(room_id, content)
 
     async def send(self, room_id: str, text: str):
         """Send a text message to a room.
@@ -103,6 +160,8 @@ class MatrixBot:
         Args:
             room_id: Matrix room ID
             text: Message content (markdown supported)
+
+        Retries on transient failures with exponential backoff.
         """
         content = {
             "msgtype": "m.text",
@@ -110,11 +169,7 @@ class MatrixBot:
             "format": "org.matrix.custom.html",
             "formatted_body": text,  # Simplified; could add markdown->HTML conversion
         }
-        await self.client.room_send(
-            room_id,
-            "m.room.message",
-            content,
-        )
+        await self._room_send_with_retry(room_id, content)
 
     async def _cancel_current(self):
         """Cancel any current in-flight work.

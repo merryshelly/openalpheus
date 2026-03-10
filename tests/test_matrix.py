@@ -495,3 +495,190 @@ class TestErrorSanitization:
         sent_body = sent_content["body"]
         assert sensitive_msg not in sent_body
         assert "Heartbeat error" in sent_body
+
+
+# --- Send Retry ---
+
+
+class TestSendRetry:
+    """Tests for retry behavior on send() and send_notice()."""
+
+    @pytest.mark.asyncio
+    async def test_send_succeeds_first_try(self):
+        """send() succeeds without retry when room_send returns normally."""
+        from nio import RoomSendResponse
+
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            return_value=RoomSendResponse("$evt1", "!room:test")
+        )
+
+        await bot.send("!room:test", "hello")
+
+        bot.client.room_send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_notice_succeeds_first_try(self):
+        """send_notice() succeeds without retry when room_send returns normally."""
+        from nio import RoomSendResponse
+
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            return_value=RoomSendResponse("$evt1", "!room:test")
+        )
+
+        await bot.send_notice("!room:test", "notice text")
+
+        bot.client.room_send.assert_awaited_once()
+        sent_content = bot.client.room_send.call_args[0][2]
+        assert sent_content["msgtype"] == "m.notice"
+
+    @pytest.mark.asyncio
+    async def test_send_retries_on_room_send_error(self):
+        """send() retries when room_send returns RoomSendError, then succeeds."""
+        from nio import RoomSendResponse, RoomSendError
+
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            side_effect=[
+                RoomSendError("rate limited", status_code="M_LIMIT_EXCEEDED"),
+                RoomSendResponse("$evt1", "!room:test"),
+            ]
+        )
+
+        # Use tiny backoff so test is fast
+        await bot._room_send_with_retry(
+            "!room:test",
+            {"msgtype": "m.text", "body": "hello"},
+            base_delay=0.01,
+        )
+
+        assert bot.client.room_send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_send_retries_on_exception(self):
+        """send() retries when room_send raises a network exception."""
+        from nio import RoomSendResponse
+
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            side_effect=[
+                ConnectionError("connection reset"),
+                RoomSendResponse("$evt1", "!room:test"),
+            ]
+        )
+
+        await bot._room_send_with_retry(
+            "!room:test",
+            {"msgtype": "m.text", "body": "hello"},
+            base_delay=0.01,
+        )
+
+        assert bot.client.room_send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_send_exhausts_retries_raises(self):
+        """send() raises RuntimeError after exhausting all retry attempts."""
+        from nio import RoomSendError
+
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            side_effect=RoomSendError("server error", status_code="M_UNKNOWN")
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to send.*after 3 attempts"):
+            await bot._room_send_with_retry(
+                "!room:test",
+                {"msgtype": "m.text", "body": "hello"},
+                base_delay=0.01,
+            )
+
+        assert bot.client.room_send.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_send_preserves_original_exception(self):
+        """The raised RuntimeError chains the original exception as __cause__."""
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            side_effect=ConnectionError("gone")
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await bot._room_send_with_retry(
+                "!room:test",
+                {"msgtype": "m.text", "body": "hello"},
+                max_attempts=2,
+                base_delay=0.01,
+            )
+
+        assert exc_info.value.__cause__ is not None
+        assert isinstance(exc_info.value.__cause__, ConnectionError)
+
+    @pytest.mark.asyncio
+    async def test_send_retry_respects_max_attempts(self):
+        """Custom max_attempts is honored."""
+        from nio import RoomSendResponse
+
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            side_effect=[
+                ConnectionError("fail 1"),
+                ConnectionError("fail 2"),
+                ConnectionError("fail 3"),
+                ConnectionError("fail 4"),
+                RoomSendResponse("$evt1", "!room:test"),
+            ]
+        )
+
+        await bot._room_send_with_retry(
+            "!room:test",
+            {"msgtype": "m.text", "body": "hello"},
+            max_attempts=5,
+            base_delay=0.01,
+        )
+
+        assert bot.client.room_send.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_send_via_public_api_retries(self):
+        """send() uses retry internally — verify via mock side_effect."""
+        from nio import RoomSendResponse, RoomSendError
+
+        config = make_matrix_config()
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(
+            side_effect=[
+                RoomSendError("transient", status_code="M_LIMIT_EXCEEDED"),
+                RoomSendResponse("$evt1", "!room:test"),
+            ]
+        )
+
+        # Patch sleep to avoid real delay and verify backoff was attempted
+        with patch("openalph.matrix.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await bot.send("!room:test", "hello")
+
+        assert bot.client.room_send.await_count == 2
+        mock_sleep.assert_awaited_once()  # one retry = one sleep
