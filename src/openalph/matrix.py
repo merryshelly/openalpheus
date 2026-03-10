@@ -12,6 +12,8 @@ import asyncio
 import hashlib
 import logging
 from pathlib import Path
+
+import mistune
 from nio import (
     AsyncClient,
     DownloadError,
@@ -205,7 +207,7 @@ class MatrixBot:
             "msgtype": "m.text",
             "body": text,
             "format": "org.matrix.custom.html",
-            "formatted_body": text,  # Simplified; could add markdown->HTML conversion
+            "formatted_body": mistune.html(text),
         }
         await self._room_send_with_retry(room_id, content)
 
