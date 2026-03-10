@@ -10,12 +10,14 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 
 import asyncio
 import logging
+from pathlib import Path
 from nio import AsyncClient, InviteMemberEvent, RoomMessageText
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.config import MatrixConfig
 from openalph.session import SessionLog
 from openalph.mention import mentions_me, is_gated, MentionCheckResult
+from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,10 @@ class MatrixBot:
         self._synced = False
         self._current_room = None
         self._active_rooms = set()
+        self.heartbeat = HeartbeatManager(
+            config_path=Path(agent.config.workspace) / "heartbeats.json",
+            callback=self._inject_heartbeat,
+        )
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -121,6 +127,44 @@ class MatrixBot:
         if self._current_room:
             await self.send(self._current_room, "Cancelled.")
             await self._set_typing(self._current_room, False)
+
+    async def _inject_heartbeat(self, room_id: str) -> None:
+        """Process a heartbeat as if the agent received a wake message."""
+        heartbeat_content = "Heartbeat: execute your WAKE instructions."
+
+        # Log to session JSONL
+        if self.session_log:
+            self.session_log.append(
+                role="system",
+                sender=self.config.user_id,
+                room=room_id,
+                event_id=None,
+                content=heartbeat_content,
+                source="heartbeat",
+            )
+
+        # Activate room if not already active
+        if room_id not in self._active_rooms:
+            await self._activate_room(room_id)
+
+        # Process through agent
+        try:
+            await self._set_typing(room_id, True)
+            response = await self.agent.handle_input(heartbeat_content, room_id)
+            if self.session_log:
+                self.session_log.append(
+                    role="assistant",
+                    sender=self.config.user_id,
+                    room=room_id,
+                    event_id=None,
+                    content=response,
+                )
+            await self.send(room_id, response)
+        except Exception as e:
+            logger.exception("Heartbeat processing error in %s", room_id)
+            await self.send(room_id, f"Heartbeat error: {e}")
+        finally:
+            await self._set_typing(room_id, False)
 
     async def _activate_room(self, room_id: str, room_name: str = ""):
         """Load session history on first message (lazy wake).
@@ -283,6 +327,37 @@ class MatrixBot:
                 await self.send(room_id, "\n".join(lines))
                 return
 
+            if body.startswith("/heartbeat"):
+                parts = body.split()
+                if len(parts) >= 3 and parts[1] == "start":
+                    interval = parse_interval(parts[2])
+                    if interval is None:
+                        await self.send(room_id, "Invalid interval. Use e.g. `15m`, `1h`, `6h`.")
+                    elif interval < 300:
+                        await self.send(room_id, "Minimum interval is 5m.")
+                    else:
+                        await self.heartbeat.start(room_id, interval)
+                        human = format_interval(interval)
+                        await self.send(room_id, f"Heartbeat started: every {human} in this room.")
+                elif len(parts) >= 2 and parts[1] == "stop":
+                    stopped = await self.heartbeat.stop(room_id)
+                    if stopped:
+                        await self.send(room_id, "Heartbeat stopped.")
+                    else:
+                        await self.send(room_id, "No heartbeat active in this room.")
+                elif len(parts) >= 2 and parts[1] == "status":
+                    entries = self.heartbeat.status()
+                    if not entries:
+                        await self.send(room_id, "No active heartbeats.")
+                    else:
+                        lines = ["Active heartbeats:"]
+                        for e in entries:
+                            lines.append(f"  {e.room_id} — every {format_interval(e.interval_seconds)} (next: {format_interval(e.seconds_until_next)})")
+                        await self.send(room_id, "\n".join(lines))
+                else:
+                    await self.send(room_id, "Usage: `/heartbeat start <interval>` | `/heartbeat stop` | `/heartbeat status`")
+                return
+
             # --- Mention gating ---
             gated = is_gated(self.config, room)
 
@@ -433,6 +508,9 @@ class MatrixBot:
         joined = len(self.client.rooms) if hasattr(self.client, 'rooms') else '?'
         logger.info("Initial sync complete in %.0fms (%s rooms joined, lazy wake active)", _sync_ms, joined)
 
+        # Resume persisted heartbeats
+        await self.heartbeat.resume()
+
         # Sync loop
         delay = self.config.retry_base
         while self._running:
@@ -452,4 +530,5 @@ class MatrixBot:
         """
         self._running = False
         await self._cancel_current()
+        await self.heartbeat.shutdown()
         await self.client.close()

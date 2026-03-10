@@ -6,18 +6,27 @@ Named for the pistol shrimp (genus *Alpheus*) — tiny crustacean, outsized impa
 
 ## Status
 
-**Phase 3.6 complete.** 276 tests passing. Local JSONL session persistence shipped; journal rooms removed. Phase 4 (multi-agent: Unix users, systemd, CLI) is next.
+**Phase 5 complete.** 511 tests passing, ~3,300 LOC. Two test agents deployed on conduwuit.
 
-Live on conduwuit (`@merry-dev:matrix.local`).
+### What's Shipped
+
+| Phase | Feature | Status |
+|-------|---------|--------|
+| 1–3 | Core agent loop, providers, session persistence, tools | ✅ |
+| 4 | Multi-agent: Unix users, systemd, CLI (`new-agent`, `run`, `start/stop/restart`, `status`, `list`, `logs`) | ✅ |
+| 5.0 | Shared rooms: @mention gating, context hydration, per-room TOML overrides | ✅ |
+| 5.1 | Emergency fallback: `openalph chat <agent>`, `openalph showprompt <agent>`, prompt refactor | ✅ |
+| — | Per-room heartbeat timers (`/heartbeat start/stop/status`) | 🚧 In progress |
 
 ## Architecture
 
-- **Process model:** One process per agent, managed by systemd (Phase 4)
+- **Process model:** One process per agent, managed by systemd (`openalph@<agent>.service`)
 - **Communication:** Matrix (conduwuit) — rooms as sessions, membership as ACL
 - **Persistence:** Local JSONL per session (`<workspace>/sessions/<room-id-safe>.jsonl`) — canonical source of agent context state. Matrix is transport only.
 - **Context reconstruction:** Read local JSONL on wake; gap-fill from Matrix for any messages missed while offline
 - **Providers:** Anthropic SDK + OpenAI SDK (OpenRouter, Ollama)
-- **Isolation:** Unix users per agent (Phase 4)
+- **Isolation:** Unix users per agent, shared `openalph` group, per-agent workspaces
+- **Prompt assembly:** Workspace files injected in safety-first order (SAFETY → SOUL → OPERATOR → WAKE → ENVIRONMENT → OPERATIONS). No hardcoded content — all behavior defined by workspace files.
 - **Language:** Python 3.11+
 - **License:** AGPL-3.0
 
@@ -25,57 +34,87 @@ Live on conduwuit (`@merry-dev:matrix.local`).
 
 ```
 src/openalph/
+├── admin.py          # new-agent scaffolding: user, workspace, config, systemd
+├── agent.py          # Agent loop, tool dispatch, cancellation, circuit breaker (25 iter)
+├── cli.py            # CLI: new-agent, run, start/stop/restart, status, list, logs, chat, showprompt
 ├── config.py         # TOML loader, AgentConfig + MatrixConfig, API key resolution
-├── provider.py       # Anthropic + OpenAI routing, response normalization, tool schema conversion
+├── matrix.py         # Matrix client, sync loop, lazy wake, mention gating, commands, typing
+├── mention.py        # Pure mention detection + room gating (no async/nio dependencies)
 ├── prompt.py         # System prompt assembly from workspace files + skills index
-├── agent.py          # Agent loop, tool dispatch, cancellation, token tracking
-├── session.py        # SessionLog: local JSONL append/read/gap-fill/context-build
-├── matrix.py         # Matrix client, sync loop, lazy room activation, /stop, /status
+├── provider.py       # Anthropic + OpenAI routing, response normalization, tool schema conversion
+├── session.py        # SessionLog: append-only JSONL, context-build, overflow handling
 └── tools/
     ├── __init__.py   # Registry, discovery (workspace/tools/*.toml), dispatch, truncation
     ├── shell.py      # Stateless subprocess (explicit cwd/env/timeout, defaults to agent home)
     ├── file.py       # read/write/edit with path resolution
     ├── web.py        # search (Brave) + fetch (HTML→text)
-    └── subagent.py   # Multi-turn sub-agent with parent's tools (minus subagent, preventing recursion)
+    └── subagent.py   # Multi-turn sub-agent with parent's tools (minus subagent)
 ```
 
 ## How to Run
 
 ```bash
-# Install dependencies
+# Install
 pip install -e .
 
-# Run agent (foreground / dev mode)
-python -m openalph --config path/to/agent.toml
+# Create a new agent (interactive — creates Unix user, workspace, config, systemd unit)
+sudo openalph new-agent myagent
+
+# Start via systemd
+sudo systemctl start openalph@myagent
+
+# Or run in foreground (dev mode)
+openalph run myagent
+
+# Emergency CLI chat (no Matrix dependency)
+openalph chat myagent
+
+# View assembled system prompt + tools
+openalph showprompt myagent
 ```
 
-Minimal config (`agent.toml`):
+Minimal config (`/etc/openalph/agents/myagent.toml`):
 
 ```toml
 [agent]
-name = "merry"
-model = "claude-opus-4-6"
+name = "myagent"
+model = "claude-haiku-4-5-20251001"
 
 [provider]
 type = "anthropic"
-api_key_cmd = "cat ~/.config/anthropic-key"
+api_key_cmd = "cat /home/oa-myagent/.config/anthropic-key"
 
 [workspace]
-path = "/home/merryshelly/.openclaw/workspace"
+path = "/home/oa-myagent/workspace"
 
 [matrix]
 homeserver = "http://matrix.local:6167"
-user_id = "@merry:matrix.local"
+user_id = "@myagent:matrix.local"
 device_id = "OPENALPH"
-access_token_cmd = "cat ~/.config/matrix-token"
+access_token_cmd = "cat /home/oa-myagent/.config/matrix-token"
 ```
+
+## Matrix Commands
+
+| Command | Description |
+|---------|-------------|
+| `/stop` | Cancel in-flight agent work |
+| `/status` | Show agent model, context usage, turn count |
+| `/showprompt` | Display full assembled system prompt + tool list |
+| `/reset` | Clear agent context for this room |
+| `/heartbeat start <interval>` | Start recurring heartbeat (e.g. `6h`, `15m`) |
+| `/heartbeat stop` | Stop heartbeat in current room |
+| `/heartbeat status` | List all active heartbeats |
+
+All slash commands bypass @mention gating in shared rooms.
 
 ## How to Test
 
 ```bash
-pytest                        # all 276 tests
-pytest tests/test_session.py  # session persistence unit tests
-pytest tests/test_matrix.py   # Matrix integration tests
+pytest                        # all 511 tests
+pytest tests/test_matrix.py   # Matrix integration
+pytest tests/test_gating.py   # mention gating unit tests
+pytest tests/test_matrix_gating.py  # gating integration
 pytest -x                     # stop on first failure
 ```
 
