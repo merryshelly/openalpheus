@@ -197,6 +197,38 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         "config": {
             "default_max_iterations": 10
         }
+    },
+    "memory_search": {
+        "description": "Search workspace memory files using hybrid semantic + keyword search. Returns ranked snippets with file paths and line numbers. Use file_read to expand context around results.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language search query"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum results to return (default: 10)"
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": "Minimum relevance score threshold 0-1 (default: 0.1)"
+                }
+            },
+            "required": ["query"]
+        },
+        "config": {
+            "embedding_model": "/opt/openalph/models/nomic-embed-text-v1.5.Q8_0.gguf",
+            "embedding_base_url": "http://localhost:11434",
+            "vector_weight": 0.7,
+            "text_weight": 0.3,
+            "mmr_enabled": True,
+            "mmr_lambda": 0.7,
+            "temporal_decay_enabled": True,
+            "temporal_decay_half_life_days": 30,
+            "extra_paths": []
+        }
     }
 }
 
@@ -428,6 +460,15 @@ async def execute_tool(
             system_prompt=input.get("system_prompt"),
             model=input.get("model"),
             max_tokens=input.get("max_tokens"),
+        )
+    elif name == "memory_search":
+        from .memory_search import run_memory_search
+        return await run_memory_search(
+            query=input["query"],
+            config=tool_config,
+            workspace=agent_config.workspace if hasattr(agent_config, "workspace") else Path("."),
+            max_results=input.get("max_results", 10),
+            min_score=input.get("min_score", 0.1),
         )
     else:
         return ToolResult(
