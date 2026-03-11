@@ -812,3 +812,85 @@ class TestProviderErrorSurfacing:
         sent_body = sent_content["body"]
         assert "Internal error" in sent_body
         assert "sk-ant" not in sent_body
+
+
+# --- Empty Response Guard (kdsn.61 follow-up) ---
+
+
+class TestEmptyResponseGuard:
+
+    @pytest.mark.asyncio
+    async def test_empty_response_not_sent(self):
+        """Empty string response from agent should not be sent to room."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.handle_input = AsyncMock(return_value="")
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Do something")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        # room_send should NOT have been called
+        bot.client.room_send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_whitespace_response_not_sent(self):
+        """Whitespace-only response should not be sent to room."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.handle_input = AsyncMock(return_value="   \n  ")
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Do something")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        bot.client.room_send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_real_response_still_sent(self):
+        """Non-empty response is still sent normally."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.handle_input = AsyncMock(return_value="Here's your answer.")
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Do something")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        bot.client.room_send.assert_awaited_once()

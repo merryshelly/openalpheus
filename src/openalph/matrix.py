@@ -259,15 +259,18 @@ class MatrixBot:
         try:
             await self._set_typing(room_id, True)
             response = await self.agent.handle_input(heartbeat_content, room_id)
-            if self.session_log:
-                self.session_log.append(
-                    role="assistant",
-                    sender=self.config.user_id,
-                    room=room_id,
-                    event_id=None,
-                    content=response,
-                )
-            await self.send(room_id, response)
+            if response and response.strip():
+                if self.session_log:
+                    self.session_log.append(
+                        role="assistant",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        content=response,
+                    )
+                await self.send(room_id, response)
+            else:
+                logger.warning("Empty heartbeat response in %s — not sending", room_id)
         except ProviderError as e:
             code = f" ({e.status_code})" if e.status_code else ""
             logger.warning("Heartbeat provider error%s in %s: %s", code, room_id, e)
@@ -542,15 +545,18 @@ class MatrixBot:
                     on_tool_intent=_tool_intent,
                 )
                 # Append assistant response to session log
-                if session_log:
-                    session_log.append(
-                        role="assistant",
-                        sender=self.config.user_id,
-                        room=room_id,
-                        event_id=None,
-                        content=response,
-                    )
-                await self.send(room_id, response)
+                if response and response.strip():
+                    if session_log:
+                        session_log.append(
+                            role="assistant",
+                            sender=self.config.user_id,
+                            room=room_id,
+                            event_id=None,
+                            content=response,
+                        )
+                    await self.send(room_id, response)
+                else:
+                    logger.warning("Empty response from agent in %s — not sending", room_id)
             except AgentOverflowError as e:
                 logger.warning("Context overflow in %s: %s", room_id, e)
                 await self.send(room_id,
