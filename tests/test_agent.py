@@ -25,9 +25,9 @@ def make_config(workspace, **kwargs):
     from openalph.config import ProviderConfig
     defaults = dict(
         name="test",
-        default_model="claude-sonnet-4-20250514",
+        default_model="anthropic/claude-sonnet-4-20250514",
         max_tokens=8192,
-        providers={"default": make_provider()},
+        providers={"anthropic": make_provider(key="anthropic")},
     )
     defaults.update(kwargs)
     defaults["workspace"] = workspace
@@ -181,7 +181,7 @@ class TestStatus:
         agent = Agent(config)
 
         status = agent.status()
-        assert status["model"] == "claude-sonnet-4-20250514"
+        assert status["model"] == "anthropic/claude-sonnet-4-20250514"
         assert status["turns"] == 0
         assert status["total_input_tokens"] == 0
         assert status["total_output_tokens"] == 0
@@ -199,7 +199,7 @@ class TestStatus:
         assert status["turns"] == 1
         assert status["total_input_tokens"] == 50
         assert status["total_output_tokens"] == 20
-        assert status["model"] == "claude-sonnet-4-20250514"
+        assert status["model"] == "anthropic/claude-sonnet-4-20250514"
         assert "name" in status
 
 

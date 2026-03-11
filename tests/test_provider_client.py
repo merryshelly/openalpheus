@@ -10,7 +10,7 @@ from openalph import provider as provider_module
 from openalph.provider import _get_client, _client_cache
 
 
-def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+def make_provider(key="anthropic", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
     return ProviderConfig(
         key=key,
         type=type,
@@ -23,9 +23,9 @@ def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=N
 def make_config(**kwargs):
     defaults = {
         "name": "test",
-        "default_model": "claude-sonnet-4-20250514",
+        "default_model": "anthropic/claude-sonnet-4-20250514",
         "max_tokens": 8192,
-        "providers": {"default": make_provider()},
+        "providers": {"anthropic": make_provider(key="anthropic")},
         "workspace": "/tmp",
     }
     defaults.update(kwargs)
@@ -36,21 +36,21 @@ def make_config(**kwargs):
 class TestGetClient:
 
     def test_client_reused_across_calls(self):
-        provider = make_provider(key="default", type="anthropic", api_key="sk-test")
+        provider = make_provider(key="anthropic", type="anthropic", api_key="sk-test")
         client1 = _get_client(provider)
         client2 = _get_client(provider)
         assert id(client1) == id(client2)
 
     def test_different_api_keys_get_different_clients(self):
-        provider1 = make_provider(key="default", type="anthropic", api_key="sk-key-one")
-        provider2 = make_provider(key="default", type="anthropic", api_key="sk-key-two")
+        provider1 = make_provider(key="anthropic", type="anthropic", api_key="sk-key-one")
+        provider2 = make_provider(key="anthropic", type="anthropic", api_key="sk-key-two")
         client1 = _get_client(provider1)
         client2 = _get_client(provider2)
         assert id(client1) != id(client2)
 
     def test_openai_client_reused_across_calls(self):
         provider = make_provider(
-            key="default", type="openai", api_key="sk-oai",
+            key="openrouter", type="openai", api_key="sk-oai",
             base_url="https://api.openai.com/v1"
         )
         client1 = _get_client(provider)
@@ -59,11 +59,11 @@ class TestGetClient:
 
     def test_openai_different_base_urls_get_different_clients(self):
         provider1 = make_provider(
-            key="default", type="openai", api_key="sk-oai",
+            key="openrouter", type="openai", api_key="sk-oai",
             base_url="https://api.openai.com/v1"
         )
         provider2 = make_provider(
-            key="default", type="openai", api_key="sk-oai",
+            key="openrouter", type="openai", api_key="sk-oai",
             base_url="https://openrouter.ai/api/v1"
         )
         client1 = _get_client(provider1)

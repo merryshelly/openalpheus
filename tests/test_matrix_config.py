@@ -21,9 +21,9 @@ def write_config(tmp_path, toml_content):
 MINIMAL_AGENT_TOML = """
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 
@@ -232,10 +232,10 @@ class TestModelMaxTokens:
         config_file = write_config(tmp_path, """
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 model_max_tokens = 128000
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 

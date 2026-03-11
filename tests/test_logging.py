@@ -34,9 +34,9 @@ def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=N
 def make_agent_config(tmp_path, **kwargs):
     defaults = dict(
         name="test-agent",
-        default_model="claude-sonnet-4-20250514",
+        default_model="anthropic/claude-sonnet-4-20250514",
         max_tokens=8192,
-        providers={"default": make_provider()},
+        providers={"anthropic": make_provider(key="anthropic")},
         workspace=tmp_path,
         max_iterations=25,
         truncation_limit=50000,

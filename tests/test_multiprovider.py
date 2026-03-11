@@ -202,36 +202,8 @@ class TestResolveModel:
         assert prov.key == "vllm-mlx"
         assert api_model == "mlx-community/Qwen3.5-397B-A17B-4bit"
 
-    def test_resolve_unprefixed_single_provider(self):
-        """Un-prefixed string resolves to the only provider."""
-        providers = {
-            "default": make_provider(key="default", type="openai",
-                                     base_url="https://openrouter.ai/api/v1"),
-        }
-        prov, api_model = resolve_model("claude-sonnet-4-20250514", providers)
-        assert prov.key == "default"
-        assert api_model == "claude-sonnet-4-20250514"
 
-    def test_resolve_unprefixed_default_provider(self):
-        """Un-prefixed string resolves to 'default' key when multiple providers exist."""
-        providers = {
-            "default": make_provider(key="default"),
-            "ollama": make_provider(key="ollama", type="openai",
-                                    base_url="http://localhost:11434/v1"),
-        }
-        prov, api_model = resolve_model("claude-opus-4-6", providers)
-        assert prov.key == "default"
-        assert api_model == "claude-opus-4-6"
 
-    def test_resolve_unprefixed_ambiguous_raises(self):
-        """Un-prefixed string with multiple providers and no 'default' key raises."""
-        providers = {
-            "anthropic": make_provider(key="anthropic"),
-            "openrouter": make_provider(key="openrouter", type="openai",
-                                        base_url="https://openrouter.ai/api/v1"),
-        }
-        with pytest.raises(ValueError, match="no provider prefix"):
-            resolve_model("claude-opus-4-6", providers)
 
     def test_resolve_unknown_prefix_raises(self):
         """Prefix that doesn't match any provider key raises ValueError."""
@@ -240,7 +212,7 @@ class TestResolveModel:
             "openrouter": make_provider(key="openrouter", type="openai",
                                         base_url="https://openrouter.ai/api/v1"),
         }
-        with pytest.raises(ValueError, match="Unknown provider prefix"):
+        with pytest.raises(ValueError, match="Unknown provider"):
             resolve_model("cohere/some-model", providers)
 
     def test_resolve_empty_model_string_raises(self):
@@ -420,129 +392,7 @@ path = "/tmp/test"
             load_config(tmp_path / "agent.toml")
 
 
-# ===========================================================================
-# SECTION 3: Config loading — [provider] backward compat
-# ===========================================================================
-
-class TestLoadLegacyProviderConfig:
-
-    def test_legacy_single_provider_synthesizes_default_registry(self, tmp_path):
-        """Old [provider] format creates a 'default' entry in providers dict."""
-        (tmp_path / "agent.toml").write_text("""
-[agent]
-name = "watson"
-model = "moonshotai/kimi-k2.5"
-max_tokens = 20480
-vision = true
-
-[provider]
-type = "openai"
-api_key = "sk-or-test"
-base_url = "https://openrouter.ai/api/v1"
-
-[workspace]
-path = "/home/oa-watson/workspace"
-""")
-        config = load_config(tmp_path / "agent.toml")
-        assert config.name == "watson"
-        # Legacy 'model' maps to default_model
-        assert config.default_model == "moonshotai/kimi-k2.5"
-        assert len(config.providers) == 1
-        assert "default" in config.providers
-        assert config.providers["default"].type == "openai"
-        assert config.providers["default"].api_key == "sk-or-test"
-        assert config.providers["default"].base_url == "https://openrouter.ai/api/v1"
-        assert config.providers["default"].key == "default"
-
-    def test_legacy_anthropic_provider(self, tmp_path):
-        (tmp_path / "agent.toml").write_text("""
-[agent]
-name = "test"
-model = "claude-sonnet-4-20250514"
-
-[provider]
-type = "anthropic"
-api_key = "sk-ant-test"
-
-[workspace]
-path = "/tmp/test"
-""")
-        config = load_config(tmp_path / "agent.toml")
-        assert config.default_model == "claude-sonnet-4-20250514"
-        assert config.providers["default"].type == "anthropic"
-        assert config.providers["default"].base_url is None
-
-    def test_legacy_config_preserves_all_fields(self, tmp_path):
-        """Legacy config still loads max_tokens, vision, etc."""
-        (tmp_path / "agent.toml").write_text("""
-[agent]
-name = "watson"
-model = "moonshotai/kimi-k2.5"
-max_tokens = 20480
-model_max_tokens = 128000
-vision = true
-max_iterations = 30
-truncation_limit = 60000
-
-[provider]
-type = "openai"
-api_key = "sk-test"
-base_url = "https://openrouter.ai/api/v1"
-
-[workspace]
-path = "/tmp/test"
-""")
-        config = load_config(tmp_path / "agent.toml")
-        assert config.max_tokens == 20480
-        assert config.model_max_tokens == 128000
-        assert config.vision is True
-        assert config.max_iterations == 30
-        assert config.truncation_limit == 60000
-
-    def test_both_provider_and_providers_raises(self, tmp_path):
-        """Cannot have both [provider] and [providers.*]."""
-        (tmp_path / "agent.toml").write_text("""
-[agent]
-name = "test"
-default_model = "anthropic/claude-sonnet-4-20250514"
-
-[provider]
-type = "anthropic"
-api_key = "sk-old"
-
-[providers.anthropic]
-type = "anthropic"
-api_key = "sk-new"
-
-[workspace]
-path = "/tmp/test"
-""")
-        with pytest.raises(ConfigError, match="[Bb]oth.*provider"):
-            load_config(tmp_path / "agent.toml")
-
-    def test_legacy_with_matrix_section(self, tmp_path):
-        """Legacy config with Matrix section still works."""
-        (tmp_path / "agent.toml").write_text("""
-[agent]
-name = "watson"
-model = "moonshotai/kimi-k2.5"
-
-[provider]
-type = "openai"
-api_key = "sk-test"
-base_url = "https://openrouter.ai/api/v1"
-
-[workspace]
-path = "/tmp/test"
-
-[matrix]
-homeserver = "http://localhost:8448"
-user_id = "@watson:matrix.local"
-access_token = "syt_token"
-""")
-        config = load_config(tmp_path / "agent.toml")
-        assert config.matrix is not None
-        assert config.matrix.user_id == "@watson:matrix.local"
+# (Legacy backward compat tests removed — [provider] format no longer supported)
 
 
 # ===========================================================================

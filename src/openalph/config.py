@@ -70,30 +70,24 @@ class AgentConfig:
 def resolve_model(model_str: str, providers: dict[str, ProviderConfig]) -> tuple[ProviderConfig, str]:
     """Returns (provider_config, api_model_name).
 
-    Parsing rule: split on first "/". If the prefix matches a provider key,
-    route to that provider with the remainder as the API model name.
-    If no match, fall back to the "default" provider (legacy configs) with
-    the full string as the model name. Otherwise raise ValueError.
+    Model strings MUST be fully qualified: "<provider_key>/<api_model_name>".
+    Split on the first "/". The prefix must match a key in providers.
+    Everything after the first "/" is the API model name (may contain more slashes).
     """
     if not model_str:
         raise ValueError("Model string cannot be empty")
     prefix, sep, remainder = model_str.partition("/")
-    if sep and prefix in providers:
-        # Explicit provider prefix matched
-        return providers[prefix], remainder
-    # No match on prefix — try "default" provider (legacy backward compat)
-    # This handles both unprefixed strings ("claude-opus-4-6") and
-    # legacy model names with slashes ("moonshotai/kimi-k2.5") where
-    # the first segment isn't a provider key.
-    if "default" in providers:
-        return providers["default"], model_str
-    # No default provider — require explicit prefix
-    if sep:
-        raise ValueError(f"Unknown provider prefix '{prefix}' in model '{model_str}'")
-    raise ValueError(
-        f"Cannot resolve model '{model_str}': no provider prefix and no "
-        f"'default' provider configured. Use '<provider>/{model_str}' format."
-    )
+    if not sep:
+        raise ValueError(
+            f"Model '{model_str}' must be fully qualified as '<provider>/<model>'. "
+            f"Available providers: {', '.join(sorted(providers.keys()))}"
+        )
+    if prefix not in providers:
+        raise ValueError(
+            f"Unknown provider '{prefix}' in model '{model_str}'. "
+            f"Available providers: {', '.join(sorted(providers.keys()))}"
+        )
+    return providers[prefix], remainder
     raise ValueError(f"Cannot resolve model '{model_str}': ambiguous provider (multiple providers configured, none named 'default')")
 
 
@@ -199,10 +193,7 @@ def load_config(path: Path) -> AgentConfig:
                 if isinstance(provider_data, dict):
                     providers_sections[f"providers.{provider_key}"] = provider_data
     
-    # Cannot have both [provider] and [providers.*]
-    if provider_section and providers_sections:
-        raise ConfigError("Both [provider] and [providers.*] found")
-    
+
     # If workspace section is missing, check for inline workspace settings in agent section
     if not workspace_section:
         agent_workspace = agent_section.get("workspace", {})
@@ -251,102 +242,47 @@ def load_config(path: Path) -> AgentConfig:
     except KeyError:
         raise ConfigError("Missing required field: workspace.path")
 
-    # Parse providers configuration
+    # Parse providers configuration — requires [providers.*] sections
     providers: dict[str, ProviderConfig] = {}
     
-    if providers_sections:
-        # New multi-provider format [providers.*]
-        try:
-            default_model = agent_section["default_model"]
-            if not default_model or not isinstance(default_model, str):
-                raise ConfigError("Agent default_model must be a non-empty string")
-        except KeyError:
-            raise ConfigError("Missing required field: agent.default_model")
+    if not providers_sections:
+        raise ConfigError("Missing [providers.*] section(s). At least one provider must be configured.")
+
+    try:
+        default_model = agent_section["default_model"]
+        if not default_model or not isinstance(default_model, str):
+            raise ConfigError("Agent default_model must be a non-empty string")
+    except KeyError:
+        raise ConfigError("Missing required field: agent.default_model")
+    
+    for section_name, section_data in providers_sections.items():
+        provider_key = section_name.split(".", 1)[1]
         
-        # Parse each provider section
-        for section_name, section_data in providers_sections.items():
-            # Extract provider key from "providers.<key>"
-            provider_key = section_name.split(".", 1)[1]
-            
-            # Validate provider type
-            provider_type = section_data.get("type")
-            if not provider_type:
-                raise ConfigError(f"Missing required field: {section_name}.type")
-            if provider_type not in ("anthropic", "openai"):
-                raise ConfigError(f"Invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
-            
-            # Resolve API key
-            api_key = _resolve_api_key(section_data)
-            
-            # Get base_url (required for openai)
-            base_url = section_data.get("base_url")
-            if provider_type == "openai":
-                if base_url is None:
-                    raise ConfigError(f"base_url is required for {section_name} provider")
-                if not isinstance(base_url, str) or not base_url:
-                    raise ConfigError(f"base_url must be a non-empty string")
-            
-            # Get quirks (optional)
-            quirks = section_data.get("quirks", [])
-            if not isinstance(quirks, list):
-                quirks = []
-            
-            providers[provider_key] = ProviderConfig(
-                key=provider_key,
-                type=provider_type,
-                api_key=api_key,
-                base_url=base_url,
-                quirks=quirks,
-            )
-    else:
-        # Legacy single provider format [provider]
-        # If provider section is missing, check for inline provider settings in agent section
-        if not provider_section:
-            if "provider" in agent_section:
-                # Inline format: agent.provider, agent.api_key, etc.
-                provider_section = {
-                    "type": agent_section.get("provider"),
-                    "api_key": agent_section.get("api_key"),
-                    "base_url": agent_section.get("base_url"),
-                }
-        
-        try:
-            model = agent_section["model"]
-            if not model or not isinstance(model, str):
-                raise ConfigError("Agent model must be a non-empty string")
-        except KeyError:
-            raise ConfigError("Missing required field: agent.model")
-        
-        # Map legacy 'model' to 'default_model'
-        default_model = model
-        
-        # Validate and extract provider fields
-        try:
-            provider_type = provider_section["type"]
-        except KeyError:
-            raise ConfigError("Missing required field: provider.type")
-        
+        provider_type = section_data.get("type")
+        if not provider_type:
+            raise ConfigError(f"Missing required field: {section_name}.type")
         if provider_type not in ("anthropic", "openai"):
             raise ConfigError(f"Invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
         
-        # Resolve API key
-        api_key = _resolve_api_key(provider_section)
+        api_key = _resolve_api_key(section_data)
         
-        # Validate base_url for openai provider
-        base_url = provider_section.get("base_url")
+        base_url = section_data.get("base_url")
         if provider_type == "openai":
             if base_url is None:
-                raise ConfigError("base_url is required for openai provider")
+                raise ConfigError(f"base_url is required for {section_name} provider")
             if not isinstance(base_url, str) or not base_url:
-                raise ConfigError("base_url must be a non-empty string")
+                raise ConfigError(f"base_url must be a non-empty string")
         
-        # Create single provider config with key "default"
-        providers["default"] = ProviderConfig(
-            key="default",
+        quirks = section_data.get("quirks", [])
+        if not isinstance(quirks, list):
+            quirks = []
+        
+        providers[provider_key] = ProviderConfig(
+            key=provider_key,
             type=provider_type,
             api_key=api_key,
             base_url=base_url,
-            quirks=[],
+            quirks=quirks,
         )
 
     # Parse optional [model_limits] section

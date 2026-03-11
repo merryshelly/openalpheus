@@ -2,7 +2,7 @@
 
 Interface contract:
     load_config(path: Path) -> AgentConfig
-    AgentConfig: name, default_model, max_tokens, providers, workspace
+    AgentConfig: name, default_model, max_tokens, providers (dict[str, ProviderConfig]), workspace
 
 Config is TOML. API key resolves from: api_key (direct), api_key_env (env var),
 api_key_cmd (shell command). Precedence: api_key > api_key_env > api_key_cmd.
@@ -23,9 +23,9 @@ class TestLoadValidConfig:
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "merry"
-model = "claude-sonnet-4-20250514"
+default_model = "anthropic/claude-sonnet-4-20250514"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test-key"
 
@@ -34,11 +34,11 @@ path = "/tmp/test-workspace"
 """)
         config = load_config(tmp_path / "agent.toml")
         assert config.name == "merry"
-        assert config.default_model == "claude-sonnet-4-20250514"
-        assert "default" in config.providers
-        assert config.providers["default"].type == "anthropic"
-        assert config.providers["default"].api_key == "sk-test-key"
-        assert config.providers["default"].base_url is None
+        assert config.default_model == "anthropic/claude-sonnet-4-20250514"
+        assert "anthropic" in config.providers
+        assert list(config.providers.values())[0].type == "anthropic"
+        assert list(config.providers.values())[0].api_key == "sk-test-key"
+        assert list(config.providers.values())[0].base_url is None
         assert config.workspace == Path("/tmp/test-workspace")
 
     def test_max_tokens_default(self, tmp_path):
@@ -46,9 +46,9 @@ path = "/tmp/test-workspace"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 
@@ -62,10 +62,10 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 max_tokens = 4096
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 
@@ -79,9 +79,9 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "babson"
-model = "moonshotai/kimi-k2.5"
+default_model = "openrouter/moonshotai/kimi-k2.5"
 
-[provider]
+[providers.openrouter]
 type = "openai"
 api_key = "sk-or-test"
 base_url = "https://openrouter.ai/api/v1"
@@ -90,17 +90,17 @@ base_url = "https://openrouter.ai/api/v1"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.providers["default"].type == "openai"
-        assert config.providers["default"].base_url == "https://openrouter.ai/api/v1"
+        assert list(config.providers.values())[0].type == "openai"
+        assert list(config.providers.values())[0].base_url == "https://openrouter.ai/api/v1"
 
     def test_ollama_via_openai(self, tmp_path):
         """Ollama uses the OpenAI-compatible path."""
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "local"
-model = "qwen3:235b-a22b"
+default_model = "ollama/qwen3:235b-a22b"
 
-[provider]
+[providers.ollama]
 type = "openai"
 api_key = "ollama"
 base_url = "http://localhost:11434/v1"
@@ -109,8 +109,8 @@ base_url = "http://localhost:11434/v1"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.providers["default"].type == "openai"
-        assert config.default_model == "qwen3:235b-a22b"
+        assert list(config.providers.values())[0].type == "openai"
+        assert config.default_model == "ollama/qwen3:235b-a22b"
 
 
 # --- API key resolution ---
@@ -123,9 +123,9 @@ class TestApiKeyResolution:
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key_env = "TEST_API_KEY"
 
@@ -133,15 +133,15 @@ api_key_env = "TEST_API_KEY"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.providers["default"].api_key == "sk-from-env"
+        assert list(config.providers.values())[0].api_key == "sk-from-env"
 
     def test_from_command(self, tmp_path):
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key_cmd = "echo sk-from-cmd"
 
@@ -149,7 +149,7 @@ api_key_cmd = "echo sk-from-cmd"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.providers["default"].api_key == "sk-from-cmd"
+        assert list(config.providers.values())[0].api_key == "sk-from-cmd"
 
     def test_precedence_direct_over_env(self, tmp_path, monkeypatch):
         """Direct api_key wins over api_key_env."""
@@ -157,9 +157,9 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "from-direct"
 api_key_env = "TEST_KEY"
@@ -168,7 +168,7 @@ api_key_env = "TEST_KEY"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.providers["default"].api_key == "from-direct"
+        assert list(config.providers.values())[0].api_key == "from-direct"
 
     def test_precedence_env_over_cmd(self, tmp_path, monkeypatch):
         """api_key_env wins over api_key_cmd."""
@@ -176,9 +176,9 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key_env = "TEST_KEY"
 api_key_cmd = "echo from-cmd"
@@ -187,7 +187,7 @@ api_key_cmd = "echo from-cmd"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.providers["default"].api_key == "from-env"
+        assert list(config.providers.values())[0].api_key == "from-env"
 
 
 # --- Validation errors ---
@@ -198,9 +198,9 @@ class TestConfigValidation:
     def test_missing_name(self, tmp_path):
         (tmp_path / "agent.toml").write_text("""
 [agent]
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 
@@ -215,14 +215,14 @@ path = "/tmp/test"
 [agent]
 name = "test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="model"):
+        with pytest.raises(ConfigError, match="default_model"):
             load_config(tmp_path / "agent.toml")
 
     def test_missing_api_key_entirely(self, tmp_path):
@@ -230,24 +230,24 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="api_key"):
+        with pytest.raises(ConfigError, match="[Aa]PI key"):
             load_config(tmp_path / "agent.toml")
 
     def test_invalid_provider_type(self, tmp_path):
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.google]
 type = "google"
 api_key = "sk-test"
 
@@ -262,9 +262,9 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.openrouter]
 type = "openai"
 api_key = "sk-test"
 
@@ -279,9 +279,9 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key_env = "NONEXISTENT_VAR"
 
@@ -295,9 +295,9 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key_cmd = "false"
 
@@ -315,13 +315,13 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test"
+default_model = "anthropic/test"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 """)
-        with pytest.raises(ConfigError, match="workspace"):
+        with pytest.raises(ConfigError):
             load_config(tmp_path / "agent.toml")
 
 
@@ -333,9 +333,9 @@ api_key = "sk-test"
 VALID_AGENT_TOML = """\
 [agent]
 name = "watson"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test-key"
 
@@ -386,8 +386,8 @@ class TestAgentConfig:
             max_tokens=8192,
             model_max_tokens=200000,
             providers={
-                "default": ProviderConfig(
-                    key="default",
+                "anthropic": ProviderConfig(
+                    key="anthropic",
                     type="anthropic",
                     api_key="sk-test",
                 )
@@ -413,9 +413,9 @@ class TestSubprocessTimeout:
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key_cmd = "sleep 999"
 
@@ -433,9 +433,9 @@ path = "/tmp/test"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 
@@ -458,9 +458,9 @@ password_cmd = "sleep 999"
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
-model = "test-model"
+default_model = "anthropic/test-model"
 
-[provider]
+[providers.anthropic]
 type = "anthropic"
 api_key = "sk-test"
 

@@ -19,9 +19,9 @@ def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=N
 def make_config(workspace, **kwargs):
     defaults = dict(
         name="test",
-        default_model="claude-sonnet-4-20250514",
+        default_model="anthropic/claude-sonnet-4-20250514",
         max_tokens=8192,
-        providers={"default": make_provider()},
+        providers={"anthropic": make_provider(key="anthropic")},
     )
     defaults.update(kwargs)
     defaults["workspace"] = workspace

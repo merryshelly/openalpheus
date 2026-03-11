@@ -44,9 +44,9 @@ def make_matrix_config(rooms=None, **kwargs):
 def make_agent_config(workspace, **kwargs):
     defaults = dict(
         name="watson",
-        default_model="claude-sonnet-4-20250514",
+        default_model="anthropic/claude-sonnet-4-20250514",
         max_tokens=8192,
-        providers={"default": ProviderConfig(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=[])},
+        providers={"anthropic": ProviderConfig(key="anthropic", type="anthropic", api_key="sk-test", base_url=None, quirks=[])},
         workspace=workspace,
         max_iterations=25,
         truncation_limit=50000,
