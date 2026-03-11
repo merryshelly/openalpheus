@@ -709,6 +709,19 @@ class MatrixBot:
             await self.send(room_id, "\n".join(lines))
             return
 
+        if body.startswith("/model"):
+            parts = body.split(None, 1)
+            if len(parts) < 2:
+                await self.send(room_id, "Usage: `/model <provider/model-name>`")
+                return
+            new_model = parts[1].strip()
+            error = self.agent.switch_model(new_model, room_id)
+            if error:
+                await self.send(room_id, f"⚠️ {error}")
+            else:
+                await self.send(room_id, f"Model switched to **{new_model}**")
+            return
+
         if body.startswith("/heartbeat"):
             parts = body.split()
             if len(parts) >= 3 and parts[1] == "start":
