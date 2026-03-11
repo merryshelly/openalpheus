@@ -14,7 +14,7 @@ import base64
 import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from openalph.config import AgentConfig, MatrixConfig
+from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
 from openalph.agent import Agent, _build_user_content, VISION_MIME_TYPES, MEDIA_TAG_RE
 from openalph.provider import (
     _convert_messages_for_anthropic,
@@ -37,11 +37,9 @@ def _make_image(tmp_path, name="photo.jpg", content=b"\xff\xd8\xff\xe0" + b"\x00
 def _make_config(tmp_path, vision=False, **kwargs):
     defaults = dict(
         name="test-agent",
-        model="test-model",
+        default_model="claude-sonnet-4-20250514",
         max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
+        providers={"default": ProviderConfig(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=[])},
         workspace=tmp_path,
         max_iterations=25,
         truncation_limit=50000,
@@ -78,11 +76,13 @@ class TestVisionConfig:
 name = "test"
 model = "test-model"
 max_tokens = 8192
-provider = "anthropic"
-api_key = "sk-test"
 vision = true
 
-[agent.workspace]
+[provider]
+type = "anthropic"
+api_key = "sk-test"
+
+[workspace]
 path = "{workspace}"
 """.format(workspace=str(tmp_path))
 
@@ -100,10 +100,12 @@ path = "{workspace}"
 name = "test"
 model = "test-model"
 max_tokens = 8192
-provider = "anthropic"
+
+[provider]
+type = "anthropic"
 api_key = "sk-test"
 
-[agent.workspace]
+[workspace]
 path = "{workspace}"
 """.format(workspace=str(tmp_path))
 
@@ -140,6 +142,20 @@ class TestMediaTagRegex:
     def test_no_match_on_plain_text(self):
         m = MEDIA_TAG_RE.search("hello world")
         assert m is None
+
+    def test_parses_filename_with_spaces(self):
+        tag = "[media: media/abc123/Screenshot from 2026-03-10 12-23-51.png (image/png, 228.0 KB)]"
+        match = MEDIA_TAG_RE.search(tag)
+        assert match is not None
+        assert match.group(1) == "media/abc123/Screenshot from 2026-03-10 12-23-51.png"
+        assert match.group(2) == "image/png"
+        assert match.group(3) == "228.0 KB"
+
+    def test_parses_filename_with_special_chars(self):
+        tag = "[media: media/abc123/image-2026.03.10.png (image/png, 100 B)]"
+        match = MEDIA_TAG_RE.search(tag)
+        assert match is not None
+        assert match.group(1) == "media/abc123/image-2026.03.10.png"
 
 
 # --- Content Building ---
@@ -261,6 +277,14 @@ class TestBuildUserContent:
         all_text = " ".join(b["text"] for b in result if b["type"] == "text")
         assert "Before image" in all_text
         assert "After image" in all_text
+
+    def test_image_with_spaces_in_filename(self, tmp_path):
+        rel = _make_image(tmp_path, name="Screenshot from 2026.png")
+        tag = f"[media: {rel} (image/png, 104 B)]"
+        config = _make_config(tmp_path, vision=True)
+        result = _build_user_content(tag, config)
+        assert isinstance(result, list)
+        assert any(b["type"] == "image" for b in result)
 
 
 # --- Vision MIME Types ---

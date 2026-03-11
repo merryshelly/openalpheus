@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 VISION_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 # Media tag regex: [media: <path> (<mime>, <size>)]
-MEDIA_TAG_RE = re.compile(r'\[media:\s*(\S+)\s+\(([^,]+),\s*([^)]+)\)\]')
+MEDIA_TAG_RE = re.compile(r'\[media:\s*(.+?)\s+\(([^,]+),\s*([^)]+)\)\]')
 
 # Approximate tokens per raw image byte (base64 decoded)
 IMAGE_TOKENS_PER_BYTE = 1 / 750
@@ -147,6 +147,8 @@ class Agent:
         self.tools = discover_tools(config.workspace)
         self._current_task: asyncio.Task | None = None
         self._room_locks: dict[str, asyncio.Lock] = {}
+        self.active_model = config.default_model
+        self._truncation_retry = False
 
 
     def history(self, room_id: str) -> list[dict]:
@@ -154,6 +156,37 @@ class Agent:
         if room_id not in self._rooms:
             self._rooms[room_id] = []
         return self._rooms[room_id]
+
+    def switch_model(self, model_str: str, room_id: str = "_default") -> str | None:
+        """Switch active model. Returns error string on failure, None on success."""
+        from openalph.config import resolve_model
+
+        # Validate the model can be resolved
+        try:
+            resolve_model(model_str, self.config.providers)
+        except ValueError as e:
+            return str(e)
+
+        # Vision guard: if session has images, block switch to non-vision model
+        history = self.history(room_id)
+        has_images = any(
+            isinstance(msg.get("content"), list) and
+            any(block.get("type") == "image" for block in msg.get("content", []))
+            for msg in history
+        )
+        if has_images:
+            return f"Cannot switch to {model_str} — session contains images and model may not support vision."
+
+        # Context window guard: check current context vs conservative default (32K)
+        # Use model_limits from config if available, else 32K default
+        model_limit = self.config.model_limits.get(model_str, 32000)
+        context_tokens = self._estimate_context_tokens(room_id)
+        if context_tokens > model_limit - self.config.max_tokens:
+            return f"Cannot switch to {model_str} — current context (~{context_tokens:,} tokens) exceeds model limit ({model_limit:,})."
+
+        self.active_model = model_str
+        return None
+
 
     def _log_turn(
         self,
@@ -243,6 +276,7 @@ class Agent:
                         system=self.system_prompt,
                         messages=list(history),
                         tools=tools_arg,
+                        model=self.active_model,
                     )
 
                     latency_ms = (time.monotonic() - start_time) * 1000
@@ -255,7 +289,7 @@ class Agent:
                         # Text response - log and return
                         self._log_turn(
                             room_id=room_id,
-                            model=self.config.model,
+                            model=self.active_model,
                             input_tokens=response.usage.input_tokens,
                             output_tokens=response.usage.output_tokens,
                             tool_calls=None,
@@ -314,7 +348,7 @@ class Agent:
                     # Log this tool-use turn
                     self._log_turn(
                         room_id=room_id,
-                        model=self.config.model,
+                        model=self.active_model,
                         input_tokens=response.usage.input_tokens,
                         output_tokens=response.usage.output_tokens,
                         tool_calls=logged_tool_calls,
@@ -411,7 +445,7 @@ class Agent:
         context_pct = round(context_tokens / model_max * 100) if model_max else 0
         return {
             "name": self.config.name,
-            "model": self.config.model,
+            "model": self.active_model,
             "turns": sum(1 for m in self.history(room_id) if m["role"] == "user"),
             "context_tokens": context_tokens,
             "context_max": model_max,

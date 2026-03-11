@@ -17,14 +17,22 @@ from openalph.config import AgentConfig
 from openalph.provider import Response, Usage, ToolCall
 
 
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    from openalph.config import ProviderConfig
+    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
+
+
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    from openalph.config import ProviderConfig
+    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
+
+
 def make_config(**kwargs):
     defaults = dict(
         name="test-parent",
-        model="claude-sonnet-4-20250514",
+        default_model="claude-sonnet-4-20250514",
         max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
+        providers={"default": make_provider()},
         workspace=Path("/tmp/test"),
         max_iterations=25,
         truncation_limit=50000,
@@ -140,7 +148,7 @@ class TestModelOverride:
     @pytest.mark.asyncio
     async def test_default_uses_parent_model(self):
         """No model override → uses parent's model from config."""
-        config = make_config(model="claude-opus-4-20250514")
+        config = make_config(default_model="claude-opus-4-20250514")
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
@@ -149,12 +157,12 @@ class TestModelOverride:
             await run_subagent("Do something", config)
 
         call_kwargs = mock_complete.call_args.kwargs
-        assert call_kwargs["config"].model == "claude-opus-4-20250514"
+        assert call_kwargs["config"].default_model == "claude-opus-4-20250514"
 
     @pytest.mark.asyncio
     async def test_model_override(self):
         """Explicit model parameter overrides parent's model."""
-        config = make_config(model="claude-opus-4-20250514")
+        config = make_config(default_model="claude-opus-4-20250514")
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
@@ -163,7 +171,7 @@ class TestModelOverride:
             await run_subagent("Do something", config, model="claude-haiku-3-5-20241022")
 
         call_kwargs = mock_complete.call_args.kwargs
-        assert call_kwargs["config"].model == "claude-haiku-3-5-20241022"
+        assert call_kwargs["config"].default_model == "claude-haiku-3-5-20241022"
 
 
 class TestMaxTokens:

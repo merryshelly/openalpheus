@@ -151,7 +151,7 @@ def cmd_run(args):
             loop.add_signal_handler(sig, _signal_handler)
 
         bot_task = asyncio.create_task(bot.start())
-        logger.info("Agent '%s' running (model: %s)", config.name, config.model)
+        logger.info("Agent '%s' running (model: %s)", config.name, config.default_model)
         await stop
         logger.info("Shutting down...")
         await bot.stop()
@@ -228,7 +228,7 @@ def cmd_chat(args):
     async def chat_loop():
         import readline  # enables arrow keys, history
 
-        print(f"{config.name} ready (model: {config.model}). "
+        print(f"{config.name} ready (model: {config.default_model}). "
               f"Type /help for commands, Ctrl+D to exit.", file=sys.stderr)
 
         while True:

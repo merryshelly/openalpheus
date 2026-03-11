@@ -5,21 +5,29 @@ Verifies that HTTP clients are reused across calls for connection pooling.
 
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
-from openalph.config import AgentConfig
+from openalph.config import AgentConfig, ProviderConfig
 from openalph import provider as provider_module
 from openalph.provider import _get_client, _client_cache
 
 
-def make_config(**kwargs):
-    defaults = dict(
-        name="test",
-        model="test-model",
-        max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
-        workspace="/tmp",
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    return ProviderConfig(
+        key=key,
+        type=type,
+        api_key=api_key,
+        base_url=base_url,
+        quirks=quirks or [],
     )
+
+
+def make_config(**kwargs):
+    defaults = {
+        "name": "test",
+        "default_model": "claude-sonnet-4-20250514",
+        "max_tokens": 8192,
+        "providers": {"default": make_provider()},
+        "workspace": "/tmp",
+    }
     defaults.update(kwargs)
     return AgentConfig(**defaults)
 
@@ -28,41 +36,52 @@ def make_config(**kwargs):
 class TestGetClient:
 
     def test_client_reused_across_calls(self):
-        config = make_config()
-        client1 = _get_client(config)
-        client2 = _get_client(config)
+        provider = make_provider(key="default", type="anthropic", api_key="sk-test")
+        client1 = _get_client(provider)
+        client2 = _get_client(provider)
         assert id(client1) == id(client2)
 
     def test_different_api_keys_get_different_clients(self):
-        config1 = make_config(api_key="sk-key-one")
-        config2 = make_config(api_key="sk-key-two")
-        client1 = _get_client(config1)
-        client2 = _get_client(config2)
+        provider1 = make_provider(key="default", type="anthropic", api_key="sk-key-one")
+        provider2 = make_provider(key="default", type="anthropic", api_key="sk-key-two")
+        client1 = _get_client(provider1)
+        client2 = _get_client(provider2)
         assert id(client1) != id(client2)
 
     def test_openai_client_reused_across_calls(self):
-        config = make_config(provider="openai", api_key="sk-oai", base_url="https://api.openai.com/v1")
-        client1 = _get_client(config)
-        client2 = _get_client(config)
+        provider = make_provider(
+            key="default", type="openai", api_key="sk-oai",
+            base_url="https://api.openai.com/v1"
+        )
+        client1 = _get_client(provider)
+        client2 = _get_client(provider)
         assert id(client1) == id(client2)
 
     def test_openai_different_base_urls_get_different_clients(self):
-        config1 = make_config(provider="openai", api_key="sk-oai", base_url="https://api.openai.com/v1")
-        config2 = make_config(provider="openai", api_key="sk-oai", base_url="https://openrouter.ai/api/v1")
-        client1 = _get_client(config1)
-        client2 = _get_client(config2)
+        provider1 = make_provider(
+            key="default", type="openai", api_key="sk-oai",
+            base_url="https://api.openai.com/v1"
+        )
+        provider2 = make_provider(
+            key="default", type="openai", api_key="sk-oai",
+            base_url="https://openrouter.ai/api/v1"
+        )
+        client1 = _get_client(provider1)
+        client2 = _get_client(provider2)
         assert id(client1) != id(client2)
 
     def test_unsupported_provider_raises(self):
-        config = make_config(provider="cohere")
+        provider = make_provider(key="default", type="cohere", api_key="sk-test")
         with pytest.raises(ValueError, match="Unsupported provider"):
-            _get_client(config)
+            _get_client(provider)
 
     def test_anthropic_and_openai_cached_separately(self):
-        config_anthropic = make_config(provider="anthropic", api_key="sk-ant")
-        config_openai = make_config(provider="openai", api_key="sk-ant", base_url=None)
-        client_a = _get_client(config_anthropic)
-        client_o = _get_client(config_openai)
+        provider_anthropic = make_provider(key="ant", type="anthropic", api_key="sk-ant")
+        provider_openai = make_provider(
+            key="oai", type="openai", api_key="sk-ant", base_url="http://localhost/v1"
+        )
+        client_a = _get_client(provider_anthropic)
+        client_o = _get_client(provider_openai)
         assert id(client_a) != id(client_o)
 
 

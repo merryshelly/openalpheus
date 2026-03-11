@@ -16,14 +16,18 @@ from openalph.config import AgentConfig
 from openalph.provider import Response, Usage
 
 
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    from openalph.config import ProviderConfig
+    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
+
+
 def make_config(workspace, **kwargs):
+    from openalph.config import ProviderConfig
     defaults = dict(
         name="test",
-        model="test-model",
+        default_model="claude-sonnet-4-20250514",
         max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
+        providers={"default": make_provider()},
     )
     defaults.update(kwargs)
     defaults["workspace"] = workspace
@@ -33,7 +37,7 @@ def make_config(workspace, **kwargs):
 def make_response(content="Hello", input_tokens=10, output_tokens=5):
     return Response(
         content=content,
-        model="test-model",
+        model="claude-sonnet-4-20250514",
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
         stop_reason="end_turn",
     )
@@ -177,7 +181,7 @@ class TestStatus:
         agent = Agent(config)
 
         status = agent.status()
-        assert status["model"] == "test-model"
+        assert status["model"] == "claude-sonnet-4-20250514"
         assert status["turns"] == 0
         assert status["total_input_tokens"] == 0
         assert status["total_output_tokens"] == 0
@@ -195,7 +199,7 @@ class TestStatus:
         assert status["turns"] == 1
         assert status["total_input_tokens"] == 50
         assert status["total_output_tokens"] == 20
-        assert status["model"] == "test-model"
+        assert status["model"] == "claude-sonnet-4-20250514"
         assert "name" in status
 
 

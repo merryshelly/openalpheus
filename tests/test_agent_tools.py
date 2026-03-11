@@ -24,14 +24,22 @@ from openalph.tools import ToolDef, ToolResult
 # --- Fixtures ---
 
 
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    from openalph.config import ProviderConfig
+    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
+
+
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    from openalph.config import ProviderConfig
+    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
+
+
 def make_config(workspace=None, **kwargs):
     defaults = dict(
         name="test-agent",
-        model="test-model",
+        default_model="claude-sonnet-4-20250514",
         max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
+        providers={"default": make_provider()},
         workspace=workspace or Path("/tmp/test-workspace"),
         max_iterations=25,
         truncation_limit=50000,
@@ -45,7 +53,7 @@ def text_response(text, input_tokens=100, output_tokens=50):
     return Response(
         content=text,
         tool_calls=[],
-        model="test-model",
+        model="claude-sonnet-4-20250514",
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
         stop_reason="end_turn",
     )
@@ -56,7 +64,7 @@ def tool_use_response(tool_calls, text="", input_tokens=100, output_tokens=50):
     return Response(
         content=text,
         tool_calls=tool_calls,
-        model="test-model",
+        model="claude-sonnet-4-20250514",
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
         stop_reason="tool_use",
     )

@@ -18,7 +18,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock, call
 from pathlib import Path
 from openalph.matrix import MatrixBot
-from openalph.config import AgentConfig, MatrixConfig
+from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
 
 
 # --- Fixtures ---
@@ -44,11 +44,9 @@ def make_matrix_config(rooms=None, **kwargs):
 def make_agent_config(workspace, **kwargs):
     defaults = dict(
         name="watson",
-        model="test-model",
+        default_model="claude-sonnet-4-20250514",
         max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
+        providers={"default": ProviderConfig(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=[])},
         workspace=workspace,
         max_iterations=25,
         truncation_limit=50000,
@@ -106,7 +104,7 @@ def make_bot(tmp_path, rooms=None):
     agent.handle_input = AsyncMock(return_value="Agent response")
     agent.status = MagicMock(return_value={
         "name": "watson",
-        "model": "test-model",
+        "model": "claude-sonnet-4-20250514",
         "context_tokens": 1000,
         "context_max": 200000,
         "context_pct": 0,

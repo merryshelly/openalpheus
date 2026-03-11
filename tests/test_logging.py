@@ -26,14 +26,17 @@ from openalph.config import AgentConfig
 # --- Fixtures ---
 
 
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    from openalph.config import ProviderConfig
+    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
+
+
 def make_agent_config(tmp_path, **kwargs):
     defaults = dict(
         name="test-agent",
-        model="claude-sonnet-4-20250514",
+        default_model="claude-sonnet-4-20250514",
         max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
+        providers={"default": make_provider()},
         workspace=tmp_path,
         max_iterations=25,
         truncation_limit=50000,
@@ -219,7 +222,7 @@ class TestLogEntryFormat:
     @pytest.mark.asyncio
     async def test_entry_model_matches_config(self, tmp_path):
         """Log entry model matches the agent's configured model."""
-        config = make_agent_config(tmp_path, model="claude-opus-4-20250514")
+        config = make_agent_config(tmp_path, default_model="claude-opus-4-20250514")
         response = make_response()
 
         with patch("openalph.agent.complete", AsyncMock(return_value=response)), \

@@ -10,7 +10,7 @@ Design decisions:
 - Workspace path is converted to Path object for consistency
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 import subprocess
@@ -42,20 +42,107 @@ class MatrixConfig:
 
 
 @dataclass
+class ProviderConfig:
+    """Configuration for an LLM provider."""
+    key: str           # e.g., "openrouter", "anthropic", "default"
+    type: str          # "anthropic" | "openai"
+    api_key: str       # resolved value
+    base_url: str | None = None
+    quirks: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentConfig:
     """Configuration for an OpenAlph agent."""
     name: str
-    model: str
+    default_model: str
     max_tokens: int
-    provider: str  # "anthropic" or "openai"
-    api_key: str  # resolved value (not the reference)
-    base_url: str | None
+    providers: dict[str, ProviderConfig]
     workspace: Path
     model_max_tokens: int = 200000
     matrix: MatrixConfig | None = None
     max_iterations: int = 25
     truncation_limit: int = 50000
     vision: bool = False
+    model_limits: dict[str, int] = field(default_factory=dict)
+
+
+def resolve_model(model_str: str, providers: dict[str, ProviderConfig]) -> tuple[ProviderConfig, str]:
+    """Returns (provider_config, api_model_name)."""
+    if not model_str:
+        raise ValueError("Model string cannot be empty")
+    prefix, sep, remainder = model_str.partition("/")
+    if sep:
+        # Model string contains "/" - treat as provider-prefixed
+        if prefix in providers:
+            return providers[prefix], remainder
+        # Prefix not found in providers
+        raise ValueError(f"Unknown provider prefix '{prefix}' in model '{model_str}'")
+    # Backward compat: un-prefixed string (no "/")
+    if len(providers) == 1:
+        return next(iter(providers.values())), model_str
+    if "default" in providers:
+        return providers["default"], model_str
+    raise ValueError(f"Cannot resolve model '{model_str}': ambiguous provider (multiple providers configured, none named 'default')")
+
+
+def _resolve_api_key(section: dict) -> str:
+    """Resolve API key from provider section using precedence: api_key > api_key_env > api_key_cmd.
+    
+    Args:
+        section: Provider section dict from TOML
+        
+    Returns:
+        Resolved API key string
+        
+    Raises:
+        ConfigError: If no API key source is available or resolution fails
+    """
+    # Try direct api_key first
+    if "api_key" in section:
+        api_key = section["api_key"]
+        if not api_key or not isinstance(api_key, str):
+            raise ConfigError("api_key must be a non-empty string")
+        return api_key
+    
+    # Try api_key_env if no direct key
+    if "api_key_env" in section:
+        env_var_name = section["api_key_env"]
+        if not env_var_name or not isinstance(env_var_name, str):
+            raise ConfigError("api_key_env must be a non-empty string")
+        
+        api_key = os.environ.get(env_var_name)
+        if api_key is None:
+            raise ConfigError(f"Environment variable {env_var_name} is not set")
+        return api_key
+    
+    # Try api_key_cmd if no key yet
+    if "api_key_cmd" in section:
+        cmd = section["api_key_cmd"]
+        if not cmd or not isinstance(cmd, str):
+            raise ConfigError("api_key_cmd must be a non-empty string")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+            api_key = result.stdout.strip()
+            if not api_key:
+                raise ConfigError("api_key_cmd produced empty output")
+            return api_key
+        except subprocess.TimeoutExpired:
+            raise ConfigError("api_key_cmd timed out after 10 seconds")
+        except subprocess.CalledProcessError as e:
+            raise ConfigError(f"api_key_cmd failed with exit code {e.returncode}")
+    
+    # No API key source found
+    raise ConfigError("No API key provided. One of api_key, api_key_env, or api_key_cmd must be set")
 
 
 def load_config(path: Path) -> AgentConfig:
@@ -90,23 +177,27 @@ def load_config(path: Path) -> AgentConfig:
     # and separate section format ([provider], [workspace])
     provider_section = toml_data.get("provider", {})
     workspace_section = toml_data.get("workspace", {})
-
-    # If provider section is missing, check for inline provider settings in agent section
-    if not provider_section:
-        if "provider" in agent_section:
-            # Inline format: agent.provider, agent.api_key, etc.
-            provider_section = {
-                "type": agent_section.get("provider"),
-                "api_key": agent_section.get("api_key"),
-                "base_url": agent_section.get("base_url"),
-            }
-
+    
+    # Check for [providers.*] sections (new multi-provider format)
+    # TOML parses [providers.anthropic] as nested dict under "providers"
+    providers_sections = {}
+    if "providers" in toml_data:
+        providers_data = toml_data["providers"]
+        if isinstance(providers_data, dict):
+            for provider_key, provider_data in providers_data.items():
+                if isinstance(provider_data, dict):
+                    providers_sections[f"providers.{provider_key}"] = provider_data
+    
+    # Cannot have both [provider] and [providers.*]
+    if provider_section and providers_sections:
+        raise ConfigError("Both [provider] and [providers.*] found")
+    
     # If workspace section is missing, check for inline workspace settings in agent section
     if not workspace_section:
         agent_workspace = agent_section.get("workspace", {})
         if isinstance(agent_workspace, dict) and "path" in agent_workspace:
             workspace_section = agent_workspace
-    
+
     # Validate and extract agent fields
     try:
         name = agent_section["name"]
@@ -114,13 +205,6 @@ def load_config(path: Path) -> AgentConfig:
             raise ConfigError("Agent name must be a non-empty string")
     except KeyError:
         raise ConfigError("Missing required field: agent.name")
-    
-    try:
-        model = agent_section["model"]
-        if not model or not isinstance(model, str):
-            raise ConfigError("Agent model must be a non-empty string")
-    except KeyError:
-        raise ConfigError("Missing required field: agent.model")
     
     # max_tokens defaults to 8192 if not specified
     max_tokens = agent_section.get("max_tokens", 8192)
@@ -147,70 +231,6 @@ def load_config(path: Path) -> AgentConfig:
     if not isinstance(vision, bool):
         raise ConfigError("vision must be a boolean")
 
-    # Validate and extract provider fields
-    try:
-        provider_type = provider_section["type"]
-    except KeyError:
-        raise ConfigError("Missing required field: provider.type")
-    
-    if provider_type not in ("anthropic", "openai"):
-        raise ConfigError(f"Invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
-    
-    # Resolve API key with precedence: api_key > api_key_env > api_key_cmd
-    api_key = None
-    
-    # Try direct api_key first
-    if "api_key" in provider_section:
-        api_key = provider_section["api_key"]
-        if not api_key or not isinstance(api_key, str):
-            raise ConfigError("api_key must be a non-empty string")
-    
-    # Try api_key_env if no direct key
-    if api_key is None and "api_key_env" in provider_section:
-        env_var_name = provider_section["api_key_env"]
-        if not env_var_name or not isinstance(env_var_name, str):
-            raise ConfigError("api_key_env must be a non-empty string")
-        
-        api_key = os.environ.get(env_var_name)
-        if api_key is None:
-            raise ConfigError(f"Environment variable {env_var_name} is not set")
-    
-    # Try api_key_cmd if no key yet
-    if api_key is None and "api_key_cmd" in provider_section:
-        cmd = provider_section["api_key_cmd"]
-        if not cmd or not isinstance(cmd, str):
-            raise ConfigError("api_key_cmd must be a non-empty string")
-        
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-            )
-            api_key = result.stdout.strip()
-            if not api_key:
-                raise ConfigError("api_key_cmd produced empty output")
-        except subprocess.TimeoutExpired:
-            raise ConfigError("api_key_cmd timed out after 10 seconds")
-        except subprocess.CalledProcessError as e:
-            raise ConfigError(f"api_key_cmd failed with exit code {e.returncode}")
-    
-    # Final API key validation
-    if api_key is None:
-        raise ConfigError("No API key provided. One of api_key, api_key_env, or api_key_cmd must be set")
-    
-    # Validate base_url for openai provider
-    base_url = provider_section.get("base_url")
-    if provider_type == "openai":
-        if base_url is None:
-            raise ConfigError("base_url is required for openai provider")
-        if not isinstance(base_url, str) or not base_url:
-            raise ConfigError("base_url must be a non-empty string")
-    
     # Validate workspace path
     try:
         workspace_path_str = workspace_section["path"]
@@ -220,23 +240,129 @@ def load_config(path: Path) -> AgentConfig:
     except KeyError:
         raise ConfigError("Missing required field: workspace.path")
 
+    # Parse providers configuration
+    providers: dict[str, ProviderConfig] = {}
+    
+    if providers_sections:
+        # New multi-provider format [providers.*]
+        try:
+            default_model = agent_section["default_model"]
+            if not default_model or not isinstance(default_model, str):
+                raise ConfigError("Agent default_model must be a non-empty string")
+        except KeyError:
+            raise ConfigError("Missing required field: agent.default_model")
+        
+        # Parse each provider section
+        for section_name, section_data in providers_sections.items():
+            # Extract provider key from "providers.<key>"
+            provider_key = section_name.split(".", 1)[1]
+            
+            # Validate provider type
+            provider_type = section_data.get("type")
+            if not provider_type:
+                raise ConfigError(f"Missing required field: {section_name}.type")
+            if provider_type not in ("anthropic", "openai"):
+                raise ConfigError(f"Invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
+            
+            # Resolve API key
+            api_key = _resolve_api_key(section_data)
+            
+            # Get base_url (required for openai)
+            base_url = section_data.get("base_url")
+            if provider_type == "openai":
+                if base_url is None:
+                    raise ConfigError(f"base_url is required for {section_name} provider")
+                if not isinstance(base_url, str) or not base_url:
+                    raise ConfigError(f"base_url must be a non-empty string")
+            
+            # Get quirks (optional)
+            quirks = section_data.get("quirks", [])
+            if not isinstance(quirks, list):
+                quirks = []
+            
+            providers[provider_key] = ProviderConfig(
+                key=provider_key,
+                type=provider_type,
+                api_key=api_key,
+                base_url=base_url,
+                quirks=quirks,
+            )
+    else:
+        # Legacy single provider format [provider]
+        # If provider section is missing, check for inline provider settings in agent section
+        if not provider_section:
+            if "provider" in agent_section:
+                # Inline format: agent.provider, agent.api_key, etc.
+                provider_section = {
+                    "type": agent_section.get("provider"),
+                    "api_key": agent_section.get("api_key"),
+                    "base_url": agent_section.get("base_url"),
+                }
+        
+        try:
+            model = agent_section["model"]
+            if not model or not isinstance(model, str):
+                raise ConfigError("Agent model must be a non-empty string")
+        except KeyError:
+            raise ConfigError("Missing required field: agent.model")
+        
+        # Map legacy 'model' to 'default_model'
+        default_model = model
+        
+        # Validate and extract provider fields
+        try:
+            provider_type = provider_section["type"]
+        except KeyError:
+            raise ConfigError("Missing required field: provider.type")
+        
+        if provider_type not in ("anthropic", "openai"):
+            raise ConfigError(f"Invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
+        
+        # Resolve API key
+        api_key = _resolve_api_key(provider_section)
+        
+        # Validate base_url for openai provider
+        base_url = provider_section.get("base_url")
+        if provider_type == "openai":
+            if base_url is None:
+                raise ConfigError("base_url is required for openai provider")
+            if not isinstance(base_url, str) or not base_url:
+                raise ConfigError("base_url must be a non-empty string")
+        
+        # Create single provider config with key "default"
+        providers["default"] = ProviderConfig(
+            key="default",
+            type=provider_type,
+            api_key=api_key,
+            base_url=base_url,
+            quirks=[],
+        )
+
+    # Parse optional [model_limits] section
+    model_limits = {}
+    if "model_limits" in toml_data:
+        model_limits_section = toml_data["model_limits"]
+        if isinstance(model_limits_section, dict):
+            for model_name, limit in model_limits_section.items():
+                if isinstance(limit, int) and limit > 0:
+                    model_limits[model_name] = limit
+
     # Parse optional [matrix] section
     matrix = _parse_matrix_config(toml_data)
 
     # Return resolved configuration
     return AgentConfig(
         name=name,
-        model=model,
+        default_model=default_model,
         max_tokens=max_tokens,
         model_max_tokens=model_max_tokens,
-        provider=provider_type,
-        api_key=api_key,
-        base_url=base_url,
+        providers=providers,
         workspace=workspace_path,
         matrix=matrix,
         max_iterations=max_iterations,
         truncation_limit=truncation_limit,
         vision=vision,
+        model_limits=model_limits,
     )
 
 

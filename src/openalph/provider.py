@@ -9,29 +9,29 @@ from dataclasses import dataclass
 import json
 import anthropic
 import openai
-from openalph.config import AgentConfig
+from openalph.config import AgentConfig, ProviderConfig, resolve_model
 
 # Client cache: reuse HTTP clients for connection pooling.
 # Keyed by (provider, api_key, base_url) so different configs get different clients.
 _client_cache: dict[tuple, object] = {}
 
 
-def _get_client(config: AgentConfig):
+def _get_client(provider: ProviderConfig):
     """Get or create a cached provider client."""
-    if config.provider == "anthropic":
-        key = ("anthropic", config.api_key, None)
+    if provider.type == "anthropic":
+        key = ("anthropic", provider.api_key, None)
         if key not in _client_cache:
-            _client_cache[key] = anthropic.AsyncAnthropic(api_key=config.api_key)
+            _client_cache[key] = anthropic.AsyncAnthropic(api_key=provider.api_key)
         return _client_cache[key]
-    elif config.provider == "openai":
-        key = ("openai", config.api_key, config.base_url)
+    elif provider.type == "openai":
+        key = ("openai", provider.api_key, provider.base_url)
         if key not in _client_cache:
             _client_cache[key] = openai.AsyncOpenAI(
-                api_key=config.api_key, base_url=config.base_url
+                api_key=provider.api_key, base_url=provider.base_url
             )
         return _client_cache[key]
     else:
-        raise ValueError(f"Unsupported provider: {config.provider}")
+        raise ValueError(f"Unsupported provider: {provider.type}")
 
 
 @dataclass
@@ -64,7 +64,7 @@ class Response:
             self.usage = Usage(input_tokens=0, output_tokens=0)
 
 
-def _convert_tools_for_provider(tools: list | None, provider: str) -> list[dict] | None:
+def _convert_tools_for_provider(tools: list | None, provider_type: str) -> list[dict] | None:
     """Convert ToolDef list to provider-native format.
     
     Anthropic: [{"name": ..., "description": ..., "input_schema": ...}]
@@ -75,13 +75,13 @@ def _convert_tools_for_provider(tools: list | None, provider: str) -> list[dict]
     
     result = []
     for tool in tools:
-        if provider == "anthropic":
+        if provider_type == "anthropic":
             result.append({
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.parameters,
             })
-        elif provider == "openai":
+        elif provider_type == "openai":
             result.append({
                 "type": "function",
                 "function": {
@@ -93,7 +93,7 @@ def _convert_tools_for_provider(tools: list | None, provider: str) -> list[dict]
     return result
 
 
-def _convert_messages_for_provider(messages: list[dict], provider: str) -> list[dict]:
+def _convert_messages_for_provider(messages: list[dict], provider_type: str) -> list[dict]:
     """Convert normalized message history to provider-native format.
     
     Normalized format:
@@ -109,9 +109,9 @@ def _convert_messages_for_provider(messages: list[dict], provider: str) -> list[
     - Assistant: {"role": "assistant", "content": "text", "tool_calls": [{"id": ..., "type": "function", "function": {"name": ..., "arguments": ...}}]}
     - Tool result: {"role": "tool", "tool_call_id": "...", "content": "..."}
     """
-    if provider == "anthropic":
+    if provider_type == "anthropic":
         return _convert_messages_for_anthropic(messages)
-    elif provider == "openai":
+    elif provider_type == "openai":
         return _convert_messages_for_openai(messages)
     return messages
 
@@ -347,29 +347,35 @@ async def complete(
     messages: list[dict],
     tools: list | None = None,
     max_tokens: int | None = None,
+    model: str | None = None,
 ) -> Response:
     """
-    Route to Anthropic or OpenAI SDK based on config.provider.
+    Route to Anthropic or OpenAI SDK based on config.providers.
     If max_tokens is None, use config.max_tokens.
+    If model is None, use config.default_model.
     
     Errors propagate directly - no wrapping, no retry.
     """
+    # Resolve model string to provider and API model name
+    model_str = model or config.default_model
+    provider_cfg, api_model = resolve_model(model_str, config.providers)
+    
+    # Convert messages to provider-native format
+    provider_messages = _convert_messages_for_provider(messages, provider_cfg.type)
+    
+    # Convert tools to provider-native format
+    provider_tools = _convert_tools_for_provider(tools, provider_cfg.type)
+    
     # Use config.max_tokens if max_tokens is not provided
     tokens = max_tokens if max_tokens is not None else config.max_tokens
     
-    # Convert messages to provider-native format
-    provider_messages = _convert_messages_for_provider(messages, config.provider)
-    
-    # Convert tools to provider-native format
-    provider_tools = _convert_tools_for_provider(tools, config.provider)
-    
-    if config.provider == "anthropic":
+    if provider_cfg.type == "anthropic":
         # Anthropic path: use their specific API shape
-        client = _get_client(config)
+        client = _get_client(provider_cfg)
         
         # Build API call kwargs
         api_kwargs = {
-            "model": config.model,
+            "model": api_model,
             "system": system,
             "messages": provider_messages,
             "max_tokens": tokens,
@@ -382,16 +388,29 @@ async def complete(
         # Parse Anthropic response into normalized format
         return _parse_anthropic_response(response)
     
-    elif config.provider == "openai":
+    elif provider_cfg.type == "openai":
         # OpenAI path: prepend system message and use their API shape
-        client = _get_client(config)
+        client = _get_client(provider_cfg)
         
-        # Prepend system message to messages list
-        messages_with_system = [{"role": "system", "content": system}] + provider_messages
+        # Handle quirks
+        if "no_system_role" in provider_cfg.quirks:
+            # Fold system into first user message instead of separate system role
+            messages_with_system = provider_messages
+            if messages_with_system and messages_with_system[0]["role"] == "user":
+                first = messages_with_system[0].copy()
+                content = first.get("content", "")
+                if isinstance(content, str):
+                    first["content"] = f"{system}\n\n{content}"
+                messages_with_system = [first] + messages_with_system[1:]
+            else:
+                messages_with_system = [{"role": "user", "content": system}] + messages_with_system
+        else:
+            # Normal: prepend system message to messages list
+            messages_with_system = [{"role": "system", "content": system}] + provider_messages
         
         # Build API call kwargs
         api_kwargs = {
-            "model": config.model,
+            "model": api_model,
             "messages": messages_with_system,
             "max_tokens": tokens,
         }
@@ -405,4 +424,4 @@ async def complete(
     
     else:
         # This shouldn't happen if config is validated, but we'll raise a clear error
-        raise ValueError(f"Unsupported provider: {config.provider}")
+        raise ValueError(f"Unsupported provider type: {provider_cfg.type}")

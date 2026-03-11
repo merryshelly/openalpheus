@@ -42,14 +42,17 @@ def make_matrix_config(**kwargs):
     return MatrixConfig(**defaults)
 
 
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    from openalph.config import ProviderConfig
+    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
+
+
 def make_agent_config(workspace, **kwargs):
     defaults = dict(
         name="watson",
-        model="test-model",
+        default_model="claude-sonnet-4-20250514",
         max_tokens=8192,
-        provider="anthropic",
-        api_key="sk-test",
-        base_url=None,
+        providers={"default": make_provider()},
         workspace=workspace,
         max_iterations=25,
         truncation_limit=50000,
@@ -90,7 +93,7 @@ def make_bot(tmp_path):
     agent.handle_input = AsyncMock(return_value="Agent response")
     agent.status = MagicMock(return_value={
         "name": "watson",
-        "model": "test-model",
+        "default_model": "claude-sonnet-4-20250514",
         "context_tokens": 1000,
         "context_max": 200000,
         "context_pct": 0,

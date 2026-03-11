@@ -14,26 +14,32 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
-from openalph.config import AgentConfig
+from openalph.config import AgentConfig, ProviderConfig
 from openalph.provider import complete, Response, Usage, ToolCall
 from openalph.tools import ToolDef
 
 
-def make_config(provider="anthropic", **kwargs):
-    defaults = dict(
-        name="test",
-        model="test-model",
-        max_tokens=8192,
-        api_key="sk-test",
-        base_url=None,
-        workspace=Path("/tmp/test"),
-        max_iterations=25,
-        truncation_limit=50000,
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    return ProviderConfig(
+        key=key,
+        type=type,
+        api_key=api_key,
+        base_url=base_url,
+        quirks=quirks or [],
     )
+
+
+def make_config(**kwargs):
+    defaults = {
+        "name": "test",
+        "default_model": "claude-sonnet-4-20250514",
+        "max_tokens": 8192,
+        "providers": {"default": make_provider()},
+        "workspace": Path("/tmp/test"),
+        "max_iterations": 25,
+        "truncation_limit": 50000,
+    }
     defaults.update(kwargs)
-    defaults["provider"] = provider
-    if provider == "openai" and "base_url" not in kwargs:
-        defaults["base_url"] = "http://localhost:11434/v1"
     return AgentConfig(**defaults)
 
 
@@ -145,7 +151,9 @@ class TestAnthropicTools:
     @pytest.mark.asyncio
     async def test_tools_sent_to_anthropic(self):
         """Tools are passed to Anthropic API in native format."""
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -169,7 +177,9 @@ class TestAnthropicTools:
     @pytest.mark.asyncio
     async def test_no_tools_omits_parameter(self):
         """tools=None → tools not sent to API (or sent as empty)."""
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -192,7 +202,9 @@ class TestAnthropicTools:
     @pytest.mark.asyncio
     async def test_tool_use_response_parsed(self):
         """Anthropic tool_use blocks are parsed into Response.tool_calls."""
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -220,7 +232,9 @@ class TestAnthropicTools:
     @pytest.mark.asyncio
     async def test_text_and_tool_use_combined(self):
         """Response with both text and tool_use preserves both."""
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -245,7 +259,9 @@ class TestAnthropicTools:
     @pytest.mark.asyncio
     async def test_multiple_tool_calls(self):
         """Multiple tool_use blocks in one response."""
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         # Build response with 2 tool_use blocks
         tool1 = MagicMock()
@@ -291,6 +307,7 @@ class TestAnthropicTools:
 class TestAnthropicMessageConversion:
 
     def _mock_text_response(self):
+        """Mock an Anthropic response with only text content."""
         text_block = MagicMock()
         text_block.type = "text"
         text_block.text = "OK"
@@ -311,7 +328,9 @@ class TestAnthropicMessageConversion:
         Normalized: {"role": "tool", "tool_call_id": "x", "content": "result"}
         Anthropic: {"role": "user", "content": [{"type": "tool_result", ...}]}
         """
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         messages = [
             {"role": "user", "content": "List files"},
@@ -368,7 +387,9 @@ class TestAnthropicMessageConversion:
     @pytest.mark.asyncio
     async def test_error_tool_result_converted(self):
         """Tool error results include is_error flag in Anthropic format."""
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         messages = [
             {"role": "user", "content": "Read missing file"},
@@ -451,7 +472,14 @@ class TestOpenAITools:
     @pytest.mark.asyncio
     async def test_tools_sent_as_functions(self):
         """Tools are sent to OpenAI API in function format."""
-        config = make_config("openai")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
@@ -476,7 +504,14 @@ class TestOpenAITools:
     @pytest.mark.asyncio
     async def test_tool_call_response_parsed(self):
         """OpenAI tool_calls are parsed into Response.tool_calls."""
-        config = make_config("openai")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
@@ -499,7 +534,14 @@ class TestOpenAITools:
     @pytest.mark.asyncio
     async def test_no_tool_calls_returns_empty(self):
         """Text-only response → empty tool_calls."""
-        config = make_config("openai")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
@@ -541,7 +583,14 @@ class TestOpenAIMessageConversion:
         Normalized: {"role": "tool", "tool_call_id": "x", "content": "result"}
         OpenAI: {"role": "tool", "tool_call_id": "x", "content": "result"}
         """
-        config = make_config("openai")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
 
         messages = [
             {"role": "user", "content": "List files"},
@@ -605,7 +654,9 @@ class TestBackwardCompat:
     @pytest.mark.asyncio
     async def test_no_tools_anthropic_unchanged(self):
         """Without tools, Anthropic path behaves exactly as Phase 1."""
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         text_block = MagicMock()
         text_block.type = "text"
@@ -637,7 +688,14 @@ class TestBackwardCompat:
     @pytest.mark.asyncio
     async def test_no_tools_openai_unchanged(self):
         """Without tools, OpenAI path behaves exactly as Phase 1."""
-        config = make_config("openai")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
 
         choice = MagicMock()
         choice.message.content = "Hello"

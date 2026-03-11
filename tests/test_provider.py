@@ -1,9 +1,9 @@
 """Tests for the provider adapter.
 
 Interface contract:
-    complete(config, system, messages, max_tokens) -> Response
+    complete(config, system, messages, max_tokens, model) -> Response
 
-Routes to Anthropic SDK or OpenAI SDK based on config.provider.
+Routes to Anthropic SDK or OpenAI SDK based on config.providers.
 Normalizes response format across both providers.
 
 Response: content (str), model (str), usage (Usage), stop_reason (str)
@@ -13,23 +13,29 @@ Usage: input_tokens, output_tokens, cache_read_tokens (optional), cache_creation
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
-from openalph.config import AgentConfig
+from openalph.config import AgentConfig, ProviderConfig
 from openalph.provider import complete, Response, Usage, _convert_messages_for_anthropic
 
 
-def make_config(provider="anthropic", **kwargs):
-    defaults = dict(
-        name="test",
-        model="test-model",
-        max_tokens=8192,
-        api_key="sk-test",
-        base_url=None,
-        workspace=Path("/tmp/test"),
+def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
+    return ProviderConfig(
+        key=key,
+        type=type,
+        api_key=api_key,
+        base_url=base_url,
+        quirks=quirks or [],
     )
+
+
+def make_config(**kwargs):
+    defaults = {
+        "name": "test-agent",
+        "default_model": "claude-sonnet-4-20250514",
+        "max_tokens": 8192,
+        "providers": {"default": make_provider()},
+        "workspace": Path("/tmp/test"),
+    }
     defaults.update(kwargs)
-    defaults["provider"] = provider
-    if provider == "openai" and "base_url" not in kwargs:
-        defaults["base_url"] = "http://localhost:11434/v1"
     return AgentConfig(**defaults)
 
 
@@ -67,7 +73,10 @@ class TestRouting:
 
     @pytest.mark.asyncio
     async def test_anthropic_uses_anthropic_sdk(self):
-        config = make_config("anthropic", model="claude-sonnet-4-20250514")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")},
+            default_model="claude-sonnet-4-20250514"
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -94,9 +103,13 @@ class TestRouting:
     @pytest.mark.asyncio
     async def test_openai_uses_openai_sdk(self):
         config = make_config(
-            "openai",
-            model="moonshotai/kimi-k2.5",
-            base_url="https://openrouter.ai/api/v1",
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="https://openrouter.ai/api/v1"
+                )
+            },
+            default_model="default/moonshotai/kimi-k2.5"
         )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
@@ -127,9 +140,13 @@ class TestRouting:
     @pytest.mark.asyncio
     async def test_ollama_uses_openai_path(self):
         config = make_config(
-            "openai",
-            model="qwen3:235b-a22b",
-            base_url="http://100.90.3.4:11434/v1",
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://100.90.3.4:11434/v1"
+                )
+            },
+            default_model="default/qwen3:235b-a22b"
         )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
@@ -158,7 +175,9 @@ class TestResponseNormalization:
 
     @pytest.mark.asyncio
     async def test_anthropic_response_fields(self):
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -190,7 +209,14 @@ class TestResponseNormalization:
 
     @pytest.mark.asyncio
     async def test_openai_response_fields(self):
-        config = make_config("openai", base_url="http://localhost/v1")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
@@ -226,7 +252,9 @@ class TestMultiTurn:
 
     @pytest.mark.asyncio
     async def test_full_history_passed(self):
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
         messages = [
             {"role": "user", "content": "What's 2+2?"},
             {"role": "assistant", "content": "4"},
@@ -248,7 +276,14 @@ class TestMultiTurn:
     @pytest.mark.asyncio
     async def test_openai_history_with_system_prepended(self):
         """OpenAI path prepends system, then passes all history messages."""
-        config = make_config("openai", base_url="http://localhost/v1")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
         messages = [
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
@@ -276,7 +311,10 @@ class TestMaxTokens:
 
     @pytest.mark.asyncio
     async def test_anthropic_max_tokens_from_config(self):
-        config = make_config("anthropic", max_tokens=4096)
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")},
+            max_tokens=4096
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -295,7 +333,15 @@ class TestMaxTokens:
 
     @pytest.mark.asyncio
     async def test_openai_max_tokens_from_config(self):
-        config = make_config("openai", max_tokens=2048, base_url="http://localhost/v1")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            },
+            max_tokens=2048
+        )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
@@ -320,7 +366,9 @@ class TestErrors:
 
     @pytest.mark.asyncio
     async def test_anthropic_error_propagates(self):
-        config = make_config("anthropic")
+        config = make_config(
+            providers={"default": make_provider(key="default", type="anthropic", api_key="sk-test")}
+        )
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
@@ -337,7 +385,14 @@ class TestErrors:
 
     @pytest.mark.asyncio
     async def test_openai_error_propagates(self):
-        config = make_config("openai", base_url="http://localhost/v1")
+        config = make_config(
+            providers={
+                "default": make_provider(
+                    key="default", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            }
+        )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value

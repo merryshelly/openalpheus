@@ -2,7 +2,7 @@
 
 Interface contract:
     load_config(path: Path) -> AgentConfig
-    AgentConfig: name, model, max_tokens, provider, api_key, base_url, workspace
+    AgentConfig: name, default_model, max_tokens, providers, workspace
 
 Config is TOML. API key resolves from: api_key (direct), api_key_env (env var),
 api_key_cmd (shell command). Precedence: api_key > api_key_env > api_key_cmd.
@@ -11,7 +11,7 @@ api_key_cmd (shell command). Precedence: api_key > api_key_env > api_key_cmd.
 import pytest
 import subprocess
 from pathlib import Path
-from openalph.config import AgentConfig, load_config, load_agent_config, ConfigError, CONFIG_DIR
+from openalph.config import AgentConfig, ProviderConfig, load_config, load_agent_config, ConfigError, CONFIG_DIR
 
 
 # --- Valid configs ---
@@ -34,10 +34,11 @@ path = "/tmp/test-workspace"
 """)
         config = load_config(tmp_path / "agent.toml")
         assert config.name == "merry"
-        assert config.model == "claude-sonnet-4-20250514"
-        assert config.provider == "anthropic"
-        assert config.api_key == "sk-test-key"
-        assert config.base_url is None
+        assert config.default_model == "claude-sonnet-4-20250514"
+        assert "default" in config.providers
+        assert config.providers["default"].type == "anthropic"
+        assert config.providers["default"].api_key == "sk-test-key"
+        assert config.providers["default"].base_url is None
         assert config.workspace == Path("/tmp/test-workspace")
 
     def test_max_tokens_default(self, tmp_path):
@@ -89,8 +90,8 @@ base_url = "https://openrouter.ai/api/v1"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.provider == "openai"
-        assert config.base_url == "https://openrouter.ai/api/v1"
+        assert config.providers["default"].type == "openai"
+        assert config.providers["default"].base_url == "https://openrouter.ai/api/v1"
 
     def test_ollama_via_openai(self, tmp_path):
         """Ollama uses the OpenAI-compatible path."""
@@ -108,8 +109,8 @@ base_url = "http://localhost:11434/v1"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.provider == "openai"
-        assert config.model == "qwen3:235b-a22b"
+        assert config.providers["default"].type == "openai"
+        assert config.default_model == "qwen3:235b-a22b"
 
 
 # --- API key resolution ---
@@ -132,7 +133,7 @@ api_key_env = "TEST_API_KEY"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.api_key == "sk-from-env"
+        assert config.providers["default"].api_key == "sk-from-env"
 
     def test_from_command(self, tmp_path):
         (tmp_path / "agent.toml").write_text("""
@@ -148,7 +149,7 @@ api_key_cmd = "echo sk-from-cmd"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.api_key == "sk-from-cmd"
+        assert config.providers["default"].api_key == "sk-from-cmd"
 
     def test_precedence_direct_over_env(self, tmp_path, monkeypatch):
         """Direct api_key wins over api_key_env."""
@@ -167,7 +168,7 @@ api_key_env = "TEST_KEY"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.api_key == "from-direct"
+        assert config.providers["default"].api_key == "from-direct"
 
     def test_precedence_env_over_cmd(self, tmp_path, monkeypatch):
         """api_key_env wins over api_key_cmd."""
@@ -186,7 +187,7 @@ api_key_cmd = "echo from-cmd"
 path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
-        assert config.api_key == "from-env"
+        assert config.providers["default"].api_key == "from-env"
 
 
 # --- Validation errors ---
@@ -381,12 +382,16 @@ class TestAgentConfig:
     def test_fields(self):
         config = AgentConfig(
             name="merry",
-            model="claude-sonnet-4-20250514",
+            default_model="claude-sonnet-4-20250514",
             max_tokens=8192,
             model_max_tokens=200000,
-            provider="anthropic",
-            api_key="sk-test",
-            base_url=None,
+            providers={
+                "default": ProviderConfig(
+                    key="default",
+                    type="anthropic",
+                    api_key="sk-test",
+                )
+            },
             workspace=Path("/tmp/test"),
             matrix=None,
         )

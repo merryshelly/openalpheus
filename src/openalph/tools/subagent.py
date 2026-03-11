@@ -48,7 +48,7 @@ async def run_subagent(
 
     # Handle model override by creating a new config with the overridden model
     if model is not None:
-        config = replace(config, model=model)
+        config = replace(config, default_model=model)
 
     # Filter out subagent tool to prevent recursion
     sub_tools = [t for t in (tools or []) if t.name != "subagent"]
