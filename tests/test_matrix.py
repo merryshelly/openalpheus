@@ -681,3 +681,134 @@ class TestSendRetry:
 
         assert bot.client.room_send.await_count == 2
         mock_sleep.assert_awaited_once()  # one retry = one sleep
+
+
+# --- Provider Error Surfacing (kdsn.61) ---
+
+
+class TestProviderErrorSurfacing:
+    """ProviderError from API calls surfaces the message in chat."""
+
+    @pytest.mark.asyncio
+    async def test_provider_error_surfaces_message(self):
+        """ProviderError → user sees the actual error, not generic 'Internal error'."""
+        from openalph.provider import ProviderError
+
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.handle_input = AsyncMock(
+            side_effect=ProviderError("model: invalid model: bongo", status_code=404)
+        )
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Hello")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        bot.client.room_send.assert_awaited_once()
+        sent_content = bot.client.room_send.call_args[0][2]
+        sent_body = sent_content["body"]
+        assert "Provider error" in sent_body
+        assert "invalid model" in sent_body
+        assert "Internal error" not in sent_body
+
+    @pytest.mark.asyncio
+    async def test_provider_error_does_not_crash_bot(self):
+        """ProviderError is caught cleanly — bot stays alive."""
+        from openalph.provider import ProviderError
+
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.handle_input = AsyncMock(
+            side_effect=ProviderError("Rate limit exceeded", status_code=429)
+        )
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Hello")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        # Should not raise
+        await bot._handle_room_message(room, event)
+
+    @pytest.mark.asyncio
+    async def test_provider_error_without_status_code(self):
+        """ProviderError without status_code still surfaces cleanly."""
+        from openalph.provider import ProviderError
+
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.handle_input = AsyncMock(
+            side_effect=ProviderError("Provider unreachable — connection failed")
+        )
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Hello")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        sent_content = bot.client.room_send.call_args[0][2]
+        sent_body = sent_content["body"]
+        assert "Provider error" in sent_body
+        assert "unreachable" in sent_body
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_still_hidden(self):
+        """Non-ProviderError exceptions still get the generic message."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.handle_input = AsyncMock(
+            side_effect=RuntimeError("some internal details with sk-ant-api03-secret")
+        )
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = {"!test:matrix.local"}
+
+        event = make_room_message("@sb:matrix.local", "Hello")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        sent_content = bot.client.room_send.call_args[0][2]
+        sent_body = sent_content["body"]
+        assert "Internal error" in sent_body
+        assert "sk-ant" not in sent_body

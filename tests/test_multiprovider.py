@@ -901,3 +901,171 @@ path = "/tmp/test"
 """)
         config = load_config(tmp_path / "agent.toml")
         assert config.model_limits == {}
+
+
+# --- ProviderError wrapping (kdsn.61) ---
+
+
+class TestProviderErrorWrapping:
+    """API errors from SDKs are wrapped as ProviderError with sanitized messages."""
+
+    @staticmethod
+    def _make_response(status_code, json_body=None):
+        """Create an httpx.Response with a request attached (required by SDKs)."""
+        import httpx
+        request = httpx.Request("POST", "https://api.example.com/v1/messages")
+        return httpx.Response(status_code, json=json_body or {}, request=request)
+
+    def _make_config(self, provider_type="anthropic", provider_key="anthropic"):
+        providers = {
+            provider_key: ProviderConfig(
+                key=provider_key, type=provider_type,
+                api_key="sk-test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1" if provider_type == "openai" else None,
+            )
+        }
+        return AgentConfig(
+            name="test", default_model=f"{provider_key}/test-model",
+            max_tokens=1024, providers=providers, workspace=Path("/tmp/test"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_bad_model_raises_provider_error(self):
+        """Anthropic NotFoundError → ProviderError with message."""
+        import anthropic as anthropic_sdk
+        from openalph.provider import complete, ProviderError
+
+        config = self._make_config("anthropic")
+        resp = self._make_response(404, {"error": {"message": "model: invalid model: bongo"}})
+        exc = anthropic_sdk.NotFoundError(
+            message="model: invalid model: bongo", response=resp, body=None
+        )
+
+        with patch("openalph.provider._get_client") as mock_client:
+            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            with pytest.raises(ProviderError) as exc_info:
+                await complete(config, "system", [{"role": "user", "content": "hi"}])
+            assert "invalid model" in str(exc_info.value)
+            assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_openai_bad_model_raises_provider_error(self):
+        """OpenAI NotFoundError → ProviderError with message."""
+        import openai as openai_sdk
+        from openalph.provider import complete, ProviderError
+
+        config = self._make_config("openai", "openrouter")
+        resp = self._make_response(404, {"error": {"message": "Model not found: bongo"}})
+        exc = openai_sdk.NotFoundError(
+            message="Model not found: bongo", response=resp, body=None
+        )
+
+        with patch("openalph.provider._get_client") as mock_client:
+            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
+            with pytest.raises(ProviderError) as exc_info:
+                await complete(config, "system", [{"role": "user", "content": "hi"}])
+            assert "Model not found" in str(exc_info.value)
+            assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_anthropic_auth_error_raises_provider_error(self):
+        """Anthropic AuthenticationError → ProviderError with 401."""
+        import anthropic as anthropic_sdk
+        from openalph.provider import complete, ProviderError
+
+        config = self._make_config("anthropic")
+        resp = self._make_response(401, {"error": {"message": "Invalid API key"}})
+        exc = anthropic_sdk.AuthenticationError(
+            message="Invalid API key", response=resp, body=None
+        )
+
+        with patch("openalph.provider._get_client") as mock_client:
+            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            with pytest.raises(ProviderError) as exc_info:
+                await complete(config, "system", [{"role": "user", "content": "hi"}])
+            assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_anthropic_connection_error_raises_provider_error(self):
+        """Anthropic APIConnectionError → ProviderError with 'unreachable'."""
+        import anthropic as anthropic_sdk
+        from openalph.provider import complete, ProviderError
+
+        config = self._make_config("anthropic")
+        exc = anthropic_sdk.APIConnectionError(request=MagicMock())
+
+        with patch("openalph.provider._get_client") as mock_client:
+            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            with pytest.raises(ProviderError, match="unreachable"):
+                await complete(config, "system", [{"role": "user", "content": "hi"}])
+
+    @pytest.mark.asyncio
+    async def test_anthropic_timeout_error_raises_provider_error(self):
+        """Anthropic APITimeoutError → ProviderError with 'timed out'."""
+        import anthropic as anthropic_sdk
+        from openalph.provider import complete, ProviderError
+
+        config = self._make_config("anthropic")
+        exc = anthropic_sdk.APITimeoutError(request=MagicMock())
+
+        with patch("openalph.provider._get_client") as mock_client:
+            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            with pytest.raises(ProviderError, match="timed out"):
+                await complete(config, "system", [{"role": "user", "content": "hi"}])
+
+    @pytest.mark.asyncio
+    async def test_openai_connection_error_raises_provider_error(self):
+        """OpenAI APIConnectionError → ProviderError with 'unreachable'."""
+        import openai as openai_sdk
+        from openalph.provider import complete, ProviderError
+
+        config = self._make_config("openai", "openrouter")
+        exc = openai_sdk.APIConnectionError(request=MagicMock())
+
+        with patch("openalph.provider._get_client") as mock_client:
+            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
+            with pytest.raises(ProviderError, match="unreachable"):
+                await complete(config, "system", [{"role": "user", "content": "hi"}])
+
+    @pytest.mark.asyncio
+    async def test_openai_rate_limit_error_raises_provider_error(self):
+        """OpenAI RateLimitError → ProviderError with 429."""
+        import openai as openai_sdk
+        from openalph.provider import complete, ProviderError
+
+        config = self._make_config("openai", "openrouter")
+        resp = self._make_response(429, {"error": {"message": "Rate limit exceeded"}})
+        exc = openai_sdk.RateLimitError(
+            message="Rate limit exceeded", response=resp, body=None
+        )
+
+        with patch("openalph.provider._get_client") as mock_client:
+            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
+            with pytest.raises(ProviderError) as exc_info:
+                await complete(config, "system", [{"role": "user", "content": "hi"}])
+            assert exc_info.value.status_code == 429
+
+
+class TestSanitizeError:
+    """API key patterns are stripped from error messages."""
+
+    def test_strips_anthropic_key(self):
+        from openalph.provider import _sanitize_error
+        msg = "Failed with key sk-ant-api03-abc123xyz456def789"
+        assert "sk-ant" not in _sanitize_error(msg)
+        assert "[REDACTED]" in _sanitize_error(msg)
+
+    def test_strips_openai_key(self):
+        from openalph.provider import _sanitize_error
+        msg = "Invalid key: sk-proj-1234567890abcdef"
+        assert "sk-proj" not in _sanitize_error(msg)
+
+    def test_preserves_normal_message(self):
+        from openalph.provider import _sanitize_error
+        msg = "model: invalid model: bongo"
+        assert _sanitize_error(msg) == msg
+
+    def test_strips_openrouter_key(self):
+        from openalph.provider import _sanitize_error
+        msg = "Auth failed: sk-or-v1-abc123def456ghi789jkl012"
+        assert "sk-or" not in _sanitize_error(msg)

@@ -33,6 +33,7 @@ MAX_MEDIA_BYTES = 20_000_000  # 20 MB
 MEDIA_DIR = "media"
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
+from openalph.provider import ProviderError
 from openalph.config import MatrixConfig
 from openalph.session import SessionLog
 from openalph.mention import mentions_me, is_gated, MentionCheckResult
@@ -267,6 +268,10 @@ class MatrixBot:
                     content=response,
                 )
             await self.send(room_id, response)
+        except ProviderError as e:
+            code = f" ({e.status_code})" if e.status_code else ""
+            logger.warning("Heartbeat provider error%s in %s: %s", code, room_id, e)
+            await self.send(room_id, f"⚠️ **Provider error** (heartbeat): {e}")
         except AgentOverflowError as e:
             logger.warning("Context overflow in %s — auto-stopping heartbeat", room_id)
             await self.heartbeat.stop(room_id)
@@ -551,6 +556,10 @@ class MatrixBot:
                 await self.send(room_id,
                     f"⚠️ **Context overflow** — ~{e.current_tokens:,} / "
                     f"{e.max_tokens:,} tokens. Start a new room to continue.")
+            except ProviderError as e:
+                code = f" ({e.status_code})" if e.status_code else ""
+                logger.warning("Provider error%s in %s: %s", code, room_id, e)
+                await self.send(room_id, f"⚠️ **Provider error:** {e}")
             except Exception as e:
                 # Agent error: send generic message to avoid leaking exception details
                 logger.exception("Agent error processing message in %s", room_id)

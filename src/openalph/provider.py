@@ -7,9 +7,29 @@ The adapter handles the differences in API shapes and response formats between p
 
 from dataclasses import dataclass
 import json
+import re
 import anthropic
 import openai
 from openalph.config import AgentConfig, ProviderConfig, resolve_model
+
+
+class ProviderError(Exception):
+    """User-surfaceable error from an LLM provider.
+
+    Wraps SDK-specific exceptions with a sanitized message
+    safe to display in chat.
+    """
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+_API_KEY_PATTERN = re.compile(r'\b(sk-[a-zA-Z0-9_-]{10,})\b')
+
+
+def _sanitize_error(message: str) -> str:
+    """Strip potential API keys from error messages."""
+    return _API_KEY_PATTERN.sub('[REDACTED]', message)
 
 # Client cache: reuse HTTP clients for connection pooling.
 # Keyed by (provider, api_key, base_url) so different configs get different clients.
@@ -383,7 +403,16 @@ async def complete(
         if provider_tools:
             api_kwargs["tools"] = provider_tools
         
-        response = await client.messages.create(**api_kwargs)
+        try:
+            response = await client.messages.create(**api_kwargs)
+        except anthropic.APIStatusError as e:
+            raise ProviderError(
+                _sanitize_error(e.message), status_code=e.status_code,
+            ) from e
+        except anthropic.APITimeoutError as e:
+            raise ProviderError("Provider request timed out") from e
+        except anthropic.APIConnectionError as e:
+            raise ProviderError("Provider unreachable — connection failed") from e
         
         # Parse Anthropic response into normalized format
         return _parse_anthropic_response(response)
@@ -417,7 +446,16 @@ async def complete(
         if provider_tools:
             api_kwargs["tools"] = provider_tools
         
-        response = await client.chat.completions.create(**api_kwargs)
+        try:
+            response = await client.chat.completions.create(**api_kwargs)
+        except openai.APIStatusError as e:
+            raise ProviderError(
+                _sanitize_error(e.message), status_code=e.status_code,
+            ) from e
+        except openai.APITimeoutError as e:
+            raise ProviderError("Provider request timed out") from e
+        except openai.APIConnectionError as e:
+            raise ProviderError("Provider unreachable — connection failed") from e
         
         # Parse OpenAI response into normalized format
         return _parse_openai_response(response)
