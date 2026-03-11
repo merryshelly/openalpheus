@@ -646,30 +646,52 @@ class TestAgentActiveModel:
         assert agent.active_model == config.default_model
 
     def test_switch_model_context_window_guard(self, tmp_path):
-        """Block model switch when context exceeds new model's max tokens."""
+        """Block model switch when context exceeds target model's configured limit."""
         (tmp_path / "SAFETY.md").write_text("")
         config = make_multi_config(
             workspace=str(tmp_path),
             model_max_tokens=200000,
             max_tokens=8192,
+            model_limits={"ollama/devstral-2:123b": 32000},
         )
         from openalph.agent import Agent
         agent = Agent(config)
 
-        # Fill room with enough history to exceed a smaller model's window
+        # Fill room with enough history to exceed devstral's 32K limit
         room_id = "!test:server"
         history = agent.history(room_id)
-        # Add enough text to represent ~50K tokens (~200K chars)
         big_text = "x" * 200000
         history.append({"role": "user", "content": big_text})
 
-        # Model limits: if target model has 32K max, this should fail
+        # Devstral has explicit 32K limit — 50K tokens should be blocked
         result = agent.switch_model(
             "ollama/devstral-2:123b", room_id=room_id
         )
-        # With a conservative 32K default for unknown models, 50K tokens should be blocked
         assert result is not None
         assert "context" in result.lower() or "exceed" in result.lower()
+
+    def test_switch_model_unknown_model_uses_config_max(self, tmp_path):
+        """Unknown model defaults to config.model_max_tokens, not conservative 32K."""
+        (tmp_path / "SAFETY.md").write_text("")
+        config = make_multi_config(
+            workspace=str(tmp_path),
+            model_max_tokens=131072,
+            max_tokens=8192,
+        )
+        from openalph.agent import Agent
+        agent = Agent(config)
+
+        # Fill room with ~35K tokens (~140K chars) — would exceed old 32K default but not 131K
+        room_id = "!test:server"
+        history = agent.history(room_id)
+        big_text = "x" * 140000
+        history.append({"role": "user", "content": big_text})
+
+        # Should succeed: 35K tokens is well under 131K - 8K = 123K
+        result = agent.switch_model(
+            "openrouter/moonshotai/kimi-k2.5", room_id=room_id
+        )
+        assert result is None  # None = success
 
     def test_switch_model_requires_fully_qualified(self, tmp_path):
         """switch_model() with unqualified model string on multi-provider config errors."""
@@ -1069,3 +1091,27 @@ class TestSanitizeError:
         from openalph.provider import _sanitize_error
         msg = "Auth failed: sk-or-v1-abc123def456ghi789jkl012"
         assert "sk-or" not in _sanitize_error(msg)
+
+    def test_extracts_message_from_sdk_error_format(self):
+        from openalph.provider import _sanitize_error
+        msg = "Error code: 400 - {'error': {'message': 'blippy is not a valid model ID', 'code': 400}, 'user_id': 'user_3AGLP2f1uNwUKjrWbWc4TYjfq6o'}"
+        result = _sanitize_error(msg)
+        assert result == "blippy is not a valid model ID"
+        assert "user_" not in result
+
+    def test_extracts_message_from_json_like_body(self):
+        from openalph.provider import _sanitize_error
+        msg = "Error code: 404 - {'error': {'message': 'model not found: bongo', 'type': 'not_found_error'}}"
+        assert _sanitize_error(msg) == "model not found: bongo"
+
+    def test_preserves_original_on_unparseable_body(self):
+        from openalph.provider import _sanitize_error
+        msg = "Error code: 500 - garbled response"
+        assert _sanitize_error(msg) == "Error code: 500 - garbled response"
+
+    def test_strips_key_from_extracted_message(self):
+        from openalph.provider import _sanitize_error
+        msg = "Error code: 401 - {'error': {'message': 'Invalid key: sk-ant-api03-abc123xyz456'}}"
+        result = _sanitize_error(msg)
+        assert "sk-ant" not in result
+        assert "[REDACTED]" in result

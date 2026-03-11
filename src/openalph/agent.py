@@ -177,9 +177,9 @@ class Agent:
         if has_images:
             return f"Cannot switch to {model_str} — session contains images and model may not support vision."
 
-        # Context window guard: check current context vs conservative default (32K)
-        # Use model_limits from config if available, else 32K default
-        model_limit = self.config.model_limits.get(model_str, 32000)
+        # Context window guard: check current context vs model limit
+        # Use model_limits from config if available, else config.model_max_tokens
+        model_limit = self.config.model_limits.get(model_str, self.config.model_max_tokens)
         context_tokens = self._estimate_context_tokens(room_id)
         if context_tokens > model_limit - self.config.max_tokens:
             return f"Cannot switch to {model_str} — current context (~{context_tokens:,} tokens) exceeds model limit ({model_limit:,})."

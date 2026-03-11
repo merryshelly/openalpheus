@@ -28,7 +28,29 @@ _API_KEY_PATTERN = re.compile(r'\b(sk-[a-zA-Z0-9_-]{10,})\b')
 
 
 def _sanitize_error(message: str) -> str:
-    """Strip potential API keys from error messages."""
+    """Extract clean error message and strip sensitive data.
+
+    SDK error messages come as 'Error code: NNN - {body_dict}'.
+    Extract just the meaningful error text from the body when possible.
+    Always strip API key patterns as a safety net.
+    """
+    # Try to extract the error message from SDK's formatted string
+    # Format: "Error code: 400 - {'error': {'message': '...', ...}, ...}"
+    import ast
+    if " - " in message and message.startswith("Error code:"):
+        _, _, body_str = message.partition(" - ")
+        try:
+            body = ast.literal_eval(body_str.strip())
+            if isinstance(body, dict):
+                # OpenRouter/OpenAI: {"error": {"message": "..."}}
+                err = body.get("error", {})
+                if isinstance(err, dict) and "message" in err:
+                    message = err["message"]
+                # Anthropic: {"error": {"message": "..."}} or {"message": "..."}
+                elif "message" in body:
+                    message = body["message"]
+        except (ValueError, SyntaxError):
+            pass  # Keep original message if parsing fails
     return _API_KEY_PATTERN.sub('[REDACTED]', message)
 
 # Client cache: reuse HTTP clients for connection pooling.
