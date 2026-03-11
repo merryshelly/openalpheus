@@ -68,21 +68,32 @@ class AgentConfig:
 
 
 def resolve_model(model_str: str, providers: dict[str, ProviderConfig]) -> tuple[ProviderConfig, str]:
-    """Returns (provider_config, api_model_name)."""
+    """Returns (provider_config, api_model_name).
+
+    Parsing rule: split on first "/". If the prefix matches a provider key,
+    route to that provider with the remainder as the API model name.
+    If no match, fall back to the "default" provider (legacy configs) with
+    the full string as the model name. Otherwise raise ValueError.
+    """
     if not model_str:
         raise ValueError("Model string cannot be empty")
     prefix, sep, remainder = model_str.partition("/")
-    if sep:
-        # Model string contains "/" - treat as provider-prefixed
-        if prefix in providers:
-            return providers[prefix], remainder
-        # Prefix not found in providers
-        raise ValueError(f"Unknown provider prefix '{prefix}' in model '{model_str}'")
-    # Backward compat: un-prefixed string (no "/")
-    if len(providers) == 1:
-        return next(iter(providers.values())), model_str
+    if sep and prefix in providers:
+        # Explicit provider prefix matched
+        return providers[prefix], remainder
+    # No match on prefix — try "default" provider (legacy backward compat)
+    # This handles both unprefixed strings ("claude-opus-4-6") and
+    # legacy model names with slashes ("moonshotai/kimi-k2.5") where
+    # the first segment isn't a provider key.
     if "default" in providers:
         return providers["default"], model_str
+    # No default provider — require explicit prefix
+    if sep:
+        raise ValueError(f"Unknown provider prefix '{prefix}' in model '{model_str}'")
+    raise ValueError(
+        f"Cannot resolve model '{model_str}': no provider prefix and no "
+        f"'default' provider configured. Use '<provider>/{model_str}' format."
+    )
     raise ValueError(f"Cannot resolve model '{model_str}': ambiguous provider (multiple providers configured, none named 'default')")
 
 

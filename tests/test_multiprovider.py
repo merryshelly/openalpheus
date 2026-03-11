@@ -230,7 +230,7 @@ class TestResolveModel:
             "openrouter": make_provider(key="openrouter", type="openai",
                                         base_url="https://openrouter.ai/api/v1"),
         }
-        with pytest.raises(ValueError, match="ambiguous"):
+        with pytest.raises(ValueError, match="no provider prefix"):
             resolve_model("claude-opus-4-6", providers)
 
     def test_resolve_unknown_prefix_raises(self):
