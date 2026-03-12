@@ -317,9 +317,9 @@ class TestCircuitBreaker:
         assert mock_exec.call_count == MAX_ITERATIONS
 
     @pytest.mark.asyncio
-    async def test_max_iterations_is_10(self):
-        """Circuit breaker is set to 10 iterations."""
-        assert MAX_ITERATIONS == 10
+    async def test_max_iterations_is_100(self):
+        """Circuit breaker is set to 100 iterations."""
+        assert MAX_ITERATIONS == 100
 
 
 class TestErrorHandling:
