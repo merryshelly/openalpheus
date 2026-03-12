@@ -107,9 +107,11 @@ def is_gated(config, room) -> bool:
 def strip_mention(user_id: str, body: str) -> str:
     """Strip the agent's mention from the message body.
 
-    Removes the first occurrence of:
+    Removes the first occurrence of (case-insensitive):
     1. Full user_id (e.g., "@watson:matrix.local")
-    2. @localpart (e.g., "@watson") with word boundary
+    2. @localpart (e.g., "@watson")
+    3. Bare localpart without @ (e.g., "watson", "SAW")
+       — clients often insert the display name, not the user ID
 
     Cleans up leading colon/comma left by mention formatting
     (e.g., "@watson: /status" -> "/status").
@@ -121,19 +123,27 @@ def strip_mention(user_id: str, body: str) -> str:
     Returns:
         Cleaned body with mention removed and whitespace normalized
     """
-    # Try full user_id first
-    if user_id in body:
-        body = body.replace(user_id, "", 1)
-    else:
-        # Try @localpart with word boundary
-        localpart = user_id.split(":")[0] if ":" in user_id else user_id
-        escaped = re.escape(localpart)
-        pattern = rf"{escaped}(?=$|\s|[,;:!?.])"
-        body = re.sub(pattern, "", body, count=1)
+    localpart = user_id.split(":")[0] if ":" in user_id else user_id
+    bare_name = localpart.lstrip("@")
+
+    # Try patterns in order of specificity (case-insensitive)
+    patterns = [
+        re.escape(user_id),                     # @saw:matrix.local
+        re.escape(localpart),                    # @saw
+        re.escape(bare_name),                    # saw / SAW
+    ]
+
+    stripped = False
+    for pat in patterns:
+        full_pattern = rf"(?i){pat}(?=$|\s|[,;:!?.])"
+        if re.search(full_pattern, body):
+            body = re.sub(full_pattern, "", body, count=1)
+            stripped = True
+            break
 
     # Collapse runs of whitespace left by removal, then strip edges
     body = re.sub(r"  +", " ", body).strip()
-    # Strip leading post-mention punctuation (e.g., "@watson: /status" → ": /status" → "/status")
+    # Strip leading post-mention punctuation (e.g., "@watson: /status" -> "/status")
     if body and body[0] in ":,":
         body = body[1:].strip()
     return body

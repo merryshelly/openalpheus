@@ -253,8 +253,8 @@ class TestThinkingBlockDataclass:
 class TestThinkingRoundTripping:
     """Thinking blocks in history must be sent back to the API."""
 
-    def test_assistant_with_thinking_includes_blocks(self):
-        """Assistant message with thinking blocks includes them in Anthropic format."""
+    def test_assistant_with_thinking_blocks_stripped(self):
+        """Thinking blocks are stripped before conversion (JSONL can't guarantee fidelity)."""
         messages = [
             {"role": "user", "content": "What is 2+2?"},
             {
@@ -268,22 +268,13 @@ class TestThinkingRoundTripping:
         ]
         result = _convert_messages_for_anthropic(messages)
 
-        # Assistant message should have thinking + text content blocks
+        # Thinking stripped — assistant message should be plain string content
         assistant = result[1]
         assert assistant["role"] == "assistant"
-        assert isinstance(assistant["content"], list)
+        assert assistant["content"] == "4"
 
-        # First block should be thinking
-        assert assistant["content"][0]["type"] == "thinking"
-        assert assistant["content"][0]["thinking"] == "Simple arithmetic"
-        assert assistant["content"][0]["signature"] == "sigABC"
-
-        # Second block should be text
-        assert assistant["content"][1]["type"] == "text"
-        assert assistant["content"][1]["text"] == "4"
-
-    def test_empty_signature_demoted_to_text(self):
-        """Thinking block with empty signature becomes plain text."""
+    def test_empty_signature_stripped_with_rest(self):
+        """Thinking blocks with empty signatures are stripped like all others."""
         messages = [
             {"role": "user", "content": "Hello"},
             {
@@ -296,19 +287,10 @@ class TestThinkingRoundTripping:
         ]
         result = _convert_messages_for_anthropic(messages)
         assistant = result[1]
-        assert isinstance(assistant["content"], list)
+        assert assistant["content"] == "Hi"
 
-        # Should be two text blocks, no thinking block
-        types = [b["type"] for b in assistant["content"]]
-        assert "thinking" not in types
-        # The demoted thinking should be a text block
-        assert assistant["content"][0]["type"] == "text"
-        assert assistant["content"][0]["text"] == "Some aborted thought"
-        assert assistant["content"][1]["type"] == "text"
-        assert assistant["content"][1]["text"] == "Hi"
-
-    def test_none_signature_demoted_to_text(self):
-        """Thinking block with None signature becomes plain text."""
+    def test_none_signature_stripped_with_rest(self):
+        """Thinking blocks with None signatures are stripped like all others."""
         messages = [
             {"role": "user", "content": "Hello"},
             {
@@ -321,8 +303,7 @@ class TestThinkingRoundTripping:
         ]
         result = _convert_messages_for_anthropic(messages)
         assistant = result[1]
-        types = [b["type"] for b in assistant["content"]]
-        assert "thinking" not in types
+        assert assistant["content"] == "Hi"
 
     def test_no_thinking_key_unchanged(self):
         """Assistant messages without thinking key work as before."""
@@ -333,8 +314,8 @@ class TestThinkingRoundTripping:
         result = _convert_messages_for_anthropic(messages)
         assert result[1] == {"role": "assistant", "content": "Hello"}
 
-    def test_thinking_with_tool_calls(self):
-        """Thinking blocks + tool calls in same assistant message."""
+    def test_thinking_stripped_tool_calls_preserved(self):
+        """Thinking stripped but tool_calls still convert to tool_use blocks."""
         from openalph.provider import ToolCall
         messages = [
             {"role": "user", "content": "Read my file"},
@@ -354,11 +335,9 @@ class TestThinkingRoundTripping:
         assert isinstance(assistant["content"], list)
 
         types = [b["type"] for b in assistant["content"]]
-        assert types == ["thinking", "tool_use"]
-        # No empty text block when content is ""
+        assert "thinking" not in types
+        assert "tool_use" in types
 
-
-# ---------------------------------------------------------------------------
 # Anthropic API call: adaptive thinking
 # ---------------------------------------------------------------------------
 
@@ -467,8 +446,8 @@ class TestBudgetThinkingAPICall:
 
         kw = client.messages.create.call_args.kwargs
         assert kw["thinking"] == {"type": "enabled", "budget_tokens": 16384}
-        # max_tokens should be adjusted: base + budget
-        assert kw["max_tokens"] == 8192 + 16384
+        # max_tokens adjusted (base + budget) then capped for non-streaming
+        assert kw["max_tokens"] == 21000  # capped from 24576
 
     @pytest.mark.asyncio
     async def test_budget_thinking_low(self):

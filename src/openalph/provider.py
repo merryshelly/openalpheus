@@ -27,6 +27,52 @@ class ProviderError(Exception):
 
 _API_KEY_PATTERN = re.compile(r'\b(sk-[a-zA-Z0-9_-]{10,})\b')
 
+# ---------------------------------------------------------------------------
+# Degeneration detection
+# ---------------------------------------------------------------------------
+# Minimum consecutive identical characters to trigger truncation.
+_DEGEN_CHAR_THRESHOLD = 50
+_DEGEN_WARNING = (
+    "\n\n⚠️ *Output truncated — repetition collapse detected. "
+    "Session context may be degraded; consider starting a new session (`/new`).*"
+)
+
+# Default frequency_penalty for OpenAI-compatible providers.
+# Discourages token repetition at the sampling level.  Moderate value
+# that shouldn't affect normal output but raises the cost of degenerate loops.
+_DEFAULT_FREQUENCY_PENALTY = 0.3
+
+
+def _detect_and_truncate_degeneration(text: str) -> tuple[str, bool]:
+    """Detect degenerate repetition in model output.
+
+    Checks for runs of identical characters >= _DEGEN_CHAR_THRESHOLD.
+    When found, truncates at the start of the degenerate run and appends
+    a warning.
+
+    Returns (possibly_truncated_text, was_degenerate).
+    """
+    if not text or len(text) < _DEGEN_CHAR_THRESHOLD:
+        return text, False
+
+    run_start = 0
+    run_len = 1
+
+    for i in range(1, len(text)):
+        if text[i] == text[i - 1]:
+            run_len += 1
+            if run_len >= _DEGEN_CHAR_THRESHOLD:
+                truncated = text[:run_start].rstrip()
+                if not truncated:
+                    # Entire output is degenerate
+                    return _DEGEN_WARNING.lstrip(), True
+                return truncated + _DEGEN_WARNING, True
+        else:
+            run_start = i
+            run_len = 1
+
+    return text, False
+
 
 def _sanitize_error(message: str) -> str:
     """Extract clean error message and strip sensitive data.
@@ -91,6 +137,10 @@ class ToolCall:
     name: str
     input: dict
 
+    def __post_init__(self):
+        # Models occasionally emit tool names with leading/trailing whitespace
+        self.name = self.name.strip()
+
 
 @dataclass
 class ThinkingBlock:
@@ -106,6 +156,7 @@ class Response:
     stop_reason: str = ""
     tool_calls: list[ToolCall] = None
     thinking: list[ThinkingBlock] = None
+    degenerate: bool = False
 
     def __post_init__(self):
         if self.tool_calls is None:
@@ -193,7 +244,21 @@ def _convert_messages_for_provider(messages: list[dict], provider_type: str) -> 
 
 
 def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
-    """Convert normalized messages to Anthropic format."""
+    """Convert normalized messages to Anthropic format.
+
+    Thinking blocks are stripped from all assistant messages.  Anthropic
+    cryptographically signs thinking blocks and rejects any modification,
+    but JSONL round-tripping cannot guarantee byte-perfect fidelity.
+    Stripping is safe: the thinking already influenced the response and
+    replaying it wastes context tokens.
+    """
+    # Strip thinking from all assistant messages before conversion
+    messages = [
+        {k: v for k, v in msg.items() if k != "thinking"}
+        if msg.get("role") == "assistant" else msg
+        for msg in messages
+    ]
+
     result = []
     for msg in messages:
         role = msg.get("role")
@@ -255,9 +320,14 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
                             "text": tb.get("thinking", ""),
                         })
             
-            # Add text content (if any and if there are tool_calls, or if no thinking to avoid empty content)
-            if content or not thinking:
+            # Add text content if non-empty, or if there are no other blocks
+            # (Anthropic rejects empty text blocks alongside tool_use)
+            if content:
                 content_blocks.append({"type": "text", "text": content})
+            elif not content_blocks and not tool_calls:
+                # No content at all and no tool calls — keep empty text to avoid
+                # sending a message with zero content blocks
+                content_blocks.append({"type": "text", "text": ""})
             
             # Add tool_use blocks
             if tool_calls:
@@ -533,6 +603,15 @@ async def complete(
                 api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
                 api_kwargs["max_tokens"] = adjusted_max
         
+        # Cap max_tokens for non-streaming Anthropic calls.
+        # The SDK rejects requests where estimated time > 10 min:
+        #   expected = 3600 * max_tokens / 128000; raises if > 600s
+        # Safe ceiling: floor(128000 * 600 / 3600) = 21333
+        # This only affects the API call; config stays uncapped.
+        _ANTHROPIC_NONSTREAMING_MAX = 21_000
+        if api_kwargs.get("max_tokens", 0) > _ANTHROPIC_NONSTREAMING_MAX:
+            api_kwargs["max_tokens"] = _ANTHROPIC_NONSTREAMING_MAX
+
         try:
             response = await client.messages.create(**api_kwargs)
         except anthropic.APIStatusError as e:
@@ -545,7 +624,9 @@ async def complete(
             raise ProviderError("Provider unreachable — connection failed") from e
         
         # Parse Anthropic response into normalized format
-        return _parse_anthropic_response(response)
+        result = _parse_anthropic_response(response)
+        result.content, result.degenerate = _detect_and_truncate_degeneration(result.content)
+        return result
     
     elif provider_cfg.type == "openai":
         # OpenAI path: prepend system message and use their API shape
@@ -572,6 +653,7 @@ async def complete(
             "model": api_model,
             "messages": messages_with_system,
             "max_tokens": tokens,
+            "frequency_penalty": _DEFAULT_FREQUENCY_PENALTY,
         }
         if provider_tools:
             api_kwargs["tools"] = provider_tools
@@ -592,7 +674,9 @@ async def complete(
             raise ProviderError("Provider unreachable — connection failed") from e
         
         # Parse OpenAI response into normalized format
-        return _parse_openai_response(response)
+        result = _parse_openai_response(response)
+        result.content, result.degenerate = _detect_and_truncate_degeneration(result.content)
+        return result
     
     else:
         # This shouldn't happen if config is validated, but we'll raise a clear error

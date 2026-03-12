@@ -141,7 +141,7 @@ class TestTemporalDecay:
                         score=1.0, snippet="today", source="memory"),
         ]
         decayed = apply_temporal_decay(
-            results, half_life_days=30, now_ms=1741651200000  # 2026-03-10
+            results, half_life_days=30, now_ms=1773100800000  # 2026-03-10
         )
         assert decayed[0].score > 0.95
 
@@ -152,7 +152,7 @@ class TestTemporalDecay:
                         score=1.0, snippet="old", source="memory"),
         ]
         decayed = apply_temporal_decay(
-            results, half_life_days=30, now_ms=1741651200000  # 2026-03-10
+            results, half_life_days=30, now_ms=1773100800000  # 2026-03-10
         )
         # 60 days / 30 day half-life = 2 half-lives → score ≈ 0.25
         assert decayed[0].score < 0.35
@@ -164,7 +164,7 @@ class TestTemporalDecay:
                         score=1.0, snippet="evergreen", source="memory"),
         ]
         decayed = apply_temporal_decay(
-            results, half_life_days=30, now_ms=1741651200000
+            results, half_life_days=30, now_ms=1773100800000
         )
         assert decayed[0].score == 1.0
 
@@ -175,7 +175,7 @@ class TestTemporalDecay:
                         score=1.0, snippet="root", source="memory"),
         ]
         decayed = apply_temporal_decay(
-            results, half_life_days=30, now_ms=1741651200000
+            results, half_life_days=30, now_ms=1773100800000
         )
         assert decayed[0].score == 1.0
 
@@ -186,7 +186,7 @@ class TestTemporalDecay:
                         score=1.0, snippet="project", source="memory"),
         ]
         decayed = apply_temporal_decay(
-            results, half_life_days=30, now_ms=1741651200000
+            results, half_life_days=30, now_ms=1773100800000
         )
         # Not dated → evergreen → no decay
         assert decayed[0].score == 1.0

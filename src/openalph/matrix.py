@@ -196,8 +196,73 @@ class MatrixBot:
         }
         await self._room_send_with_retry(room_id, content)
 
+    # Matrix PDU limit is 65535 bytes.  HTML formatting roughly doubles
+    # the size of markdown, so we split at 25K *characters* to stay well
+    # under the wire-format limit in all cases.
+    MAX_MESSAGE_CHARS = 25_000
+
+    @staticmethod
+    def _split_message(text: str, limit: int | None = None) -> list[str]:
+        """Split a long message into chunks that fit within the PDU limit.
+
+        Splits on paragraph boundaries (double-newline) first, then on
+        single newlines, falling back to a hard cut only if a single
+        unbreakable block exceeds the limit.
+
+        Each chunk except the last gets a continuation footer and each
+        chunk except the first gets a continuation header so readers
+        know the message was split.
+
+        Returns a list of 1+ chunks.
+        """
+        if limit is None:
+            limit = MatrixBot.MAX_MESSAGE_CHARS
+
+        if len(text) <= limit:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+        # Reserve room for the continuation markers
+        marker_budget = len("\n\n[\u2026continued]")
+        effective = limit - marker_budget
+
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+
+            # Try to split on a paragraph boundary
+            candidate = remaining[:effective]
+            split_pos = candidate.rfind("\n\n")
+
+            # Fall back to single newline
+            if split_pos < effective // 4:
+                split_pos = candidate.rfind("\n")
+
+            # Hard cut as last resort
+            if split_pos < effective // 4:
+                split_pos = effective
+
+            chunk = remaining[:split_pos].rstrip()
+            remaining = remaining[split_pos:].lstrip("\n")
+            chunks.append(chunk)
+
+        # Add continuation markers
+        if len(chunks) > 1:
+            for i in range(len(chunks)):
+                if i < len(chunks) - 1:
+                    chunks[i] += "\n\n[\u2026continued]"
+                if i > 0:
+                    chunks[i] = "[\u2026continued]\n\n" + chunks[i]
+
+        return chunks
+
     async def send(self, room_id: str, text: str):
-        """Send a text message to a room.
+        """Send a text message to a room, splitting if too large.
+
+        Messages exceeding MAX_MESSAGE_CHARS are split on paragraph
+        boundaries and sent as sequential messages.
 
         Args:
             room_id: Matrix room ID
@@ -205,13 +270,15 @@ class MatrixBot:
 
         Retries on transient failures with exponential backoff.
         """
-        content = {
-            "msgtype": "m.text",
-            "body": text,
-            "format": "org.matrix.custom.html",
-            "formatted_body": mistune.html(text),
-        }
-        await self._room_send_with_retry(room_id, content)
+        chunks = self._split_message(text)
+        for chunk in chunks:
+            content = {
+                "msgtype": "m.text",
+                "body": chunk,
+                "format": "org.matrix.custom.html",
+                "formatted_body": mistune.html(chunk),
+            }
+            await self._room_send_with_retry(room_id, content)
 
     async def _cancel_current(self):
         """Cancel any current in-flight work.
@@ -502,8 +569,24 @@ class MatrixBot:
 
             # Wire tool visibility for this turn
             async def _tool_notice(call_id, name, input_data, result, is_error):
-                # Send abbreviated notice to Matrix room
-                notice_body = f"🔧 {name}: {str(result)[:200]}"
+                # Show tool name + brief input context, but NEVER output
+                # (which may contain secrets from op read, API responses, etc.)
+                status = "❌ error" if is_error else "✅"
+                detail = ""
+                if isinstance(input_data, dict):
+                    # Pick the most informative input field per tool type
+                    for key in ("path", "file_path", "command", "query", "url"):
+                        if key in input_data:
+                            val = str(input_data[key])[:120]
+                            detail = f" `{val}`"
+                            break
+                notice_body = f"🔧 {name}{detail} {status}"
+                # Refresh typing indicator — Matrix expires it after ~30s,
+                # so long tool loops look dead without this.
+                try:
+                    await self._set_typing(room_id, True)
+                except Exception:
+                    pass
                 try:
                     await self.send_notice(room_id, notice_body)
                 except Exception:

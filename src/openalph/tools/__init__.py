@@ -381,6 +381,24 @@ async def execute_tool(
         This is a stub that dispatches to tool-specific modules.
         Full implementation will be in Phase 2.
     """
+    # Validate tool name exists
+    if name not in BUILTIN_TOOLS:
+        return ToolResult(
+            content=f"Unknown tool: {name}. Available tools: {', '.join(BUILTIN_TOOLS.keys())}",
+            is_error=True,
+        )
+    
+    # Validate required parameters against schema
+    schema = BUILTIN_TOOLS[name]["parameters"]
+    required = schema.get("required", [])
+    missing = [p for p in required if p not in input]
+    if missing:
+        return ToolResult(
+            content=f"Missing required parameter(s): {', '.join(missing)}. "
+                    f"Expected: {', '.join(required)}. Got: {', '.join(input.keys())}",
+            is_error=True,
+        )
+    
     # Never mutate caller's input dict
     input = dict(input)
 
