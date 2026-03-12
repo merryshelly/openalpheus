@@ -449,6 +449,9 @@ class Agent:
             # Tool calls have input dicts — estimate their JSON size
             for tc in msg.get("tool_calls", []):
                 total_chars += len(str(tc.input))
+            # Thinking blocks can be large — include in estimate
+            for tb in msg.get("thinking", []):
+                total_chars += len(tb.get("thinking", ""))
         return total_chars // 4
 
     def status(self, room_id: str = "_default") -> dict:

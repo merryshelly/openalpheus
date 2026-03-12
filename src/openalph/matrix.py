@@ -88,6 +88,7 @@ class MatrixBot:
         self._synced = False
         self._current_room = None
         self._active_rooms = set()
+        self._room_thinking = {}
         self.heartbeat = HeartbeatManager(
             config_path=Path(agent.config.workspace) / "heartbeats.json",
             callback=self._inject_heartbeat,
@@ -790,7 +791,7 @@ class MatrixBot:
             parts = body.split(None, 1)
             if len(parts) < 2:
                 # Show current thinking level
-                current = getattr(self, '_room_thinking', {}).get(room_id)
+                current = self._room_thinking.get(room_id)
                 if current is None:
                     current = getattr(self.agent.config, 'thinking', 'off')
                     source = "config"
@@ -803,8 +804,6 @@ class MatrixBot:
             if level not in valid_levels:
                 await self.send(room_id, f"Invalid level. Use: {', '.join(valid_levels)}")
                 return
-            if not hasattr(self, '_room_thinking'):
-                self._room_thinking = {}
             self._room_thinking[room_id] = level
             await self.send(room_id, f"Thinking set to **{level}** for this room")
             return

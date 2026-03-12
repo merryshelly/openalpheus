@@ -5,6 +5,7 @@ Routes completion requests to either Anthropic or OpenAI SDKs based on configura
 The adapter handles the differences in API shapes and response formats between providers.
 """
 
+import copy
 from dataclasses import dataclass
 import json
 import re
@@ -500,16 +501,18 @@ async def complete(
         if provider_tools:
             api_kwargs["tools"] = provider_tools
         
-        # Add prompt caching to last user message
+        # Add prompt caching to last user message.
+        # Deep copy the target message to avoid mutating the caller's history
+        # dicts (shared references from agent.py's shallow list copy).
         if api_kwargs["messages"]:
             last_msg = api_kwargs["messages"][-1]
             if last_msg.get("role") == "user":
+                last_msg = copy.deepcopy(last_msg)
+                api_kwargs["messages"][-1] = last_msg
                 msg_content = last_msg.get("content")
                 if isinstance(msg_content, str):
-                    # Convert string content to list with cache_control
                     last_msg["content"] = [{"type": "text", "text": msg_content, "cache_control": {"type": "ephemeral"}}]
                 elif isinstance(msg_content, list) and msg_content:
-                    # Add cache_control to last block
                     msg_content[-1]["cache_control"] = {"type": "ephemeral"}
         
         # Add thinking parameters if enabled

@@ -89,7 +89,6 @@ def resolve_model(model_str: str, providers: dict[str, ProviderConfig]) -> tuple
             f"Available providers: {', '.join(sorted(providers.keys()))}"
         )
     return providers[prefix], remainder
-    raise ValueError(f"Cannot resolve model '{model_str}': ambiguous provider (multiple providers configured, none named 'default')")
 
 
 def _resolve_api_key(section: dict) -> str:

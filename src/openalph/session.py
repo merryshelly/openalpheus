@@ -232,10 +232,38 @@ class SessionLog:
 
             elif role == "tool":
                 # Map call_id → tool_call_id to match agent.py format
-                context.append({
+                tool_entry = {
                     "role": "tool",
                     "tool_call_id": entry.get("call_id"),
                     "content": entry.get("output", ""),
-                })
+                }
+                if entry.get("is_error"):
+                    tool_entry["is_error"] = True
+                context.append(tool_entry)
+
+        # Strip orphaned tool_calls at the end of context (crash recovery).
+        # If the agent crashed mid-tool-loop, the JSONL will have an assistant
+        # message with tool_calls but no corresponding tool results. Sending
+        # this to the API causes errors (tool_use requires tool_result).
+        while context:
+            last = context[-1]
+            if last.get("role") == "assistant" and last.get("tool_calls"):
+                # Check if all tool_calls have matching tool results
+                needed_ids = {tc.id for tc in last["tool_calls"]}
+                # Look backwards for tool results matching these IDs
+                found_ids = set()
+                for entry in context:
+                    if entry.get("role") == "tool" and entry.get("tool_call_id") in needed_ids:
+                        found_ids.add(entry["tool_call_id"])
+                if needed_ids - found_ids:
+                    # Orphaned tool_calls — strip this assistant message
+                    logger.warning(
+                        "Stripping orphaned assistant+tool_calls from context "
+                        "(crash recovery): missing results for %s",
+                        needed_ids - found_ids,
+                    )
+                    context.pop()
+                    continue
+            break
 
         return context

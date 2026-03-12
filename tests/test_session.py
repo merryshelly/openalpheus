@@ -349,6 +349,9 @@ class TestBuildContext:
         tool_calls = [{"call_id": "c1", "name": "shell", "input": {"command": "uptime"}}]
         sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id="$e1",
                   content="", tool_calls=tool_calls)
+        # Add matching tool result so crash recovery doesn't strip it
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="c1", name="shell", output="up 10 days")
 
         ctx = sl.build_context(ROOM_ID)
         rehydrated = ctx[0]["tool_calls"]
@@ -358,6 +361,39 @@ class TestBuildContext:
         assert tc.id == "c1"
         assert tc.name == "shell"
         assert tc.input == {"command": "uptime"}
+        # Tool result should also be present
+        assert ctx[1]["role"] == "tool"
+        assert ctx[1]["tool_call_id"] == "c1"
+
+    def test_build_context_strips_orphaned_tool_calls(self, tmp_path):
+        """Crash recovery: orphaned tool_calls at end of context are stripped."""
+        sl = make_session_log(tmp_path)
+        # User message followed by assistant with tool_calls but NO tool results
+        # (simulates crash mid-tool-loop)
+        sl.append(role="user", sender="@sb:matrix.local", room=ROOM_ID,
+                  event_id="$u1", content="check uptime")
+        tool_calls = [{"call_id": "c1", "name": "shell", "input": {"command": "uptime"}}]
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id="$e1",
+                  content="", tool_calls=tool_calls)
+
+        ctx = sl.build_context(ROOM_ID)
+        # Orphaned assistant+tool_calls should be stripped, leaving only the user message
+        assert len(ctx) == 1
+        assert ctx[0]["role"] == "user"
+        assert ctx[0]["content"] == "check uptime"
+
+    def test_build_context_tool_result_includes_is_error(self, tmp_path):
+        """Tool results preserve is_error flag through rehydration."""
+        sl = make_session_log(tmp_path)
+        tool_calls = [{"call_id": "c1", "name": "shell", "input": {"command": "fail"}}]
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id="$e1",
+                  content="", tool_calls=tool_calls)
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="c1", name="shell", output="command not found", is_error=True)
+
+        ctx = sl.build_context(ROOM_ID)
+        assert ctx[1]["role"] == "tool"
+        assert ctx[1]["is_error"] is True
 
     def test_build_context_assistant_no_tool_calls(self, tmp_path):
         sl = make_session_log(tmp_path)
