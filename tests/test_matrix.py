@@ -279,6 +279,150 @@ class TestCommands:
         agent.handle_input.assert_not_called()
 
 
+
+
+class TestThinkingCommand:
+    """Tests for /thinking command — per-room thinking level control."""
+
+    def _make_bot(self):
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.config = MagicMock()
+        agent.config.thinking = "off"
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot._set_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._room_thinking = {}
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_thinking_show_default(self):
+        """/thinking with no args shows config default when no room override."""
+        bot = self._make_bot()
+        bot.agent.config.thinking = "medium"
+
+        event = make_room_message("@sb:matrix.local", "/thinking")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "medium" in sent.get("body", "")
+        assert "config" in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_thinking_show_override(self):
+        """/thinking with no args shows room override when set."""
+        bot = self._make_bot()
+        bot._room_thinking["!test:matrix.local"] = "high"
+
+        event = make_room_message("@sb:matrix.local", "/thinking")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "high" in sent.get("body", "")
+        assert "override" in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_thinking_set_valid_level(self):
+        """/thinking high sets room-level override."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/thinking high")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        assert bot._room_thinking["!test:matrix.local"] == "high"
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "high" in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_thinking_set_off(self):
+        """/thinking off disables thinking for the room."""
+        bot = self._make_bot()
+        bot._room_thinking["!test:matrix.local"] = "high"
+
+        event = make_room_message("@sb:matrix.local", "/thinking off")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        assert bot._room_thinking["!test:matrix.local"] == "off"
+
+    @pytest.mark.asyncio
+    async def test_thinking_invalid_level_rejected(self):
+        """/thinking banana rejects invalid levels."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/thinking banana")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        assert "!test:matrix.local" not in bot._room_thinking
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "Invalid" in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_thinking_case_insensitive(self):
+        """/thinking HIGH is normalized to lowercase."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/thinking HIGH")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        assert bot._room_thinking["!test:matrix.local"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_thinking_does_not_reach_agent(self):
+        """/thinking command does not trigger agent processing."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/thinking low")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+
+        bot.agent.handle_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thinking_override_used_in_processing(self):
+        """Room thinking override is passed to agent.handle_input."""
+        bot = self._make_bot()
+        bot.agent.handle_input = AsyncMock(return_value="OK")
+        bot._active_rooms = {"!test:matrix.local"}
+        bot._room_thinking["!test:matrix.local"] = "high"
+        bot.session_log = None
+
+        event = make_room_message("@sb:matrix.local", "hello")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+        room.users = {"@sb:matrix.local": MagicMock(), "@merry:matrix.local": MagicMock()}
+
+        await bot._handle_room_message(room, event)
+
+        call_kwargs = bot.agent.handle_input.call_args.kwargs
+        assert call_kwargs.get("thinking") == "high"
+
+
 # --- Typing Indicator ---
 
 
