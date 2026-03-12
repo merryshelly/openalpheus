@@ -342,35 +342,217 @@ class TestTomlOverride:
 # --- Commands Bypass Gating ---
 
 
-class TestCommandsBypassGating:
-    """/stop and /status work in gated rooms without @mention."""
+class TestCommandsGatedInSharedRooms:
+    """All commands require @mention in gated rooms (kdsn.60)."""
 
     @pytest.mark.asyncio
-    async def test_stop_works_in_gated_room(self, tmp_path):
-        """"/stop" in gated room without mention → still cancels."""
+    async def test_bare_stop_ignored_in_gated_room(self, tmp_path):
+        """"/stop" in gated room without mention → ignored (buffered only)."""
         bot, agent = make_bot(tmp_path)
         room = make_room("!group:matrix.local", 3)
         event = make_event("@alice:matrix.local", "/stop")
-        
+
         await bot._handle_room_message(room, event)
-        
-        # /stop should have triggered cancel, not agent processing
+
         agent.handle_input.assert_not_called()
+        # Should send a hint notice, not a status/cancel response
+        if bot.send_notice.called:
+            msg = bot.send_notice.call_args[0][1]
+            assert "@watson" in msg
 
     @pytest.mark.asyncio
-    async def test_status_works_in_gated_room(self, tmp_path):
-        """"/status" in gated room without mention → still responds."""
+    async def test_bare_status_ignored_in_gated_room(self, tmp_path):
+        """"/status" in gated room without mention → ignored (hint sent)."""
         bot, agent = make_bot(tmp_path)
         room = make_room("!group:matrix.local", 3)
         event = make_event("@alice:matrix.local", "/status")
-        
-        bot._active_rooms.add("!group:matrix.local")
-        
+
         await bot._handle_room_message(room, event)
-        
-        # /status should send status, not process through agent
+
+        agent.handle_input.assert_not_called()
+        # Should NOT send a real status response
+        bot.send.assert_not_called()
+        # Should send a hint notice
+        bot.send_notice.assert_called_once()
+        msg = bot.send_notice.call_args[0][1]
+        assert "@watson" in msg
+
+    @pytest.mark.asyncio
+    async def test_bare_model_ignored_in_gated_room(self, tmp_path):
+        """"/model foo" in gated room without mention → ignored."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event("@alice:matrix.local", "/model openrouter/foo")
+
+        await bot._handle_room_message(room, event)
+
+        bot.send.assert_not_called()
+        bot.send_notice.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_bare_command_buffered_to_session_log(self, tmp_path):
+        """Bare command in gated room is still buffered to session JSONL."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event("@alice:matrix.local", "/status")
+
+        await bot._handle_room_message(room, event)
+
+        entries = bot.session_log.read("!group:matrix.local")
+        user_entries = [e for e in entries if e["role"] == "user"]
+        assert len(user_entries) >= 1
+        assert user_entries[-1]["content"] == "/status"
+        assert user_entries[-1]["mentioned"] is False
+
+
+class TestMentionScopedCommands:
+    """@mention + command in gated rooms → only mentioned agent processes."""
+
+    @pytest.mark.asyncio
+    async def test_mentioned_stop_cancels(self, tmp_path):
+        """@watson /stop → cancels Watson's current work."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event(
+            "@alice:matrix.local", "@watson /stop",
+            mentions_user_ids=["@watson:matrix.local"],
+        )
+
+        await bot._handle_room_message(room, event)
+
+        # Should have triggered cancel
+        agent.handle_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mentioned_status_responds(self, tmp_path):
+        """@watson /status → Watson responds with status."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event(
+            "@alice:matrix.local", "@watson:matrix.local /status",
+            mentions_user_ids=["@watson:matrix.local"],
+        )
+
+        bot._active_rooms.add("!group:matrix.local")
+
+        await bot._handle_room_message(room, event)
+
         agent.handle_input.assert_not_called()
         bot.send.assert_called_once()
+        msg = bot.send.call_args[0][1]
+        assert "watson" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_mentioned_model_switches(self, tmp_path):
+        """@watson /model openrouter/foo → Watson switches model."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event(
+            "@alice:matrix.local",
+            "@watson:matrix.local /model openrouter/foo",
+            mentions_user_ids=["@watson:matrix.local"],
+        )
+        agent.switch_model = MagicMock(return_value=None)
+
+        await bot._handle_room_message(room, event)
+
+        agent.switch_model.assert_called_once_with("openrouter/foo", "!group:matrix.local")
+        bot.send.assert_called_once()
+        assert "openrouter/foo" in bot.send.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_mentioned_showprompt_responds(self, tmp_path):
+        """@watson /showprompt → Watson shows prompt."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event(
+            "@alice:matrix.local",
+            "@watson /showprompt",
+            mentions_user_ids=["@watson:matrix.local"],
+        )
+        agent.system_prompt = "Test prompt"
+        agent.tools = []
+
+        await bot._handle_room_message(room, event)
+
+        bot.send.assert_called_once()
+        assert "Test prompt" in bot.send.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_mentioned_heartbeat_start(self, tmp_path):
+        """@watson /heartbeat start 6h → Watson starts heartbeat."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event(
+            "@alice:matrix.local",
+            "@watson /heartbeat start 6h",
+            mentions_user_ids=["@watson:matrix.local"],
+        )
+
+        await bot._handle_room_message(room, event)
+
+        bot.send.assert_called_once()
+        msg = bot.send.call_args[0][1]
+        assert "heartbeat" in msg.lower() or "6h" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_other_agent_mentioned_ignored(self, tmp_path):
+        """@babson /status in room → Watson ignores (not mentioned)."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!group:matrix.local", 3)
+        event = make_event(
+            "@alice:matrix.local",
+            "@babson:matrix.local /status",
+            mentions_user_ids=["@babson:matrix.local"],
+        )
+
+        await bot._handle_room_message(room, event)
+
+        agent.handle_input.assert_not_called()
+        # Watson should not respond to Babson's command
+        bot.send.assert_not_called()
+
+
+class TestCommandsInDMRoomsUnchanged:
+    """2-member rooms: all commands work without @mention (no change)."""
+
+    @pytest.mark.asyncio
+    async def test_bare_stop_works_in_dm(self, tmp_path):
+        """"/stop" in DM room → cancels (no mention needed)."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!dm:matrix.local", 2)
+        event = make_event("@alice:matrix.local", "/stop")
+
+        await bot._handle_room_message(room, event)
+
+        # Should have triggered cancel path (not agent processing)
+        agent.handle_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bare_status_works_in_dm(self, tmp_path):
+        """"/status" in DM room → responds (no mention needed)."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!dm:matrix.local", 2)
+        event = make_event("@alice:matrix.local", "/status")
+
+        bot._active_rooms.add("!dm:matrix.local")
+
+        await bot._handle_room_message(room, event)
+
+        agent.handle_input.assert_not_called()
+        bot.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_bare_model_works_in_dm(self, tmp_path):
+        """"/model foo" in DM → switches model (no mention needed)."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!dm:matrix.local", 2)
+        event = make_event("@alice:matrix.local", "/model openrouter/foo")
+        agent.switch_model = MagicMock(return_value=None)
+
+        await bot._handle_room_message(room, event)
+
+        agent.switch_model.assert_called_once()
 
 
 # --- Room Transition ---

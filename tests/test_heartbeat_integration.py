@@ -72,13 +72,15 @@ def make_room(room_id, member_count):
     return room
 
 
-def make_event(sender, body, event_id="$evt1"):
+def make_event(sender, body, event_id="$evt1", mentions_user_ids=None):
     event = MagicMock()
     event.sender = sender
     event.body = body
     event.event_id = event_id
     event.server_timestamp = 1000000
     content = {"msgtype": "m.text", "body": body}
+    if mentions_user_ids is not None:
+        content["m.mentions"] = {"user_ids": mentions_user_ids}
     event.source = {"content": content}
     return event
 
@@ -363,12 +365,14 @@ class TestHeartbeatCommands:
 # --- Gating Bypass ---
 
 
-class TestHeartbeatBypassesGating:
-    @pytest.mark.asyncio
-    async def test_command_works_in_gated_room_without_mention(self, tmp_path):
-        """/heartbeat in a gated room (3+ members) without @mention → processed.
+class TestHeartbeatGatedInSharedRooms:
+    """Heartbeat commands require @mention in gated rooms (kdsn.60)."""
 
-        Consistent with /stop and /status behavior.
+    @pytest.mark.asyncio
+    async def test_bare_heartbeat_ignored_in_gated_room(self, tmp_path):
+        """/heartbeat in a gated room (3+ members) without @mention → ignored.
+
+        Consistent with all commands requiring mention in shared rooms.
         """
         bot, agent = make_bot(tmp_path)
         room = make_room("!room1:matrix.local", 4)  # Gated: 4 members
@@ -376,9 +380,27 @@ class TestHeartbeatBypassesGating:
 
         await bot._handle_room_message(room, event)
 
+        # Should NOT process the heartbeat command
+        bot.send.assert_not_awaited()
+        # Should send a hint notice
+        bot.send_notice.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mentioned_heartbeat_works_in_gated_room(self, tmp_path):
+        """@watson /heartbeat start 6h in gated room → processed."""
+        bot, agent = make_bot(tmp_path)
+        room = make_room("!room1:matrix.local", 4)
+        event = make_event(
+            "@sb:matrix.local",
+            "@watson:matrix.local /heartbeat start 6h",
+            mentions_user_ids=["@watson:matrix.local"],
+        )
+
+        await bot._handle_room_message(room, event)
+
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
-        assert "started" in msg.lower() or "Heartbeat" in msg
+        assert "heartbeat" in msg.lower() or "6h" in msg.lower()
 
 
 # --- Heartbeat Injection ---

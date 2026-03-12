@@ -13,7 +13,7 @@ Interface contract:
 """
 
 import pytest
-from openalph.mention import MentionCheckResult, mentions_me
+from openalph.mention import MentionCheckResult, mentions_me, strip_mention
 
 
 USER_ID = "@watson:matrix.local"
@@ -291,3 +291,116 @@ class TestEdgeCases:
         result = mentions_me(USER_ID, event_source, body)
         assert result.mentioned is True
         assert result.method == "body_localpart"
+
+
+# --- strip_mention tests ---
+
+class TestStripMentionFullId:
+    """Strip full user_id (@watson:matrix.local) from body."""
+
+    def test_full_id_at_start(self):
+        """@watson:matrix.local /status → /status"""
+        result = strip_mention(USER_ID, "@watson:matrix.local /status")
+        assert result == "/status"
+
+    def test_full_id_at_start_with_colon(self):
+        """@watson:matrix.local: /status → /status"""
+        result = strip_mention(USER_ID, "@watson:matrix.local: /status")
+        assert result == "/status"
+
+    def test_full_id_only(self):
+        """@watson:matrix.local → empty string."""
+        result = strip_mention(USER_ID, "@watson:matrix.local")
+        assert result == ""
+
+    def test_full_id_with_text_after(self):
+        """@watson:matrix.local what do you think? → what do you think?"""
+        result = strip_mention(USER_ID, "@watson:matrix.local what do you think?")
+        assert result == "what do you think?"
+
+    def test_full_id_in_middle(self):
+        """hey @watson:matrix.local help → hey help"""
+        result = strip_mention(USER_ID, "hey @watson:matrix.local help")
+        assert result == "hey help"
+
+
+class TestStripMentionLocalpart:
+    """Strip @localpart from body."""
+
+    def test_localpart_at_start(self):
+        """@watson /status → /status"""
+        result = strip_mention(USER_ID, "@watson /status")
+        assert result == "/status"
+
+    def test_localpart_at_start_with_colon(self):
+        """@watson: /status → /status"""
+        result = strip_mention(USER_ID, "@watson: /status")
+        assert result == "/status"
+
+    def test_localpart_at_start_with_comma(self):
+        """@watson, /status → /status"""
+        result = strip_mention(USER_ID, "@watson, /status")
+        assert result == "/status"
+
+    def test_localpart_only(self):
+        """@watson → empty string."""
+        result = strip_mention(USER_ID, "@watson")
+        assert result == ""
+
+    def test_localpart_with_text(self):
+        """@watson what is the status? → what is the status?"""
+        result = strip_mention(USER_ID, "@watson what is the status?")
+        assert result == "what is the status?"
+
+
+class TestStripMentionNoMatch:
+    """Body with no mention of this agent."""
+
+    def test_no_mention_returns_unchanged(self):
+        """/status without mention → /status unchanged."""
+        result = strip_mention(USER_ID, "/status")
+        assert result == "/status"
+
+    def test_other_agent_mention(self):
+        """@babson /status → @babson /status (not stripped)."""
+        result = strip_mention(USER_ID, "@babson /status")
+        assert result == "@babson /status"
+
+    def test_empty_body(self):
+        """Empty string → empty string."""
+        result = strip_mention(USER_ID, "")
+        assert result == ""
+
+
+class TestStripMentionEdgeCases:
+    """Edge cases for strip_mention."""
+
+    def test_full_id_preferred_over_localpart(self):
+        """When full ID present, strip that (not just localpart)."""
+        result = strip_mention(USER_ID, "@watson:matrix.local /model foo")
+        assert result == "/model foo"
+
+    def test_only_first_occurrence_stripped(self):
+        """Only the first mention is removed."""
+        result = strip_mention(USER_ID, "@watson @watson help")
+        assert result == "@watson help"
+
+    def test_multiword_command(self):
+        """@watson /model openrouter/kimi-k2.5 → /model openrouter/kimi-k2.5"""
+        result = strip_mention(USER_ID, "@watson /model openrouter/kimi-k2.5")
+        assert result == "/model openrouter/kimi-k2.5"
+
+    def test_heartbeat_command(self):
+        """@watson /heartbeat start 6h → /heartbeat start 6h"""
+        result = strip_mention(USER_ID, "@watson /heartbeat start 6h")
+        assert result == "/heartbeat start 6h"
+
+    def test_whitespace_normalized(self):
+        """Extra whitespace around mention is cleaned up."""
+        result = strip_mention(USER_ID, "  @watson   /status  ")
+        assert result == "/status"
+
+    def test_partial_localpart_not_stripped(self):
+        """@watsonville should NOT be stripped for @watson."""
+        result = strip_mention(USER_ID, "@watsonville /status")
+        assert result == "@watsonville /status"

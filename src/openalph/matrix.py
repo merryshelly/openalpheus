@@ -36,7 +36,7 @@ from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.provider import ProviderError
 from openalph.config import MatrixConfig
 from openalph.session import SessionLog
-from openalph.mention import mentions_me, is_gated, MentionCheckResult
+from openalph.mention import mentions_me, is_gated, strip_mention, MentionCheckResult
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 
 logger = logging.getLogger(__name__)
@@ -425,7 +425,7 @@ class MatrixBot:
         else:
             return f"{size_bytes} B"
 
-    async def _process_message(self, room, event, body: str):
+    async def _process_message(self, room, event, body: str, _gating_handled: bool = False):
         """Process a message through the agent pipeline.
 
         Shared logic for both text and media messages. Handles:
@@ -445,14 +445,15 @@ class MatrixBot:
 
         try:
             # --- Mention gating ---
+            session_log = getattr(self, 'session_log', None)
             gated = is_gated(self.config, room)
 
-            if gated:
+            if gated and not _gating_handled:
+                # Media messages still need gating here (text messages handled in _handle_room_message)
                 event_source = getattr(event, 'source', {}) or {}
                 mention = mentions_me(self.config.user_id, event_source, body)
 
                 # Always buffer to session log
-                session_log = getattr(self, 'session_log', None)
                 if session_log:
                     session_log.append(
                         role="user",
@@ -471,13 +472,12 @@ class MatrixBot:
                 logger.info("Gated room %s: mentioned via %s, processing",
                              room_id, mention.method)
 
-                # Context hydration: reload history from session_log to include
-                # all buffered non-mentioned messages since last response
-                if room_id in self._active_rooms and self.session_log:
-                    history = self.agent.history(room_id)
-                    history.clear()
-                    history.extend(self.session_log.build_context(room_id))
-                    logger.info("Hydrated context for %s: %d entries", room_id, len(history))
+            # Context hydration for gated rooms (regardless of who handled gating)
+            if gated and room_id in self._active_rooms and self.session_log:
+                history = self.agent.history(room_id)
+                history.clear()
+                history.extend(self.session_log.build_context(room_id))
+                logger.info("Hydrated context for %s: %d entries", room_id, len(history))
             # --- End mention gating ---
 
             # Lazy wake: activate room on first live message
@@ -487,7 +487,6 @@ class MatrixBot:
 
             # Append user message to session log (only for ungated rooms — gated already buffered above)
             if not gated:
-                session_log = getattr(self, 'session_log', None)
                 if session_log:
                     session_log.append(
                         role="user",
@@ -539,21 +538,32 @@ class MatrixBot:
                     )
 
             try:
+                # Resolve thinking level: room override > config
+                _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
                 response = await self.agent.handle_input(
                     body, room_id,
                     on_tool_call=_tool_notice,
                     on_tool_intent=_tool_intent,
+                    thinking=_thinking_override,
                 )
                 # Append assistant response to session log
                 if response and response.strip():
                     if session_log:
-                        session_log.append(
+                        # Capture thinking blocks from agent's history for session persistence
+                        _thinking_data = None
+                        _agent_history = self.agent.history(room_id)
+                        if _agent_history and _agent_history[-1].get("role") == "assistant":
+                            _thinking_data = _agent_history[-1].get("thinking")
+                        _log_kwargs = dict(
                             role="assistant",
                             sender=self.config.user_id,
                             room=room_id,
                             event_id=None,
                             content=response,
                         )
+                        if _thinking_data:
+                            _log_kwargs["thinking"] = _thinking_data
+                        session_log.append(**_log_kwargs)
                     await self.send(room_id, response)
                 else:
                     logger.warning("Empty response from agent in %s — not sending", room_id)
@@ -659,12 +669,16 @@ class MatrixBot:
     async def _handle_room_message(self, room, event):
         """Handle a room message event.
 
-        Routes messages:
-        - Skip events from initial sync (lazy wake: no hydration)
-        - Skip own messages
-        - /stop → cancel current work
-        - /status → post agent status
-        - Otherwise → activate room if needed, process through agent
+        Routes messages through mention gating before command parsing.
+        In gated rooms (3+ members), all commands require @mention.
+        In DM rooms (2 members), all commands work without mention.
+
+        Flow:
+        1. Skip pre-sync events and own messages
+        2. In gated rooms: check mention, buffer to session log, send hint for
+           bare commands, strip mention from body
+        3. Parse slash commands with (possibly stripped) body
+        4. Regular messages → _process_message
 
         Args:
             room: Matrix room object
@@ -682,10 +696,45 @@ class MatrixBot:
             return
 
         room_id = room.room_id
-
-        # Check for commands
         body = event.body.strip()
 
+        # --- Mention gating (kdsn.60) ---
+        gated = is_gated(self.config, room)
+
+        if gated:
+            event_source = getattr(event, 'source', {}) or {}
+            mention = mentions_me(self.config.user_id, event_source, body)
+
+            # Buffer ALL messages to session log (mentioned or not)
+            if self.session_log:
+                self.session_log.append(
+                    role="user",
+                    sender=event.sender,
+                    room=room_id,
+                    event_id=getattr(event, 'event_id', None),
+                    content=body,
+                    mentioned=mention.mentioned,
+                )
+
+            if not mention.mentioned:
+                # Not mentioned — send hint for bare commands, then skip
+                if body.startswith("/"):
+                    localpart = self.config.user_id.split(":")[0] if ":" in self.config.user_id else self.config.user_id
+                    await self.send_notice(
+                        room_id,
+                        f"\U0001f4a1 Commands need a mention in shared rooms: "
+                        f"`{localpart} {body.split()[0]}`",
+                    )
+                logger.debug("Gated room %s: not mentioned, skipping", room_id)
+                return
+
+            # Strip mention from body for command parsing
+            body = strip_mention(self.config.user_id, body)
+            logger.info("Gated room %s: mentioned via %s, processing (body=%r)",
+                         room_id, mention.method, body[:50])
+        # --- End mention gating ---
+
+        # --- Slash commands ---
         if body == "/stop":
             await self._cancel_current()
             return
@@ -732,9 +781,32 @@ class MatrixBot:
             new_model = parts[1].strip()
             error = self.agent.switch_model(new_model, room_id)
             if error:
-                await self.send(room_id, f"⚠️ {error}")
+                await self.send(room_id, f"\u26a0\ufe0f {error}")
             else:
                 await self.send(room_id, f"Model switched to **{new_model}**")
+            return
+
+        if body.startswith("/thinking"):
+            parts = body.split(None, 1)
+            if len(parts) < 2:
+                # Show current thinking level
+                current = getattr(self, '_room_thinking', {}).get(room_id)
+                if current is None:
+                    current = getattr(self.agent.config, 'thinking', 'off')
+                    source = "config"
+                else:
+                    source = "override"
+                await self.send(room_id, f"Thinking: **{current}** ({source})")
+                return
+            level = parts[1].strip().lower()
+            valid_levels = ("off", "low", "medium", "high")
+            if level not in valid_levels:
+                await self.send(room_id, f"Invalid level. Use: {', '.join(valid_levels)}")
+                return
+            if not hasattr(self, '_room_thinking'):
+                self._room_thinking = {}
+            self._room_thinking[room_id] = level
+            await self.send(room_id, f"Thinking set to **{level}** for this room")
             return
 
         if body.startswith("/heartbeat"):
@@ -762,14 +834,14 @@ class MatrixBot:
                 else:
                     lines = ["Active heartbeats:"]
                     for e in entries:
-                        lines.append(f"  {e.room_id} — every {format_interval(e.interval_seconds)} (next: {format_interval(e.seconds_until_next)})")
+                        lines.append(f"  {e.room_id} \u2014 every {format_interval(e.interval_seconds)} (next: {format_interval(e.seconds_until_next)})")
                     await self.send(room_id, "\n".join(lines))
             else:
                 await self.send(room_id, "Usage: `/heartbeat start <interval>` | `/heartbeat stop` | `/heartbeat status`")
             return
 
         # Process regular message through shared pipeline
-        await self._process_message(room, event, body)
+        await self._process_message(room, event, body, _gating_handled=gated)
 
     async def start(self):
         """Start the Matrix bot.
