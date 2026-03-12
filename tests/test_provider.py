@@ -96,8 +96,8 @@ class TestRouting:
         # Verify Anthropic SDK call shape
         kw = client.messages.create.call_args.kwargs
         assert kw["model"] == "claude-sonnet-4-20250514"
-        assert kw["system"] == "You are a test agent."
-        assert kw["messages"] == [{"role": "user", "content": "Hi"}]
+        assert kw["system"] == [{"type": "text", "text": "You are a test agent.", "cache_control": {"type": "ephemeral"}}]
+        assert kw["messages"] == [{"role": "user", "content": [{"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}]}]
         assert kw["max_tokens"] == 8192
 
     @pytest.mark.asyncio
@@ -272,7 +272,7 @@ class TestMultiTurn:
 
         kw = client.messages.create.call_args.kwargs
         assert len(kw["messages"]) == 3
-        assert kw["messages"][2]["content"] == "And 3+3?"
+        assert kw["messages"][2]["content"] == [{"type": "text", "text": "And 3+3?", "cache_control": {"type": "ephemeral"}}]
 
     @pytest.mark.asyncio
     async def test_openai_history_with_system_prepended(self):

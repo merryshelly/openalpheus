@@ -227,7 +227,7 @@ class Agent:
             logger.warning(f"Failed to write JSONL log: {e}")
 
     async def handle_input(self, text: str, room_id: str = "_default", *,
-                           on_tool_call=None, on_tool_intent=None) -> str:
+                           on_tool_call=None, on_tool_intent=None, thinking: str | None = None) -> str:
         """Process a user message and return the assistant's response.
 
         Appends the user message to room history, calls the LLM, appends the
@@ -277,6 +277,7 @@ class Agent:
                         messages=list(history),
                         tools=tools_arg,
                         model=self.active_model,
+                        thinking=thinking,
                     )
 
                     latency_ms = (time.monotonic() - start_time) * 1000
@@ -296,15 +297,27 @@ class Agent:
                             latency_ms=latency_ms,
                             content_preview=response.content,
                         )
-                        history.append({"role": "assistant", "content": response.content})
+                        assistant_msg = {"role": "assistant", "content": response.content}
+                        if response.thinking:
+                            assistant_msg["thinking"] = [
+                                {"thinking": tb.thinking, "signature": tb.signature}
+                                for tb in response.thinking
+                            ]
+                        history.append(assistant_msg)
                         return response.content
 
                     # Tool use - append assistant message with tool_calls to history
-                    history.append({
+                    tool_msg = {
                         "role": "assistant",
                         "content": response.content,
                         "tool_calls": response.tool_calls,
-                    })
+                    }
+                    if response.thinking:
+                        tool_msg["thinking"] = [
+                            {"thinking": tb.thinking, "signature": tb.signature}
+                            for tb in response.thinking
+                        ]
+                    history.append(tool_msg)
 
                     # Emit tool intent before execution (for session logging / observability)
                     if on_tool_intent:

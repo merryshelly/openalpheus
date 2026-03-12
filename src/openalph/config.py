@@ -61,9 +61,10 @@ class AgentConfig:
     workspace: Path
     model_max_tokens: int = 200000
     matrix: MatrixConfig | None = None
-    max_iterations: int = 25
+    max_iterations: int = 50
     truncation_limit: int = 50000
     vision: bool = False
+    thinking: str = "off"
     model_limits: dict[str, int] = field(default_factory=dict)
 
 
@@ -219,7 +220,7 @@ def load_config(path: Path) -> AgentConfig:
         raise ConfigError("model_max_tokens must be a positive integer")
 
     # max_iterations defaults to 25 if not specified
-    max_iterations = agent_section.get("max_iterations", 25)
+    max_iterations = agent_section.get("max_iterations", 50)
     if not isinstance(max_iterations, int) or max_iterations <= 0:
         raise ConfigError("max_iterations must be a positive integer")
     
@@ -232,6 +233,12 @@ def load_config(path: Path) -> AgentConfig:
     vision = agent_section.get("vision", False)
     if not isinstance(vision, bool):
         raise ConfigError("vision must be a boolean")
+
+    # thinking defaults to "off" if not specified
+    thinking = agent_section.get("thinking", "off")
+    valid_thinking = ("off", "low", "medium", "high")
+    if thinking not in valid_thinking:
+        raise ConfigError(f"thinking must be one of {valid_thinking}, got: {thinking!r}")
 
     # Validate workspace path
     try:
@@ -309,6 +316,7 @@ def load_config(path: Path) -> AgentConfig:
         max_iterations=max_iterations,
         truncation_limit=truncation_limit,
         vision=vision,
+        thinking=thinking,
         model_limits=model_limits,
     )
 

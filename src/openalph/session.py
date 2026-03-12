@@ -226,6 +226,8 @@ class SessionLog:
                         )
                         for tc in entry["tool_calls"]
                     ]
+                if entry.get("thinking"):
+                    msg["thinking"] = entry["thinking"]
                 context.append(msg)
 
             elif role == "tool":

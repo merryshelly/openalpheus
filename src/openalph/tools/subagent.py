@@ -15,7 +15,7 @@ from openalph.config import AgentConfig
 
 logger = logging.getLogger("openalph.subagent")
 
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 100
 
 
 async def run_subagent(

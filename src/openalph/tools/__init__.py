@@ -195,7 +195,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "required": ["task"]
         },
         "config": {
-            "default_max_iterations": 10
+            "default_max_iterations": 100
         }
     },
     "memory_search": {

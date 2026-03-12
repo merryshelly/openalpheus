@@ -92,19 +92,52 @@ class ToolCall:
 
 
 @dataclass
+class ThinkingBlock:
+    thinking: str
+    signature: str
+
+
+@dataclass
 class Response:
     content: str
     model: str = ""
     usage: Usage = None
     stop_reason: str = ""
     tool_calls: list[ToolCall] = None
+    thinking: list[ThinkingBlock] = None
 
     def __post_init__(self):
         if self.tool_calls is None:
             self.tool_calls = []
+        if self.thinking is None:
+            self.thinking = []
         if self.usage is None:
             self.usage = Usage(input_tokens=0, output_tokens=0)
 
+
+def _supports_adaptive_thinking(model_id: str) -> bool:
+    """Returns True for claude-opus-4-6 and claude-sonnet-4-6 variants."""
+    return "opus-4-6" in model_id or "sonnet-4-6" in model_id
+
+
+def _thinking_effort(level: str) -> str:
+    """Map config thinking level to Anthropic effort. low→low, medium→medium, high→high."""
+    return level  # Direct mapping
+
+
+def _thinking_budget(level: str, base_max_tokens: int, model_max_tokens: int) -> tuple[int, int]:
+    """Budget-based thinking for older models.
+    Returns (budget_tokens, adjusted_max_tokens).
+    Budget mapping: low=2048, medium=8192, high=16384.
+    max_tokens = min(base + budget, model_max_tokens).
+    If clamped, reduce budget to leave at least 1024 for output.
+    """
+    budgets = {"low": 2048, "medium": 8192, "high": 16384}
+    budget = budgets.get(level, 16384)
+    max_tokens = min(base_max_tokens + budget, model_max_tokens)
+    if max_tokens <= budget:
+        budget = max(0, max_tokens - 1024)
+    return budget, max_tokens
 
 def _convert_tools_for_provider(tools: list | None, provider_type: str) -> list[dict] | None:
     """Convert ToolDef list to provider-native format.
@@ -190,15 +223,43 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
                 result.append(msg)
 
         elif role == "assistant":
-            # Assistant message may have tool_calls
+            # Assistant message may have tool_calls and thinking blocks
             tool_calls = msg.get("tool_calls", [])
             content = msg.get("content", "")
+            thinking = msg.get("thinking", [])
             
+            # If no thinking and no tool_calls, keep original behavior (string content)
+            if not thinking and not tool_calls:
+                result.append(msg)
+                continue
+            
+            # Build content blocks: thinking blocks + text block + tool_use blocks
+            content_blocks = []
+            
+            # Add thinking blocks first (if any)
+            if thinking:
+                for tb in thinking:
+                    sig = tb.get("signature")
+                    if sig:
+                        # Valid signature - add as thinking block
+                        content_blocks.append({
+                            "type": "thinking",
+                            "thinking": tb.get("thinking", ""),
+                            "signature": sig,
+                        })
+                    else:
+                        # Empty/None signature - demote to text block
+                        content_blocks.append({
+                            "type": "text",
+                            "text": tb.get("thinking", ""),
+                        })
+            
+            # Add text content (if any and if there are tool_calls, or if no thinking to avoid empty content)
+            if content or not thinking:
+                content_blocks.append({"type": "text", "text": content})
+            
+            # Add tool_use blocks
             if tool_calls:
-                # Build content blocks: text block + tool_use blocks
-                content_blocks = []
-                if content:
-                    content_blocks.append({"type": "text", "text": content})
                 for tc in tool_calls:
                     content_blocks.append({
                         "type": "tool_use",
@@ -206,10 +267,12 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
                         "name": tc.name,
                         "input": tc.input,
                     })
+            
+            if content_blocks:
                 result.append({"role": "assistant", "content": content_blocks})
             else:
-                # No tool calls - simple text message
-                result.append(msg)
+                # No content at all - pass through minimal message
+                result.append({"role": "assistant", "content": content})
         
         elif role == "tool":
             # Tool result -> user role with tool_result content block
@@ -314,9 +377,10 @@ def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
 
 def _parse_anthropic_response(response) -> Response:
     """Parse Anthropic response into normalized Response."""
-    # Extract text content and tool_calls from content blocks
+    # Extract text content, tool_calls, and thinking blocks from content blocks
     text_parts = []
     tool_calls = []
+    thinking_blocks = []
     
     for block in response.content:
         # Handle both MagicMock (no type attr) and real response blocks
@@ -329,6 +393,11 @@ def _parse_anthropic_response(response) -> Response:
                 name=block.name,
                 input=block.input,
             ))
+        elif block_type == "thinking":
+            thinking_blocks.append(ThinkingBlock(
+                thinking=block.thinking,
+                signature=block.signature,
+            ))
         else:
             # Backward compatibility: old mocks have .text but no .type="text"
             text = getattr(block, "text", None)
@@ -340,6 +409,7 @@ def _parse_anthropic_response(response) -> Response:
     return Response(
         content=content,
         tool_calls=tool_calls,
+        thinking=thinking_blocks,
         model=response.model,
         usage=Usage(
             input_tokens=response.usage.input_tokens,
@@ -390,11 +460,13 @@ async def complete(
     tools: list | None = None,
     max_tokens: int | None = None,
     model: str | None = None,
+    thinking: str | None = None,
 ) -> Response:
     """
     Route to Anthropic or OpenAI SDK based on config.providers.
     If max_tokens is None, use config.max_tokens.
     If model is None, use config.default_model.
+    If thinking is None, use config.thinking (defaults to "off").
     
     Errors propagate directly - no wrapping, no retry.
     """
@@ -411,19 +483,47 @@ async def complete(
     # Use config.max_tokens if max_tokens is not provided
     tokens = max_tokens if max_tokens is not None else config.max_tokens
     
+    # Resolve thinking level: param > config > "off"
+    thinking_level = thinking if thinking is not None else getattr(config, "thinking", "off")
+    
     if provider_cfg.type == "anthropic":
         # Anthropic path: use their specific API shape
         client = _get_client(provider_cfg)
         
-        # Build API call kwargs
+        # Build API call kwargs with prompt caching on system
         api_kwargs = {
             "model": api_model,
-            "system": system,
+            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": provider_messages,
             "max_tokens": tokens,
         }
         if provider_tools:
             api_kwargs["tools"] = provider_tools
+        
+        # Add prompt caching to last user message
+        if api_kwargs["messages"]:
+            last_msg = api_kwargs["messages"][-1]
+            if last_msg.get("role") == "user":
+                msg_content = last_msg.get("content")
+                if isinstance(msg_content, str):
+                    # Convert string content to list with cache_control
+                    last_msg["content"] = [{"type": "text", "text": msg_content, "cache_control": {"type": "ephemeral"}}]
+                elif isinstance(msg_content, list) and msg_content:
+                    # Add cache_control to last block
+                    msg_content[-1]["cache_control"] = {"type": "ephemeral"}
+        
+        # Add thinking parameters if enabled
+        if thinking_level != "off":
+            if _supports_adaptive_thinking(api_model):
+                # Adaptive thinking for Opus/Sonnet 4-6
+                api_kwargs["thinking"] = {"type": "adaptive"}
+                api_kwargs["output_config"] = {"effort": _thinking_effort(thinking_level)}
+            else:
+                # Budget-based thinking for older models
+                model_max = getattr(config, "model_max_tokens", 200000)
+                budget, adjusted_max = _thinking_budget(thinking_level, tokens, model_max)
+                api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                api_kwargs["max_tokens"] = adjusted_max
         
         try:
             response = await client.messages.create(**api_kwargs)
@@ -467,6 +567,10 @@ async def complete(
         }
         if provider_tools:
             api_kwargs["tools"] = provider_tools
+        
+        # Add reasoning effort for OpenRouter if thinking enabled
+        if thinking_level != "off":
+            api_kwargs["extra_body"] = {"reasoning": {"effort": thinking_level}}
         
         try:
             response = await client.chat.completions.create(**api_kwargs)
