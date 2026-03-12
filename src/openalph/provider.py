@@ -363,10 +363,15 @@ def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
         
         elif role == "tool":
             # Tool result -> OpenAI tool role
+            # OpenAI has no native is_error field; prepend marker so the
+            # model knows the tool call failed.
+            tool_content = msg.get("content", "")
+            if msg.get("is_error") and not tool_content.startswith("Error: "):
+                tool_content = f"Error: {tool_content}"
             result.append({
                 "role": "tool",
                 "tool_call_id": msg.get("tool_call_id"),
-                "content": msg.get("content", ""),
+                "content": tool_content,
             })
         
         else:
