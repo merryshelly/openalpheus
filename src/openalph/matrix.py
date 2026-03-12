@@ -339,6 +339,9 @@ class MatrixBot:
                 await self.send(room_id, response)
             else:
                 logger.warning("Empty heartbeat response in %s — not sending", room_id)
+                await self.send(room_id,
+                    "⚠️ **Empty heartbeat response** — the model returned no content. "
+                    "This may indicate degeneration or a provider issue.")
         except ProviderError as e:
             code = f" ({e.status_code})" if e.status_code else ""
             logger.warning("Heartbeat provider error%s in %s: %s", code, room_id, e)
@@ -651,6 +654,10 @@ class MatrixBot:
                     await self.send(room_id, response)
                 else:
                     logger.warning("Empty response from agent in %s — not sending", room_id)
+                    await self.send(room_id,
+                        "⚠️ **Empty response** — the model returned no content. "
+                        "This may indicate degeneration or a provider issue. "
+                        "Try again or start a new room.")
             except AgentOverflowError as e:
                 logger.warning("Context overflow in %s: %s", room_id, e)
                 await self.send(room_id,

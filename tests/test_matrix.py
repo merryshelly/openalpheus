@@ -964,8 +964,8 @@ class TestProviderErrorSurfacing:
 class TestEmptyResponseGuard:
 
     @pytest.mark.asyncio
-    async def test_empty_response_not_sent(self):
-        """Empty string response from agent should not be sent to room."""
+    async def test_empty_response_sends_warning(self):
+        """Empty string response from agent should send a warning to room."""
         config = make_matrix_config(user_id="@merry:matrix.local")
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="")
@@ -986,12 +986,12 @@ class TestEmptyResponseGuard:
 
         await bot._handle_room_message(room, event)
 
-        # room_send should NOT have been called
-        bot.client.room_send.assert_not_awaited()
+        # Warning message should have been sent
+        bot.client.room_send.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_whitespace_response_not_sent(self):
-        """Whitespace-only response should not be sent to room."""
+    async def test_whitespace_response_sends_warning(self):
+        """Whitespace-only response should send a warning to room."""
         config = make_matrix_config(user_id="@merry:matrix.local")
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="   \n  ")
@@ -1012,7 +1012,7 @@ class TestEmptyResponseGuard:
 
         await bot._handle_room_message(room, event)
 
-        bot.client.room_send.assert_not_awaited()
+        bot.client.room_send.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_real_response_still_sent(self):
