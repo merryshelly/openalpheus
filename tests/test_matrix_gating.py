@@ -141,6 +141,9 @@ class TestGatedRoomSkipsNonMention:
         event = make_event("@alice:matrix.local", "Hello everyone")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_not_called()
 
@@ -152,6 +155,9 @@ class TestGatedRoomSkipsNonMention:
         event = make_event("@alice:matrix.local", "Hello everyone")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         bot.send.assert_not_called()
 
@@ -163,6 +169,9 @@ class TestGatedRoomSkipsNonMention:
         event = make_event("@alice:matrix.local", "Hello everyone")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         # Check session log was written
         entries = bot.session_log.read("!group:matrix.local")
@@ -179,6 +188,9 @@ class TestGatedRoomSkipsNonMention:
         event = make_event("@alice:matrix.local", "Hello everyone")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         bot._set_typing.assert_not_called()
 
@@ -204,6 +216,9 @@ class TestGatedRoomProcessesMention:
         bot._active_rooms.add("!group:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_called_once()
 
@@ -217,6 +232,9 @@ class TestGatedRoomProcessesMention:
         bot._active_rooms.add("!group:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_called_once()
 
@@ -230,6 +248,9 @@ class TestGatedRoomProcessesMention:
         bot._active_rooms.add("!group:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_called_once()
 
@@ -247,6 +268,9 @@ class TestGatedRoomProcessesMention:
         bot._active_rooms.add("!group:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         bot.send.assert_called_once_with("!group:matrix.local", "Agent response")
 
@@ -264,6 +288,9 @@ class TestGatedRoomProcessesMention:
         bot._active_rooms.add("!group:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         # Typing ON was called
         bot._set_typing.assert_any_call("!group:matrix.local", True)
@@ -287,6 +314,9 @@ class TestUngatedRoomProcessesAll:
         bot._active_rooms.add("!dm:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_called_once()
 
@@ -300,6 +330,9 @@ class TestUngatedRoomProcessesAll:
         bot._active_rooms.add("!dm:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         bot.send.assert_called_once()
 
@@ -322,6 +355,9 @@ class TestTomlOverride:
         bot._active_rooms.add("!group:matrix.local")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_called_once()
 
@@ -335,6 +371,9 @@ class TestTomlOverride:
         event = make_event("@alice:matrix.local", "Hello")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_not_called()
 
@@ -353,6 +392,9 @@ class TestCommandsGatedInSharedRooms:
         event = make_event("@alice:matrix.local", "/stop")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_called()
         # Should send a hint notice, not a status/cancel response
@@ -368,6 +410,9 @@ class TestCommandsGatedInSharedRooms:
         event = make_event("@alice:matrix.local", "/status")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_called()
         # Should NOT send a real status response
@@ -385,6 +430,9 @@ class TestCommandsGatedInSharedRooms:
         event = make_event("@alice:matrix.local", "/model openrouter/foo")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_not_called()
         bot.send_notice.assert_called_once()
@@ -397,6 +445,9 @@ class TestCommandsGatedInSharedRooms:
         event = make_event("@alice:matrix.local", "/status")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         entries = bot.session_log.read("!group:matrix.local")
         user_entries = [e for e in entries if e["role"] == "user"]
@@ -419,6 +470,9 @@ class TestMentionScopedCommands:
         )
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should have triggered cancel
         agent.handle_input.assert_not_called()
@@ -436,6 +490,9 @@ class TestMentionScopedCommands:
         bot._active_rooms.add("!group:matrix.local")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_called()
         bot.send.assert_called_once()
@@ -455,6 +512,9 @@ class TestMentionScopedCommands:
         agent.switch_model = MagicMock(return_value=None)
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.switch_model.assert_called_once_with("openrouter/foo", "!group:matrix.local")
         bot.send.assert_called_once()
@@ -474,6 +534,9 @@ class TestMentionScopedCommands:
         agent.tools = []
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_called_once()
         assert "Test prompt" in bot.send.call_args[0][1]
@@ -490,6 +553,9 @@ class TestMentionScopedCommands:
         )
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_called_once()
         msg = bot.send.call_args[0][1]
@@ -507,6 +573,9 @@ class TestMentionScopedCommands:
         )
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_called()
         # Watson should not respond to Babson's command
@@ -524,6 +593,9 @@ class TestCommandsInDMRoomsUnchanged:
         event = make_event("@alice:matrix.local", "/stop")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should have triggered cancel path (not agent processing)
         agent.handle_input.assert_not_called()
@@ -538,6 +610,9 @@ class TestCommandsInDMRoomsUnchanged:
         bot._active_rooms.add("!dm:matrix.local")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_called()
         bot.send.assert_called_once()
@@ -551,6 +626,9 @@ class TestCommandsInDMRoomsUnchanged:
         agent.switch_model = MagicMock(return_value=None)
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.switch_model.assert_called_once()
 
@@ -571,6 +649,9 @@ class TestRoomTransition:
         event1 = make_event("@alice:matrix.local", "Hello", event_id="$e1")
         bot._active_rooms.add("!room:matrix.local")
         await bot._handle_room_message(room, event1)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         assert agent.handle_input.call_count == 1
         
         # 3rd member joins
@@ -580,6 +661,9 @@ class TestRoomTransition:
         agent.handle_input.reset_mock()
         event2 = make_event("@alice:matrix.local", "Anyone there?", event_id="$e2")
         await bot._handle_room_message(room, event2)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         agent.handle_input.assert_not_called()
 
     @pytest.mark.asyncio
@@ -591,6 +675,9 @@ class TestRoomTransition:
         # First message: 3 members, gated, no mention → skipped
         event1 = make_event("@alice:matrix.local", "Hello", event_id="$e1")
         await bot._handle_room_message(room, event1)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         agent.handle_input.assert_not_called()
         
         # Member leaves
@@ -601,6 +688,9 @@ class TestRoomTransition:
         event2 = make_event("@alice:matrix.local", "Now it's a DM", event_id="$e2")
         bot._active_rooms.add("!room:matrix.local")
         await bot._handle_room_message(room, event2)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         agent.handle_input.assert_called_once()
 
 
@@ -625,6 +715,9 @@ class TestContextHydration:
                 event_id=f"$e{i+1}",
             )
             await bot._handle_room_message(room, event)
+            # Drain background tasks fired by handler
+            if hasattr(bot, "_background_tasks"):
+                await asyncio.gather(*bot._background_tasks)
         
         assert agent.handle_input.call_count == 0
         
@@ -636,6 +729,9 @@ class TestContextHydration:
             mentions_user_ids=["@watson:matrix.local"],
         )
         await bot._handle_room_message(room, event4)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         assert agent.handle_input.call_count == 1
         
@@ -693,6 +789,9 @@ class TestExistingGuards:
         )
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_not_called()
 
@@ -704,5 +803,8 @@ class TestExistingGuards:
         event = make_event("@watson:matrix.local", "My own message")
         
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         
         agent.handle_input.assert_not_called()

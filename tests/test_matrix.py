@@ -178,6 +178,9 @@ class TestMessageRouting:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_awaited()
 
@@ -203,6 +206,9 @@ class TestMessageRouting:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_awaited_once()
         assert agent.handle_input.await_args[0] == ("Hello", "!test:matrix.local")
@@ -235,6 +241,9 @@ class TestCommands:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot._cancel_current.assert_awaited_once()
         # Should NOT go through agent.handle_input
@@ -271,6 +280,9 @@ class TestCommands:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should post a status message
         bot.client.room_send.assert_awaited_once()
@@ -312,6 +324,9 @@ class TestThinkingCommand:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
         assert "medium" in sent.get("body", "")
@@ -328,6 +343,9 @@ class TestThinkingCommand:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
         assert "high" in sent.get("body", "")
@@ -343,6 +361,9 @@ class TestThinkingCommand:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         assert bot._room_thinking["!test:matrix.local"] == "high"
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
@@ -359,6 +380,9 @@ class TestThinkingCommand:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         assert bot._room_thinking["!test:matrix.local"] == "off"
 
@@ -372,6 +396,9 @@ class TestThinkingCommand:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         assert "!test:matrix.local" not in bot._room_thinking
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
@@ -387,6 +414,9 @@ class TestThinkingCommand:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         assert bot._room_thinking["!test:matrix.local"] == "high"
 
@@ -400,6 +430,9 @@ class TestThinkingCommand:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.agent.handle_input.assert_not_called()
 
@@ -418,6 +451,9 @@ class TestThinkingCommand:
         room.users = {"@sb:matrix.local": MagicMock(), "@merry:matrix.local": MagicMock()}
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         call_kwargs = bot.agent.handle_input.call_args.kwargs
         assert call_kwargs.get("thinking") == "high"
@@ -450,6 +486,9 @@ class TestTypingIndicator:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Typing should have been set and then cleared
         typing_calls = bot.client.room_typing.call_args_list
@@ -482,6 +521,9 @@ class TestTypingIndicator:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Typing should be cleared (last call = False)
         typing_calls = bot.client.room_typing.call_args_list
@@ -520,6 +562,9 @@ class TestErrorHandling:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should send an error message (not crash)
         bot.client.room_send.assert_awaited_once()
@@ -547,6 +592,9 @@ class TestErrorHandling:
 
         # Should not raise
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
 
 # --- Reconnection ---
@@ -607,6 +655,9 @@ class TestErrorSanitization:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.client.room_send.assert_awaited_once()
         sent_content = bot.client.room_send.call_args[0][2]
@@ -859,6 +910,9 @@ class TestProviderErrorSurfacing:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.client.room_send.assert_awaited_once()
         sent_content = bot.client.room_send.call_args[0][2]
@@ -894,6 +948,9 @@ class TestProviderErrorSurfacing:
 
         # Should not raise
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
     @pytest.mark.asyncio
     async def test_provider_error_without_status_code(self):
@@ -921,6 +978,9 @@ class TestProviderErrorSurfacing:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         sent_content = bot.client.room_send.call_args[0][2]
         sent_body = sent_content["body"]
@@ -951,6 +1011,9 @@ class TestProviderErrorSurfacing:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         sent_content = bot.client.room_send.call_args[0][2]
         sent_body = sent_content["body"]
@@ -985,6 +1048,9 @@ class TestEmptyResponseGuard:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Warning message should have been sent
         bot.client.room_send.assert_awaited_once()
@@ -1011,6 +1077,9 @@ class TestEmptyResponseGuard:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.client.room_send.assert_awaited_once()
 
@@ -1036,5 +1105,8 @@ class TestEmptyResponseGuard:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.client.room_send.assert_awaited_once()

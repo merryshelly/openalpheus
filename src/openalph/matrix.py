@@ -89,6 +89,7 @@ class MatrixBot:
         self._current_room = None
         self._active_rooms = set()
         self._room_thinking = {}
+        self._background_tasks: set[asyncio.Task] = set()
         self.heartbeat = HeartbeatManager(
             config_path=Path(agent.config.workspace) / "heartbeats.json",
             callback=self._inject_heartbeat,
@@ -280,6 +281,20 @@ class MatrixBot:
             }
             await self._room_send_with_retry(room_id, content)
 
+    def _fire_background(self, coro) -> asyncio.Task:
+        """Schedule a coroutine as a background task.
+
+        Allows sync_forever to continue dispatching events (including /stop)
+        while the agent processes a message.
+        """
+        task = asyncio.create_task(coro)
+        # Lazy-init for tests that construct MatrixBot via __new__
+        if not hasattr(self, '_background_tasks'):
+            self._background_tasks = set()
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def _cancel_current(self):
         """Cancel any current in-flight work.
 
@@ -287,6 +302,9 @@ class MatrixBot:
         - Kill tool subprocesses
         - Send cancellation notice to room
         """
+        # Capture room before cancellation — the task's finally block clears it
+        room = self._current_room
+
         task = None
         if hasattr(self.agent, "cancel"):
             task = self.agent.cancel()
@@ -300,9 +318,9 @@ class MatrixBot:
             except Exception:
                 pass  # Task may raise other errors during cancellation
 
-        if self._current_room:
-            await self.send(self._current_room, "Cancelled.")
-            await self._set_typing(self._current_room, False)
+        if room:
+            await self.send(room, "Cancelled.")
+            await self._set_typing(room, False)
 
     async def _inject_heartbeat(self, room_id: str) -> None:
         """Process a heartbeat as if the agent received a wake message."""
@@ -709,7 +727,7 @@ class MatrixBot:
             if isinstance(response, DownloadError):
                 error_msg = f"[media: download failed — {filename} ({response.message})]"
                 logger.warning("Media download failed for %s: %s", event.url, response.message)
-                await self._process_message(room, event, error_msg)
+                self._fire_background(self._process_message(room, event, error_msg))
                 return
 
             # Check size limit
@@ -718,7 +736,7 @@ class MatrixBot:
                 size_human = self._format_size(file_size)
                 skip_msg = f"[media: skipped — {filename} exceeds 20 MB limit ({size_human})]"
                 logger.warning("Media file too large: %s (%s)", filename, size_human)
-                await self._process_message(room, event, skip_msg)
+                self._fire_background(self._process_message(room, event, skip_msg))
                 return
 
             # Determine storage path
@@ -749,13 +767,13 @@ class MatrixBot:
                 message += f"\n{event.body}"
 
             # Process through the shared pipeline
-            await self._process_message(room, event, message)
+            self._fire_background(self._process_message(room, event, message))
 
         except Exception as e:
             # Handle unexpected errors (network issues, etc.)
             error_msg = f"[media: download failed — {filename} ({str(e)})]"
             logger.exception("Unexpected error downloading media from %s", event.url)
-            await self._process_message(room, event, error_msg)
+            self._fire_background(self._process_message(room, event, error_msg))
 
     async def _handle_room_message(self, room, event):
         """Handle a room message event.
@@ -929,8 +947,8 @@ class MatrixBot:
                 await self.send(room_id, "Usage: `/heartbeat start <interval>` | `/heartbeat stop` | `/heartbeat status`")
             return
 
-        # Process regular message through shared pipeline
-        await self._process_message(room, event, body, _gating_handled=gated)
+        # Fire as background task so sync_forever can dispatch /stop during tool loops
+        self._fire_background(self._process_message(room, event, body, _gating_handled=gated))
 
     async def start(self):
         """Start the Matrix bot.

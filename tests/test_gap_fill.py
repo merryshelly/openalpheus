@@ -1,3 +1,4 @@
+import asyncio
 """Tests for gap-fill pagination in _activate_room.
 
 Verifies that gap-fill pages backward through Matrix messages until it finds
@@ -104,6 +105,10 @@ class TestGapFillPagination:
         room = make_room("!room:local")
         event = make_room_message("@sb:local", "trigger")
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by _handle_room_message
+        await asyncio.gather(*bot._background_tasks)
+        # Drain background tasks fired by _handle_room_message
+        await asyncio.gather(*bot._background_tasks)
 
         # Should have called room_messages twice (stopped on overlap)
         assert bot.client.room_messages.await_count == 2
@@ -143,6 +148,8 @@ class TestGapFillPagination:
         room = make_room("!room:local")
         event = make_room_message("@sb:local", "trigger")
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by _handle_room_message
+        await asyncio.gather(*bot._background_tasks)
 
         # Should have stopped after ~5-6 pages (500 messages cap)
         assert bot.client.room_messages.await_count <= 6
@@ -166,6 +173,8 @@ class TestGapFillPagination:
         room = make_room("!room:local")
         event = make_room_message("@sb:local", "trigger")
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by _handle_room_message
+        await asyncio.gather(*bot._background_tasks)
 
         assert bot.client.room_messages.await_count == 1
         # Only the trigger message and session_resume, no gap-fill user messages
@@ -190,6 +199,8 @@ class TestGapFillPagination:
         room = make_room("!room:local")
         event = make_room_message("@sb:local", "trigger")
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by _handle_room_message
+        await asyncio.gather(*bot._background_tasks)
 
         first_call_kwargs = bot.client.room_messages.call_args_list[0].kwargs
         assert first_call_kwargs.get("start") is None, (
@@ -213,6 +224,8 @@ class TestGapFillPagination:
 
         with caplog.at_level(logging.WARNING, logger="openalph.matrix"):
             await bot._handle_room_message(room, event)
+            # Drain background tasks fired by _handle_room_message
+            await asyncio.gather(*bot._background_tasks)
 
         assert any("no overlap found" in r.message for r in caplog.records), \
             f"Expected 'no overlap found' warning, got: {[r.message for r in caplog.records]}"

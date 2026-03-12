@@ -470,6 +470,9 @@ class TestMatrixBotIntegration:
         room.room_id = ROOM_ID
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         entries = bot.session_log.read(ROOM_ID)
         user_entries = [e for e in entries if e["role"] == "user"]
@@ -489,6 +492,9 @@ class TestMatrixBotIntegration:
         room.room_id = ROOM_ID
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         entries = bot.session_log.read(ROOM_ID)
         assistant_entries = [e for e in entries if e["role"] == "assistant"]
@@ -514,6 +520,9 @@ class TestMatrixBotIntegration:
         room.room_id = ROOM_ID
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         entries = bot.session_log.read(ROOM_ID)
         tool_entries = [e for e in entries if e["role"] == "tool"]
@@ -547,6 +556,9 @@ class TestMatrixBotIntegration:
         room.room_id = ROOM_ID
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         entries = bot.session_log.read(ROOM_ID)
         # Should see: user → assistant(intent) → tool → assistant(final)

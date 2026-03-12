@@ -214,6 +214,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat start 6h")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -228,6 +231,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat start 15m")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -241,6 +247,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat start abc")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -254,6 +263,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat start 1m")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -268,11 +280,17 @@ class TestHeartbeatCommands:
         # Start first
         start_event = make_event("@sb:matrix.local", "/heartbeat start 6h")
         await bot._handle_room_message(room, start_event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         bot.send.reset_mock()
 
         # Then stop
         stop_event = make_event("@sb:matrix.local", "/heartbeat stop", event_id="$evt2")
         await bot._handle_room_message(room, stop_event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -286,6 +304,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat stop")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -300,11 +321,17 @@ class TestHeartbeatCommands:
         # Start a heartbeat first
         start_event = make_event("@sb:matrix.local", "/heartbeat start 6h")
         await bot._handle_room_message(room, start_event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         bot.send.reset_mock()
 
         # Check status
         status_event = make_event("@sb:matrix.local", "/heartbeat status", event_id="$evt2")
         await bot._handle_room_message(room, status_event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -319,6 +346,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat status")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -332,6 +362,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat foo")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -345,6 +378,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -358,6 +394,9 @@ class TestHeartbeatCommands:
         event = make_event("@sb:matrix.local", "/heartbeat start 6h")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_awaited()
 
@@ -379,6 +418,9 @@ class TestHeartbeatGatedInSharedRooms:
         event = make_event("@sb:matrix.local", "/heartbeat start 6h")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should NOT process the heartbeat command
         bot.send.assert_not_awaited()
@@ -397,6 +439,9 @@ class TestHeartbeatGatedInSharedRooms:
         )
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
@@ -474,6 +519,9 @@ class TestHeartbeatEndToEnd:
         # Start with a very short interval for testing
         event = make_event("@sb:matrix.local", "/heartbeat start 5m")
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Verify heartbeat manager was created and has an entry
         assert hasattr(bot, 'heartbeat')

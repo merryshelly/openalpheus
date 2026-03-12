@@ -101,6 +101,9 @@ class TestResetRemoval:
         room = make_room("!test:matrix.local")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should go through agent.handle_input as a regular message,
         # not be intercepted as a command
@@ -149,8 +152,17 @@ class TestLazyWake:
         room2 = make_room("!room2:local")
 
         await bot._handle_room_message(room1, make_room_message("@sb:local", "old msg 1"))
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         await bot._handle_room_message(room1, make_room_message("@merry:local", "old reply"))
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         await bot._handle_room_message(room2, make_room_message("@sb:local", "old msg 2"))
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Agent history should NOT have been populated
         assert len(agent._rooms) == 0, \
@@ -190,6 +202,9 @@ class TestLazyWake:
         event = make_room_message("@sb:local", "Hello now")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should have called room_messages to load history
         bot.client.room_messages.assert_awaited()
@@ -225,10 +240,16 @@ class TestLazyWake:
 
         # First message: triggers history load
         await bot._handle_room_message(room, make_room_message("@sb:local", "First"))
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         first_call_count = bot.client.room_messages.await_count
 
         # Second message: should NOT trigger history load again
         await bot._handle_room_message(room, make_room_message("@sb:local", "Second"))
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         second_call_count = bot.client.room_messages.await_count
 
         assert second_call_count == first_call_count, \
@@ -263,7 +284,13 @@ class TestLazyWake:
         room2 = make_room("!room2:local")
 
         await bot._handle_room_message(room1, make_room_message("@sb:local", "Hi room1"))
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         await bot._handle_room_message(room2, make_room_message("@sb:local", "Hi room2"))
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         assert "!room1:local" in bot._active_rooms
         assert "!room2:local" in bot._active_rooms
@@ -311,6 +338,9 @@ class TestHistoryLoadOnActivation:
         event = make_room_message("@sb:local", "New question")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Agent history for this room should include the loaded messages
         history = real_rooms.get("!room:local", [])
@@ -355,6 +385,9 @@ class TestHistoryLoadOnActivation:
         event = make_room_message("@sb:local", "New msg")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         history = real_rooms.get("!room:local", [])
         # After reversal to chronological: user msg first, then bot reply
@@ -399,6 +432,9 @@ class TestHistoryLoadOnActivation:
 
         # Should not crash — should send an overflow message
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should have sent an overflow notice to the room
         send_calls = bot.client.room_send.call_args_list
@@ -461,6 +497,9 @@ class TestHistoryPagination:
         event = make_room_message("@sb:local", "New message")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should have paginated (called room_messages twice)
         assert bot.client.room_messages.await_count == 2
@@ -501,6 +540,9 @@ class TestHistoryPagination:
         event = make_room_message("@sb:local", "First message ever")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Only one call to room_messages (initial, finds nothing)
         assert bot.client.room_messages.await_count == 1
@@ -541,6 +583,9 @@ class TestHistoryPagination:
         event = make_room_message("@sb:local", "New message")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # 1 initial call + at most 5 pages (500 messages reached after 5 more = 6 total calls)
         assert bot.client.room_messages.await_count <= 6
@@ -584,6 +629,9 @@ class TestHistoryPagination:
         event = make_room_message("@sb:local", "New message")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should stop after second call (empty chunk breaks the loop)
         assert bot.client.room_messages.await_count == 2
@@ -619,6 +667,9 @@ class TestCommandsPostRefactor:
         room = make_room("!room:local")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
         bot._cancel_current.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -652,6 +703,9 @@ class TestCommandsPostRefactor:
         room = make_room("!room:local")
 
         await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         bot.client.room_send.assert_awaited_once()
         agent.handle_input.assert_not_called()

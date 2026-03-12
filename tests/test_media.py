@@ -270,6 +270,9 @@ class TestMediaDownload:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # File should exist at workspace/media/<hash>/photo.jpg
         expected_dir = tmp_path / MEDIA_DIR / _event_id_hash("$dl1")
@@ -288,6 +291,9 @@ class TestMediaDownload:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         media_dir = tmp_path / MEDIA_DIR / _event_id_hash("$dl2")
         assert media_dir.is_dir()
@@ -304,6 +310,9 @@ class TestMediaDownload:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         client.download.assert_awaited_once()
         call_kwargs = client.download.call_args
@@ -329,6 +338,9 @@ class TestMessageFormat:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Check what was passed to agent.handle_input
         agent.handle_input.assert_awaited_once()
@@ -349,6 +361,9 @@ class TestMessageFormat:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
         # Should contain MB representation (1.5 MB or similar)
@@ -368,6 +383,9 @@ class TestMessageFormat:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
         assert "Check this out" in message
@@ -383,6 +401,9 @@ class TestMessageFormat:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
         lines = [l for l in message.strip().split("\n") if l.strip()]
@@ -402,6 +423,9 @@ class TestMessageFormat:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
         assert "application/octet-stream" in message
@@ -426,6 +450,9 @@ class TestSizeLimit:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # File should NOT be stored
         media_dir = tmp_path / MEDIA_DIR
@@ -447,6 +474,9 @@ class TestSizeLimit:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Agent should receive a skip message
         agent.handle_input.assert_awaited_once()
@@ -467,6 +497,9 @@ class TestSizeLimit:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         # Should be stored, not skipped
         message = agent.handle_input.call_args[0][0]
@@ -490,6 +523,9 @@ class TestDownloadErrors:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_awaited_once()
         message = agent.handle_input.call_args[0][0]
@@ -508,6 +544,9 @@ class TestDownloadErrors:
 
         # Should not raise
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
     @pytest.mark.asyncio
     async def test_download_exception_handled(self, tmp_path):
@@ -521,6 +560,9 @@ class TestDownloadErrors:
 
         # Should not raise — bot should catch and notify
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
 
 # --- Guards ---
@@ -540,6 +582,9 @@ class TestMediaGuards:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_awaited()
 
@@ -553,6 +598,9 @@ class TestMediaGuards:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         agent.handle_input.assert_not_awaited()
         client.download.assert_not_awaited()
@@ -583,6 +631,9 @@ class TestSharedProcessing:
 
         with patch.object(bot, '_process_message', new_callable=AsyncMock) as mock_process:
             await bot._handle_media_message(room, event)
+            # Drain background tasks fired by handler
+            if hasattr(bot, "_background_tasks"):
+                await asyncio.gather(*bot._background_tasks)
             mock_process.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -601,6 +652,9 @@ class TestSharedProcessing:
 
         with patch.object(bot, '_process_message', new_callable=AsyncMock) as mock_process:
             await bot._handle_room_message(room, event)
+            # Drain background tasks fired by handler
+            if hasattr(bot, "_background_tasks"):
+                await asyncio.gather(*bot._background_tasks)
             mock_process.assert_awaited_once()
 
 
@@ -622,6 +676,9 @@ class TestMediaTypes:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
         assert "audio/ogg" in message
@@ -638,6 +695,9 @@ class TestMediaTypes:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
         assert "video/mp4" in message
@@ -654,6 +714,9 @@ class TestMediaTypes:
         room.room_id = "!test:matrix.local"
 
         await bot._handle_media_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
         assert "application/pdf" in message
