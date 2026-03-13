@@ -89,10 +89,19 @@ class TestFormatInterval:
     def test_minutes(self):
         assert format_interval(900) == "15m"
 
-    def test_non_round_minutes(self):
-        assert format_interval(5400) == "90m"
+    def test_hours_and_minutes(self):
+        assert format_interval(5400) == "1h 30m"
 
-    def test_seconds_fallback(self):
+    def test_hours_minutes_mixed(self):
+        assert format_interval(7393) == "2h 3m"
+
+    def test_minutes_and_seconds_under_5m(self):
+        assert format_interval(90) == "1m 30s"
+
+    def test_minutes_drops_seconds_over_5m(self):
+        assert format_interval(610) == "10m"
+
+    def test_seconds_only(self):
         assert format_interval(45) == "45s"
 
     def test_zero(self):

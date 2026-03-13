@@ -110,6 +110,8 @@ def make_bot(tmp_path):
     with patch("openalph.matrix.AsyncClient"):
         bot = MatrixBot(agent, matrix_config)
 
+    # Configure mock client.rooms to return empty dict (no room name resolution)
+    bot.client.rooms = {}
     bot._synced = True
     bot.send = AsyncMock()
     bot.send_notice = AsyncMock()
@@ -335,8 +337,9 @@ class TestHeartbeatCommands:
 
         bot.send.assert_awaited_once()
         msg = bot.send.call_args[0][1]
-        assert "!room1:matrix.local" in msg
+        assert "!room1:matrix.local" in msg  # room ID as fallback name
         assert "6h" in msg
+        assert "next in" in msg
 
     @pytest.mark.asyncio
     async def test_status_empty(self, tmp_path):

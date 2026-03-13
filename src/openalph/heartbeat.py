@@ -224,13 +224,27 @@ def parse_interval(s: str) -> int | None:
 
 
 def format_interval(seconds: int) -> str:
-    """Format seconds as human-readable.
+    """Format seconds as human-readable, using mixed units when needed.
 
     3600 → '1h', 900 → '15m', 45 → '45s'
+    7393 → '2h 3m', 3661 → '1h 1m', 90 → '1m 30s'
     """
-    if seconds >= 3600 and seconds % 3600 == 0:
-        return f"{seconds // 3600}h"
-    elif seconds >= 60 and seconds % 60 == 0:
-        return f"{seconds // 60}m"
-    else:
-        return f"{seconds}s"
+    if seconds < 0:
+        return "0s"
+    if seconds == 0:
+        return "0s"
+
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    # Only show seconds if no larger unit, or if total < 5 minutes (precision matters)
+    if s and (not parts or seconds < 300):
+        parts.append(f"{s}s")
+
+    return " ".join(parts) if parts else "0s"

@@ -17,5 +17,13 @@ def clear_provider_client_cache():
     _client_cache.clear()
 
 
-# Tests use tmp_path (built-in pytest fixture) and construct
-# their own configs/workspaces as needed.
+@pytest.fixture(autouse=True)
+def ensure_test_workspace_dirs():
+    """Ensure hardcoded workspace paths used by config tests exist.
+
+    Several test TOMLs reference /tmp/test or /tmp/test-workspace.
+    Config validation checks that workspace.path is a real directory.
+    """
+    from pathlib import Path
+    for d in ("/tmp/test", "/tmp/test-workspace"):
+        Path(d).mkdir(exist_ok=True)

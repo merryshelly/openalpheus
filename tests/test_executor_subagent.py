@@ -297,14 +297,25 @@ class TestCircuitBreaker:
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_fires(self):
-        """After MAX_ITERATIONS tool calls, returns error."""
+        """After MAX_ITERATIONS tool calls, returns error with summary."""
         config = make_config()
         tools = make_tools()
+
+        call_count = 0
+
+        async def _mock_complete(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("tools") is not None:
+                return tool_response("shell", {"command": "echo loop"})
+            else:
+                # Summary call (tools=None)
+                return text_response("Here is what I did so far.")
 
         with patch(
             "openalph.tools.subagent.complete",
             new_callable=AsyncMock,
-            return_value=tool_response("shell", {"command": "echo loop"}),
+            side_effect=_mock_complete,
         ), patch(
             "openalph.tools.execute_tool",
             new_callable=AsyncMock,
@@ -314,12 +325,73 @@ class TestCircuitBreaker:
 
         assert result.is_error is True
         assert "limit" in result.content.lower()
+        assert "what I did" in result.content  # summary content present
         assert mock_exec.call_count == MAX_ITERATIONS
+        assert call_count == MAX_ITERATIONS + 1  # iterations + summary
 
     @pytest.mark.asyncio
-    async def test_max_iterations_is_100(self):
-        """Circuit breaker is set to 100 iterations."""
-        assert MAX_ITERATIONS == 100
+    async def test_max_iterations_is_200(self):
+        """Circuit breaker is set to 200 iterations."""
+        assert MAX_ITERATIONS == 200
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_summary_failure_returns_fallback(self):
+        """If summary generation fails, a static fallback is returned."""
+        config = make_config()
+        tools = make_tools()
+
+        async def _mock_complete(*args, **kwargs):
+            if kwargs.get("tools") is not None:
+                return tool_response("shell", {"command": "echo"})
+            else:
+                raise RuntimeError("Provider down")
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=_mock_complete,
+        ), patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="ok"),
+        ):
+            result = await run_subagent("Loop forever", config, tools=tools)
+
+        assert result.is_error is True
+        assert "limit" in result.content.lower()
+        assert "failed" in result.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_custom_max_iterations(self):
+        """max_iterations parameter overrides the default."""
+        config = make_config()
+        tools = make_tools()
+
+        call_count = 0
+
+        async def _mock_complete(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("tools") is not None:
+                return tool_response("shell", {"command": "echo"})
+            else:
+                return text_response("Done after custom limit.")
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=_mock_complete,
+        ), patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="ok"),
+        ) as mock_exec:
+            result = await run_subagent("Work", config, tools=tools, max_iterations=5)
+
+        assert result.is_error is True
+        assert "5" in result.content  # mentions the custom limit
+        assert mock_exec.call_count == 5
+        assert call_count == 6  # 5 iterations + 1 summary
 
 
 class TestErrorHandling:

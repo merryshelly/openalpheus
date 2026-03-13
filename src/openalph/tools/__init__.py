@@ -190,6 +190,10 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 "max_tokens": {
                     "type": "integer",
                     "description": "Maximum tokens for response (optional)"
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "description": "Maximum tool-call iterations (optional, default 200)"
                 }
             },
             "required": ["task"]
@@ -336,6 +340,27 @@ def tool_schemas(tools: list[ToolDef]) -> list[dict]:
         }
         for tool in tools
     ]
+
+
+def wrap_tool_result(content: str, tool_name: str, tool_call_id: str) -> str:
+    """Wrap tool result content in XML-style delimiter tags.
+
+    Gives the LLM a structural signal that the content is tool output
+    (data), not instructions.  Content is never escaped or modified.
+
+    Args:
+        content: Raw tool result text (already truncated if needed)
+        tool_name: Name of the tool that produced this result
+        tool_call_id: Unique tool call identifier
+
+    Returns:
+        Content wrapped in ``<tool_result>`` tags with provenance attributes
+    """
+    return (
+        f'<tool_result tool="{tool_name}" id="{tool_call_id}">\n'
+        f"{content}\n"
+        f"</tool_result>"
+    )
 
 
 def truncate_result(text: str, max_chars: int) -> str:
@@ -505,6 +530,7 @@ async def execute_tool(
             system_prompt=input.get("system_prompt"),
             model=input.get("model"),
             max_tokens=input.get("max_tokens"),
+            max_iterations=input.get("max_iterations"),
         )
     elif name == "memory_search":
         from .memory_search import run_memory_search

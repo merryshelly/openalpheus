@@ -673,26 +673,26 @@ class TestClientCacheMultiProvider:
 
 class TestAgentActiveModel:
 
-    def test_agent_active_model_initialized_from_config(self, tmp_path):
-        """Agent.active_model starts as config.default_model."""
+    def test_agent_default_model_from_config(self, tmp_path):
+        """Agent.get_model() returns config.default_model when no override set."""
         (tmp_path / "SAFETY.md").write_text("")
         config = make_config(workspace=str(tmp_path),
                              default_model="anthropic/claude-sonnet-4-20250514")
         from openalph.agent import Agent
         agent = Agent(config)
-        assert agent.active_model == "anthropic/claude-sonnet-4-20250514"
+        assert agent.get_model() == "anthropic/claude-sonnet-4-20250514"
 
-    def test_agent_status_reports_active_model(self, tmp_path):
-        """Agent.status() includes the active model, not just default."""
+    def test_agent_status_reports_room_model(self, tmp_path):
+        """Agent.status() reports the model for the queried room."""
         (tmp_path / "SAFETY.md").write_text("")
         config = make_config(workspace=str(tmp_path))
         from openalph.agent import Agent
         agent = Agent(config)
         status = agent.status()
-        assert status["model"] == agent.active_model
+        assert status["model"] == agent.get_model()
 
-    def test_switch_model_changes_active_model(self, tmp_path):
-        """switch_model() updates active_model."""
+    def test_switch_model_changes_room_model(self, tmp_path):
+        """switch_model() updates the model for the specified room."""
         (tmp_path / "SAFETY.md").write_text("")
         config = make_multi_config(workspace=str(tmp_path))
         from openalph.agent import Agent
@@ -700,7 +700,7 @@ class TestAgentActiveModel:
 
         result = agent.switch_model("openrouter/moonshotai/kimi-k2.5")
         assert result is None  # no error
-        assert agent.active_model == "openrouter/moonshotai/kimi-k2.5"
+        assert agent.get_model() == "openrouter/moonshotai/kimi-k2.5"
 
     def test_switch_model_unknown_provider_returns_error(self, tmp_path):
         """switch_model() returns error string for unknown provider prefix."""
@@ -712,8 +712,8 @@ class TestAgentActiveModel:
         result = agent.switch_model("cohere/some-model")
         assert result is not None
         assert "cohere" in result.lower() or "unknown" in result.lower()
-        # Active model should NOT change on error
-        assert agent.active_model == config.default_model
+        # Model should NOT change on error
+        assert agent.get_model() == config.default_model
 
     def test_switch_model_vision_guard(self, tmp_path):
         """Block model switch when images exist in room history and target is non-vision."""
@@ -737,8 +737,8 @@ class TestAgentActiveModel:
         result = agent.switch_model("ollama/devstral-2:123b", room_id=room_id)
         assert result is not None
         assert "image" in result.lower() or "vision" in result.lower()
-        # Active model unchanged
-        assert agent.active_model == config.default_model
+        # Room model unchanged
+        assert agent.get_model(room_id) == config.default_model
 
     def test_switch_model_context_window_guard(self, tmp_path):
         """Block model switch when context exceeds target model's configured limit."""
@@ -954,7 +954,7 @@ class TestHandleInputMultiProvider:
 
         from openalph.agent import Agent
         agent = Agent(config)
-        agent.switch_model("openrouter/moonshotai/kimi-k2.5")
+        agent.switch_model("openrouter/moonshotai/kimi-k2.5", "room1")
 
         mock_resp = Response(
             content="Hi from Kimi",

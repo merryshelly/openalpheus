@@ -324,6 +324,40 @@ api_key = "sk-test"
         with pytest.raises(ConfigError):
             load_config(tmp_path / "agent.toml")
 
+    def test_nonexistent_workspace_path(self, tmp_path):
+        """workspace.path pointing to nonexistent dir raises ConfigError."""
+        (tmp_path / "agent.toml").write_text("""
+[agent]
+name = "test"
+default_model = "anthropic/test"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "sk-test"
+
+[workspace]
+path = "/nonexistent/path/here"
+""")
+        with pytest.raises(ConfigError, match="does not exist"):
+            load_config(tmp_path / "agent.toml")
+
+    def test_default_model_unknown_provider(self, tmp_path):
+        """default_model referencing unconfigured provider raises ConfigError."""
+        (tmp_path / "agent.toml").write_text("""
+[agent]
+name = "test"
+default_model = "banana/some-model"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "sk-test"
+
+[workspace]
+path = "/tmp/test"
+""")
+        with pytest.raises(ConfigError, match="banana.*not configured"):
+            load_config(tmp_path / "agent.toml")
+
 
 # --- Dataclass ---
 

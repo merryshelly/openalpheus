@@ -17,7 +17,7 @@ from pathlib import Path
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
 from openalph.provider import complete, stream, StreamEvent
-from openalph.tools import discover_tools, execute_tool, truncate_result
+from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -147,49 +147,8 @@ class Agent:
         self.tools = discover_tools(config.workspace)
         self._current_task: asyncio.Task | None = None
         self._room_locks: dict[str, asyncio.Lock] = {}
-        self.active_model = config.default_model
+        self._room_models: dict[str, str] = {}  # room_id → model override
         self._truncation_retry = False
-        self._reconstruct_usage_stats()
-
-
-    def _reconstruct_usage_stats(self) -> None:
-        """Scan JSONL log files and reconstruct cumulative usage counters."""
-        logs_dir = Path(self.config.workspace) / "logs"
-        if not logs_dir.exists():
-            return
-        n_files = 0
-        total_in = 0
-        total_out = 0
-        total_tc = 0
-        for log_file in sorted(logs_dir.glob("*.jsonl")):
-            n_files += 1
-            try:
-                with log_file.open() as fh:
-                    for lineno, line in enumerate(fh, 1):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
-                            logger.warning("Skipping malformed JSON in %s line %d", log_file.name, lineno)
-                            continue
-                        total_in += entry.get("input_tokens", 0) or 0
-                        total_out += entry.get("output_tokens", 0) or 0
-                        tool_calls = entry.get("tool_calls") or []
-                        total_tc += len(tool_calls)
-            except OSError as exc:
-                logger.warning("Could not read log file %s: %s", log_file, exc)
-        self.total_input_tokens = total_in
-        self.total_output_tokens = total_out
-        self.total_tool_calls = total_tc
-        logger.info(
-            "Reconstructed usage: %d in / %d out / %d tool calls from %d log files",
-            self.total_input_tokens,
-            self.total_output_tokens,
-            self.total_tool_calls,
-            n_files,
-        )
 
 
     def history(self, room_id: str) -> list[dict]:
@@ -197,6 +156,10 @@ class Agent:
         if room_id not in self._rooms:
             self._rooms[room_id] = []
         return self._rooms[room_id]
+
+    def get_model(self, room_id: str = "_default") -> str:
+        """Return the active model for a room, falling back to config default."""
+        return self._room_models.get(room_id, self.config.default_model)
 
     def switch_model(self, model_str: str, room_id: str = "_default") -> str | None:
         """Switch active model. Returns error string on failure, None on success."""
@@ -225,7 +188,7 @@ class Agent:
         if context_tokens > model_limit - self.config.max_tokens:
             return f"Cannot switch to {model_str} — current context (~{context_tokens:,} tokens) exceeds model limit ({model_limit:,})."
 
-        self.active_model = model_str
+        self._room_models[room_id] = model_str
         return None
 
 
@@ -329,7 +292,7 @@ class Agent:
                         system=self.system_prompt,
                         messages=list(history),
                         tools=tools_arg,
-                        model=self.active_model,
+                        model=self.get_model(room_id),
                         thinking=thinking,
                     ):
                         if event.type == "text":
@@ -362,7 +325,7 @@ class Agent:
                             system=self.system_prompt,
                             messages=list(history),
                             tools=tools_arg,
-                            model=self.active_model,
+                            model=self.get_model(room_id),
                             thinking=thinking,
                         )
 
@@ -377,7 +340,7 @@ class Agent:
                         # Text response - log and return
                         self._log_turn(
                             room_id=room_id,
-                            model=self.active_model,
+                            model=self.get_model(room_id),
                             input_tokens=usage.input_tokens,
                             output_tokens=usage.output_tokens,
                             tool_calls=None,
@@ -458,7 +421,7 @@ class Agent:
                     # Log this tool-use turn
                     self._log_turn(
                         room_id=room_id,
-                        model=self.active_model,
+                        model=self.get_model(room_id),
                         input_tokens=usage.input_tokens,
                         output_tokens=usage.output_tokens,
                         tool_calls=logged_tool_calls,
@@ -466,27 +429,71 @@ class Agent:
                         content_preview=accumulated_text or response.content,
                     )
 
-                    # Append tool results to history (truncated) and notify
+                    # Append tool results to history (truncated + wrapped) and notify
                     for tc, result in zip(active_tool_calls, results):
                         truncated_content = truncate_result(result.content, self.config.truncation_limit)
+                        wrapped_content = wrap_tool_result(truncated_content, tc.name, tc.id)
                         history.append({
                             "role": "tool",
                             "tool_call_id": tc.id,
-                            "content": truncated_content,
+                            "content": wrapped_content,
                             "is_error": result.is_error,
                         })
                         if on_tool_call:
                             try:
                                 await on_tool_call(
-                                    tc.id, tc.name, tc.input, truncated_content, result.is_error
+                                    tc.id, tc.name, tc.input, wrapped_content, result.is_error
                                 )
                             except Exception as e:
                                 logger.warning("Tool call callback failed: %s", e)
 
-                # Hit max iterations - append limit message to maintain history consistency
-                limit_msg = "[Tool call limit reached. Please summarize your progress.]"
-                history.append({"role": "assistant", "content": limit_msg})
-                return limit_msg
+                # Hit max iterations — request a summary from the model
+                logger.warning("Tool call limit (%d) reached in room %s",
+                               self.config.max_iterations, room_id)
+                limit_notice = (
+                    "[SYSTEM: Tool call limit reached. You MUST now summarize your progress. "
+                    "State what you completed, what remains, and any partial results. "
+                    "Do NOT attempt further tool calls.]"
+                )
+                history.append({"role": "user", "content": limit_notice})
+
+                try:
+                    summary_text = ""
+                    summary_response = None
+                    async for event in stream(
+                        config=self.config,
+                        system=self.system_prompt,
+                        messages=list(history),
+                        tools=None,  # no tools — force text response
+                        model=self.get_model(room_id),
+                        thinking=thinking,
+                    ):
+                        if event.type == "text":
+                            summary_text += event.content
+                            if on_text_delta:
+                                await on_text_delta(event.content, done=False)
+                        elif event.type == "done":
+                            summary_response = event.response
+                            if on_text_delta:
+                                await on_text_delta("", done=True)
+
+                    if summary_response:
+                        self.total_input_tokens += summary_response.usage.input_tokens
+                        self.total_output_tokens += summary_response.usage.output_tokens
+
+                    final_text = summary_text or (
+                        summary_response.content if summary_response else
+                        "⚠️ Tool call limit reached and summary generation failed."
+                    )
+                except Exception as e:
+                    logger.warning("Summary generation failed after tool limit: %s", e)
+                    final_text = (
+                        f"⚠️ **Tool call limit reached** ({self.config.max_iterations} iterations). "
+                        "Summary generation also failed — check logs for details."
+                    )
+
+                history.append({"role": "assistant", "content": final_text})
+                return final_text
             finally:
                 self._current_task = None
 
@@ -558,7 +565,7 @@ class Agent:
         context_pct = round(context_tokens / model_max * 100) if model_max else 0
         return {
             "name": self.config.name,
-            "model": self.active_model,
+            "model": self.get_model(room_id),
             "turns": sum(1 for m in self.history(room_id) if m["role"] == "user"),
             "context_tokens": context_tokens,
             "context_max": model_max,

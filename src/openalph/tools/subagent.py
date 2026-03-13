@@ -10,12 +10,12 @@ import logging
 from dataclasses import replace
 
 from openalph.provider import complete
-from openalph.tools import ToolDef, ToolResult, tool_schemas, truncate_result
+from openalph.tools import ToolDef, ToolResult, tool_schemas, truncate_result, wrap_tool_result
 from openalph.config import AgentConfig
 
 logger = logging.getLogger("openalph.subagent")
 
-MAX_ITERATIONS = 100
+MAX_ITERATIONS = 200
 
 
 async def run_subagent(
@@ -25,6 +25,7 @@ async def run_subagent(
     system_prompt: str | None = None,
     model: str | None = None,
     max_tokens: int | None = None,
+    max_iterations: int | None = None,
 ) -> ToolResult:
     """Execute a multi-turn LLM call as a sub-agent.
 
@@ -39,6 +40,7 @@ async def run_subagent(
         system_prompt: Custom system prompt (default: "You are a helpful assistant.")
         model: Model override (default: use parent's model)
         max_tokens: Max tokens override (default: use parent's max_tokens)
+        max_iterations: Max tool-call iterations (default: MAX_ITERATIONS)
 
     Returns:
         ToolResult with the LLM's response content, or error description on failure
@@ -50,6 +52,9 @@ async def run_subagent(
     if model is not None:
         config = replace(config, default_model=model)
 
+    # Resolve iteration limit
+    iteration_limit = max_iterations if max_iterations is not None else MAX_ITERATIONS
+
     # Filter out subagent tool to prevent recursion
     sub_tools = [t for t in (tools or []) if t.name != "subagent"]
     tools_arg = sub_tools if sub_tools else None
@@ -58,7 +63,7 @@ async def run_subagent(
     messages = [{"role": "user", "content": task}]
 
     try:
-        for iteration in range(MAX_ITERATIONS):
+        for iteration in range(iteration_limit):
             response = await complete(
                 config=config,
                 system=system,
@@ -99,22 +104,46 @@ async def run_subagent(
 
             for tc, result in zip(response.tool_calls, results):
                 truncated = truncate_result(result.content, config.truncation_limit)
+                wrapped = wrap_tool_result(truncated, tc.name, tc.id)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": truncated,
+                    "content": wrapped,
                     "is_error": result.is_error,
                 })
                 logger.debug("Sub-agent tool %s: %s (%d chars)",
                              tc.name, "error" if result.is_error else "ok",
-                             len(truncated))
+                             len(wrapped))
 
-        # Circuit breaker
-        return ToolResult(
-            content="[Sub-agent tool call limit reached after "
-                    f"{MAX_ITERATIONS} iterations]",
-            is_error=True,
+        # Circuit breaker — request summary from the model
+        logger.warning("Sub-agent tool call limit (%d) reached", iteration_limit)
+        limit_notice = (
+            "[SYSTEM: Tool call limit reached. You MUST now summarize your progress. "
+            "State what you completed, what remains, and any partial results. "
+            "Do NOT attempt further tool calls.]"
         )
+        messages.append({"role": "user", "content": limit_notice})
+
+        try:
+            summary = await complete(
+                config=config,
+                system=system,
+                messages=list(messages),
+                tools=None,  # no tools — force text response
+                max_tokens=max_tokens,
+            )
+            return ToolResult(
+                content=f"⚠️ Sub-agent hit tool call limit ({iteration_limit} iterations). "
+                        f"Summary:\n\n{summary.content}",
+                is_error=True,
+            )
+        except Exception as e:
+            logger.warning("Sub-agent summary generation failed: %s", e)
+            return ToolResult(
+                content=f"⚠️ Sub-agent hit tool call limit ({iteration_limit} iterations). "
+                        "Summary generation also failed.",
+                is_error=True,
+            )
 
     except Exception as e:
         return ToolResult(content=f"Sub-agent error: {e}", is_error=True)

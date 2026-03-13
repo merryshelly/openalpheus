@@ -252,102 +252,296 @@ class TestContextOverflowPreAppend:
         assert big_message not in contents
 
 
-# --- Usage Reconstruction ---
+# --- Session-Scoped Usage Counters ---
 
 
-import json as _json
+class TestSessionScopedUsage:
 
-
-class TestUsageReconstruction:
-
-    def _write_jsonl(self, path, entries):
-        with open(path, "w") as f:
-            for entry in entries:
-                f.write(_json.dumps(entry) + "\n")
-
-    def test_reconstruct_from_empty_logs_dir(self, tmp_path):
-        (tmp_path / "logs").mkdir()
+    def test_counters_start_at_zero(self, tmp_path):
         config = make_config(tmp_path)
         agent = Agent(config)
         assert agent.total_input_tokens == 0
         assert agent.total_output_tokens == 0
         assert agent.total_tool_calls == 0
 
-    def test_reconstruct_from_no_logs_dir(self, tmp_path):
+    def test_counters_ignore_prior_logs(self, tmp_path):
+        """Existing JSONL logs do NOT inflate session counters."""
+        import json
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        with open(logs / "prior.jsonl", "w") as f:
+            f.write(json.dumps({"input_tokens": 999, "output_tokens": 888, "tool_calls": []}) + "\n")
         config = make_config(tmp_path)
         agent = Agent(config)
         assert agent.total_input_tokens == 0
         assert agent.total_output_tokens == 0
-        assert agent.total_tool_calls == 0
 
-    def test_reconstruct_sums_across_files(self, tmp_path):
-        logs = tmp_path / "logs"
-        logs.mkdir()
-        self._write_jsonl(logs / "a.jsonl", [
-            {"input_tokens": 10, "output_tokens": 20, "tool_calls": []},
-            {"input_tokens": 5, "output_tokens": 15, "tool_calls": []},
-        ])
-        self._write_jsonl(logs / "b.jsonl", [
-            {"input_tokens": 100, "output_tokens": 200, "tool_calls": []},
-        ])
+    @pytest.mark.asyncio
+    async def test_counters_accumulate_within_session(self, tmp_path):
         config = make_config(tmp_path)
         agent = Agent(config)
-        assert agent.total_input_tokens == 115
-        assert agent.total_output_tokens == 235
-        assert agent.total_tool_calls == 0
 
-    def test_reconstruct_skips_malformed_lines(self, tmp_path):
-        logs = tmp_path / "logs"
-        logs.mkdir()
-        log_file = logs / "mixed.jsonl"
-        with open(log_file, "w") as f:
-            f.write(_json.dumps({"input_tokens": 7, "output_tokens": 3, "tool_calls": []}) + "\n")
-            f.write("this is not json\n")
-            f.write(_json.dumps({"input_tokens": 2, "output_tokens": 1, "tool_calls": []}) + "\n")
-        config = make_config(tmp_path)
-        agent = Agent(config)
-        assert agent.total_input_tokens == 9
-        assert agent.total_output_tokens == 4
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("A", input_tokens=100, output_tokens=50)
+            await agent.handle_input("First")
+            mock.side_effect = make_stream_events("B", input_tokens=200, output_tokens=80)
+            await agent.handle_input("Second")
 
-    def test_reconstruct_counts_tool_calls(self, tmp_path):
-        logs = tmp_path / "logs"
-        logs.mkdir()
-        self._write_jsonl(logs / "tools.jsonl", [
-            {"input_tokens": 1, "output_tokens": 1, "tool_calls": [{"name": "shell"}, {"name": "read"}]},
-            {"input_tokens": 1, "output_tokens": 1, "tool_calls": [{"name": "write"}]},
-            {"input_tokens": 1, "output_tokens": 1, "tool_calls": []},
-        ])
-        config = make_config(tmp_path)
-        agent = Agent(config)
-        assert agent.total_tool_calls == 3
+        assert agent.total_input_tokens == 300
+        assert agent.total_output_tokens == 130
 
-    def test_status_reflects_reconstructed_stats(self, tmp_path):
-        logs = tmp_path / "logs"
-        logs.mkdir()
-        self._write_jsonl(logs / "run.jsonl", [
-            {"input_tokens": 50, "output_tokens": 100, "tool_calls": [{"name": "shell"}]},
-        ])
+    def test_status_reflects_session_counters(self, tmp_path):
         config = make_config(tmp_path)
         agent = Agent(config)
         s = agent.status()
-        assert s["total_input_tokens"] == 50
-        assert s["total_output_tokens"] == 100
-        assert s["total_tool_calls"] == 1
+        assert s["total_input_tokens"] == 0
+        assert s["total_output_tokens"] == 0
+        assert s["total_tool_calls"] == 0
 
-    @pytest.mark.asyncio
-    async def test_new_usage_adds_to_reconstructed(self, tmp_path):
-        logs = tmp_path / "logs"
-        logs.mkdir()
-        self._write_jsonl(logs / "prior.jsonl", [
-            {"input_tokens": 30, "output_tokens": 60, "tool_calls": []},
-        ])
+
+# --- Per-Room Model Override (bead .83) ---
+
+
+class TestPerRoomModelOverride:
+
+    def test_default_fallback_no_override(self, tmp_path):
+        config = make_config(tmp_path, default_model="test/default-model")
+        agent = Agent(config)
+
+        assert agent.get_model("room_a") == "test/default-model"
+        assert agent.get_model("room_b") == "test/default-model"
+
+    def test_switch_model_sets_per_room(self, tmp_path):
         config = make_config(tmp_path)
         agent = Agent(config)
-        assert agent.total_input_tokens == 30
+
+        with patch("openalph.config.resolve_model"):
+            result = agent.switch_model("other/model-x", "room_a")
+
+        assert result is None
+        assert agent.get_model("room_a") == "other/model-x"
+
+    def test_per_room_isolation(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.config.resolve_model"):
+            agent.switch_model("other/model-a", "room_a")
+            agent.switch_model("other/model-b", "room_b")
+
+        assert agent.get_model("room_a") == "other/model-a"
+        assert agent.get_model("room_b") == "other/model-b"
+        assert agent.get_model("room_c") == config.default_model
+
+    def test_status_shows_per_room_model(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.config.resolve_model"):
+            agent.switch_model("other/room-model", "room_a")
+
+        status_a = agent.status("room_a")
+        status_b = agent.status("room_b")
+
+        assert status_a["model"] == "other/room-model"
+        assert status_b["model"] == config.default_model
+
+    @pytest.mark.asyncio
+    async def test_override_persists_across_calls(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        with patch("openalph.config.resolve_model"):
+            agent.switch_model("persistent/model", "test_room")
 
         with patch("openalph.agent.stream") as mock:
-            mock.side_effect = make_stream_events("Hi", input_tokens=10, output_tokens=5)
-            await agent.handle_input("hello")
+            mock.side_effect = make_stream_events("r1")
+            await agent.handle_input("msg 1", "test_room")
 
-        assert agent.total_input_tokens == 40
-        assert agent.total_output_tokens == 65
+            mock.side_effect = make_stream_events("r2")
+            await agent.handle_input("msg 2", "test_room")
+
+        for call in mock.call_args_list:
+            assert call.kwargs["model"] == "persistent/model"
+
+    def test_new_agent_has_no_overrides(self, tmp_path):
+        """Process restart (new Agent instance) resets all rooms to default."""
+        config = make_config(tmp_path, default_model="original/default")
+
+        agent1 = Agent(config)
+        with patch("openalph.config.resolve_model"):
+            agent1.switch_model("override/model", "room_a")
+        assert agent1.get_model("room_a") == "override/model"
+
+        agent2 = Agent(config)
+        assert agent2.get_model("room_a") == "original/default"
+
+    def test_vision_guard_per_room(self, tmp_path):
+        """Vision guard only blocks the room that has images, not other rooms."""
+        config = make_config(tmp_path)
+        agent = Agent(config)
+
+        # Room A has images in history
+        agent._rooms["room_a"] = [
+            {"role": "user", "content": [
+                {"type": "image", "media_type": "image/png", "data": "fakedata"},
+            ]},
+        ]
+        # Room B has no images
+        agent._rooms["room_b"] = [
+            {"role": "user", "content": "just text"},
+        ]
+
+        with patch("openalph.config.resolve_model"):
+            result_a = agent.switch_model("other/model", "room_a")
+            result_b = agent.switch_model("other/model", "room_b")
+
+        assert result_a is not None  # blocked
+        assert "image" in result_a.lower() or "vision" in result_a.lower()
+        assert result_b is None  # allowed
+        assert agent.get_model("room_a") == config.default_model  # unchanged
+        assert agent.get_model("room_b") == "other/model"  # set
+
+
+# --- Tool Call Limit Summary (bead .83 follow-up) ---
+
+
+class TestToolCallLimitSummary:
+
+    @staticmethod
+    def _give_agent_tools(agent):
+        """Give agent a fake tool so tools_arg is not None in the loop."""
+        from openalph.tools import ToolDef
+        agent.tools = [ToolDef(name="shell", description="Run shell", parameters={}, config={})]
+
+    @pytest.mark.asyncio
+    async def test_limit_returns_summary_not_static_message(self, tmp_path):
+        """When tool limit is hit, agent makes a final LLM call for a summary."""
+        from openalph.tools import ToolResult
+        from openalph.provider import ToolCall as TC
+
+        config = make_config(tmp_path, max_iterations=1)
+        agent = Agent(config)
+        self._give_agent_tools(agent)
+        tool_result = ToolResult(content="ok", is_error=False)
+        tc = TC(id="tc_1", name="shell", input={"command": "echo hi"})
+        call_count = 0
+
+        async def _mock_stream(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("tools") is not None:
+                yield StreamEvent(type="tool_done", tool_call=tc)
+                yield StreamEvent(
+                    type="done",
+                    response=Response(
+                        content="", model="test",
+                        usage=Usage(input_tokens=10, output_tokens=5),
+                        stop_reason="tool_use", tool_calls=[tc],
+                    ),
+                    stop_reason="tool_use", model="test",
+                )
+            else:
+                yield StreamEvent(type="text", content="Here is my summary.")
+                yield StreamEvent(
+                    type="done",
+                    response=Response(
+                        content="Here is my summary.", model="test",
+                        usage=Usage(input_tokens=20, output_tokens=10),
+                        stop_reason="end_turn",
+                    ),
+                    stop_reason="end_turn", model="test",
+                )
+
+        with patch("openalph.agent.stream", _mock_stream), \
+             patch("openalph.agent.execute_tool", return_value=tool_result):
+            result = await agent.handle_input("Do something", "_default")
+
+        assert "summary" in result.lower()
+        assert call_count == 2  # one tool iteration + one summary call
+
+    @pytest.mark.asyncio
+    async def test_limit_summary_streams_through_callback(self, tmp_path):
+        """Summary turn fires on_text_delta so streaming delivery works."""
+        from openalph.tools import ToolResult
+        from openalph.provider import ToolCall as TC
+
+        config = make_config(tmp_path, max_iterations=1)
+        agent = Agent(config)
+        self._give_agent_tools(agent)
+        tool_result = ToolResult(content="ok", is_error=False)
+        tc = TC(id="tc_1", name="shell", input={"command": "echo"})
+        streamed_deltas = []
+
+        async def _on_text_delta(text, done=False):
+            streamed_deltas.append((text, done))
+
+        async def _mock_stream(*args, **kwargs):
+            if kwargs.get("tools") is not None:
+                yield StreamEvent(type="tool_done", tool_call=tc)
+                yield StreamEvent(
+                    type="done",
+                    response=Response(
+                        content="", model="test",
+                        usage=Usage(input_tokens=10, output_tokens=5),
+                        stop_reason="tool_use", tool_calls=[tc],
+                    ),
+                    stop_reason="tool_use", model="test",
+                )
+            else:
+                yield StreamEvent(type="text", content="Summary content")
+                yield StreamEvent(
+                    type="done",
+                    response=Response(
+                        content="Summary content", model="test",
+                        usage=Usage(input_tokens=20, output_tokens=10),
+                        stop_reason="end_turn",
+                    ),
+                    stop_reason="end_turn", model="test",
+                )
+
+        with patch("openalph.agent.stream", _mock_stream), \
+             patch("openalph.agent.execute_tool", return_value=tool_result):
+            result = await agent.handle_input(
+                "Do work", "_default", on_text_delta=_on_text_delta
+            )
+
+        text_deltas = [t for t, d in streamed_deltas if t and not d]
+        done_signals = [d for t, d in streamed_deltas if d]
+        assert any("Summary" in t for t in text_deltas)
+        assert len(done_signals) >= 1
+
+    @pytest.mark.asyncio
+    async def test_limit_summary_failure_returns_fallback(self, tmp_path):
+        """If summary generation fails, a static error message is returned."""
+        from openalph.tools import ToolResult
+        from openalph.provider import ToolCall as TC
+
+        config = make_config(tmp_path, max_iterations=1)
+        agent = Agent(config)
+        self._give_agent_tools(agent)
+        tool_result = ToolResult(content="ok", is_error=False)
+        tc = TC(id="tc_1", name="shell", input={"command": "echo"})
+
+        async def _mock_stream(*args, **kwargs):
+            if kwargs.get("tools") is not None:
+                yield StreamEvent(type="tool_done", tool_call=tc)
+                yield StreamEvent(
+                    type="done",
+                    response=Response(
+                        content="", model="test",
+                        usage=Usage(input_tokens=10, output_tokens=5),
+                        stop_reason="tool_use", tool_calls=[tc],
+                    ),
+                    stop_reason="tool_use", model="test",
+                )
+            else:
+                raise RuntimeError("Provider exploded")
+                yield  # make it a generator
+
+        with patch("openalph.agent.stream", _mock_stream), \
+             patch("openalph.agent.execute_tool", return_value=tool_result):
+            result = await agent.handle_input("Do work", "_default")
+
+        assert "Tool call limit reached" in result
+        assert "failed" in result.lower()

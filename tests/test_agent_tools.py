@@ -341,24 +341,39 @@ class TestCircuitBreaker:
 
     @pytest.mark.asyncio
     async def test_max_iterations_stops_loop(self, tmp_path):
-        """Agent stops after max_iterations tool calls."""
+        """Agent stops after max_iterations tool calls and generates summary."""
         tools_dir = tmp_path / "tools"
         tools_dir.mkdir()
         (tools_dir / "shell.toml").write_text("[config]\n")
 
         config = make_config(workspace=tmp_path, max_iterations=3)
 
-        # LLM always returns tool_use (infinite loop without breaker)
+        # LLM returns tool_use during iterations, text summary when tools=None
         infinite_tool_use = tool_use_response([
             ToolCall(id="tc_x", name="shell", input={"command": "loop"})
         ])
+        summary_response = Response(
+            content="Hit the iteration limit.",
+            model="claude-sonnet-4-20250514",
+            usage=Usage(input_tokens=50, output_tokens=20),
+            stop_reason="end_turn",
+        )
+
+        async def _mock_stream(*args, **kwargs):
+            if kwargs.get("tools") is not None:
+                async for event in make_stream_from_response(infinite_tool_use)(*args, **kwargs):
+                    yield event
+            else:
+                yield StreamEvent(type="text", content=summary_response.content)
+                yield StreamEvent(
+                    type="done", response=summary_response,
+                    stop_reason="end_turn", model=summary_response.model,
+                )
 
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch(
-            "openalph.agent.stream", side_effect=make_stream_from_response(infinite_tool_use),
-        ):
+        with patch("openalph.agent.stream", _mock_stream):
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -366,7 +381,7 @@ class TestCircuitBreaker:
             ):
                 result = await agent.handle_input("Do something in a loop")
 
-        # Should have stopped and returned a message about the limit
+        # Should have stopped and returned the LLM-generated summary
         assert "limit" in result.lower() or "iteration" in result.lower()
 
     @pytest.mark.asyncio
@@ -386,14 +401,27 @@ class TestCircuitBreaker:
             agent = Agent(config)
 
         call_count = 0
+        summary_response = Response(
+            content="Summary after limit.",
+            model="claude-sonnet-4-20250514",
+            usage=Usage(input_tokens=50, output_tokens=20),
+            stop_reason="end_turn",
+        )
 
         async def counting_stream(*args, **kwargs):
             nonlocal call_count
             call_count += 1
-            async for event in make_stream_from_response(infinite_tool_use)(*args, **kwargs):
-                yield event
+            if kwargs.get("tools") is not None:
+                async for event in make_stream_from_response(infinite_tool_use)(*args, **kwargs):
+                    yield event
+            else:
+                yield StreamEvent(type="text", content=summary_response.content)
+                yield StreamEvent(
+                    type="done", response=summary_response,
+                    stop_reason="end_turn", model=summary_response.model,
+                )
 
-        with patch("openalph.agent.stream", side_effect=counting_stream):
+        with patch("openalph.agent.stream", counting_stream):
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -401,8 +429,8 @@ class TestCircuitBreaker:
             ):
                 await agent.handle_input("Loop forever")
 
-        # Should have called complete at most max_iterations times
-        assert call_count <= 2
+        # Should have called stream at most max_iterations + 1 (summary)
+        assert call_count <= 3
 
 
 # --- Truncation ---
@@ -475,7 +503,10 @@ class TestToolResultTruncation:
 
         second_call_messages = mock_complete.call_args_list[1].kwargs["messages"]
         tool_msgs = [m for m in second_call_messages if m.get("role") == "tool"]
-        assert tool_msgs[0]["content"] == "hi"
+        # Content is wrapped in tool_result tags
+        assert "hi" in tool_msgs[0]["content"]
+        assert tool_msgs[0]["content"].startswith("<tool_result")
+        assert tool_msgs[0]["content"].endswith("</tool_result>")
 
 
 # --- Status tracking ---
@@ -648,7 +679,15 @@ class TestCallbackParameters:
             callback = AsyncMock()
             await agent.handle_input("list files", on_tool_call=callback)
 
-        callback.assert_called_once_with("call_1", "shell", {"command": "ls"}, "file.txt", False)
+        # Callback receives wrapped content
+        callback.assert_called_once()
+        args = callback.call_args[0]
+        assert args[0] == "call_1"
+        assert args[1] == "shell"
+        assert args[2] == {"command": "ls"}
+        assert "file.txt" in args[3]
+        assert args[3].startswith("<tool_result")
+        assert args[4] is False
 
     @pytest.mark.asyncio
     async def test_on_tool_intent_invoked(self, tmp_path):

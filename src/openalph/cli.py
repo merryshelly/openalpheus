@@ -71,16 +71,31 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _systemctl(action: str, agent: str):
+    """Run a systemctl command with helpful error on permission failure."""
+    try:
+        subprocess.run(
+            ["systemctl", action, f"openalph@{agent}.service"],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        import os
+        if os.geteuid() != 0:
+            print(f"Failed to {action} openalph@{agent}. Try: sudo openalph {action} {agent}",
+                  file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_start(args):
-    subprocess.run(["systemctl", "start", f"openalph@{args.agent}.service"], check=True)
+    _systemctl("start", args.agent)
 
 
 def cmd_stop(args):
-    subprocess.run(["systemctl", "stop", f"openalph@{args.agent}.service"], check=True)
+    _systemctl("stop", args.agent)
 
 
 def cmd_restart(args):
-    subprocess.run(["systemctl", "restart", f"openalph@{args.agent}.service"], check=True)
+    _systemctl("restart", args.agent)
 
 
 def cmd_status(args):
@@ -168,28 +183,205 @@ def cmd_run(args):
 
 
 def cmd_monitor(args):
-    print("not yet implemented")
+    """Live tail of agent JSONL logs with formatted output."""
+    import json
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    # Read workspace path directly from TOML — monitor never needs API keys,
+    # so skip load_agent_config which triggers api_key_cmd (op CLI prompts).
+    import tomllib
+    config_path = CONFIG_DIR / f"{args.agent}.toml"
+    if not config_path.exists():
+        print(f"Config not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with config_path.open("rb") as f:
+            toml_data = tomllib.load(f)
+        workspace = Path(toml_data.get("workspace", {}).get("path", ""))
+        agent_name = toml_data.get("agent", {}).get("name", args.agent)
+    except Exception as e:
+        print(f"Failed to read config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    logs_dir = workspace / "logs"
+    if not logs_dir.is_dir():
+        print(f"No logs directory: {logs_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # ANSI colors
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    CYAN = "\033[36m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    MAGENTA = "\033[35m"
+    RESET = "\033[0m"
+
+    def format_entry(entry: dict) -> str:
+        ts = entry.get("ts", "")
+        try:
+            dt = datetime.fromisoformat(ts).astimezone()
+            time_str = dt.strftime("%H:%M:%S")
+        except (ValueError, TypeError):
+            time_str = ts[:8] if ts else "??:??:??"
+
+        model = entry.get("model", "?")
+        # Shorten model name: "anthropic/claude-opus-4-6" → "opus-4-6"
+        short_model = model.split("/")[-1] if "/" in model else model
+
+        in_tok = entry.get("input_tokens", 0)
+        out_tok = entry.get("output_tokens", 0)
+        latency = entry.get("latency_ms", 0)
+        latency_s = latency / 1000 if latency else 0
+
+        tool_calls = entry.get("tool_calls", [])
+        preview = entry.get("content_preview", "").replace("\n", " ")[:120]
+
+        # Room ID → short form: "!ABC...XYZ:server" → "ABC..XYZ"
+        room = entry.get("room_id", "")
+        if room.startswith("!") and ":" in room:
+            room_short = room[1:room.index(":")]
+            if len(room_short) > 8:
+                room_short = room_short[:4] + ".." + room_short[-4:]
+        else:
+            room_short = room[:10]
+
+        lines = []
+
+        # Header line
+        header = (
+            f"{DIM}{time_str}{RESET} "
+            f"{CYAN}{short_model}{RESET} "
+            f"{DIM}[{room_short}]{RESET} "
+            f"{GREEN}{in_tok:,}→{out_tok:,}tok{RESET} "
+            f"{DIM}{latency_s:.1f}s{RESET}"
+        )
+        lines.append(header)
+
+        # Tool calls
+        for tc in tool_calls:
+            name = tc.get("name", "?")
+            tc_input = tc.get("input", {})
+            is_err = tc.get("is_error", False)
+            color = RED if is_err else YELLOW
+            status = "✗" if is_err else "→"
+
+            # Compact input preview
+            if name == "shell":
+                detail = tc_input.get("command", "")[:80]
+            elif name == "file_read":
+                detail = tc_input.get("path", "")
+            elif name == "file_write":
+                detail = tc_input.get("path", "")
+            elif name == "file_edit":
+                detail = tc_input.get("path", "")
+            elif name == "web_search":
+                detail = tc_input.get("query", "")[:60]
+            elif name == "web_fetch":
+                detail = tc_input.get("url", "")[:60]
+            elif name == "subagent":
+                task = tc_input.get("task", "")[:60]
+                model_override = tc_input.get("model", "")
+                detail = f"{model_override + ': ' if model_override else ''}{task}"
+            elif name == "memory_search":
+                detail = tc_input.get("query", "")[:60]
+            else:
+                detail = str(tc_input)[:60]
+
+            lines.append(f"  {color}{status} {name}{RESET} {DIM}{detail}{RESET}")
+
+        # Content preview (if any, and not just tool calls)
+        if preview:
+            lines.append(f"  {MAGENTA}▸{RESET} {DIM}{preview}{RESET}")
+
+        return "\n".join(lines)
+
+    def tail_file(path: Path):
+        """Yield new lines from a file, starting from the end."""
+        try:
+            fh = open(path, "r")
+        except FileNotFoundError:
+            return
+        fh.seek(0, 2)  # seek to end
+        try:
+            while True:
+                line = fh.readline()
+                if line:
+                    yield line
+                else:
+                    time.sleep(0.3)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            fh.close()
+
+    def current_log_path():
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return logs_dir / f"{agent_name}-{date_str}.jsonl"
+
+    print(f"{BOLD}Monitoring {agent_name}{RESET} — {logs_dir}", file=sys.stderr)
+    print(f"{DIM}Ctrl+C to stop{RESET}\n", file=sys.stderr)
+
+    try:
+        current_date = None
+        for line in tail_file(current_log_path()):
+            # Check for date rotation
+            new_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if new_date != current_date:
+                current_date = new_date
+                # Will pick up new file on next iteration naturally
+                # (tail_file follows the current file handle)
+
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                print(format_entry(entry))
+            except json.JSONDecodeError:
+                print(f"{DIM}(malformed: {line[:80]}){RESET}")
+    except KeyboardInterrupt:
+        print(f"\n{DIM}Monitor stopped.{RESET}", file=sys.stderr)
 
 
 def cmd_showprompt(args):
-    """Display the full assembled system prompt and available tools for an agent."""
+    """Display the full assembled system prompt and available tools for an agent.
+
+    Only needs the workspace path — does not resolve API keys, so it works
+    without the agent's credentials (e.g. when run as a different user).
+    """
+    import tomllib
+    from pathlib import Path
     from openalph.prompt import assemble_prompt
     from openalph.tools import discover_tools
 
-    try:
-        config = load_agent_config(args.agent)
-    except ConfigError as e:
-        print(f"Config error: {e}", file=sys.stderr)
+    config_path = CONFIG_DIR / f"{args.agent}.toml"
+    if not config_path.exists():
+        print(f"Config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
 
-    prompt = assemble_prompt(config.workspace)
+    try:
+        with config_path.open("rb") as f:
+            toml_data = tomllib.load(f)
+        workspace = Path(toml_data.get("workspace", {}).get("path", ""))
+        if not workspace.is_dir():
+            print(f"Workspace not found: {workspace}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Failed to read config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    prompt = assemble_prompt(workspace)
     if prompt:
         print(prompt)
     else:
         print("(empty prompt — no workspace files found)", file=sys.stderr)
 
     # Show tools available via API tool parameter
-    tools = discover_tools(config.workspace)
+    tools = discover_tools(workspace)
     if tools:
         print("\n## Available Tools (passed via API, not in prompt)\n")
         for tool in tools:
@@ -304,5 +496,11 @@ def main(argv=None) -> int:
     }
 
     handler = dispatch[args.command]
-    handler(args)
+    try:
+        handler(args)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
     return 0

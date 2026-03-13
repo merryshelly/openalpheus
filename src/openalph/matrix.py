@@ -80,6 +80,7 @@ class StreamingDelivery:
         self._last_edit_time: float = 0
         self._last_edit_len: int = 0
         self._delivered = False
+        self._delivered_text = ""  # last finalized content, for duplicate detection
 
     async def push(self, delta: str, done: bool = False):
         """Accept a text delta and manage delivery."""
@@ -151,6 +152,7 @@ class StreamingDelivery:
             return
 
         self._delivered = True
+        self._delivered_text = self._buffer
 
         if self._event_id is None:
             # Never sent initial - use normal send
@@ -430,7 +432,69 @@ class MatrixBot:
                 if i > 0:
                     chunks[i] = "[\u2026continued]\n\n" + chunks[i]
 
+            # Repair any code fences broken by the split
+            chunks = MatrixBot._repair_fences(chunks)
+
         return chunks
+
+    @staticmethod
+    def _repair_fences(chunks: list[str]) -> list[str]:
+        """Fix markdown code fences broken by message splitting.
+
+        If a split falls inside a fenced code block, the first chunk gets
+        an unclosed fence (breaking all subsequent rendering) and the next
+        chunk starts mid-block. This repairs both sides by closing the
+        fence at the end of the chunk and re-opening it at the start of
+        the next, preserving the language tag.
+        """
+        if not chunks:
+            return chunks
+
+        CONT_END = "\n\n[\u2026continued]"
+        CONT_START = "[\u2026continued]\n\n"
+
+        result = []
+        fence_opener_for_next = None
+
+        for chunk in chunks:
+            # Extract continuation markers
+            end_marker = ""
+            start_marker = ""
+            content = chunk
+
+            if content.endswith(CONT_END):
+                end_marker = CONT_END
+                content = content[:-len(end_marker)]
+
+            if content.startswith(CONT_START):
+                start_marker = CONT_START
+                content = content[len(start_marker):]
+
+            # If previous chunk had open fence, prepend opener
+            if fence_opener_for_next:
+                content = fence_opener_for_next + content
+                fence_opener_for_next = None
+
+            # Track fence state through this chunk
+            lines = content.split("\n")
+            fence_count = 0
+            last_opener = "```"
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("```"):
+                    fence_count += 1
+                    if fence_count % 2 == 1:  # opening fence
+                        last_opener = stripped
+
+            # If fence is open at end of chunk, close it and queue opener for next
+            if fence_count % 2 == 1:
+                content += "\n```"
+                fence_opener_for_next = last_opener + "\n"
+
+            result.append(start_marker + content + end_marker)
+
+        return result
 
     async def send(self, room_id: str, text: str):
         """Send a text message to a room, splitting if too large.
@@ -885,8 +949,13 @@ class MatrixBot:
                         if _thinking_data:
                             _log_kwargs["thinking"] = _thinking_data
                         session_log.append(**_log_kwargs)
-                    # Only send if streaming didn't already deliver
+                    # Send if streaming didn't deliver, or if the response
+                    # differs from what was streamed (e.g. tool-limit summary
+                    # generated after the last streamed tool-call text).
                     if not streaming._delivered:
+                        await self.send(room_id, response)
+                    elif streaming._delivered_text.strip() != response.strip():
+                        logger.info("Response differs from streamed content — sending separately")
                         await self.send(room_id, response)
                 else:
                     logger.warning("Empty response from agent in %s — not sending", room_id)
@@ -1093,17 +1162,23 @@ class MatrixBot:
 
         if body == "/status":
             status = self.agent.status(room_id)
-            # Format status message
             ctx = status['context_tokens']
             ctx_max = status['context_max']
             ctx_pct = status['context_pct']
+            bar_len = 20
+            filled = round(bar_len * ctx_pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
             lines = [
-                f"**{status['name']}**",
-                f"Model: {status['model']}",
-                f"Context: ~{ctx:,} / {ctx_max:,} tokens ({ctx_pct}%)",
-                f"Turns: {status['turns']}",
-                f"Cumulative: {status['total_input_tokens']:,} in / {status['total_output_tokens']:,} out",
-                f"Tool calls: {status['total_tool_calls']}",
+                f"### {status['name']}",
+                "",
+                f"| | |",
+                f"|---|---|",
+                f"| **Model** | `{status['model']}` |",
+                f"| **Turns** | {status['turns']} |",
+                f"| **Context** | {bar} {ctx_pct}% (~{ctx:,} / {ctx_max:,}) |",
+                f"| **Session in** | {status['total_input_tokens']:,} tokens |",
+                f"| **Session out** | {status['total_output_tokens']:,} tokens |",
+                f"| **Tool calls** | {status['total_tool_calls']} |",
             ]
             await self.send(room_id, "\n".join(lines))
             return
@@ -1165,9 +1240,12 @@ class MatrixBot:
                 if not entries:
                     await self.send(room_id, "No active heartbeats.")
                 else:
-                    lines = ["Active heartbeats:"]
+                    lines = ["**Active heartbeats:**", ""]
                     for e in entries:
-                        lines.append(f"  {e.room_id} \u2014 every {format_interval(e.interval_seconds)} (next: {format_interval(e.seconds_until_next)})")
+                        # Resolve room name from nio client
+                        nio_room = self.client.rooms.get(e.room_id)
+                        name = (getattr(nio_room, 'name', '') or getattr(nio_room, 'display_name', '') or e.room_id) if nio_room else e.room_id
+                        lines.append(f"- **{name}** — every {format_interval(e.interval_seconds)}, next in {format_interval(e.seconds_until_next)}")
                     await self.send(room_id, "\n".join(lines))
             else:
                 await self.send(room_id, "Usage: `/heartbeat start <interval>` | `/heartbeat stop` | `/heartbeat status`")

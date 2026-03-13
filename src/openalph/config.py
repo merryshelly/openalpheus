@@ -61,7 +61,7 @@ class AgentConfig:
     workspace: Path
     model_max_tokens: int = 200000
     matrix: MatrixConfig | None = None
-    max_iterations: int = 50
+    max_iterations: int = 100
     truncation_limit: int = 50000
     vision: bool = False
     thinking: str = "off"
@@ -218,8 +218,8 @@ def load_config(path: Path) -> AgentConfig:
     if not isinstance(model_max_tokens, int) or model_max_tokens <= 0:
         raise ConfigError("model_max_tokens must be a positive integer")
 
-    # max_iterations defaults to 50 if not specified
-    max_iterations = agent_section.get("max_iterations", 50)
+    # max_iterations defaults to 100 if not specified
+    max_iterations = agent_section.get("max_iterations", 100)
     if not isinstance(max_iterations, int) or max_iterations <= 0:
         raise ConfigError("max_iterations must be a positive integer")
     
@@ -245,6 +245,8 @@ def load_config(path: Path) -> AgentConfig:
         if not workspace_path_str or not isinstance(workspace_path_str, str):
             raise ConfigError("workspace.path must be a non-empty string")
         workspace_path = Path(workspace_path_str)
+        if not workspace_path.is_dir():
+            raise ConfigError(f"workspace.path does not exist or is not a directory: {workspace_path}")
     except KeyError:
         raise ConfigError("Missing required field: workspace.path")
 
@@ -290,6 +292,16 @@ def load_config(path: Path) -> AgentConfig:
             base_url=base_url,
             quirks=quirks,
         )
+
+    # Validate default_model references a configured provider
+    if "/" in default_model:
+        provider_prefix = default_model.split("/", 1)[0]
+        if provider_prefix not in providers:
+            available = ", ".join(sorted(providers.keys()))
+            raise ConfigError(
+                f"default_model '{default_model}' references provider '{provider_prefix}' "
+                f"which is not configured. Available providers: {available}"
+            )
 
     # Parse optional [model_limits] section
     model_limits = {}

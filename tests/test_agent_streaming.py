@@ -597,16 +597,17 @@ class TestBackwardCompat:
 
     @pytest.mark.asyncio
     async def test_circuit_breaker(self, tmp_path):
-        """max_iterations still enforced with streaming."""
+        """max_iterations still enforced with streaming; summary is generated."""
         config = make_config(tmp_path, max_iterations=3)
         agent = Agent(config)
 
         tc = ToolCall(id="tc1", name="shell", input={"command": "loop"})
-        # Every call returns tool use — should hit circuit breaker
-        infinite_tools = [tool_events("", [tc]) for _ in range(10)]
+        # 3 tool iterations + 1 summary call (text response, tools=None)
+        calls = [tool_events("", [tc]) for _ in range(3)]
+        calls.append(text_events("Here is my progress summary."))
 
         with patch("openalph.agent.stream",
-                    new=make_stream_fn(infinite_tools)), \
+                    new=make_stream_fn(calls)), \
              patch("openalph.agent.discover_tools", return_value=[SHELL_TOOL]), \
              patch("openalph.agent.execute_tool",
                    new_callable=AsyncMock,
@@ -614,7 +615,7 @@ class TestBackwardCompat:
 
             result = await agent.handle_input("Loop forever")
 
-        assert "limit" in result.lower() or "progress" in result.lower()
+        assert "progress" in result.lower() or "summary" in result.lower()
 
     @pytest.mark.asyncio
     async def test_context_overflow(self, tmp_path):
