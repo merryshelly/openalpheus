@@ -533,9 +533,16 @@ def _parse_openai_response(response) -> Response:
                 input=arguments,
             ))
     
+    # Extract reasoning (OpenRouter extension) into thinking blocks
+    thinking_blocks = []
+    reasoning = getattr(message, 'reasoning', None)
+    if isinstance(reasoning, str) and reasoning:
+        thinking_blocks.append(ThinkingBlock(thinking=reasoning, signature=""))
+
     return Response(
         content=content,
         tool_calls=tool_calls,
+        thinking=thinking_blocks,
         model=response.model,
         usage=Usage(
             input_tokens=response.usage.prompt_tokens,
@@ -762,6 +769,7 @@ async def stream(
             response = await client.chat.completions.create(**api_kwargs)
             
             accumulated_text = ""
+            accumulated_reasoning = ""
             usage = None
             stop_reason = None
             # Accumulate tool call data: index -> {"id": str, "name": str, "arguments": str}
@@ -784,6 +792,12 @@ async def stream(
                     if delta.content is not None:
                         yield StreamEvent(type="text", content=delta.content)
                         accumulated_text += delta.content
+                    
+                    # Handle reasoning (OpenRouter extension)
+                    reasoning_text = getattr(delta, 'reasoning', None)
+                    if isinstance(reasoning_text, str) and reasoning_text:
+                        yield StreamEvent(type="thinking", content=reasoning_text)
+                        accumulated_reasoning += reasoning_text
                     
                     # Handle tool calls
                     if delta.tool_calls:
@@ -835,12 +849,17 @@ async def stream(
                 ))
             
             # Build and yield final done event
+            thinking_blocks = []
+            if accumulated_reasoning:
+                thinking_blocks.append(ThinkingBlock(thinking=accumulated_reasoning, signature=""))
+
             response_obj = Response(
                 content=accumulated_text,
                 model=api_model,
                 usage=usage or Usage(input_tokens=0, output_tokens=0),
                 stop_reason=stop_reason or "",
                 tool_calls=response_tool_calls,
+                thinking=thinking_blocks,
             )
             response_obj.content, response_obj.degenerate = _detect_and_truncate_degeneration(response_obj.content)
             

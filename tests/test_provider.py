@@ -14,7 +14,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.provider import complete, Response, Usage, _convert_messages_for_anthropic
+from openalph.provider import complete, stream, Response, Usage, ThinkingBlock, StreamEvent, _convert_messages_for_anthropic
 
 
 def make_provider(key="anthropic", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
@@ -600,3 +600,147 @@ class TestConvertMessagesForAnthropic:
         assert isinstance(result[0]["content"], list)
         assert result[1]["role"] == "user"
         assert result[1]["content"] == "follow up question"
+
+
+def mock_openai_reasoning_stream_chunks(reasoning_text='I think...', content_text='Hello',
+                                         model='test-model', prompt_tokens=100, completion_tokens=50):
+    """Create mock OpenAI streaming chunks with reasoning (OpenRouter format)."""
+    chunks = []
+
+    # Reasoning chunk
+    chunk = MagicMock()
+    chunk.choices = [MagicMock()]
+    chunk.choices[0].delta = MagicMock(spec=[])
+    chunk.choices[0].delta.content = ''
+    chunk.choices[0].delta.tool_calls = None
+    chunk.choices[0].delta.reasoning = reasoning_text
+    chunk.choices[0].finish_reason = None
+    chunk.usage = None
+    chunks.append(chunk)
+
+    # Text chunk
+    chunk = MagicMock()
+    chunk.choices = [MagicMock()]
+    chunk.choices[0].delta = MagicMock(spec=[])
+    chunk.choices[0].delta.content = content_text
+    chunk.choices[0].delta.tool_calls = None
+    chunk.choices[0].delta.reasoning = None
+    chunk.choices[0].finish_reason = 'stop'
+    chunk.usage = None
+    chunks.append(chunk)
+
+    # Usage chunk
+    chunk = MagicMock()
+    chunk.choices = []
+    chunk.usage = MagicMock()
+    chunk.usage.prompt_tokens = prompt_tokens
+    chunk.usage.completion_tokens = completion_tokens
+    chunks.append(chunk)
+
+    return chunks
+
+
+def mock_openai_complete_with_reasoning(content='Hello', reasoning='I think...'):
+    """Create a mock non-streaming OpenAI response with reasoning."""
+    response = MagicMock()
+    response.model = 'test-model'
+    response.choices = [MagicMock()]
+    response.choices[0].message = MagicMock(spec=[])
+    response.choices[0].message.content = content
+    response.choices[0].message.tool_calls = None
+    response.choices[0].message.reasoning = reasoning
+    response.choices[0].finish_reason = 'stop'
+    response.usage = MagicMock()
+    response.usage.prompt_tokens = 100
+    response.usage.completion_tokens = 50
+    return response
+
+
+class TestOpenAIReasoning:
+
+    def make_config_openai(self):
+        return make_config(
+            providers={'openai': make_provider(key='openai', type='openai', api_key='sk-test')},
+            default_model='openai/gpt-4o',
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_reasoning_yields_thinking_events(self):
+        config = self.make_config_openai()
+        with patch('openalph.provider._get_client') as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(
+                    mock_openai_reasoning_stream_chunks(reasoning_text='Deep thoughts', content_text='Answer')
+                )
+            )
+            events = []
+            async for event in stream(config=config, system='You are helpful.', messages=[{'role': 'user', 'content': 'Hello'}]):
+                events.append(event)
+
+        thinking_events = [e for e in events if e.type == 'thinking']
+        done_events = [e for e in events if e.type == 'done']
+
+        assert len(thinking_events) >= 1
+        assert thinking_events[0].content == 'Deep thoughts'
+
+        assert len(done_events) == 1
+        resp = done_events[0].response
+        assert len(resp.thinking) == 1
+        assert isinstance(resp.thinking[0], ThinkingBlock)
+        assert resp.thinking[0].thinking == 'Deep thoughts'
+        assert resp.content == 'Answer'
+
+    @pytest.mark.asyncio
+    async def test_streaming_no_reasoning_no_thinking(self):
+        config = self.make_config_openai()
+        with patch('openalph.provider._get_client') as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(mock_openai_stream_chunks('Hello'))
+            )
+            events = []
+            async for event in stream(config=config, system='You are helpful.', messages=[{'role': 'user', 'content': 'Hello'}]):
+                events.append(event)
+
+        thinking_events = [e for e in events if e.type == 'thinking']
+        done_events = [e for e in events if e.type == 'done']
+
+        assert thinking_events == []
+        assert len(done_events) == 1
+        assert done_events[0].response.thinking == []
+
+    @pytest.mark.asyncio
+    async def test_complete_reasoning_extracted(self):
+        """complete() accumulates reasoning from streaming and returns it in response.thinking."""
+        config = self.make_config_openai()
+        with patch('openalph.provider._get_client') as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(
+                    mock_openai_reasoning_stream_chunks(reasoning_text='My reasoning', content_text='Answer')
+                )
+            )
+            response = await complete(config=config, system='You are helpful.', messages=[{'role': 'user', 'content': 'Hello'}])
+
+        assert len(response.thinking) == 1
+        assert isinstance(response.thinking[0], ThinkingBlock)
+        assert response.thinking[0].thinking == 'My reasoning'
+        assert response.content == 'Answer'
+
+    @pytest.mark.asyncio
+    async def test_complete_no_reasoning_no_thinking(self):
+        """complete() without reasoning returns empty thinking list."""
+        config = self.make_config_openai()
+        with patch('openalph.provider._get_client') as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(mock_openai_stream_chunks('Hello'))
+            )
+            response = await complete(config=config, system='You are helpful.', messages=[{'role': 'user', 'content': 'Hello'}])
+
+        assert response.thinking == []
