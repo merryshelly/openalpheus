@@ -2,7 +2,7 @@
 
 Multi-turn LLM call for focused, isolated tasks. Sub-agents get the parent's
 tools (minus subagent itself, preventing recursion) and can iterate up to
-a circuit breaker limit (default 10 iterations).
+a circuit breaker limit (default 100 iterations).
 """
 
 import asyncio

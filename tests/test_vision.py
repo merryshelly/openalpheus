@@ -17,6 +17,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
 from openalph.agent import Agent, _build_user_content, VISION_MIME_TYPES, MEDIA_TAG_RE
 from openalph.provider import (
+    Response,
+    Usage,
+    StreamEvent,
     _convert_messages_for_anthropic,
     _convert_messages_for_openai,
 )
@@ -54,6 +57,24 @@ def _make_config(tmp_path, vision=False, **kwargs):
 # --- Config ---
 
 
+
+
+def make_stream_events(content="Hello!", input_tokens=100, output_tokens=50):
+    """Create a mock async generator that yields stream events."""
+    async def _stream(*args, **kwargs):
+        yield StreamEvent(type="text", content=content)
+        yield StreamEvent(
+            type="done",
+            response=Response(
+                content=content,
+                model="claude-sonnet-4-20250514",
+                usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+                stop_reason="end_turn",
+            ),
+            stop_reason="end_turn",
+            model="claude-sonnet-4-20250514",
+        )
+    return _stream
 class TestVisionConfig:
     """Test vision config flag."""
 
@@ -429,9 +450,10 @@ class TestImageTokenEstimation:
         """Messages with image blocks have higher token estimates than text-only."""
         config = _make_config(tmp_path, vision=True)
 
-        with patch("openalph.agent.complete") as mock_complete, \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events()
             agent = Agent(config)
 
             # Manually add a text-only message
@@ -470,9 +492,10 @@ class TestHandleInputVision:
             stop_reason="end_turn",
         )
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, return_value=mock_response), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=mock_response.content, input_tokens=mock_response.usage.input_tokens, output_tokens=mock_response.usage.output_tokens)
             agent = Agent(config)
             text = f"[media: {rel_path} (image/jpeg, 102 B)]\nWhat's in this image?"
             result = await agent.handle_input(text)
@@ -500,9 +523,10 @@ class TestHandleInputVision:
             stop_reason="end_turn",
         )
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, return_value=mock_response), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=mock_response.content, input_tokens=mock_response.usage.input_tokens, output_tokens=mock_response.usage.output_tokens)
             agent = Agent(config)
             text = f"[media: {rel_path} (image/jpeg, 104 B)]\nWhat's this?"
             result = await agent.handle_input(text)

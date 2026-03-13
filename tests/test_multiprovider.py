@@ -37,6 +37,101 @@ from openalph.provider import Response, ToolCall, Usage
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def mock_anthropic_stream(response):
+    """Create a mock Anthropic stream that yields the response."""
+    from unittest.mock import MagicMock
+    
+    async def _stream_gen(*args, **kwargs):
+        # Yield text if content exists
+        content = getattr(response, 'content', None)
+        if content:
+            # Handle both string and list content
+            if isinstance(content, list):
+                text = ''.join(str(c) for c in content)
+            else:
+                text = str(content)
+            # Create mock text event
+            event = MagicMock()
+            event.type = "text"
+            event.text = text
+            yield event
+        # Yield message_stop
+        event = MagicMock()
+        event.type = "message_stop"
+        yield event
+    
+    class MockStreamContext:
+        def __init__(self):
+            self._gen = None
+        
+        def _set_gen(self, gen):
+            self._gen = gen
+            return self
+        
+        async def __aenter__(self):
+            return self
+        
+        async def __aexit__(self, *args):
+            pass
+        
+        def __aiter__(self):
+            return self._gen.__aiter__()
+        
+        async def get_final_message(self):
+            return response
+    
+    # Create a MagicMock that tracks calls and returns the context manager
+    stream_mock = MagicMock()
+    
+    def stream_side_effect(*args, **kwargs):
+        ctx = MockStreamContext()
+        ctx._set_gen(_stream_gen(*args, **kwargs))
+        return ctx
+    
+    stream_mock.side_effect = stream_side_effect
+    return stream_mock
+
+
+def mock_openai_stream(response):
+    """Create a mock OpenAI stream that yields the response."""
+    from unittest.mock import MagicMock
+    
+    async def _stream(*args, **kwargs):
+        # Yield chunk with content
+        chunk = MagicMock()
+        chunk.choices = [MagicMock()]
+        chunk.choices[0].delta = MagicMock()
+        chunk.choices[0].delta.content = response.choices[0].message.content if response.choices else ""
+        chunk.choices[0].delta.tool_calls = None
+        chunk.choices[0].finish_reason = "stop"
+        chunk.usage = None
+        yield chunk
+        
+        # Yield usage chunk
+        usage_chunk = MagicMock()
+        usage_chunk.choices = []
+        usage_chunk.usage = response.usage
+        yield usage_chunk
+    
+    # Create a MagicMock that tracks calls and returns an async iterator
+    stream_mock = MagicMock()
+    
+    # The mock should return an async iterator when called
+    async def _mock_iter(*args, **kwargs):
+        # Ensure stream=True was passed
+        assert kwargs.get('stream') is True, "stream=True must be passed to OpenAI"
+        async for chunk in _stream(*args, **kwargs):
+            yield chunk
+    
+    # Make the mock callable and return an async iterator
+    def mock_call(*args, **kwargs):
+        return _mock_iter(*args, **kwargs)
+    
+    stream_mock.side_effect = mock_call
+    return stream_mock
+
+
 def make_provider(key="default", type="anthropic", api_key="sk-test",
                   base_url=None, quirks=None):
     return ProviderConfig(
@@ -448,8 +543,8 @@ class TestCompleteMultiProvider:
         mock_resp = mock_anthropic_response(content="Hi from Claude")
 
         with patch("openalph.provider._get_client") as mock_get:
-            mock_client = AsyncMock()
-            mock_client.messages.create = AsyncMock(return_value=mock_resp)
+            mock_client = MagicMock()
+            mock_client.messages.stream = mock_anthropic_stream(mock_resp)
             mock_get.return_value = mock_client
 
             from openalph.provider import complete
@@ -462,7 +557,7 @@ class TestCompleteMultiProvider:
 
             assert response.content == "Hi from Claude"
             # Verify the API was called with the un-prefixed model name
-            call_kwargs = mock_client.messages.create.call_args
+            call_kwargs = mock_client.messages.stream.call_args
             assert call_kwargs.kwargs["model"] == "claude-sonnet-4-20250514"
 
     @pytest.mark.asyncio
@@ -472,8 +567,8 @@ class TestCompleteMultiProvider:
         mock_resp = mock_openai_response(content="Hi from Kimi")
 
         with patch("openalph.provider._get_client") as mock_get:
-            mock_client = AsyncMock()
-            mock_client.chat.completions.create = AsyncMock(return_value=mock_resp)
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = mock_openai_stream(mock_resp)
             mock_get.return_value = mock_client
 
             from openalph.provider import complete
@@ -495,8 +590,8 @@ class TestCompleteMultiProvider:
         mock_resp = mock_anthropic_response()
 
         with patch("openalph.provider._get_client") as mock_get:
-            mock_client = AsyncMock()
-            mock_client.messages.create = AsyncMock(return_value=mock_resp)
+            mock_client = MagicMock()
+            mock_client.messages.stream = mock_anthropic_stream(mock_resp)
             mock_get.return_value = mock_client
 
             from openalph.provider import complete
@@ -506,7 +601,7 @@ class TestCompleteMultiProvider:
                 messages=[{"role": "user", "content": "hi"}],
             )
 
-            call_kwargs = mock_client.messages.create.call_args
+            call_kwargs = mock_client.messages.stream.call_args
             assert call_kwargs.kwargs["model"] == "claude-sonnet-4-20250514"
 
     @pytest.mark.asyncio
@@ -730,8 +825,8 @@ class TestQuirksHandling:
         mock_resp = mock_openai_response(content="response")
 
         with patch("openalph.provider._get_client") as mock_get:
-            mock_client = AsyncMock()
-            mock_client.chat.completions.create = AsyncMock(return_value=mock_resp)
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = mock_openai_stream(mock_resp)
             mock_get.return_value = mock_client
 
             from openalph.provider import complete
@@ -764,8 +859,8 @@ class TestSubagentMultiProvider:
         mock_resp = mock_openai_response(content="Research done")
 
         with patch("openalph.provider._get_client") as mock_get:
-            mock_client = AsyncMock()
-            mock_client.chat.completions.create = AsyncMock(return_value=mock_resp)
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = mock_openai_stream(mock_resp)
             mock_get.return_value = mock_client
 
             from openalph.tools.subagent import run_subagent
@@ -798,8 +893,8 @@ class TestSubagentMultiProvider:
         mock_resp = mock_anthropic_response(content="Done")
 
         with patch("openalph.provider._get_client") as mock_get:
-            mock_client = AsyncMock()
-            mock_client.messages.create = AsyncMock(return_value=mock_resp)
+            mock_client = MagicMock()
+            mock_client.messages.stream = mock_anthropic_stream(mock_resp)
             mock_get.return_value = mock_client
 
             from openalph.tools.subagent import run_subagent
@@ -808,7 +903,7 @@ class TestSubagentMultiProvider:
                 config=config,
             )
 
-            call_kwargs = mock_client.messages.create.call_args.kwargs
+            call_kwargs = mock_client.messages.stream.call_args.kwargs
             assert call_kwargs["model"] == "claude-sonnet-4-20250514"
 
 
@@ -837,11 +932,15 @@ class TestHandleInputMultiProvider:
             stop_reason="end_turn",
         )
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock_complete:
-            mock_complete.return_value = mock_resp
+        async def mock_stream(*args, **kwargs):
+            from openalph.provider import StreamEvent
+            yield StreamEvent(type="text", content=mock_resp.content)
+            yield StreamEvent(type="done", response=mock_resp, stop_reason="end_turn", model=mock_resp.model)
+        
+        with patch("openalph.agent.stream", side_effect=mock_stream) as mock_stream_mock:
             await agent.handle_input("Hi", "room1")
 
-            call_kwargs = mock_complete.call_args
+            call_kwargs = mock_stream_mock.call_args
             assert call_kwargs.kwargs.get("model") == "anthropic/claude-sonnet-4-20250514"
 
     @pytest.mark.asyncio
@@ -864,11 +963,15 @@ class TestHandleInputMultiProvider:
             stop_reason="stop",
         )
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock_complete:
-            mock_complete.return_value = mock_resp
+        async def mock_stream(*args, **kwargs):
+            from openalph.provider import StreamEvent
+            yield StreamEvent(type="text", content=mock_resp.content)
+            yield StreamEvent(type="done", response=mock_resp, stop_reason="stop", model=mock_resp.model)
+        
+        with patch("openalph.agent.stream", side_effect=mock_stream) as mock_stream_mock:
             await agent.handle_input("Hi", "room1")
 
-            call_kwargs = mock_complete.call_args
+            call_kwargs = mock_stream_mock.call_args
             assert call_kwargs.kwargs.get("model") == "openrouter/moonshotai/kimi-k2.5"
 
 
@@ -964,7 +1067,7 @@ class TestProviderErrorWrapping:
         )
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            mock_client.return_value.messages.stream = MagicMock(side_effect=exc)
             with pytest.raises(ProviderError) as exc_info:
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
             assert "invalid model" in str(exc_info.value)
@@ -983,7 +1086,7 @@ class TestProviderErrorWrapping:
         )
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
+            mock_client.return_value.chat.completions.create = MagicMock(side_effect=exc)
             with pytest.raises(ProviderError) as exc_info:
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
             assert "Model not found" in str(exc_info.value)
@@ -1002,7 +1105,7 @@ class TestProviderErrorWrapping:
         )
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            mock_client.return_value.messages.stream = MagicMock(side_effect=exc)
             with pytest.raises(ProviderError) as exc_info:
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
             assert exc_info.value.status_code == 401
@@ -1017,7 +1120,7 @@ class TestProviderErrorWrapping:
         exc = anthropic_sdk.APIConnectionError(request=MagicMock())
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            mock_client.return_value.messages.stream = MagicMock(side_effect=exc)
             with pytest.raises(ProviderError, match="unreachable"):
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
 
@@ -1031,7 +1134,7 @@ class TestProviderErrorWrapping:
         exc = anthropic_sdk.APITimeoutError(request=MagicMock())
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.messages.create = AsyncMock(side_effect=exc)
+            mock_client.return_value.messages.stream = MagicMock(side_effect=exc)
             with pytest.raises(ProviderError, match="timed out"):
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
 
@@ -1045,7 +1148,7 @@ class TestProviderErrorWrapping:
         exc = openai_sdk.APIConnectionError(request=MagicMock())
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
+            mock_client.return_value.chat.completions.create = MagicMock(side_effect=exc)
             with pytest.raises(ProviderError, match="unreachable"):
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
 
@@ -1062,7 +1165,7 @@ class TestProviderErrorWrapping:
         )
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
+            mock_client.return_value.chat.completions.create = MagicMock(side_effect=exc)
             with pytest.raises(ProviderError) as exc_info:
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
             assert exc_info.value.status_code == 429

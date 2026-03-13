@@ -7,6 +7,7 @@ The adapter handles the differences in API shapes and response formats between p
 
 import copy
 from dataclasses import dataclass
+from typing import AsyncGenerator
 import json
 import re
 import anthropic
@@ -165,6 +166,21 @@ class Response:
             self.thinking = []
         if self.usage is None:
             self.usage = Usage(input_tokens=0, output_tokens=0)
+
+
+@dataclass
+class StreamEvent:
+    """A single event from a streaming LLM response."""
+    type: str  # "text", "thinking", "signature", "tool_start", "tool_delta", "tool_done", "usage", "done"
+    content: str = ""
+    tool_index: int = 0
+    tool_id: str = ""
+    tool_name: str = ""
+    tool_call: ToolCall | None = None
+    usage: Usage | None = None
+    stop_reason: str = ""
+    model: str = ""
+    response: Response | None = None
 
 
 def _supports_adaptive_thinking(model_id: str) -> bool:
@@ -529,7 +545,97 @@ def _parse_openai_response(response) -> Response:
     )
 
 
-async def complete(
+def _build_anthropic_kwargs(
+    api_model: str,
+    system: str,
+    provider_messages: list[dict],
+    provider_tools: list[dict] | None,
+    max_tokens: int,
+    thinking_level: str,
+    model_max_tokens: int = 200000,
+) -> dict:
+    """Build kwargs for Anthropic messages API."""
+    api_kwargs = {
+        "model": api_model,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "messages": provider_messages,
+        "max_tokens": max_tokens,
+    }
+    if provider_tools:
+        api_kwargs["tools"] = provider_tools
+    
+    # Add prompt caching to last user message.
+    # Deep copy the target message to avoid mutating the caller's history
+    # dicts (shared references from agent.py's shallow list copy).
+    if api_kwargs["messages"]:
+        last_msg = api_kwargs["messages"][-1]
+        if last_msg.get("role") == "user":
+            last_msg = copy.deepcopy(last_msg)
+            api_kwargs["messages"][-1] = last_msg
+            msg_content = last_msg.get("content")
+            if isinstance(msg_content, str):
+                last_msg["content"] = [{"type": "text", "text": msg_content, "cache_control": {"type": "ephemeral"}}]
+            elif isinstance(msg_content, list) and msg_content:
+                msg_content[-1]["cache_control"] = {"type": "ephemeral"}
+    
+    # Add thinking parameters if enabled
+    if thinking_level != "off":
+        if _supports_adaptive_thinking(api_model):
+            # Adaptive thinking for Opus/Sonnet 4-6
+            api_kwargs["thinking"] = {"type": "adaptive"}
+            api_kwargs["output_config"] = {"effort": _thinking_effort(thinking_level)}
+        else:
+            # Budget-based thinking for older models
+            budget, adjusted_max = _thinking_budget(thinking_level, max_tokens, model_max_tokens)
+            api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            api_kwargs["max_tokens"] = adjusted_max
+    
+    return api_kwargs
+
+
+def _build_openai_kwargs(
+    api_model: str,
+    system: str,
+    provider_messages: list[dict],
+    provider_tools: list[dict] | None,
+    max_tokens: int,
+    thinking_level: str,
+    quirks: list[str],
+) -> dict:
+    """Build kwargs for OpenAI chat completions API."""
+    # Handle quirks
+    if "no_system_role" in quirks:
+        # Fold system into first user message instead of separate system role
+        messages_with_system = provider_messages
+        if messages_with_system and messages_with_system[0]["role"] == "user":
+            first = messages_with_system[0].copy()
+            content = first.get("content", "")
+            if isinstance(content, str):
+                first["content"] = f"{system}\n\n{content}"
+            messages_with_system = [first] + messages_with_system[1:]
+        else:
+            messages_with_system = [{"role": "user", "content": system}] + messages_with_system
+    else:
+        # Normal: prepend system message to messages list
+        messages_with_system = [{"role": "system", "content": system}] + provider_messages
+    
+    api_kwargs = {
+        "model": api_model,
+        "messages": messages_with_system,
+        "max_tokens": max_tokens,
+        "frequency_penalty": _DEFAULT_FREQUENCY_PENALTY,
+    }
+    if provider_tools:
+        api_kwargs["tools"] = provider_tools
+    
+    # Add reasoning effort for OpenRouter if thinking enabled
+    if thinking_level != "off":
+        api_kwargs["extra_body"] = {"reasoning": {"effort": thinking_level}}
+    
+    return api_kwargs
+
+
+async def stream(
     config: AgentConfig,
     system: str,
     messages: list[dict],
@@ -537,14 +643,12 @@ async def complete(
     max_tokens: int | None = None,
     model: str | None = None,
     thinking: str | None = None,
-) -> Response:
+) -> AsyncGenerator[StreamEvent, None]:
     """
-    Route to Anthropic or OpenAI SDK based on config.providers.
-    If max_tokens is None, use config.max_tokens.
-    If model is None, use config.default_model.
-    If thinking is None, use config.thinking (defaults to "off").
+    Stream completion events from Anthropic or OpenAI SDK based on config.providers.
     
-    Errors propagate directly - no wrapping, no retry.
+    Yields StreamEvent objects for each event in the stream.
+    Final event is always type="done" with the complete Response.
     """
     # Resolve model string to provider and API model name
     model_str = model or config.default_model
@@ -563,57 +667,71 @@ async def complete(
     thinking_level = thinking if thinking is not None else getattr(config, "thinking", "off")
     
     if provider_cfg.type == "anthropic":
-        # Anthropic path: use their specific API shape
         client = _get_client(provider_cfg)
         
-        # Build API call kwargs with prompt caching on system
-        api_kwargs = {
-            "model": api_model,
-            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            "messages": provider_messages,
-            "max_tokens": tokens,
-        }
-        if provider_tools:
-            api_kwargs["tools"] = provider_tools
+        api_kwargs = _build_anthropic_kwargs(
+            api_model=api_model,
+            system=system,
+            provider_messages=provider_messages,
+            provider_tools=provider_tools,
+            max_tokens=tokens,
+            thinking_level=thinking_level,
+            model_max_tokens=getattr(config, "model_max_tokens", 200000),
+        )
         
-        # Add prompt caching to last user message.
-        # Deep copy the target message to avoid mutating the caller's history
-        # dicts (shared references from agent.py's shallow list copy).
-        if api_kwargs["messages"]:
-            last_msg = api_kwargs["messages"][-1]
-            if last_msg.get("role") == "user":
-                last_msg = copy.deepcopy(last_msg)
-                api_kwargs["messages"][-1] = last_msg
-                msg_content = last_msg.get("content")
-                if isinstance(msg_content, str):
-                    last_msg["content"] = [{"type": "text", "text": msg_content, "cache_control": {"type": "ephemeral"}}]
-                elif isinstance(msg_content, list) and msg_content:
-                    msg_content[-1]["cache_control"] = {"type": "ephemeral"}
-        
-        # Add thinking parameters if enabled
-        if thinking_level != "off":
-            if _supports_adaptive_thinking(api_model):
-                # Adaptive thinking for Opus/Sonnet 4-6
-                api_kwargs["thinking"] = {"type": "adaptive"}
-                api_kwargs["output_config"] = {"effort": _thinking_effort(thinking_level)}
-            else:
-                # Budget-based thinking for older models
-                model_max = getattr(config, "model_max_tokens", 200000)
-                budget, adjusted_max = _thinking_budget(thinking_level, tokens, model_max)
-                api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                api_kwargs["max_tokens"] = adjusted_max
-        
-        # Cap max_tokens for non-streaming Anthropic calls.
-        # The SDK rejects requests where estimated time > 10 min:
-        #   expected = 3600 * max_tokens / 128000; raises if > 600s
-        # Safe ceiling: floor(128000 * 600 / 3600) = 21333
-        # This only affects the API call; config stays uncapped.
-        _ANTHROPIC_NONSTREAMING_MAX = 21_000
-        if api_kwargs.get("max_tokens", 0) > _ANTHROPIC_NONSTREAMING_MAX:
-            api_kwargs["max_tokens"] = _ANTHROPIC_NONSTREAMING_MAX
-
         try:
-            response = await client.messages.create(**api_kwargs)
+            async with client.messages.stream(**api_kwargs) as stream:
+                accumulated_text = ""
+                
+                async for event in stream:
+                    event_type = getattr(event, "type", None)
+                    
+                    if event_type == "text":
+                        yield StreamEvent(type="text", content=event.text)
+                        accumulated_text += event.text
+                    elif event_type == "thinking":
+                        yield StreamEvent(type="thinking", content=event.thinking)
+                    elif event_type == "signature":
+                        yield StreamEvent(type="signature", content=event.signature)
+                    elif event_type == "input_json":
+                        yield StreamEvent(
+                            type="tool_delta",
+                            content=event.partial_json,
+                        )
+                    elif event_type == "content_block_start":
+                        block = event.content_block
+                        if getattr(block, "type", None) == "tool_use":
+                            yield StreamEvent(
+                                type="tool_start",
+                                tool_index=event.index,
+                                tool_id=block.id,
+                                tool_name=block.name,
+                            )
+                    elif event_type == "content_block_stop":
+                        block = event.content_block
+                        if getattr(block, "type", None) == "tool_use":
+                            yield StreamEvent(
+                                type="tool_done",
+                                tool_index=event.index,
+                                tool_call=ToolCall(
+                                    id=block.id,
+                                    name=block.name,
+                                    input=block.input,
+                                ),
+                            )
+                    elif event_type == "message_stop":
+                        # Get final message and build response
+                        final_message = await stream.get_final_message()
+                        response = _parse_anthropic_response(final_message)
+                        response.content, response.degenerate = _detect_and_truncate_degeneration(response.content)
+                        
+                        yield StreamEvent(
+                            type="done",
+                            stop_reason=final_message.stop_reason,
+                            model=final_message.model,
+                            response=response,
+                        )
+                        
         except anthropic.APIStatusError as e:
             raise ProviderError(
                 _sanitize_error(e.message), status_code=e.status_code,
@@ -622,48 +740,117 @@ async def complete(
             raise ProviderError("Provider request timed out") from e
         except anthropic.APIConnectionError as e:
             raise ProviderError("Provider unreachable — connection failed") from e
-        
-        # Parse Anthropic response into normalized format
-        result = _parse_anthropic_response(response)
-        result.content, result.degenerate = _detect_and_truncate_degeneration(result.content)
-        return result
     
     elif provider_cfg.type == "openai":
-        # OpenAI path: prepend system message and use their API shape
         client = _get_client(provider_cfg)
         
-        # Handle quirks
-        if "no_system_role" in provider_cfg.quirks:
-            # Fold system into first user message instead of separate system role
-            messages_with_system = provider_messages
-            if messages_with_system and messages_with_system[0]["role"] == "user":
-                first = messages_with_system[0].copy()
-                content = first.get("content", "")
-                if isinstance(content, str):
-                    first["content"] = f"{system}\n\n{content}"
-                messages_with_system = [first] + messages_with_system[1:]
-            else:
-                messages_with_system = [{"role": "user", "content": system}] + messages_with_system
-        else:
-            # Normal: prepend system message to messages list
-            messages_with_system = [{"role": "system", "content": system}] + provider_messages
+        api_kwargs = _build_openai_kwargs(
+            api_model=api_model,
+            system=system,
+            provider_messages=provider_messages,
+            provider_tools=provider_tools,
+            max_tokens=tokens,
+            thinking_level=thinking_level,
+            quirks=provider_cfg.quirks,
+        )
         
-        # Build API call kwargs
-        api_kwargs = {
-            "model": api_model,
-            "messages": messages_with_system,
-            "max_tokens": tokens,
-            "frequency_penalty": _DEFAULT_FREQUENCY_PENALTY,
-        }
-        if provider_tools:
-            api_kwargs["tools"] = provider_tools
-        
-        # Add reasoning effort for OpenRouter if thinking enabled
-        if thinking_level != "off":
-            api_kwargs["extra_body"] = {"reasoning": {"effort": thinking_level}}
+        # Add streaming-specific kwargs
+        api_kwargs["stream"] = True
+        api_kwargs["stream_options"] = {"include_usage": True}
         
         try:
-            response = await client.chat.completions.create(**api_kwargs)
+            response = client.chat.completions.create(**api_kwargs)
+            
+            accumulated_text = ""
+            usage = None
+            stop_reason = None
+            # Accumulate tool call data: index -> {"id": str, "name": str, "arguments": str}
+            tool_call_accumulators: dict[int, dict] = {}
+            
+            async for chunk in response:
+                # Handle usage chunk
+                if chunk.usage:
+                    usage = Usage(
+                        input_tokens=chunk.usage.prompt_tokens,
+                        output_tokens=chunk.usage.completion_tokens,
+                    )
+                
+                # Process content deltas
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    
+                    # Handle text content
+                    if delta.content is not None:
+                        yield StreamEvent(type="text", content=delta.content)
+                        accumulated_text += delta.content
+                    
+                    # Handle tool calls
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_call_accumulators:
+                                tool_call_accumulators[idx] = {
+                                    "id": tc_delta.id or "",
+                                    "name": tc_delta.function.name or "",
+                                    "arguments": "",
+                                }
+                            if tc_delta.function.arguments:
+                                tool_call_accumulators[idx]["arguments"] += tc_delta.function.arguments
+                    
+                    # Track finish reason
+                    if choice.finish_reason:
+                        stop_reason = choice.finish_reason
+            
+            # Yield tool_done events for accumulated tool calls
+            for idx in sorted(tool_call_accumulators.keys()):
+                tc_data = tool_call_accumulators[idx]
+                try:
+                    input_dict = json.loads(tc_data["arguments"])
+                except json.JSONDecodeError:
+                    input_dict = {}
+                
+                yield StreamEvent(
+                    type="tool_done",
+                    tool_index=idx,
+                    tool_call=ToolCall(
+                        id=tc_data["id"],
+                        name=tc_data["name"],
+                        input=input_dict,
+                    ),
+                )
+            
+            # Build tool_calls list for the response
+            response_tool_calls = []
+            for idx in sorted(tool_call_accumulators.keys()):
+                tc_data = tool_call_accumulators[idx]
+                try:
+                    input_dict = json.loads(tc_data["arguments"])
+                except json.JSONDecodeError:
+                    input_dict = {}
+                response_tool_calls.append(ToolCall(
+                    id=tc_data["id"],
+                    name=tc_data["name"],
+                    input=input_dict,
+                ))
+            
+            # Build and yield final done event
+            response_obj = Response(
+                content=accumulated_text,
+                model=api_model,
+                usage=usage or Usage(input_tokens=0, output_tokens=0),
+                stop_reason=stop_reason or "",
+                tool_calls=response_tool_calls,
+            )
+            response_obj.content, response_obj.degenerate = _detect_and_truncate_degeneration(response_obj.content)
+            
+            yield StreamEvent(
+                type="done",
+                stop_reason=stop_reason or "",
+                model=api_model,
+                response=response_obj,
+            )
+            
         except openai.APIStatusError as e:
             raise ProviderError(
                 _sanitize_error(e.message), status_code=e.status_code,
@@ -672,12 +859,39 @@ async def complete(
             raise ProviderError("Provider request timed out") from e
         except openai.APIConnectionError as e:
             raise ProviderError("Provider unreachable — connection failed") from e
-        
-        # Parse OpenAI response into normalized format
-        result = _parse_openai_response(response)
-        result.content, result.degenerate = _detect_and_truncate_degeneration(result.content)
-        return result
     
     else:
-        # This shouldn't happen if config is validated, but we'll raise a clear error
         raise ValueError(f"Unsupported provider type: {provider_cfg.type}")
+
+
+async def complete(
+    config: AgentConfig,
+    system: str,
+    messages: list[dict],
+    tools: list | None = None,
+    max_tokens: int | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
+) -> Response:
+    """
+    Route to Anthropic or OpenAI SDK based on config.providers.
+    If max_tokens is None, use config.max_tokens.
+    If model is None, use config.default_model.
+    If thinking is None, use config.thinking (defaults to "off").
+    
+    Errors propagate directly - no wrapping, no retry.
+    """
+    response = None
+    async for event in stream(
+        config=config,
+        system=system,
+        messages=messages,
+        tools=tools,
+        max_tokens=max_tokens,
+        model=model,
+        thinking=thinking,
+    ):
+        if event.type == "done":
+            response = event.response
+    
+    return response

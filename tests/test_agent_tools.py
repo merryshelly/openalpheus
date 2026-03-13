@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 from pathlib import Path
 from openalph.agent import Agent
 from openalph.config import AgentConfig
-from openalph.provider import Response, Usage, ToolCall
+from openalph.provider import Response, Usage, ToolCall, StreamEvent, ThinkingBlock
 from openalph.tools import ToolDef, ToolResult
 
 
@@ -68,6 +68,46 @@ def tool_use_response(tool_calls, text="", input_tokens=100, output_tokens=50):
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
         stop_reason="tool_use",
     )
+
+
+def make_stream_from_response(response):
+    """Convert a Response into a stream (async generator)."""
+    async def _stream(*args, **kwargs):
+        # Yield text if any
+        if response.content:
+            yield StreamEvent(type="text", content=response.content)
+        # Yield tool_done for each tool call
+        for i, tc in enumerate(response.tool_calls):
+            yield StreamEvent(type="tool_done", tool_index=i, tool_call=tc)
+        # Yield done with response
+        yield StreamEvent(
+            type="done",
+            response=response,
+            stop_reason=response.stop_reason,
+            model=response.model,
+        )
+    return _stream
+
+
+def make_stream_responses(responses):
+    """Create a side_effect function that cycles through responses."""
+    call_iter = iter(responses)
+    async def _stream(*args, **kwargs):
+        response = next(call_iter)
+        # Yield text if any
+        if response.content:
+            yield StreamEvent(type="text", content=response.content)
+        # Yield tool_done for each tool call
+        for i, tc in enumerate(response.tool_calls):
+            yield StreamEvent(type="tool_done", tool_index=i, tool_call=tc)
+        # Yield done with response
+        yield StreamEvent(
+            type="done",
+            response=response,
+            stop_reason=response.stop_reason,
+            model=response.model,
+        )
+    return _stream
 
 
 SHELL_TOOL = ToolDef(
@@ -138,7 +178,7 @@ class TestToolUseFlow:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses):
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)):
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -167,7 +207,7 @@ class TestToolUseFlow:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses) as mock_complete:
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)) as mock_complete:
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -207,7 +247,7 @@ class TestParallelExecution:
 
         call_count = 0
 
-        async def mock_execute(name, input, tool_config, agent_config, tools=None):
+        async def mock_execute(name, input, tool_config, agent_config, tools=None, callbacks=None):
             nonlocal call_count
             call_count += 1
             cmd = input.get("command", "")
@@ -216,7 +256,7 @@ class TestParallelExecution:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses):
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)):
             with patch("openalph.agent.execute_tool", side_effect=mock_execute):
                 result = await agent.handle_input("Run two commands")
 
@@ -239,14 +279,14 @@ class TestParallelExecution:
             text_response("Both done"),
         ]
 
-        async def mock_execute(name, input, tool_config, agent_config, tools=None):
+        async def mock_execute(name, input, tool_config, agent_config, tools=None, callbacks=None):
             cmd = input.get("command", "")
             return ToolResult(content=f"result_{cmd[-1]}")
 
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses) as mock_complete:
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)) as mock_complete:
             with patch("openalph.agent.execute_tool", side_effect=mock_execute):
                 await agent.handle_input("Two things")
 
@@ -279,7 +319,7 @@ class TestToolErrors:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses) as mock_complete:
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)) as mock_complete:
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -317,9 +357,7 @@ class TestCircuitBreaker:
             agent = Agent(config)
 
         with patch(
-            "openalph.agent.complete",
-            new_callable=AsyncMock,
-            return_value=infinite_tool_use,
+            "openalph.agent.stream", side_effect=make_stream_from_response(infinite_tool_use),
         ):
             with patch(
                 "openalph.agent.execute_tool",
@@ -349,14 +387,19 @@ class TestCircuitBreaker:
 
         call_count = 0
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, return_value=infinite_tool_use) as mock_complete:
+        async def counting_stream(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            async for event in make_stream_from_response(infinite_tool_use)(*args, **kwargs):
+                yield event
+
+        with patch("openalph.agent.stream", side_effect=counting_stream):
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
                 return_value=ToolResult(content="loop"),
             ):
                 await agent.handle_input("Loop forever")
-                call_count = mock_complete.await_count
 
         # Should have called complete at most max_iterations times
         assert call_count <= 2
@@ -388,7 +431,7 @@ class TestToolResultTruncation:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses) as mock_complete:
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)) as mock_complete:
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -422,7 +465,7 @@ class TestToolResultTruncation:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses) as mock_complete:
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)) as mock_complete:
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -460,7 +503,7 @@ class TestStatusWithTools:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses):
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)):
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -487,9 +530,8 @@ class TestNoToolsBackwardCompat:
             agent = Agent(config)
 
         with patch(
-            "openalph.agent.complete",
-            new_callable=AsyncMock,
-            return_value=text_response("Hello there!"),
+            "openalph.agent.stream",
+            side_effect=make_stream_from_response(text_response("Hello there!")),
         ):
             result = await agent.handle_input("Hi")
 
@@ -506,7 +548,7 @@ class TestNoToolsBackwardCompat:
 
         # Turn 1: normal text
         # Turn 2: tool use → result → text
-        responses_turn1 = text_response("Hi!")
+        responses_turn1 = [text_response("Hi!")]
         responses_turn2 = [
             tool_use_response([
                 ToolCall(id="tc_1", name="shell", input={"command": "date"})
@@ -518,11 +560,11 @@ class TestNoToolsBackwardCompat:
             agent = Agent(config)
 
         # Turn 1
-        with patch("openalph.agent.complete", new_callable=AsyncMock, return_value=responses_turn1):
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses_turn1)):
             await agent.handle_input("Hello")
 
         # Turn 2
-        with patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=responses_turn2) as mock_complete:
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses_turn2)) as mock_stream:
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -554,10 +596,7 @@ class TestToolsPassedToProvider:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch(
-            "openalph.agent.complete",
-            new_callable=AsyncMock,
-            return_value=text_response("Hi"),
+        with patch("openalph.agent.stream", side_effect=make_stream_from_response(text_response("Hi")),
         ) as mock_complete:
             await agent.handle_input("Hello")
 
@@ -575,10 +614,7 @@ class TestToolsPassedToProvider:
         with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
             agent = Agent(config)
 
-        with patch(
-            "openalph.agent.complete",
-            new_callable=AsyncMock,
-            return_value=text_response("Hi"),
+        with patch("openalph.agent.stream", side_effect=make_stream_from_response(text_response("Hi")),
         ) as mock_complete:
             await agent.handle_input("Hello")
 
@@ -602,11 +638,10 @@ class TestCallbackParameters:
 
         with patch("openalph.agent.assemble_prompt", return_value="prompt"), \
              patch("openalph.agent.discover_tools", return_value=[SHELL_TOOL]), \
-             patch("openalph.agent.complete", new_callable=AsyncMock,
-                   side_effect=[
+             patch("openalph.agent.stream", side_effect=make_stream_responses([
                        tool_use_response([tc], text="Running..."),
                        text_response("Done"),
-                   ]), \
+                   ])), \
              patch("openalph.agent.execute_tool", new_callable=AsyncMock,
                    return_value=ToolResult(content="file.txt", is_error=False)):
             agent = Agent(config)
@@ -624,11 +659,10 @@ class TestCallbackParameters:
 
         with patch("openalph.agent.assemble_prompt", return_value="prompt"), \
              patch("openalph.agent.discover_tools", return_value=[SHELL_TOOL]), \
-             patch("openalph.agent.complete", new_callable=AsyncMock,
-                   side_effect=[
+             patch("openalph.agent.stream", side_effect=make_stream_responses([
                        tool_use_response([tc], text="Let me check"),
                        text_response("Done"),
-                   ]), \
+                   ])), \
              patch("openalph.agent.execute_tool", new_callable=AsyncMock,
                    return_value=ToolResult(content="ok", is_error=False)):
             agent = Agent(config)
@@ -648,28 +682,34 @@ class TestCallbackParameters:
 
         call_count = 0
 
-        async def fake_complete(**kwargs):
+        async def fake_complete(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             idx = call_count
             if idx == 1:
                 # Room A first call — tool use, but add delay so B starts
-                return tool_use_response([tc_a], text="A running")
+                resp = tool_use_response([tc_a], text="A running")
             elif idx == 2:
                 # Room B first call — tool use
-                return tool_use_response([tc_b], text="B running")
+                resp = tool_use_response([tc_b], text="B running")
             else:
                 # Final text responses
-                return text_response("Done")
+                resp = text_response("Done")
+            # Yield as stream events
+            if resp.content:
+                yield StreamEvent(type="text", content=resp.content)
+            for i, tc in enumerate(resp.tool_calls):
+                yield StreamEvent(type="tool_done", tool_index=i, tool_call=tc)
+            yield StreamEvent(type="done", response=resp, stop_reason=resp.stop_reason, model=resp.model)
 
-        async def fake_execute(*, name, input, tool_config, agent_config, tools):
+        async def fake_execute(*, name, input, tool_config, agent_config, tools, callbacks=None):
             # Add a delay to simulate real tool execution and allow interleaving
             await asyncio.sleep(0.01)
             return ToolResult(content=f"result-{input['command']}", is_error=False)
 
         with patch("openalph.agent.assemble_prompt", return_value="prompt"), \
              patch("openalph.agent.discover_tools", return_value=[SHELL_TOOL]), \
-             patch("openalph.agent.complete", new_callable=AsyncMock, side_effect=fake_complete), \
+             patch("openalph.agent.stream", side_effect=fake_complete), \
              patch("openalph.agent.execute_tool", new_callable=AsyncMock, side_effect=fake_execute):
             agent = Agent(config)
 
@@ -710,9 +750,8 @@ class TestCallbackErrorResilience:
         async def exploding_intent(tool_calls, content):
             raise RuntimeError("intent callback boom")
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock_complete, \
+        with patch("openalph.agent.stream", side_effect=make_stream_responses([tool_resp, text_resp])) as mock_complete, \
              patch("openalph.agent.execute_tool", new_callable=AsyncMock) as mock_exec:
-            mock_complete.side_effect = [tool_resp, text_resp]
             mock_exec.return_value = ToolResult(content="file contents", is_error=False)
 
             result = await agent.handle_input("hello", on_tool_intent=exploding_intent)
@@ -733,9 +772,8 @@ class TestCallbackErrorResilience:
         async def exploding_call(*args, **kwargs):
             raise RuntimeError("call callback boom")
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock_complete, \
+        with patch("openalph.agent.stream", side_effect=make_stream_responses([tool_resp, text_resp])) as mock_complete, \
              patch("openalph.agent.execute_tool", new_callable=AsyncMock) as mock_exec:
-            mock_complete.side_effect = [tool_resp, text_resp]
             mock_exec.return_value = ToolResult(content="file contents", is_error=False)
 
             result = await agent.handle_input("hello", on_tool_call=exploding_call)

@@ -7,8 +7,8 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from openalph.agent import Agent
+from openalph.provider import StreamEvent, Response, Usage
 from openalph.config import AgentConfig
-from openalph.provider import Response, Usage
 
 
 def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
@@ -47,16 +47,23 @@ class TestConcurrentSameRoom:
 
         call_count = 0
 
-        async def mock_complete(**kwargs):
+        async def mock_stream(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             current = call_count
             # First call is slow to force overlap window
             if current == 1:
                 await asyncio.sleep(0.1)
-            return make_response(f"Response {current}")
+            content = f"Response {current}"
+            yield StreamEvent(type="text", content=content)
+            yield StreamEvent(
+                type="done",
+                response=make_response(content),
+                stop_reason="end_turn",
+                model="test",
+            )
 
-        with patch("openalph.agent.complete", side_effect=mock_complete):
+        with patch("openalph.agent.stream", side_effect=mock_stream):
             r1, r2 = await asyncio.gather(
                 agent.handle_input("Message 1", room_id="room1"),
                 agent.handle_input("Message 2", room_id="room1"),
@@ -81,11 +88,17 @@ class TestConcurrentDifferentRooms:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        async def slow_complete(**kwargs):
+        async def slow_stream(*args, **kwargs):
             await asyncio.sleep(0.1)
-            return make_response("Done")
+            yield StreamEvent(type="text", content="Done")
+            yield StreamEvent(
+                type="done",
+                response=make_response("Done"),
+                stop_reason="end_turn",
+                model="test",
+            )
 
-        with patch("openalph.agent.complete", side_effect=slow_complete):
+        with patch("openalph.agent.stream", side_effect=slow_stream):
             start = time.monotonic()
             await asyncio.gather(
                 agent.handle_input("A", room_id="room_a"),
@@ -107,7 +120,7 @@ class TestHeartbeatWaits:
 
         call_order = []
 
-        async def mock_complete(**kwargs):
+        async def mock_stream(*args, **kwargs):
             msgs = kwargs.get("messages", [])
             last_user = [m for m in msgs if m["role"] == "user"][-1]["content"]
             if last_user == "user message":
@@ -116,9 +129,16 @@ class TestHeartbeatWaits:
                 call_order.append("user_llm_end")
             else:
                 call_order.append("heartbeat_llm")
-            return make_response(f"Re: {last_user}")
+            content = f"Re: {last_user}"
+            yield StreamEvent(type="text", content=content)
+            yield StreamEvent(
+                type="done",
+                response=make_response(content),
+                stop_reason="end_turn",
+                model="test",
+            )
 
-        with patch("openalph.agent.complete", side_effect=mock_complete):
+        with patch("openalph.agent.stream", side_effect=mock_stream):
             # Start user message, then fire heartbeat after a short delay
             async def delayed_heartbeat():
                 await asyncio.sleep(0.02)  # fires while user msg is processing

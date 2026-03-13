@@ -218,7 +218,7 @@ def load_config(path: Path) -> AgentConfig:
     if not isinstance(model_max_tokens, int) or model_max_tokens <= 0:
         raise ConfigError("model_max_tokens must be a positive integer")
 
-    # max_iterations defaults to 25 if not specified
+    # max_iterations defaults to 50 if not specified
     max_iterations = agent_section.get("max_iterations", 50)
     if not isinstance(max_iterations, int) or max_iterations <= 0:
         raise ConfigError("max_iterations must be a positive integer")

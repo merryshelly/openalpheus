@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from openalph.agent import Agent
 from openalph.config import AgentConfig
+from openalph.provider import StreamEvent, Response, Usage, ToolCall
 
 
 # --- Fixtures ---
@@ -58,6 +59,59 @@ def make_response(content="Hello!", input_tokens=100, output_tokens=50, tool_cal
     return resp
 
 
+def make_stream_events(content="Hello!", input_tokens=100, output_tokens=50, tool_calls=None):
+    """Create a mock async generator that yields stream events."""
+    async def _stream(*args, **kwargs):
+        # Yield text delta
+        yield StreamEvent(type="text", content=content)
+        # Yield done event with response
+        yield StreamEvent(
+            type="done",
+            response=Response(
+                content=content,
+                model="claude-sonnet-4-20250514",
+                usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+                stop_reason="end_turn",
+                tool_calls=tool_calls or [],
+            ),
+            stop_reason="end_turn",
+            model="claude-sonnet-4-20250514",
+        )
+    return _stream
+
+
+def make_stream_events_with_tool(content="", tool_call=None, input_tokens=100, output_tokens=50):
+    """Create a mock async generator that yields a tool call."""
+    async def _stream(*args, **kwargs):
+        # Yield tool_start
+        yield StreamEvent(
+            type="tool_start",
+            tool_index=0,
+            tool_id=tool_call.id if tool_call else "tc_1",
+            tool_name=tool_call.name if tool_call else "shell",
+        )
+        # Yield tool_done
+        yield StreamEvent(
+            type="tool_done",
+            tool_index=0,
+            tool_call=tool_call if tool_call else ToolCall(id="tc_1", name="shell", input={}),
+        )
+        # Yield done event with response
+        yield StreamEvent(
+            type="done",
+            response=Response(
+                content=content,
+                model="claude-sonnet-4-20250514",
+                usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+                stop_reason="end_turn",
+                tool_calls=[tool_call] if tool_call else [],
+            ),
+            stop_reason="end_turn",
+            model="claude-sonnet-4-20250514",
+        )
+    return _stream
+
+
 def make_tool_call(name="shell", tool_input=None, call_id="tc_1"):
     """Create a mock tool call."""
     tc = MagicMock()
@@ -84,12 +138,12 @@ class TestLogFileCreation:
     async def test_log_file_created_on_first_turn(self, tmp_path):
         """JSONL log file is created after the first LLM call."""
         config = make_agent_config(tmp_path)
-        agent = Agent(config)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -109,9 +163,10 @@ class TestLogFileCreation:
         log_dir = tmp_path / "logs"
         assert not log_dir.exists()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -123,9 +178,10 @@ class TestLogFileCreation:
         config = make_agent_config(tmp_path, name="watson")
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -153,9 +209,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -170,9 +227,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response(input_tokens=1200, output_tokens=350)
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -193,9 +251,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!myroom:local")
 
@@ -209,9 +268,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -225,9 +285,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path, default_model="claude-opus-4-20250514")
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -241,9 +302,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response(input_tokens=1500, output_tokens=400)
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -258,9 +320,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -276,9 +339,10 @@ class TestLogEntryFormat:
         long_content = "x" * 500
         response = make_response(content=long_content)
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -292,9 +356,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response(content="Hello back!")
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -308,9 +373,10 @@ class TestLogEntryFormat:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -337,17 +403,23 @@ class TestToolCallLogging:
 
         call_count = 0
 
-        async def mock_complete(**kwargs):
+        async def mock_stream_fn(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return tool_response
-            return final_response
+                # First call returns tool call
+                async for event in make_stream_events_with_tool(content="", tool_call=tc, input_tokens=100, output_tokens=50)():
+                    yield event
+            else:
+                # Second call returns final response
+                async for event in make_stream_events(content="It's Monday.", input_tokens=200, output_tokens=100)():
+                    yield event
 
-        with patch("openalph.agent.complete", side_effect=mock_complete), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.execute_tool", AsyncMock(return_value=tool_result)), \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[MagicMock(name="shell", config={})]):
+            mock_stream.side_effect = mock_stream_fn
             agent = Agent(config)
             await agent.handle_input("What day is it?", "!room:local")
 
@@ -375,9 +447,10 @@ class TestToolCallLogging:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room:local")
 
@@ -396,17 +469,21 @@ class TestToolCallLogging:
 
         call_count = 0
 
-        async def mock_complete(**kwargs):
+        async def mock_stream_fn(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return tool_response
-            return final_response
+                async for event in make_stream_events_with_tool(content="", tool_call=tc, input_tokens=100, output_tokens=50)():
+                    yield event
+            else:
+                async for event in make_stream_events(content="That command failed.", input_tokens=200, output_tokens=100)():
+                    yield event
 
-        with patch("openalph.agent.complete", side_effect=mock_complete), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.execute_tool", AsyncMock(return_value=tool_result)), \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[MagicMock(name="shell", config={})]):
+            mock_stream.side_effect = mock_stream_fn
             agent = Agent(config)
             await agent.handle_input("Run bad-cmd", "!room:local")
 
@@ -435,9 +512,10 @@ class TestMultipleTurns:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("First", "!room:local")
             await agent.handle_input("Second", "!room:local")
@@ -457,9 +535,10 @@ class TestMultipleTurns:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
             await agent.handle_input("Hello", "!room1:local")
             await agent.handle_input("Hello", "!room2:local")
@@ -487,9 +566,10 @@ class TestDateRotation:
         config = make_agent_config(tmp_path)
         response = make_response()
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
 
             # First call: logs to today's file
@@ -521,9 +601,10 @@ class TestLoggingResilience:
         config = make_agent_config(tmp_path)
         response = make_response(content="I'm still working!")
 
-        with patch("openalph.agent.complete", AsyncMock(return_value=response)), \
+        with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system prompt"), \
              patch("openalph.agent.discover_tools", return_value=[]):
+            mock_stream.side_effect = make_stream_events(content=response.content, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
             agent = Agent(config)
 
             # Make logs dir read-only to simulate write failure

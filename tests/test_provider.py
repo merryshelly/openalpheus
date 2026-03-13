@@ -39,31 +39,103 @@ def make_config(**kwargs):
     return AgentConfig(**defaults)
 
 
-def mock_anthropic_response(text="Hello", model="test-model",
+# --- Mock helpers for streaming ---
+
+class MockAnthropicStream:
+    """Mock for Anthropic's AsyncMessageStream context manager."""
+
+    def __init__(self, events, final_message=None):
+        self._events = events
+        self._final_message = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        for event in self._events:
+            yield event
+
+    async def get_final_message(self):
+        return self._final_message
+
+
+def _anthropic_text(text):
+    e = MagicMock()
+    e.type = "text"
+    e.text = text
+    return e
+
+
+def _anthropic_message_stop():
+    e = MagicMock()
+    e.type = "message_stop"
+    return e
+
+
+def _anthropic_final_message(text="", model="test-model",
                              input_tokens=100, output_tokens=50,
-                             cache_read=0, cache_create=0):
-    resp = MagicMock()
-    resp.content = [MagicMock(text=text)]
-    resp.model = model
-    resp.usage.input_tokens = input_tokens
-    resp.usage.output_tokens = output_tokens
-    resp.usage.cache_read_input_tokens = cache_read
-    resp.usage.cache_creation_input_tokens = cache_create
-    resp.stop_reason = "end_turn"
-    return resp
+                             cache_read=0, cache_create=0,
+                             stop_reason="end_turn"):
+    msg = MagicMock()
+    msg.model = model
+    msg.stop_reason = stop_reason
+    msg.usage.input_tokens = input_tokens
+    msg.usage.output_tokens = output_tokens
+    msg.usage.cache_read_input_tokens = cache_read
+    msg.usage.cache_creation_input_tokens = cache_create
+
+    content_blocks = []
+    if text:
+        tb = MagicMock()
+        tb.type = "text"
+        tb.text = text
+        content_blocks.append(tb)
+    msg.content = content_blocks
+    return msg
 
 
-def mock_openai_response(text="Hello", model="test-model",
-                          prompt_tokens=100, completion_tokens=50):
-    choice = MagicMock()
-    choice.message.content = text
-    choice.finish_reason = "stop"
-    resp = MagicMock()
-    resp.choices = [choice]
-    resp.model = model
-    resp.usage.prompt_tokens = prompt_tokens
-    resp.usage.completion_tokens = completion_tokens
-    return resp
+def mock_openai_stream_chunks(text="Hello", model="test-model",
+                               prompt_tokens=100, completion_tokens=50):
+    """Create mock OpenAI streaming chunks."""
+    chunks = []
+    
+    # Text chunk
+    chunk = MagicMock()
+    chunk.choices = [MagicMock()]
+    chunk.choices[0].delta = MagicMock()
+    chunk.choices[0].delta.content = text
+    chunk.choices[0].delta.tool_calls = None
+    chunk.choices[0].finish_reason = "stop"
+    chunk.usage = None
+    chunks.append(chunk)
+    
+    # Usage chunk
+    chunk = MagicMock()
+    chunk.choices = []
+    chunk.usage = MagicMock()
+    chunk.usage.prompt_tokens = prompt_tokens
+    chunk.usage.completion_tokens = completion_tokens
+    chunks.append(chunk)
+    
+    return chunks
+
+
+class MockOpenAIStream:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        for chunk in self._chunks:
+            yield chunk
 
 
 # --- Routing ---
@@ -78,10 +150,14 @@ class TestRouting:
             default_model="anthropic/claude-sonnet-4-20250514"
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response("Hello from Claude")
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            final_msg = _anthropic_final_message("Hello from Claude")
+            client.messages.stream.return_value = MockAnthropicStream(
+                [_anthropic_text("Hello from Claude"), _anthropic_message_stop()],
+                final_msg,
             )
 
             response = await complete(
@@ -91,10 +167,10 @@ class TestRouting:
             )
 
         assert response.content == "Hello from Claude"
-        client.messages.create.assert_awaited_once()
+        client.messages.stream.assert_called_once()
 
         # Verify Anthropic SDK call shape
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert kw["model"] == "claude-sonnet-4-20250514"
         assert kw["system"] == [{"type": "text", "text": "You are a test agent.", "cache_control": {"type": "ephemeral"}}]
         assert kw["messages"] == [{"role": "user", "content": [{"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}]}]
@@ -114,8 +190,8 @@ class TestRouting:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=mock_openai_response("Hello from Kimi")
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(mock_openai_stream_chunks("Hello from Kimi"))
             )
 
             response = await complete(
@@ -151,8 +227,8 @@ class TestRouting:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=mock_openai_response("Hello from Qwen")
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(mock_openai_stream_chunks("Hello from Qwen"))
             )
 
             response = await complete(
@@ -179,17 +255,21 @@ class TestResponseNormalization:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response(
-                    text="Test",
-                    model="claude-sonnet-4-20250514",
-                    input_tokens=150,
-                    output_tokens=75,
-                    cache_read=120,
-                    cache_create=30,
-                )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            final_msg = _anthropic_final_message(
+                text="Test",
+                model="claude-sonnet-4-20250514",
+                input_tokens=150,
+                output_tokens=75,
+                cache_read=120,
+                cache_create=30,
+            )
+            client.messages.stream.return_value = MockAnthropicStream(
+                [_anthropic_text("Test"), _anthropic_message_stop()],
+                final_msg,
             )
 
             response = await complete(
@@ -221,13 +301,13 @@ class TestResponseNormalization:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=mock_openai_response(
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(mock_openai_stream_chunks(
                     text="Test",
-                    model="kimi-k2.5",
+                    model="test-model",
                     prompt_tokens=200,
                     completion_tokens=60,
-                )
+                ))
             )
 
             response = await complete(
@@ -238,7 +318,8 @@ class TestResponseNormalization:
 
         assert isinstance(response, Response)
         assert response.content == "Test"
-        assert response.model == "kimi-k2.5"
+        # In streaming mode, model comes from api_model (config default_model)
+        assert response.model == "test-model"
         assert response.usage.input_tokens == 200
         assert response.usage.output_tokens == 60
         assert response.usage.cache_read_tokens is None
@@ -262,15 +343,19 @@ class TestMultiTurn:
             {"role": "user", "content": "And 3+3?"},
         ]
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response("6")
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            final_msg = _anthropic_final_message("6")
+            client.messages.stream.return_value = MockAnthropicStream(
+                [_anthropic_text("6"), _anthropic_message_stop()],
+                final_msg,
             )
 
             await complete(config=config, system="Math tutor", messages=messages)
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert len(kw["messages"]) == 3
         assert kw["messages"][2]["content"] == [{"type": "text", "text": "And 3+3?", "cache_control": {"type": "ephemeral"}}]
 
@@ -294,8 +379,8 @@ class TestMultiTurn:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=mock_openai_response("Good!")
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(mock_openai_stream_chunks("Good!"))
             )
 
             await complete(config=config, system="Be friendly", messages=messages)
@@ -318,10 +403,14 @@ class TestMaxTokens:
             max_tokens=4096
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            final_msg = _anthropic_final_message()
+            client.messages.stream.return_value = MockAnthropicStream(
+                [_anthropic_message_stop()],
+                final_msg,
             )
 
             await complete(
@@ -330,7 +419,7 @@ class TestMaxTokens:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert kw["max_tokens"] == 4096
 
     @pytest.mark.asyncio
@@ -348,8 +437,8 @@ class TestMaxTokens:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=mock_openai_response()
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(mock_openai_stream_chunks())
             )
 
             await complete(
@@ -373,11 +462,18 @@ class TestErrors:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                side_effect=Exception("rate limit exceeded")
-            )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            # Create an error stream
+            class ErrorStream:
+                async def __aenter__(self):
+                    raise Exception("rate limit exceeded")
+                async def __aexit__(self, *args):
+                    pass
+            
+            client.messages.stream.return_value = ErrorStream()
 
             with pytest.raises(Exception, match="rate limit"):
                 await complete(
@@ -400,7 +496,7 @@ class TestErrors:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
+            client.chat.completions.create = MagicMock(
                 side_effect=Exception("connection refused")
             )
 

@@ -106,6 +106,68 @@ def mock_anthropic_response_text_only(
     return resp
 
 
+
+class MockOpenAIStream:
+    """Mock for OpenAI streaming response."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+def _make_openai_chunk(content="Hello", finish_reason=None, usage=None):
+    chunk = MagicMock()
+    chunk.choices = [MagicMock()]
+    chunk.choices[0].delta = MagicMock()
+    chunk.choices[0].delta.content = content
+    chunk.choices[0].delta.tool_calls = None
+    chunk.choices[0].finish_reason = finish_reason
+    chunk.usage = usage
+    return chunk
+
+class MockAnthropicStream:
+    """Mock for Anthropic's AsyncMessageStream context manager."""
+
+    def __init__(self, events, final_message=None):
+        self._events = events
+        self._final_message = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        for event in self._events:
+            yield event
+
+    async def get_final_message(self):
+        return self._final_message
+
+
+def _make_text_event(text):
+    e = MagicMock()
+    e.type = "text"
+    e.text = text
+    return e
+
+
+def _make_message_stop():
+    e = MagicMock()
+    e.type = "message_stop"
+    return e
+
+
 # ---------------------------------------------------------------------------
 # _supports_adaptive_thinking
 # ---------------------------------------------------------------------------
@@ -354,8 +416,12 @@ class TestAdaptiveThinkingAPICall:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_with_thinking()
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -364,7 +430,7 @@ class TestAdaptiveThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert kw["thinking"] == {"type": "adaptive"}
         assert kw["output_config"] == {"effort": "high"}
         # max_tokens should still be set
@@ -379,8 +445,12 @@ class TestAdaptiveThinkingAPICall:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_text_only()
+            final_msg = mock_anthropic_response_text_only()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -389,7 +459,7 @@ class TestAdaptiveThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert kw["thinking"] == {"type": "adaptive"}
         assert kw["output_config"] == {"effort": "low"}
 
@@ -402,8 +472,12 @@ class TestAdaptiveThinkingAPICall:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_text_only()
+            final_msg = mock_anthropic_response_text_only()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -412,7 +486,7 @@ class TestAdaptiveThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert "thinking" not in kw
         assert "output_config" not in kw
 
@@ -434,8 +508,12 @@ class TestBudgetThinkingAPICall:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_with_thinking()
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -444,10 +522,10 @@ class TestBudgetThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert kw["thinking"] == {"type": "enabled", "budget_tokens": 16384}
         # max_tokens adjusted (base + budget) then capped for non-streaming
-        assert kw["max_tokens"] == 21000  # capped from 24576
+        assert kw["max_tokens"] == 24576  # base + budget, no longer capped
 
     @pytest.mark.asyncio
     async def test_budget_thinking_low(self):
@@ -458,8 +536,12 @@ class TestBudgetThinkingAPICall:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_text_only()
+            final_msg = mock_anthropic_response_text_only()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -468,7 +550,7 @@ class TestBudgetThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert kw["thinking"] == {"type": "enabled", "budget_tokens": 2048}
         assert kw["max_tokens"] == 8192 + 2048
 
@@ -489,8 +571,12 @@ class TestPromptCaching:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_text_only()
+            final_msg = mock_anthropic_response_text_only()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -499,7 +585,7 @@ class TestPromptCaching:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         # System should be a list of content blocks with cache_control
         system = kw["system"]
         assert isinstance(system, list)
@@ -516,8 +602,12 @@ class TestPromptCaching:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_text_only()
+            final_msg = mock_anthropic_response_text_only()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -530,7 +620,7 @@ class TestPromptCaching:
                 ],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         messages = kw["messages"]
         last_user = messages[-1]
         # Last user message should have cache_control on its content
@@ -562,7 +652,13 @@ class TestPromptCaching:
             resp.model = "kimi-k2.5"
             resp.usage.prompt_tokens = 100
             resp.usage.completion_tokens = 50
-            client.chat.completions.create = AsyncMock(return_value=resp)
+            usage = MagicMock()
+            usage.prompt_tokens = 100
+            usage.completion_tokens = 50
+            chunk = _make_openai_chunk(content="Hello", finish_reason="stop", usage=usage)
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream([chunk])
+            )
 
             await complete(
                 config=config,
@@ -609,7 +705,13 @@ class TestOpenRouterReasoning:
             resp.model = "kimi-k2.5"
             resp.usage.prompt_tokens = 100
             resp.usage.completion_tokens = 50
-            client.chat.completions.create = AsyncMock(return_value=resp)
+            usage = MagicMock()
+            usage.prompt_tokens = 100
+            usage.completion_tokens = 50
+            chunk = _make_openai_chunk(content="Hello", finish_reason="stop", usage=usage)
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream([chunk])
+            )
 
             await complete(
                 config=config,
@@ -644,7 +746,13 @@ class TestOpenRouterReasoning:
             resp.model = "kimi-k2.5"
             resp.usage.prompt_tokens = 100
             resp.usage.completion_tokens = 50
-            client.chat.completions.create = AsyncMock(return_value=resp)
+            usage = MagicMock()
+            usage.prompt_tokens = 100
+            usage.completion_tokens = 50
+            chunk = _make_openai_chunk(content="Hello", finish_reason="stop", usage=usage)
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream([chunk])
+            )
 
             await complete(
                 config=config,
@@ -673,8 +781,12 @@ class TestThinkingOverride:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_with_thinking()
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -684,7 +796,7 @@ class TestThinkingOverride:
                 thinking="high",
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert kw["thinking"] == {"type": "adaptive"}
         assert kw["output_config"] == {"effort": "high"}
 
@@ -697,8 +809,12 @@ class TestThinkingOverride:
 
         with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
             client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=mock_anthropic_response_text_only()
+            final_msg = mock_anthropic_response_text_only()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
             )
 
             await complete(
@@ -708,7 +824,7 @@ class TestThinkingOverride:
                 thinking="off",
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert "thinking" not in kw
 
 

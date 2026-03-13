@@ -229,6 +229,30 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "temporal_decay_half_life_days": 30,
             "extra_paths": []
         }
+    },
+    "send_media": {
+        "description": (
+            "Send a file to the current Matrix room. Supports audio, images, "
+            "video, and generic files. The file must exist in your workspace. "
+            "Use after generating files (e.g., TTS audio) to deliver them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to send (relative to workspace)"
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional caption/description for the file"
+                },
+            },
+            "required": ["path"]
+        },
+        "config": {
+            "max_upload_bytes": 20971520
+        }
     }
 }
 
@@ -363,6 +387,7 @@ async def execute_tool(
     tool_config: dict,
     agent_config: Any,
     tools: list[ToolDef] | None = None,
+    callbacks: dict | None = None,
 ) -> ToolResult:
     """Dispatch to the named tool executor.
     
@@ -403,7 +428,7 @@ async def execute_tool(
     input = dict(input)
 
     # Resolve relative paths for file tools against workspace
-    if name in ("file_read", "file_write", "file_edit") and "path" in input:
+    if name in ("file_read", "file_write", "file_edit", "send_media") and "path" in input:
         file_path = input["path"]
         if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
             input["path"] = str(agent_config.workspace / file_path)
@@ -489,6 +514,14 @@ async def execute_tool(
             workspace=agent_config.workspace if hasattr(agent_config, "workspace") else Path("."),
             max_results=input.get("max_results", 10),
             min_score=input.get("min_score", 0.1),
+        )
+    elif name == "send_media":
+        from .media import send_media
+        return await send_media(
+            path=input["path"],
+            caption=input.get("caption"),
+            max_upload_bytes=tool_config.get("max_upload_bytes", 20_971_520),
+            upload_callback=callbacks.get("send_media") if callbacks else None,
         )
     else:
         return ToolResult(

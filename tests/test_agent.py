@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from openalph.agent import Agent
 from openalph.config import AgentConfig
-from openalph.provider import Response, Usage
+from openalph.provider import Response, Usage, StreamEvent
 
 
 def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
@@ -41,6 +41,24 @@ def make_response(content="Hello", input_tokens=10, output_tokens=5):
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
         stop_reason="end_turn",
     )
+
+
+def make_stream_events(content="Hello", input_tokens=10, output_tokens=5):
+    """Create a mock async generator that yields stream events."""
+    async def _stream(*args, **kwargs):
+        yield StreamEvent(type="text", content=content)
+        yield StreamEvent(
+            type="done",
+            response=Response(
+                content=content,
+                model="claude-sonnet-4-20250514",
+                usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+                stop_reason="end_turn",
+            ),
+            stop_reason="end_turn",
+            model="claude-sonnet-4-20250514",
+        )
+    return _stream
 
 
 # --- Initialization ---
@@ -80,8 +98,8 @@ class TestHandleInput:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
-            mock.return_value = make_response("Hi there!")
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("Hi there!")
             result = await agent.handle_input("Hello")
 
         assert result == "Hi there!"
@@ -91,11 +109,11 @@ class TestHandleInput:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
-            mock.return_value = make_response("Response 1")
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("Response 1")
             await agent.handle_input("Message 1")
 
-            mock.return_value = make_response("Response 2")
+            mock.side_effect = make_stream_events("Response 2")
             await agent.handle_input("Message 2")
 
         assert len(agent.history("_default")) == 4
@@ -110,8 +128,8 @@ class TestHandleInput:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
-            mock.return_value = make_response("OK")
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("OK")
             await agent.handle_input("Hi")
 
         kw = mock.call_args.kwargs
@@ -122,8 +140,8 @@ class TestHandleInput:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
-            mock.return_value = make_response("OK")
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("OK")
             await agent.handle_input("Hi")
 
         kw = mock.call_args.kwargs
@@ -134,11 +152,11 @@ class TestHandleInput:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
-            mock.return_value = make_response("First")
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("First")
             await agent.handle_input("Hello")
 
-            mock.return_value = make_response("Second")
+            mock.side_effect = make_stream_events("Second")
             await agent.handle_input("Follow-up")
 
         # Second call should include full history + new message
@@ -160,11 +178,11 @@ class TestTokenTracking:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
-            mock.return_value = make_response("A", input_tokens=100, output_tokens=50)
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("A", input_tokens=100, output_tokens=50)
             await agent.handle_input("First")
 
-            mock.return_value = make_response("B", input_tokens=200, output_tokens=80)
+            mock.side_effect = make_stream_events("B", input_tokens=200, output_tokens=80)
             await agent.handle_input("Second")
 
         assert agent.total_input_tokens == 300
@@ -191,8 +209,8 @@ class TestStatus:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
-            mock.return_value = make_response("Hi", input_tokens=50, output_tokens=20)
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("Hi", input_tokens=50, output_tokens=20)
             await agent.handle_input("Hello")
 
         status = agent.status()
@@ -226,9 +244,110 @@ class TestContextOverflowPreAppend:
         big_message = "z" * 2000  # would push well over
 
         with pytest.raises(ContextOverflowError):
-            with patch("openalph.agent.complete", new_callable=AsyncMock) as mock:
+            with patch("openalph.agent.stream") as mock:
                 await agent.handle_input(big_message)
 
         # The big message must NOT be in history
         contents = [m.get("content", "") for m in agent.history("_default")]
         assert big_message not in contents
+
+
+# --- Usage Reconstruction ---
+
+
+import json as _json
+
+
+class TestUsageReconstruction:
+
+    def _write_jsonl(self, path, entries):
+        with open(path, "w") as f:
+            for entry in entries:
+                f.write(_json.dumps(entry) + "\n")
+
+    def test_reconstruct_from_empty_logs_dir(self, tmp_path):
+        (tmp_path / "logs").mkdir()
+        config = make_config(tmp_path)
+        agent = Agent(config)
+        assert agent.total_input_tokens == 0
+        assert agent.total_output_tokens == 0
+        assert agent.total_tool_calls == 0
+
+    def test_reconstruct_from_no_logs_dir(self, tmp_path):
+        config = make_config(tmp_path)
+        agent = Agent(config)
+        assert agent.total_input_tokens == 0
+        assert agent.total_output_tokens == 0
+        assert agent.total_tool_calls == 0
+
+    def test_reconstruct_sums_across_files(self, tmp_path):
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        self._write_jsonl(logs / "a.jsonl", [
+            {"input_tokens": 10, "output_tokens": 20, "tool_calls": []},
+            {"input_tokens": 5, "output_tokens": 15, "tool_calls": []},
+        ])
+        self._write_jsonl(logs / "b.jsonl", [
+            {"input_tokens": 100, "output_tokens": 200, "tool_calls": []},
+        ])
+        config = make_config(tmp_path)
+        agent = Agent(config)
+        assert agent.total_input_tokens == 115
+        assert agent.total_output_tokens == 235
+        assert agent.total_tool_calls == 0
+
+    def test_reconstruct_skips_malformed_lines(self, tmp_path):
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        log_file = logs / "mixed.jsonl"
+        with open(log_file, "w") as f:
+            f.write(_json.dumps({"input_tokens": 7, "output_tokens": 3, "tool_calls": []}) + "\n")
+            f.write("this is not json\n")
+            f.write(_json.dumps({"input_tokens": 2, "output_tokens": 1, "tool_calls": []}) + "\n")
+        config = make_config(tmp_path)
+        agent = Agent(config)
+        assert agent.total_input_tokens == 9
+        assert agent.total_output_tokens == 4
+
+    def test_reconstruct_counts_tool_calls(self, tmp_path):
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        self._write_jsonl(logs / "tools.jsonl", [
+            {"input_tokens": 1, "output_tokens": 1, "tool_calls": [{"name": "shell"}, {"name": "read"}]},
+            {"input_tokens": 1, "output_tokens": 1, "tool_calls": [{"name": "write"}]},
+            {"input_tokens": 1, "output_tokens": 1, "tool_calls": []},
+        ])
+        config = make_config(tmp_path)
+        agent = Agent(config)
+        assert agent.total_tool_calls == 3
+
+    def test_status_reflects_reconstructed_stats(self, tmp_path):
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        self._write_jsonl(logs / "run.jsonl", [
+            {"input_tokens": 50, "output_tokens": 100, "tool_calls": [{"name": "shell"}]},
+        ])
+        config = make_config(tmp_path)
+        agent = Agent(config)
+        s = agent.status()
+        assert s["total_input_tokens"] == 50
+        assert s["total_output_tokens"] == 100
+        assert s["total_tool_calls"] == 1
+
+    @pytest.mark.asyncio
+    async def test_new_usage_adds_to_reconstructed(self, tmp_path):
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        self._write_jsonl(logs / "prior.jsonl", [
+            {"input_tokens": 30, "output_tokens": 60, "tool_calls": []},
+        ])
+        config = make_config(tmp_path)
+        agent = Agent(config)
+        assert agent.total_input_tokens == 30
+
+        with patch("openalph.agent.stream") as mock:
+            mock.side_effect = make_stream_events("Hi", input_tokens=10, output_tokens=5)
+            await agent.handle_input("hello")
+
+        assert agent.total_input_tokens == 40
+        assert agent.total_output_tokens == 65

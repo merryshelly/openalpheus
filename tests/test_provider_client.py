@@ -85,6 +85,65 @@ class TestGetClient:
         assert id(client_a) != id(client_o)
 
 
+class MockAnthropicStream:
+    """Mock for Anthropic's AsyncMessageStream context manager."""
+
+    def __init__(self, events, final_message=None):
+        self._events = events
+        self._final_message = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        for event in self._events:
+            yield event
+
+    async def get_final_message(self):
+        return self._final_message
+
+
+def _anthropic_text(text):
+    e = MagicMock()
+    e.type = "text"
+    e.text = text
+    return e
+
+
+def _anthropic_message_stop():
+    e = MagicMock()
+    e.type = "message_stop"
+    return e
+
+
+def _anthropic_final_message(text="", model="test-model",
+                             input_tokens=100, output_tokens=50,
+                             cache_read=0, cache_create=0,
+                             stop_reason="end_turn"):
+    msg = MagicMock()
+    msg.model = model
+    msg.stop_reason = stop_reason
+    msg.usage.input_tokens = input_tokens
+    msg.usage.output_tokens = output_tokens
+    msg.usage.cache_read_input_tokens = cache_read
+    msg.usage.cache_creation_input_tokens = cache_create
+
+    content_blocks = []
+    if text:
+        tb = MagicMock()
+        tb.type = "text"
+        tb.text = text
+        content_blocks.append(tb)
+    msg.content = content_blocks
+    return msg
+
+
 class TestCompleteReusesClient:
 
     def test_anthropic_constructor_called_once_for_same_config(self, tmp_path):
@@ -95,27 +154,14 @@ class TestCompleteReusesClient:
 
         config = make_config(workspace=str(tmp_path))
 
-        fake_response = Response(
-            content="hi",
-            model="test-model",
-            usage=Usage(input_tokens=5, output_tokens=3),
-            stop_reason="end_turn",
-        )
-
         with patch("openalph.provider._get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_get_client.return_value = mock_client
 
-            # Mock anthropic messages.create
-            mock_msg = MagicMock()
-            mock_msg.content = [MagicMock(type="text", text="hi")]
-            mock_msg.model = "test-model"
-            mock_msg.usage.input_tokens = 5
-            mock_msg.usage.output_tokens = 3
-            mock_msg.usage.cache_read_input_tokens = 0
-            mock_msg.usage.cache_creation_input_tokens = 0
-            mock_msg.stop_reason = "end_turn"
-            mock_client.messages.create = AsyncMock(return_value=mock_msg)
+            # Mock anthropic messages.stream
+            events = [_anthropic_text("hi"), _anthropic_message_stop()]
+            final_msg = _anthropic_final_message(text="hi")
+            mock_client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             messages = [{"role": "user", "content": "hello"}]
 

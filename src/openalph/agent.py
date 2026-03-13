@@ -16,7 +16,7 @@ from pathlib import Path
 
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
-from openalph.provider import complete
+from openalph.provider import complete, stream, StreamEvent
 from openalph.tools import discover_tools, execute_tool, truncate_result
 
 logger = logging.getLogger(__name__)
@@ -149,6 +149,47 @@ class Agent:
         self._room_locks: dict[str, asyncio.Lock] = {}
         self.active_model = config.default_model
         self._truncation_retry = False
+        self._reconstruct_usage_stats()
+
+
+    def _reconstruct_usage_stats(self) -> None:
+        """Scan JSONL log files and reconstruct cumulative usage counters."""
+        logs_dir = Path(self.config.workspace) / "logs"
+        if not logs_dir.exists():
+            return
+        n_files = 0
+        total_in = 0
+        total_out = 0
+        total_tc = 0
+        for log_file in sorted(logs_dir.glob("*.jsonl")):
+            n_files += 1
+            try:
+                with log_file.open() as fh:
+                    for lineno, line in enumerate(fh, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            logger.warning("Skipping malformed JSON in %s line %d", log_file.name, lineno)
+                            continue
+                        total_in += entry.get("input_tokens", 0) or 0
+                        total_out += entry.get("output_tokens", 0) or 0
+                        tool_calls = entry.get("tool_calls") or []
+                        total_tc += len(tool_calls)
+            except OSError as exc:
+                logger.warning("Could not read log file %s: %s", log_file, exc)
+        self.total_input_tokens = total_in
+        self.total_output_tokens = total_out
+        self.total_tool_calls = total_tc
+        logger.info(
+            "Reconstructed usage: %d in / %d out / %d tool calls from %d log files",
+            self.total_input_tokens,
+            self.total_output_tokens,
+            self.total_tool_calls,
+            n_files,
+        )
 
 
     def history(self, room_id: str) -> list[dict]:
@@ -227,7 +268,9 @@ class Agent:
             logger.warning(f"Failed to write JSONL log: {e}")
 
     async def handle_input(self, text: str, room_id: str = "_default", *,
-                           on_tool_call=None, on_tool_intent=None, thinking: str | None = None) -> str:
+                           on_tool_call=None, on_tool_intent=None, thinking: str | None = None,
+                           callbacks: dict | None = None,
+                           on_text_delta=None, on_thinking_delta=None) -> str:
         """Process a user message and return the assistant's response.
 
         Appends the user message to room history, calls the LLM, appends the
@@ -237,6 +280,8 @@ class Agent:
         Args:
             text: User message
             room_id: Room identifier for per-room history isolation
+            on_text_delta: Optional callback(text: str, done: bool) for text streaming
+            on_thinking_delta: Optional callback(text: str, done: bool) for thinking streaming
         """
         if room_id not in self._room_locks:
             self._room_locks[room_id] = asyncio.Lock()
@@ -270,65 +315,116 @@ class Agent:
                     # Record start time for latency measurement
                     start_time = time.monotonic()
 
-                    # Pass a snapshot of history, not the live list.
-                    response = await complete(
+                    # Use streaming
+                    accumulated_text = ""
+                    accumulated_thinking = ""
+                    response = None
+                    text_emitted = False
+                    thinking_emitted = False
+                    tool_calls = []
+                    usage = None
+
+                    async for event in stream(
                         config=self.config,
                         system=self.system_prompt,
                         messages=list(history),
                         tools=tools_arg,
                         model=self.active_model,
                         thinking=thinking,
-                    )
+                    ):
+                        if event.type == "text":
+                            accumulated_text += event.content
+                            if on_text_delta:
+                                await on_text_delta(event.content, done=False)
+                            text_emitted = True
+                        elif event.type == "thinking":
+                            accumulated_thinking += event.content
+                            if on_thinking_delta:
+                                await on_thinking_delta(event.content, done=False)
+                            thinking_emitted = True
+                        elif event.type == "signature":
+                            # Signature is part of thinking block, but we handle it at done
+                            pass
+                        elif event.type == "tool_done":
+                            tool_calls.append(event.tool_call)
+                        elif event.type == "done":
+                            response = event.response
+                            # Fire done signals
+                            if text_emitted and on_text_delta:
+                                await on_text_delta("", done=True)
+                            if thinking_emitted and on_thinking_delta:
+                                await on_thinking_delta("", done=True)
+
+                    if response is None:
+                        # Fallback if no done event
+                        response = await complete(
+                            config=self.config,
+                            system=self.system_prompt,
+                            messages=list(history),
+                            tools=tools_arg,
+                            model=self.active_model,
+                            thinking=thinking,
+                        )
 
                     latency_ms = (time.monotonic() - start_time) * 1000
 
                     self.total_input_tokens += response.usage.input_tokens
                     self.total_output_tokens += response.usage.output_tokens
+                    usage = response.usage
 
                     # Check if response has tool calls
-                    if not response.tool_calls:
+                    if not tool_calls and not response.tool_calls:
                         # Text response - log and return
                         self._log_turn(
                             room_id=room_id,
                             model=self.active_model,
-                            input_tokens=response.usage.input_tokens,
-                            output_tokens=response.usage.output_tokens,
+                            input_tokens=usage.input_tokens,
+                            output_tokens=usage.output_tokens,
                             tool_calls=None,
                             latency_ms=latency_ms,
-                            content_preview=response.content,
+                            content_preview=accumulated_text or response.content,
                         )
-                        assistant_msg = {"role": "assistant", "content": response.content}
-                        if response.thinking:
+                        assistant_msg = {"role": "assistant", "content": accumulated_text or response.content}
+                        if accumulated_thinking or response.thinking:
+                            thinking_blocks = response.thinking if response.thinking else []
+                            if accumulated_thinking and not thinking_blocks:
+                                thinking_blocks = [ThinkingBlock(thinking=accumulated_thinking, signature="")]
                             assistant_msg["thinking"] = [
                                 {"thinking": tb.thinking, "signature": tb.signature}
-                                for tb in response.thinking
+                                for tb in thinking_blocks
                             ]
                         history.append(assistant_msg)
-                        return response.content
+                        return accumulated_text or response.content
+
+                    # Use tool_calls from stream or from response
+                    active_tool_calls = tool_calls if tool_calls else response.tool_calls
 
                     # Tool use - append assistant message with tool_calls to history
                     tool_msg = {
                         "role": "assistant",
-                        "content": response.content,
-                        "tool_calls": response.tool_calls,
+                        "content": accumulated_text or response.content,
+                        "tool_calls": active_tool_calls,
                     }
-                    if response.thinking:
+                    if accumulated_thinking or response.thinking:
+                        thinking_blocks = response.thinking if response.thinking else []
+                        if accumulated_thinking and not thinking_blocks:
+                            thinking_blocks = [ThinkingBlock(thinking=accumulated_thinking, signature="")]
                         tool_msg["thinking"] = [
                             {"thinking": tb.thinking, "signature": tb.signature}
-                            for tb in response.thinking
+                            for tb in thinking_blocks
                         ]
                     history.append(tool_msg)
 
                     # Emit tool intent before execution (for session logging / observability)
                     if on_tool_intent:
                         try:
-                            await on_tool_intent(response.tool_calls, response.content)
+                            await on_tool_intent(active_tool_calls, accumulated_text or response.content)
                         except Exception as e:
                             logger.warning("Tool intent callback failed: %s", e)
 
                     # Execute tool calls in parallel
                     tool_coros = []
-                    for tc in response.tool_calls:
+                    for tc in active_tool_calls:
                         # Find the tool config for this tool
                         tool_config = {}
                         for t in self.tools:
@@ -342,16 +438,17 @@ class Agent:
                             tool_config=tool_config,
                             agent_config=self.config,
                             tools=self.tools,
+                            callbacks=callbacks,
                         ))
 
                     results = await asyncio.gather(*tool_coros)
 
                     # Track total tool calls
-                    self.total_tool_calls += len(response.tool_calls)
+                    self.total_tool_calls += len(active_tool_calls)
 
                     # Build tool_calls log entry with is_error from results
                     logged_tool_calls = []
-                    for tc, result in zip(response.tool_calls, results):
+                    for tc, result in zip(active_tool_calls, results):
                         logged_tool_calls.append({
                             "name": tc.name,
                             "input": tc.input,
@@ -362,15 +459,15 @@ class Agent:
                     self._log_turn(
                         room_id=room_id,
                         model=self.active_model,
-                        input_tokens=response.usage.input_tokens,
-                        output_tokens=response.usage.output_tokens,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
                         tool_calls=logged_tool_calls,
                         latency_ms=latency_ms,
-                        content_preview=response.content,
+                        content_preview=accumulated_text or response.content,
                     )
 
                     # Append tool results to history (truncated) and notify
-                    for tc, result in zip(response.tool_calls, results):
+                    for tc, result in zip(active_tool_calls, results):
                         truncated_content = truncate_result(result.content, self.config.truncation_limit)
                         history.append({
                             "role": "tool",

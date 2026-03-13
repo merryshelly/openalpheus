@@ -57,6 +57,137 @@ SAMPLE_TOOL = ToolDef(
 )
 
 
+# --- Mock helpers for streaming ---
+
+class MockAnthropicStream:
+    """Mock for Anthropic's AsyncMessageStream context manager."""
+
+    def __init__(self, events, final_message=None):
+        self._events = events
+        self._final_message = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        for event in self._events:
+            yield event
+
+    async def get_final_message(self):
+        return self._final_message
+
+
+def _anthropic_text(text):
+    e = MagicMock()
+    e.type = "text"
+    e.text = text
+    return e
+
+
+def _anthropic_block_start(index, block_type="text", **kwargs):
+    e = MagicMock()
+    e.type = "content_block_start"
+    e.index = index
+    block = MagicMock()
+    block.type = block_type
+    if block_type == "tool_use":
+        block.id = kwargs.get("tool_id", f"toolu_{index}")
+        block.name = kwargs.get("tool_name", "test_tool")
+    e.content_block = block
+    return e
+
+
+def _anthropic_block_stop(index, content_block):
+    e = MagicMock()
+    e.type = "content_block_stop"
+    e.index = index
+    e.content_block = content_block
+    return e
+
+
+def _anthropic_tool_block(tool_id, name, input_dict):
+    block = MagicMock()
+    block.type = "tool_use"
+    block.id = tool_id
+    block.name = name
+    block.input = input_dict
+    return block
+
+
+def _anthropic_message_stop():
+    e = MagicMock()
+    e.type = "message_stop"
+    return e
+
+
+def _anthropic_final_message(text="", model="test-model",
+                             input_tokens=100, output_tokens=50,
+                             cache_read=0, cache_create=0,
+                             stop_reason="end_turn", tool_calls=None):
+    msg = MagicMock()
+    msg.model = model
+    msg.stop_reason = stop_reason
+    msg.usage.input_tokens = input_tokens
+    msg.usage.output_tokens = output_tokens
+    msg.usage.cache_read_input_tokens = cache_read
+    msg.usage.cache_creation_input_tokens = cache_create
+
+    content_blocks = []
+    if text:
+        tb = MagicMock()
+        tb.type = "text"
+        tb.text = text
+        content_blocks.append(tb)
+    if tool_calls:
+        for tc in tool_calls:
+            tb = MagicMock()
+            tb.type = "tool_use"
+            tb.id = tc["id"]
+            tb.name = tc["name"]
+            tb.input = tc["input"]
+            content_blocks.append(tb)
+    msg.content = content_blocks
+    return msg
+
+
+class MockOpenAIStream:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+def _openai_text_chunk(text, finish_reason=None):
+    chunk = MagicMock()
+    chunk.choices = [MagicMock()]
+    chunk.choices[0].delta = MagicMock()
+    chunk.choices[0].delta.content = text
+    chunk.choices[0].delta.tool_calls = None
+    chunk.choices[0].finish_reason = finish_reason
+    chunk.usage = None
+    return chunk
+
+
+def _openai_usage_chunk(prompt_tokens=100, completion_tokens=50):
+    chunk = MagicMock()
+    chunk.choices = []
+    chunk.usage = MagicMock()
+    chunk.usage.prompt_tokens = prompt_tokens
+    chunk.usage.completion_tokens = completion_tokens
+    return chunk
+
+
 # --- ToolCall dataclass ---
 
 
@@ -104,49 +235,32 @@ class TestResponseBackwardCompat:
 
 class TestAnthropicTools:
 
-    def _mock_text_response(self, text="Hello"):
-        """Mock an Anthropic response with only text content."""
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = text
-
-        resp = MagicMock()
-        resp.content = [text_block]
-        resp.model = "test-model"
-        resp.usage.input_tokens = 100
-        resp.usage.output_tokens = 50
-        resp.usage.cache_read_input_tokens = 0
-        resp.usage.cache_creation_input_tokens = 0
-        resp.stop_reason = "end_turn"
-        return resp
+    def _mock_text_response_events(self, text="Hello"):
+        """Create mock events for a text-only response."""
+        final_msg = _anthropic_final_message(text=text)
+        return [_anthropic_text(text), _anthropic_message_stop()], final_msg
 
     def _mock_tool_use_response(self, tool_id="toolu_123", tool_name="shell",
                                  tool_input=None, text=None):
-        """Mock an Anthropic response with tool_use (and optional text)."""
-        blocks = []
-
+        """Create mock events and final message for a tool_use response."""
+        tool_input = tool_input or {"command": "echo hi"}
+        
+        events = []
         if text:
-            text_block = MagicMock()
-            text_block.type = "text"
-            text_block.text = text
-            blocks.append(text_block)
-
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = tool_id
-        tool_block.name = tool_name
-        tool_block.input = tool_input or {"command": "echo hi"}
-        blocks.append(tool_block)
-
-        resp = MagicMock()
-        resp.content = blocks
-        resp.model = "test-model"
-        resp.usage.input_tokens = 100
-        resp.usage.output_tokens = 50
-        resp.usage.cache_read_input_tokens = 0
-        resp.usage.cache_creation_input_tokens = 0
-        resp.stop_reason = "tool_use"
-        return resp
+            events.append(_anthropic_text(text))
+        
+        tool_block = _anthropic_tool_block(tool_id, tool_name, tool_input)
+        events.append(_anthropic_block_start(len(events), "tool_use", tool_id=tool_id, tool_name=tool_name))
+        events.append(_anthropic_block_stop(len(events), tool_block))
+        events.append(_anthropic_message_stop())
+        
+        final_msg = _anthropic_final_message(
+            text=text or "",
+            tool_calls=[{"id": tool_id, "name": tool_name, "input": tool_input}],
+            stop_reason="tool_use",
+        )
+        
+        return events, final_msg
 
     @pytest.mark.asyncio
     async def test_tools_sent_to_anthropic(self):
@@ -155,11 +269,12 @@ class TestAnthropicTools:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=self._mock_text_response()
-            )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            events, final_msg = self._mock_text_response_events()
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             await complete(
                 config=config,
@@ -168,7 +283,7 @@ class TestAnthropicTools:
                 tools=[SAMPLE_TOOL],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         assert "tools" in kw
         assert len(kw["tools"]) == 1
         assert kw["tools"][0]["name"] == "shell"
@@ -181,11 +296,12 @@ class TestAnthropicTools:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=self._mock_text_response()
-            )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            events, final_msg = self._mock_text_response_events()
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             await complete(
                 config=config,
@@ -194,7 +310,7 @@ class TestAnthropicTools:
                 tools=None,
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         # Either tools not in kwargs, or empty
         tools = kw.get("tools")
         assert tools is None or tools == []
@@ -206,15 +322,16 @@ class TestAnthropicTools:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=self._mock_tool_use_response(
-                    tool_id="toolu_abc",
-                    tool_name="shell",
-                    tool_input={"command": "ls -la"},
-                )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            events, final_msg = self._mock_tool_use_response(
+                tool_id="toolu_abc",
+                tool_name="shell",
+                tool_input={"command": "ls -la"},
             )
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             response = await complete(
                 config=config,
@@ -236,15 +353,16 @@ class TestAnthropicTools:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=self._mock_tool_use_response(
-                    text="Let me check that for you.",
-                    tool_name="shell",
-                    tool_input={"command": "pwd"},
-                )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            events, final_msg = self._mock_tool_use_response(
+                text="Let me check that for you.",
+                tool_name="shell",
+                tool_input={"command": "pwd"},
             )
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             response = await complete(
                 config=config,
@@ -263,31 +381,30 @@ class TestAnthropicTools:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        # Build response with 2 tool_use blocks
-        tool1 = MagicMock()
-        tool1.type = "tool_use"
-        tool1.id = "toolu_1"
-        tool1.name = "shell"
-        tool1.input = {"command": "ls"}
+        # Build events with 2 tool_use blocks
+        tool1_block = _anthropic_tool_block("toolu_1", "shell", {"command": "ls"})
+        tool2_block = _anthropic_tool_block("toolu_2", "shell", {"command": "pwd"})
+        
+        events = [
+            _anthropic_block_start(0, "tool_use", tool_id="toolu_1", tool_name="shell"),
+            _anthropic_block_stop(0, tool1_block),
+            _anthropic_block_start(1, "tool_use", tool_id="toolu_2", tool_name="shell"),
+            _anthropic_block_stop(1, tool2_block),
+            _anthropic_message_stop(),
+        ]
+        
+        final_msg = _anthropic_final_message(
+            tool_calls=[
+                {"id": "toolu_1", "name": "shell", "input": {"command": "ls"}},
+                {"id": "toolu_2", "name": "shell", "input": {"command": "pwd"}},
+            ],
+            stop_reason="tool_use",
+        )
 
-        tool2 = MagicMock()
-        tool2.type = "tool_use"
-        tool2.id = "toolu_2"
-        tool2.name = "shell"
-        tool2.input = {"command": "pwd"}
-
-        resp = MagicMock()
-        resp.content = [tool1, tool2]
-        resp.model = "test-model"
-        resp.usage.input_tokens = 100
-        resp.usage.output_tokens = 50
-        resp.usage.cache_read_input_tokens = 0
-        resp.usage.cache_creation_input_tokens = 0
-        resp.stop_reason = "tool_use"
-
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(return_value=resp)
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             response = await complete(
                 config=config,
@@ -307,19 +424,10 @@ class TestAnthropicTools:
 class TestAnthropicMessageConversion:
 
     def _mock_text_response(self):
-        """Mock an Anthropic response with only text content."""
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "OK"
-        resp = MagicMock()
-        resp.content = [text_block]
-        resp.model = "test-model"
-        resp.usage.input_tokens = 10
-        resp.usage.output_tokens = 5
-        resp.usage.cache_read_input_tokens = 0
-        resp.usage.cache_creation_input_tokens = 0
-        resp.stop_reason = "end_turn"
-        return resp
+        """Create mock for text response."""
+        events = [_anthropic_text("OK"), _anthropic_message_stop()]
+        final_msg = _anthropic_final_message(text="OK")
+        return events, final_msg
 
     @pytest.mark.asyncio
     async def test_tool_result_in_history_converted(self):
@@ -349,11 +457,12 @@ class TestAnthropicMessageConversion:
             },
         ]
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=self._mock_text_response()
-            )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            events, final_msg = self._mock_text_response()
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             await complete(
                 config=config,
@@ -362,7 +471,7 @@ class TestAnthropicMessageConversion:
                 tools=[SAMPLE_TOOL],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         api_messages = kw["messages"]
 
         # First message: user (unchanged)
@@ -412,11 +521,12 @@ class TestAnthropicMessageConversion:
             },
         ]
 
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(
-                return_value=self._mock_text_response()
-            )
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            
+            events, final_msg = self._mock_text_response()
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             await complete(
                 config=config,
@@ -425,7 +535,7 @@ class TestAnthropicMessageConversion:
                 tools=[SAMPLE_TOOL],
             )
 
-        kw = client.messages.create.call_args.kwargs
+        kw = client.messages.stream.call_args.kwargs
         api_messages = kw["messages"]
         tool_result = api_messages[2]["content"][0]
         assert tool_result["is_error"] is True
@@ -436,55 +546,59 @@ class TestAnthropicMessageConversion:
 
 class TestOpenAITools:
 
-    def _mock_text_response(self, text="Hello"):
-        choice = MagicMock()
-        choice.message.content = text
-        choice.message.tool_calls = None
-        choice.finish_reason = "stop"
-        resp = MagicMock()
-        resp.choices = [choice]
-        resp.model = "test-model"
-        resp.usage.prompt_tokens = 100
-        resp.usage.completion_tokens = 50
-        return resp
+    def _mock_text_chunks(self, text="Hello"):
+        """Create mock OpenAI streaming chunks for text response."""
+        chunks = [
+            _openai_text_chunk(text, finish_reason="stop"),
+            _openai_usage_chunk(),
+        ]
+        return chunks
 
-    def _mock_tool_call_response(self, calls=None):
-        """Mock OpenAI response with tool_calls."""
+    def _mock_tool_call_chunks(self, calls=None):
+        """Create mock OpenAI streaming chunks with tool calls."""
         if calls is None:
+            calls = [{"id": "call_123", "name": "shell", "arguments": '{"command": "echo hi"}'}]
+        
+        chunks = []
+        for call in calls:
+            chunk = MagicMock()
+            chunk.choices = [MagicMock()]
+            chunk.choices[0].delta = MagicMock()
+            chunk.choices[0].delta.content = None
+            
             tc = MagicMock()
-            tc.id = "call_123"
-            tc.type = "function"
-            tc.function.name = "shell"
-            tc.function.arguments = json.dumps({"command": "echo hi"})
-            calls = [tc]
-
-        choice = MagicMock()
-        choice.message.content = None
-        choice.message.tool_calls = calls
-        choice.finish_reason = "tool_calls"
-        resp = MagicMock()
-        resp.choices = [choice]
-        resp.model = "test-model"
-        resp.usage.prompt_tokens = 100
-        resp.usage.completion_tokens = 50
-        return resp
+            tc.index = 0
+            tc.id = call["id"]
+            tc.function = MagicMock()
+            tc.function.name = call["name"]
+            tc.function.arguments = call["arguments"]
+            chunk.choices[0].delta.tool_calls = [tc]
+            chunk.choices[0].finish_reason = "tool_calls"  # Set finish_reason
+            chunk.usage = None
+            chunks.append(chunk)
+        
+        # Usage chunk
+        chunks.append(_openai_usage_chunk())
+        
+        return chunks
 
     @pytest.mark.asyncio
     async def test_tools_sent_as_functions(self):
         """Tools are sent to OpenAI API in function format."""
         config = make_config(
             providers={
-                "anthropic": make_provider(
+                "openrouter": make_provider(
                     key="openrouter", type="openai", api_key="sk-test",
                     base_url="http://localhost/v1"
                 )
-            }
+            },
+            default_model="openrouter/test-model",
         )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=self._mock_text_response()
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(self._mock_text_chunks())
             )
 
             await complete(
@@ -506,17 +620,18 @@ class TestOpenAITools:
         """OpenAI tool_calls are parsed into Response.tool_calls."""
         config = make_config(
             providers={
-                "anthropic": make_provider(
+                "openrouter": make_provider(
                     key="openrouter", type="openai", api_key="sk-test",
                     base_url="http://localhost/v1"
                 )
-            }
+            },
+            default_model="openrouter/test-model",
         )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=self._mock_tool_call_response()
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(self._mock_tool_call_chunks())
             )
 
             response = await complete(
@@ -536,17 +651,18 @@ class TestOpenAITools:
         """Text-only response → empty tool_calls."""
         config = make_config(
             providers={
-                "anthropic": make_provider(
+                "openrouter": make_provider(
                     key="openrouter", type="openai", api_key="sk-test",
                     base_url="http://localhost/v1"
                 )
-            }
+            },
+            default_model="openrouter/test-model",
         )
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=self._mock_text_response("Just text")
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(self._mock_text_chunks("Just text"))
             )
 
             response = await complete(
@@ -564,17 +680,12 @@ class TestOpenAITools:
 
 class TestOpenAIMessageConversion:
 
-    def _mock_text_response(self):
-        choice = MagicMock()
-        choice.message.content = "OK"
-        choice.message.tool_calls = None
-        choice.finish_reason = "stop"
-        resp = MagicMock()
-        resp.choices = [choice]
-        resp.model = "test-model"
-        resp.usage.prompt_tokens = 10
-        resp.usage.completion_tokens = 5
-        return resp
+    def _mock_text_chunks(self):
+        """Create mock OpenAI streaming chunks."""
+        return [
+            _openai_text_chunk("OK", finish_reason="stop"),
+            _openai_usage_chunk(prompt_tokens=10, completion_tokens=5),
+        ]
 
     @pytest.mark.asyncio
     async def test_tool_result_in_history_converted(self):
@@ -585,11 +696,12 @@ class TestOpenAIMessageConversion:
         """
         config = make_config(
             providers={
-                "anthropic": make_provider(
+                "openrouter": make_provider(
                     key="openrouter", type="openai", api_key="sk-test",
                     base_url="http://localhost/v1"
                 )
-            }
+            },
+            default_model="openrouter/test-model",
         )
 
         messages = [
@@ -611,8 +723,8 @@ class TestOpenAIMessageConversion:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(
-                return_value=self._mock_text_response()
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(self._mock_text_chunks())
             )
 
             await complete(
@@ -658,22 +770,13 @@ class TestBackwardCompat:
             providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")}
         )
 
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Hello"
+        events = [_anthropic_text("Hello"), _anthropic_message_stop()]
+        final_msg = _anthropic_final_message(text="Hello", stop_reason="end_turn")
 
-        resp = MagicMock()
-        resp.content = [text_block]
-        resp.model = "test-model"
-        resp.usage.input_tokens = 100
-        resp.usage.output_tokens = 50
-        resp.usage.cache_read_input_tokens = 0
-        resp.usage.cache_creation_input_tokens = 0
-        resp.stop_reason = "end_turn"
-
-        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
-            client = MockClient.return_value
-            client.messages.create = AsyncMock(return_value=resp)
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.messages.stream.return_value = MockAnthropicStream(events, final_msg)
 
             response = await complete(
                 config=config,
@@ -690,26 +793,24 @@ class TestBackwardCompat:
         """Without tools, OpenAI path behaves exactly as Phase 1."""
         config = make_config(
             providers={
-                "anthropic": make_provider(
+                "openrouter": make_provider(
                     key="openrouter", type="openai", api_key="sk-test",
                     base_url="http://localhost/v1"
                 )
-            }
+            },
+            default_model="openrouter/test-model",
         )
 
-        choice = MagicMock()
-        choice.message.content = "Hello"
-        choice.message.tool_calls = None
-        choice.finish_reason = "stop"
-        resp = MagicMock()
-        resp.choices = [choice]
-        resp.model = "test-model"
-        resp.usage.prompt_tokens = 100
-        resp.usage.completion_tokens = 50
+        chunks = [
+            _openai_text_chunk("Hello", finish_reason="stop"),
+            _openai_usage_chunk(),
+        ]
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = AsyncMock(return_value=resp)
+            client.chat.completions.create = MagicMock(
+                return_value=MockOpenAIStream(chunks)
+            )
 
             response = await complete(
                 config=config,
