@@ -203,9 +203,6 @@ class MatrixBot:
             agent: An OpenAlph Agent instance
             config: MatrixConfig with connection details
         """
-        # Handle test calling convention where first arg is AgentConfig with .matrix attribute
-        if config is None and hasattr(agent, 'matrix'):
-            config = agent.matrix
         self.agent = agent
         self.config = config
         self.client = AsyncClient(config.homeserver, config.user_id, config.device_id)
@@ -226,12 +223,6 @@ class MatrixBot:
         self._active_rooms = set()
         self._room_thinking = {}
         self._background_tasks: set[asyncio.Task] = set()
-
-    def _matrix_config(self):
-        """Get MatrixConfig, handling test cases where config might be AgentConfig."""
-        if hasattr(self.config, 'matrix'):
-            return self.config.matrix
-        return self.config
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -721,7 +712,7 @@ class MatrixBot:
         try:
             # --- Mention gating ---
             session_log = getattr(self, 'session_log', None)
-            gated = is_gated(self._matrix_config(), room)
+            gated = is_gated(self.config, room)
 
             if gated and not _gating_handled:
                 # Media messages still need gating here (text messages handled in _handle_room_message)
@@ -867,9 +858,7 @@ class MatrixBot:
                             }
                             await self._room_send_with_retry(room_id, content)
 
-                # Try with streaming callbacks first, fall back if not supported
-                try:
-                    response = await self.agent.handle_input(
+                response = await self.agent.handle_input(
                         body, room_id,
                         on_tool_call=_tool_notice,
                         on_tool_intent=_tool_intent,
@@ -878,18 +867,6 @@ class MatrixBot:
                         thinking=_thinking_override,
                         callbacks=callbacks,
                     )
-                except TypeError as e:
-                    if "on_text_delta" in str(e) or "on_thinking_delta" in str(e):
-                        # Agent doesn't support streaming callbacks
-                        response = await self.agent.handle_input(
-                            body, room_id,
-                            on_tool_call=_tool_notice,
-                            on_tool_intent=_tool_intent,
-                            thinking=_thinking_override,
-                            callbacks=callbacks,
-                        )
-                    else:
-                        raise
                 # Append assistant response to session log
                 if response and response.strip():
                     if session_log:
@@ -1049,7 +1026,7 @@ class MatrixBot:
         body = event.body.strip()
 
         # --- Mention gating (kdsn.60) ---
-        gated = is_gated(self._matrix_config(), room)
+        gated = is_gated(self.config, room)
 
         if gated:
             event_source = getattr(event, 'source', {}) or {}

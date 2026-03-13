@@ -64,10 +64,11 @@ def make_bot(tmp_path, **kwargs):
     agent.system_prompt = "test prompt"
     agent.history = MagicMock(return_value=[])
 
+    matrix_config = make_matrix_config()
     with patch("openalph.matrix.AsyncClient"):
-        bot = MatrixBot(agent_config)
+        bot = MatrixBot(agent, matrix_config)
         bot.agent = agent
-        bot.config = agent_config
+        bot.config = matrix_config
         bot._synced = True
         bot._active_rooms = set()
         bot.session_log = None

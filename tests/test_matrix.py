@@ -61,6 +61,33 @@ def make_room_message(sender, body, event_id="$evt1"):
     event.server_timestamp = 1000000
     return event
 
+def make_bot(agent=None, config=None, **overrides):
+    """Create a MatrixBot for testing, bypassing __init__.
+
+    Sets sensible defaults for all commonly-needed attributes.
+    Tests can override any attribute via kwargs.
+    """
+    if config is None:
+        config = make_matrix_config(user_id="@merry:matrix.local")
+    if agent is None:
+        agent = MagicMock()
+    bot = MatrixBot.__new__(MatrixBot)
+    bot.config = config
+    bot.agent = agent
+    bot.client = MagicMock()
+    bot.client.room_send = AsyncMock()
+    bot.client.room_typing = AsyncMock()
+    bot._current_room = None
+    bot._synced = True
+    bot._active_rooms = set()
+    bot._room_thinking = {}
+    bot._background_tasks = set()
+    bot.session_log = None
+    bot.heartbeat = None
+    for key, val in overrides.items():
+        setattr(bot, key, val)
+    return bot
+
 
 # --- Login ---
 
@@ -163,15 +190,7 @@ class TestMessageRouting:
         config = make_matrix_config(user_id="@merry:matrix.local")
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="response")
-
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
+        bot = make_bot(agent, config)
 
         event = make_room_message("@merry:matrix.local", "my own message")
         room = MagicMock()
@@ -190,16 +209,7 @@ class TestMessageRouting:
         config = make_matrix_config(user_id="@merry:matrix.local")
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="Hello back!")
-
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -226,15 +236,7 @@ class TestCommands:
         agent = MagicMock()
         agent.cancel = MagicMock()
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._cancel_current = AsyncMock()
+        bot = make_bot(agent, config, _cancel_current=AsyncMock())
 
         event = make_room_message("@sb:matrix.local", "/stop")
         room = MagicMock()
@@ -266,14 +268,7 @@ class TestCommands:
             "total_tool_calls": 3,
         }
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
+        bot = make_bot(agent, config)
 
         event = make_room_message("@sb:matrix.local", "/status")
         room = MagicMock()
@@ -301,14 +296,7 @@ class TestCommands:
             "total_input_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
         }
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
+        bot = make_bot(agent, config)
         # Simulate post-restart: _active_rooms not yet initialized
         # (do NOT set bot._active_rooms here)
 
@@ -356,14 +344,7 @@ class TestCommands:
             }
         agent.status.side_effect = _status
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
+        bot = make_bot(agent, config)
         bot.session_log = session_log
         # Simulate post-restart: room NOT in _active_rooms
 
@@ -395,14 +376,7 @@ class TestThinkingCommand:
         agent.config = MagicMock()
         agent.config.thinking = "off"
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
+        bot = make_bot(agent, config)
         bot._room_thinking = {}
         return bot
 
@@ -564,15 +538,7 @@ class TestTypingIndicator:
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="response")
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -599,15 +565,7 @@ class TestTypingIndicator:
         agent = MagicMock()
         agent.handle_input = AsyncMock(side_effect=Exception("LLM error"))
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -640,15 +598,7 @@ class TestErrorHandling:
         agent = MagicMock()
         agent.handle_input = AsyncMock(side_effect=Exception("Something broke"))
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Do something")
         room = MagicMock()
@@ -669,15 +619,7 @@ class TestErrorHandling:
         agent = MagicMock()
         agent.handle_input = AsyncMock(side_effect=RuntimeError("LLM down"))
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}  # Pre-activated
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -697,8 +639,7 @@ class TestReconnection:
 
     def test_backoff_doubles(self):
         """Retry delay doubles after each failure."""
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = make_matrix_config(retry_base=1, retry_max=60)
+        bot = make_bot(config=make_matrix_config(retry_base=1, retry_max=60))
 
         delay = bot.config.retry_base
         delays = []
@@ -710,8 +651,7 @@ class TestReconnection:
 
     def test_backoff_caps_at_max(self):
         """Retry delay doesn't exceed retry_max."""
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = make_matrix_config(retry_base=1, retry_max=10)
+        bot = make_bot(config=make_matrix_config(retry_base=1, retry_max=10))
 
         delay = bot.config.retry_base
         for _ in range(20):
@@ -733,15 +673,7 @@ class TestErrorSanitization:
         sensitive_msg = "Failed to connect to api.anthropic.com with key sk-ant-abc123"
         agent.handle_input = AsyncMock(side_effect=Exception(sensitive_msg))
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Do something")
         room = MagicMock()
@@ -766,14 +698,7 @@ class TestErrorSanitization:
         sensitive_msg = "Failed to connect to api.anthropic.com with key sk-ant-abc123"
         agent.handle_input = AsyncMock(side_effect=Exception(sensitive_msg))
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot._set_typing = AsyncMock()
-        bot._active_rooms = {"!test:matrix.local"}
-        bot.session_log = None
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         await bot._inject_heartbeat("!test:matrix.local")
 
@@ -795,10 +720,7 @@ class TestSendRetry:
         """send() succeeds without retry when room_send returns normally."""
         from nio import RoomSendResponse
 
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             return_value=RoomSendResponse("$evt1", "!room:test")
         )
@@ -812,10 +734,7 @@ class TestSendRetry:
         """send_notice() succeeds without retry when room_send returns normally."""
         from nio import RoomSendResponse
 
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             return_value=RoomSendResponse("$evt1", "!room:test")
         )
@@ -831,10 +750,7 @@ class TestSendRetry:
         """send() retries when room_send returns RoomSendError, then succeeds."""
         from nio import RoomSendResponse, RoomSendError
 
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             side_effect=[
                 RoomSendError("rate limited", status_code="M_LIMIT_EXCEEDED"),
@@ -856,10 +772,7 @@ class TestSendRetry:
         """send() retries when room_send raises a network exception."""
         from nio import RoomSendResponse
 
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             side_effect=[
                 ConnectionError("connection reset"),
@@ -880,10 +793,7 @@ class TestSendRetry:
         """send() raises RuntimeError after exhausting all retry attempts."""
         from nio import RoomSendError
 
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             side_effect=RoomSendError("server error", status_code="M_UNKNOWN")
         )
@@ -900,10 +810,7 @@ class TestSendRetry:
     @pytest.mark.asyncio
     async def test_send_preserves_original_exception(self):
         """The raised RuntimeError chains the original exception as __cause__."""
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             side_effect=ConnectionError("gone")
         )
@@ -924,10 +831,7 @@ class TestSendRetry:
         """Custom max_attempts is honored."""
         from nio import RoomSendResponse
 
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             side_effect=[
                 ConnectionError("fail 1"),
@@ -952,10 +856,7 @@ class TestSendRetry:
         """send() uses retry internally — verify via mock side_effect."""
         from nio import RoomSendResponse, RoomSendError
 
-        config = make_matrix_config()
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.client = MagicMock()
+        bot = make_bot()
         bot.client.room_send = AsyncMock(
             side_effect=[
                 RoomSendError("transient", status_code="M_LIMIT_EXCEEDED"),
@@ -988,15 +889,7 @@ class TestProviderErrorSurfacing:
             side_effect=ProviderError("model: invalid model: bongo", status_code=404)
         )
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -1025,15 +918,7 @@ class TestProviderErrorSurfacing:
             side_effect=ProviderError("Rate limit exceeded", status_code=429)
         )
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -1056,15 +941,7 @@ class TestProviderErrorSurfacing:
             side_effect=ProviderError("Provider unreachable — connection failed")
         )
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -1089,15 +966,7 @@ class TestProviderErrorSurfacing:
             side_effect=RuntimeError("some internal details with sk-ant-api03-secret")
         )
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Hello")
         room = MagicMock()
@@ -1126,15 +995,7 @@ class TestEmptyResponseGuard:
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="")
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Do something")
         room = MagicMock()
@@ -1155,15 +1016,7 @@ class TestEmptyResponseGuard:
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="   \n  ")
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Do something")
         room = MagicMock()
@@ -1183,15 +1036,7 @@ class TestEmptyResponseGuard:
         agent = MagicMock()
         agent.handle_input = AsyncMock(return_value="Here's your answer.")
 
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = config
-        bot.agent = agent
-        bot.client = MagicMock()
-        bot.client.room_send = AsyncMock()
-        bot.client.room_typing = AsyncMock()
-        bot._current_room = None
-        bot._synced = True
-        bot._active_rooms = {"!test:matrix.local"}
+        bot = make_bot(agent, config, _active_rooms={"!test:matrix.local"})
 
         event = make_room_message("@sb:matrix.local", "Do something")
         room = MagicMock()
