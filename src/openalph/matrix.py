@@ -1084,6 +1084,14 @@ class MatrixBot:
                          room_id, mention.method, body[:50])
         # --- End mention gating ---
 
+        # Lazy wake: ensure room is activated before processing any command so that
+        # _process_message and slash commands both see full room history (kdsn.79).
+        if not hasattr(self, '_active_rooms'):
+            self._active_rooms = set()
+        if room_id not in self._active_rooms:
+            room_name = getattr(room, 'name', '') or getattr(room, 'display_name', '') or room_id
+            await self._activate_room(room_id, room_name=room_name)
+
         # --- Slash commands ---
         if body == "/stop":
             await self._cancel_current()

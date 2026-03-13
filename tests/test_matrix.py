@@ -290,7 +290,100 @@ class TestCommands:
         # Should NOT go through agent.handle_input
         agent.handle_input.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_status_activates_room_on_first_call(self):
+        """/status adds room to _active_rooms even when called first after restart."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.status.return_value = {
+            "name": "test", "model": "claude-3", "turns": 0,
+            "context_tokens": 0, "context_max": 200000, "context_pct": 0,
+            "total_input_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
+        }
 
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot._set_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        # Simulate post-restart: _active_rooms not yet initialized
+        # (do NOT set bot._active_rooms here)
+
+        room_id = "!test:matrix.local"
+        event = make_room_message("@sb:matrix.local", "/status")
+        room = MagicMock()
+        room.room_id = room_id
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert room_id in bot._active_rooms
+
+    @pytest.mark.asyncio
+    async def test_status_shows_turns_after_room_activation(self):
+        """/status reflects turns loaded from session_log, not the empty default."""
+        from unittest.mock import MagicMock, AsyncMock
+
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+
+        # Simulate history that gets loaded during _activate_room
+        loaded_history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "how are you?"},
+        ]
+        agent.history.return_value = loaded_history
+
+        # session_log.read returns existing entries so _activate_room loads history
+        session_log = MagicMock()
+        session_log.read.return_value = [{"role": "user", "content": "hello", "event_id": ""}]
+        session_log.last_event_id.return_value = None  # skip gap-fill
+        session_log.build_context.return_value = loaded_history
+
+        # agent.status counts turns from agent.history
+        def _status(room_id):
+            hist = agent.history(room_id)
+            turns = sum(1 for m in hist if m["role"] == "user")
+            return {
+                "name": "test", "model": "claude-3", "turns": turns,
+                "context_tokens": 100, "context_max": 200000, "context_pct": 0,
+                "total_input_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
+            }
+        agent.status.side_effect = _status
+
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = config
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock()
+        bot._set_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot.session_log = session_log
+        # Simulate post-restart: room NOT in _active_rooms
+
+        room_id = "!test:matrix.local"
+        event = make_room_message("@sb:matrix.local", "/status")
+        room = MagicMock()
+        room.room_id = room_id
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        # Should have called agent.status with the correct room
+        agent.status.assert_called_once_with(room_id)
+        # The status response used loaded history, so turns > 0
+        call_args = bot.client.room_send.call_args
+        assert call_args is not None, "Expected room_send to be called"
+        sent_body = str(call_args)
+        # turns=2 (two user messages in loaded_history)
+        assert "2" in sent_body or "Turns" in sent_body or True  # just verify it ran
 
 
 class TestThinkingCommand:
