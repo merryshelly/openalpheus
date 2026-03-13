@@ -819,7 +819,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -856,7 +856,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -890,7 +890,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -919,7 +919,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -947,7 +947,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -974,7 +974,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -1003,7 +1003,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=ErrorStream([]),
             )
 
@@ -1028,7 +1028,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -1061,7 +1061,7 @@ class TestOpenAIStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -1123,7 +1123,7 @@ class TestCompleteWrapsStream:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 
@@ -1360,7 +1360,7 @@ class TestExistingBehavior:
         with patch("openalph.provider._get_client") as mock_gc:
             client = MagicMock()
             mock_gc.return_value = client
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks),
             )
 

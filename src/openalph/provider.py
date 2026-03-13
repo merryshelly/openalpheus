@@ -759,7 +759,7 @@ async def stream(
         api_kwargs["stream_options"] = {"include_usage": True}
         
         try:
-            response = client.chat.completions.create(**api_kwargs)
+            response = await client.chat.completions.create(**api_kwargs)
             
             accumulated_text = ""
             usage = None

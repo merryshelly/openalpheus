@@ -656,7 +656,7 @@ class TestPromptCaching:
             usage.prompt_tokens = 100
             usage.completion_tokens = 50
             chunk = _make_openai_chunk(content="Hello", finish_reason="stop", usage=usage)
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream([chunk])
             )
 
@@ -709,7 +709,7 @@ class TestOpenRouterReasoning:
             usage.prompt_tokens = 100
             usage.completion_tokens = 50
             chunk = _make_openai_chunk(content="Hello", finish_reason="stop", usage=usage)
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream([chunk])
             )
 
@@ -750,7 +750,7 @@ class TestOpenRouterReasoning:
             usage.prompt_tokens = 100
             usage.completion_tokens = 50
             chunk = _make_openai_chunk(content="Hello", finish_reason="stop", usage=usage)
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream([chunk])
             )
 

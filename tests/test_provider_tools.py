@@ -597,7 +597,7 @@ class TestOpenAITools:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(self._mock_text_chunks())
             )
 
@@ -630,7 +630,7 @@ class TestOpenAITools:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(self._mock_tool_call_chunks())
             )
 
@@ -661,7 +661,7 @@ class TestOpenAITools:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(self._mock_text_chunks("Just text"))
             )
 
@@ -723,7 +723,7 @@ class TestOpenAIMessageConversion:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(self._mock_text_chunks())
             )
 
@@ -808,7 +808,7 @@ class TestBackwardCompat:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(chunks)
             )
 

@@ -124,8 +124,8 @@ def mock_openai_stream(response):
         async for chunk in _stream(*args, **kwargs):
             yield chunk
     
-    # Make the mock callable and return an async iterator
-    def mock_call(*args, **kwargs):
+    # Make the mock callable and return a coroutine (create() is now awaited)
+    async def mock_call(*args, **kwargs):
         return _mock_iter(*args, **kwargs)
     
     stream_mock.side_effect = mock_call
@@ -1086,7 +1086,7 @@ class TestProviderErrorWrapping:
         )
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.chat.completions.create = MagicMock(side_effect=exc)
+            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
             with pytest.raises(ProviderError) as exc_info:
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
             assert "Model not found" in str(exc_info.value)
@@ -1148,7 +1148,7 @@ class TestProviderErrorWrapping:
         exc = openai_sdk.APIConnectionError(request=MagicMock())
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.chat.completions.create = MagicMock(side_effect=exc)
+            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
             with pytest.raises(ProviderError, match="unreachable"):
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
 
@@ -1165,7 +1165,7 @@ class TestProviderErrorWrapping:
         )
 
         with patch("openalph.provider._get_client") as mock_client:
-            mock_client.return_value.chat.completions.create = MagicMock(side_effect=exc)
+            mock_client.return_value.chat.completions.create = AsyncMock(side_effect=exc)
             with pytest.raises(ProviderError) as exc_info:
                 await complete(config, "system", [{"role": "user", "content": "hi"}])
             assert exc_info.value.status_code == 429

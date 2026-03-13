@@ -190,7 +190,7 @@ class TestRouting:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(mock_openai_stream_chunks("Hello from Kimi"))
             )
 
@@ -227,7 +227,7 @@ class TestRouting:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(mock_openai_stream_chunks("Hello from Qwen"))
             )
 
@@ -301,7 +301,7 @@ class TestResponseNormalization:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(mock_openai_stream_chunks(
                     text="Test",
                     model="test-model",
@@ -379,7 +379,7 @@ class TestMultiTurn:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(mock_openai_stream_chunks("Good!"))
             )
 
@@ -437,7 +437,7 @@ class TestMaxTokens:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 return_value=MockOpenAIStream(mock_openai_stream_chunks())
             )
 
@@ -496,7 +496,7 @@ class TestErrors:
 
         with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
             client = MockClient.return_value
-            client.chat.completions.create = MagicMock(
+            client.chat.completions.create = AsyncMock(
                 side_effect=Exception("connection refused")
             )
 
