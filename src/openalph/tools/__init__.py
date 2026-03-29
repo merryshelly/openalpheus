@@ -171,7 +171,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         "config": {}
     },
     "subagent": {
-        "description": "Run a focused sub-agent task. Single-turn LLM call for isolated work. No tools available to the sub-agent. Uses parent's config for API key and provider.",
+        "description": "Run a focused sub-agent task. Multi-turn LLM call with tool access for isolated work. Sub-agent inherits parent's tools (except subagent) and iterates up to max_iterations (default 200). Uses parent's config for API key and provider.",
         "parameters": {
             "type": "object",
             "properties": {
