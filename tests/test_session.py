@@ -430,6 +430,10 @@ def make_bot_with_session_log(tmp_path, user_id=AGENT_USER):
     bot._current_room = None
     bot._synced = True
     bot._active_rooms = set()
+    bot._halted_rooms = set()
+    bot._room_thinking = {}
+    bot._background_tasks = set()
+    bot._session_locks = {}
     bot.session_log = SessionLog(tmp_path, user_id)
 
     return bot, agent
@@ -714,6 +718,141 @@ class TestRehydrationRoundTrip:
                      if isinstance(b, dict) and b.get("type") == "tool_use"]
         assert len(tool_uses) == 2
         assert {tu["id"] for tu in tool_uses} == {"toolu_A", "toolu_B"}
+
+
+class TestBuildContextReorder:
+    """Tests for build_context() reordering of interleaved messages.
+
+    When a user message arrives during a long-running tool execution, the JSONL
+    may record the sequence: assistant(tool_calls) → user → tool(result).
+    The Anthropic API rejects this because tool_use must be immediately followed
+    by tool_result. build_context() must reorder: assistant → tool → user.
+    """
+
+    def test_single_tool_call_user_interleaved(self, tmp_path):
+        """User message wedged between assistant(tool_calls) and tool result is moved after."""
+        sl = make_session_log(tmp_path)
+        # assistant dispatches tool
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="", tool_calls=[{"call_id": "toolu_X", "name": "shell", "input": {"command": "sleep 60"}}])
+        # user message arrives during tool execution
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u1", content="new message")
+        # tool finishes
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="toolu_X", name="shell", output="done")
+
+        ctx = sl.build_context(ROOM_ID)
+        roles = [m["role"] for m in ctx]
+        # Must be: assistant → tool → user (not assistant → user → tool)
+        assert roles == ["assistant", "tool", "user"]
+        assert ctx[1]["tool_call_id"] == "toolu_X"
+        assert ctx[2]["content"] == "new message"
+
+    def test_parallel_tool_calls_user_interleaved(self, tmp_path):
+        """User message between parallel tool calls is moved after all results."""
+        sl = make_session_log(tmp_path)
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="", tool_calls=[
+                      {"call_id": "toolu_A", "name": "shell", "input": {"command": "uptime"}},
+                      {"call_id": "toolu_B", "name": "web_fetch", "input": {"url": "http://example.com"}},
+                  ])
+        # First tool result
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="toolu_A", name="shell", output="up 5 days")
+        # User message arrives between results
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u1", content="also check disk")
+        # Second tool result
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="toolu_B", name="web_fetch", output="<html>ok</html>")
+
+        ctx = sl.build_context(ROOM_ID)
+        roles = [m["role"] for m in ctx]
+        # Must be: assistant → tool → tool → user
+        assert roles == ["assistant", "tool", "tool", "user"]
+        # Tool results must be for the right calls
+        assert {ctx[1]["tool_call_id"], ctx[2]["tool_call_id"]} == {"toolu_A", "toolu_B"}
+        assert ctx[3]["content"] == "also check disk"
+
+    def test_multiple_interleaved_user_messages(self, tmp_path):
+        """Multiple user messages wedged in tool results are all moved."""
+        sl = make_session_log(tmp_path)
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="", tool_calls=[{"call_id": "toolu_X", "name": "subagent", "input": {"task": "research"}}])
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u1", content="first interruption")
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u2", content="second interruption")
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="toolu_X", name="subagent", output="research done")
+
+        ctx = sl.build_context(ROOM_ID)
+        roles = [m["role"] for m in ctx]
+        assert roles == ["assistant", "tool", "user", "user"]
+        assert ctx[2]["content"] == "first interruption"
+        assert ctx[3]["content"] == "second interruption"
+
+    def test_no_reorder_when_user_after_all_tool_results(self, tmp_path):
+        """User message legitimately after all tool results is not moved."""
+        sl = make_session_log(tmp_path)
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="", tool_calls=[{"call_id": "toolu_X", "name": "shell", "input": {"command": "ls"}}])
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="toolu_X", name="shell", output="file.txt")
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="Here are the files.")
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u1", content="thanks")
+
+        ctx = sl.build_context(ROOM_ID)
+        roles = [m["role"] for m in ctx]
+        # Already correct order — no reordering needed
+        assert roles == ["assistant", "tool", "assistant", "user"]
+
+    def test_reorder_survives_anthropic_serialization(self, tmp_path):
+        """Reordered context passes Anthropic serialization without error."""
+        from openalph.provider import _convert_messages_for_anthropic
+
+        sl = make_session_log(tmp_path)
+        # Simulate the interleaving bug
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u0", content="run something")
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="", tool_calls=[{"call_id": "toolu_X", "name": "shell", "input": {"command": "sleep 30"}}])
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u1", content="still waiting?")
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="toolu_X", name="shell", output="done")
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="All done.")
+
+        ctx = sl.build_context(ROOM_ID)
+        # This would blow up if the interleaving isn't fixed
+        converted = _convert_messages_for_anthropic(ctx)
+
+        # Verify: user → assistant(tool_use) → user(tool_result) → user(new msg) → assistant
+        roles = [m["role"] for m in converted]
+        assert roles == ["user", "assistant", "user", "user", "assistant"]
+        # The tool_result should be in the first "user" after assistant
+        tool_result_blocks = [b for b in converted[2]["content"] if b["type"] == "tool_result"]
+        assert len(tool_result_blocks) == 1
+        assert tool_result_blocks[0]["tool_use_id"] == "toolu_X"
+
+    def test_reorder_with_completed_turn_before(self, tmp_path):
+        """Reordering only affects the interleaved turn, not prior completed turns."""
+        sl = make_session_log(tmp_path)
+        # First turn: clean
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u0", content="hello")
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None, content="hi")
+        # Second turn: interleaved
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u1", content="run tool")
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="", tool_calls=[{"call_id": "toolu_Y", "name": "shell", "input": {"command": "uptime"}}])
+        sl.append(role="user", sender=USER, room=ROOM_ID, event_id="$u2", content="interruption")
+        sl.append(role="tool", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  call_id="toolu_Y", name="shell", output="up 3 days")
+        sl.append(role="assistant", sender=AGENT_USER, room=ROOM_ID, event_id=None,
+                  content="System up 3 days.")
+
+        ctx = sl.build_context(ROOM_ID)
+        roles = [m["role"] for m in ctx]
+        assert roles == ["user", "assistant", "user", "assistant", "tool", "user", "assistant"]
+        # The interleaved user message is after the tool result
+        assert ctx[5]["content"] == "interruption"
 
 
 class TestSafeCallId:

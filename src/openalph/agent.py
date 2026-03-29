@@ -502,8 +502,61 @@ class Agent:
 
                 history.append({"role": "assistant", "content": final_text})
                 return final_text
+            except asyncio.CancelledError:
+                # /stop or process shutdown cancelled us mid-tool-loop.
+                # The in-memory history may have an assistant message with
+                # tool_calls but no tool results (orphan). Strip orphans
+                # to prevent bricking the session on the next message.
+                self._repair_history(history)
+                raise
             finally:
                 self._current_task = None
+
+    @staticmethod
+    def _repair_history(history: list[dict]) -> None:
+        """Strip orphaned tool_calls and their partial results from history.
+
+        An orphan is an assistant message with tool_calls where not all
+        tool_call IDs have matching tool results after it in the history.
+        This happens when CancelledError interrupts asyncio.gather() during
+        tool execution.
+
+        Mutates the list in place. Also strips partial tool results that
+        belong to orphaned assistant messages (they would reference
+        non-existent tool_use blocks).
+        """
+        # Identify orphaned assistant messages
+        orphaned_indices = set()
+        orphaned_tc_ids = set()
+
+        for i, msg in enumerate(history):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                needed_ids = {tc.id for tc in msg["tool_calls"]}
+                found_ids = set()
+                for j in range(i + 1, len(history)):
+                    entry = history[j]
+                    if entry.get("role") == "tool" and entry.get("tool_call_id") in needed_ids:
+                        found_ids.add(entry["tool_call_id"])
+                if needed_ids - found_ids:
+                    logger.warning(
+                        "Repairing history: stripping orphaned tool_calls %s",
+                        needed_ids - found_ids,
+                    )
+                    orphaned_indices.add(i)
+                    orphaned_tc_ids.update(needed_ids)
+
+        if orphaned_indices:
+            # Remove orphans and their partial results in reverse order
+            to_remove = set()
+            for i, msg in enumerate(history):
+                if i in orphaned_indices:
+                    to_remove.add(i)
+                elif (msg.get("role") == "tool" and
+                      msg.get("tool_call_id") in orphaned_tc_ids):
+                    to_remove.add(i)
+
+            for i in sorted(to_remove, reverse=True):
+                history.pop(i)
 
     def cancel(self) -> asyncio.Task | None:
         """Cancel current processing and return the task for awaiting."""

@@ -241,29 +241,114 @@ class SessionLog:
                     tool_entry["is_error"] = True
                 context.append(tool_entry)
 
-        # Strip orphaned tool_calls at the end of context (crash recovery).
+        # Strip orphaned tool_calls anywhere in context (crash recovery).
         # If the agent crashed mid-tool-loop, the JSONL will have an assistant
         # message with tool_calls but no corresponding tool results. Sending
         # this to the API causes errors (tool_use requires tool_result).
-        while context:
-            last = context[-1]
-            if last.get("role") == "assistant" and last.get("tool_calls"):
-                # Check if all tool_calls have matching tool results
-                needed_ids = {tc.id for tc in last["tool_calls"]}
-                # Look backwards for tool results matching these IDs
+        # Full-scan approach to handle orphans anywhere, not just at the tail.
+        
+        # First pass: identify orphaned assistant messages
+        orphaned_indices = []
+        orphaned_tool_call_ids = set()
+        
+        for i, msg in enumerate(context):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                needed_ids = {tc.id for tc in msg["tool_calls"]}
+                
+                # Look for tool results AFTER this assistant message
                 found_ids = set()
-                for entry in context:
+                for j in range(i + 1, len(context)):
+                    entry = context[j]
                     if entry.get("role") == "tool" and entry.get("tool_call_id") in needed_ids:
                         found_ids.add(entry["tool_call_id"])
-                if needed_ids - found_ids:
-                    # Orphaned tool_calls — strip this assistant message
+                
+                missing_ids = needed_ids - found_ids
+                if missing_ids:
+                    # This assistant message is orphaned
                     logger.warning(
                         "Stripping orphaned assistant+tool_calls from context "
                         "(crash recovery): missing results for %s",
-                        needed_ids - found_ids,
+                        missing_ids,
                     )
-                    context.pop()
+                    orphaned_indices.append(i)
+                    orphaned_tool_call_ids.update(needed_ids)
+        
+        # Second pass: remove orphaned messages and their partial tool results
+        if orphaned_indices or orphaned_tool_call_ids:
+            filtered_context = []
+            for i, msg in enumerate(context):
+                # Skip orphaned assistant messages
+                if i in orphaned_indices:
                     continue
-            break
+                
+                # Skip tool results that belong to orphaned assistant messages
+                if (msg.get("role") == "tool" and 
+                    msg.get("tool_call_id") in orphaned_tool_call_ids):
+                    continue
+                
+                # Keep all other messages
+                filtered_context.append(msg)
+            
+            context = filtered_context
+
+        # Third pass: reorder interleaved messages.
+        # If a user message was logged between an assistant(tool_calls) and its
+        # tool results (race during long tool execution), move it after the last
+        # tool result for that assistant turn.  The Anthropic API requires every
+        # tool_use to be immediately followed by its tool_result(s).
+        changed = True
+        while changed:
+            changed = False
+            for i, msg in enumerate(context):
+                if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                    continue
+
+                needed_ids = {tc.id for tc in msg["tool_calls"]}
+
+                # Find the index of the last tool_result belonging to this
+                # assistant turn (scanning forward from the assistant message).
+                last_tool_idx = None
+                for j in range(i + 1, len(context)):
+                    if (context[j].get("role") == "tool" and
+                            context[j].get("tool_call_id") in needed_ids):
+                        last_tool_idx = j
+
+                if last_tool_idx is None:
+                    # No tool results at all — orphan stripping should have
+                    # caught this, but be defensive.
+                    continue
+
+                # Collect indices of non-tool messages wedged between the
+                # assistant message and the last tool result.
+                interleaved = []
+                for j in range(i + 1, last_tool_idx):
+                    entry = context[j]
+                    if entry.get("role") == "tool" and entry.get("tool_call_id") in needed_ids:
+                        continue  # this is a valid tool result for this turn
+                    interleaved.append(j)
+
+                if not interleaved:
+                    continue
+
+                # Move interleaved messages to just after last_tool_idx.
+                logger.warning(
+                    "Reordering %d interleaved message(s) from between "
+                    "assistant(tool_calls) at index %d and tool results "
+                    "(session resume fix)",
+                    len(interleaved),
+                    i,
+                )
+                moved = [context[j] for j in interleaved]
+                # Remove in reverse order to keep indices stable
+                for j in reversed(interleaved):
+                    context.pop(j)
+                # Recalculate insertion point: last_tool_idx shifted by
+                # the number of items removed before it.
+                removed_before = sum(1 for j in interleaved if j < last_tool_idx)
+                insert_at = last_tool_idx - removed_before + 1
+                for k, m in enumerate(moved):
+                    context.insert(insert_at + k, m)
+                changed = True
+                break  # restart scan since indices shifted
 
         return context
