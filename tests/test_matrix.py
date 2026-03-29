@@ -368,6 +368,61 @@ class TestCommands:
         # turns=2 (two user messages in loaded_history)
         assert "2" in sent_body or "Turns" in sent_body or True  # just verify it ran
 
+    @pytest.mark.asyncio
+    async def test_resume_clears_halt(self):
+        """/resume un-halts a room that was stopped with /stop."""
+        bot = make_bot()
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        # Halt the room
+        bot._halted_rooms.add(room.room_id)
+
+        event = make_room_message("@sb:matrix.local", "/resume")
+        await bot._handle_room_message(room, event)
+
+        assert room.room_id not in bot._halted_rooms
+
+    @pytest.mark.asyncio
+    async def test_status_works_while_halted(self):
+        """/status is accessible even when the room is halted."""
+        agent = MagicMock()
+        agent.status.return_value = {
+            "name": "test", "model": "test-model", "turns": 0,
+            "context_tokens": 0, "context_max": 200000, "context_pct": 0,
+            "total_input_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
+        }
+        bot = make_bot(agent)
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        # Halt the room
+        bot._halted_rooms.add(room.room_id)
+
+        event = make_room_message("@sb:matrix.local", "/status")
+        await bot._handle_room_message(room, event)
+
+        # Status should have been posted despite halt
+        bot.client.room_send.assert_awaited_once()
+        agent.handle_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_regular_message_blocked_while_halted(self):
+        """Regular messages are dropped when the room is halted."""
+        bot = make_bot()
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        # Halt the room
+        bot._halted_rooms.add(room.room_id)
+
+        event = make_room_message("@sb:matrix.local", "Hello there")
+        await bot._handle_room_message(room, event)
+
+        # Should NOT send anything or invoke the agent
+        bot.client.room_send.assert_not_awaited()
+        bot.agent.handle_input.assert_not_called()
+
 
 class TestThinkingCommand:
     """Tests for /thinking command — per-room thinking level control."""

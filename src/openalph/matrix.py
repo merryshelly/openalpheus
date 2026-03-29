@@ -1479,10 +1479,6 @@ class MatrixBot:
 
         room_id = room.room_id
 
-        # If room is halted via /stop, drop all incoming messages silently
-        if room_id in self._halted_rooms:
-            return
-
         # For final edit events, use the replacement content (m.new_content)
         event_content = event_source.get("content", {})
         if event_content.get("m.relates_to", {}).get("rel_type") == "m.replace":
@@ -1721,6 +1717,12 @@ class MatrixBot:
             else:
                 await self.send(room_id,
                     "Usage: `/umbral start <interval>` | `/umbral stop` | `/umbral status`")
+            return
+
+        # If room is halted via /stop, drop regular messages but allow slash
+        # commands through (they already returned above).  This prevents a
+        # deadlock where /resume is blocked by the very halt it needs to clear.
+        if room_id in self._halted_rooms:
             return
 
         # Fire as background task so sync_forever can dispatch /stop during tool loops
