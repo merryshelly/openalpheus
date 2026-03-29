@@ -716,10 +716,11 @@ class MatrixBot:
                             '</details>'
                         )
                         thinking_content = {
-                            "msgtype": "m.openalph.thinking",
+                            "msgtype": "m.notice",
                             "body": f"💭 Thinking\n\n{full_thinking}",
                             "format": "org.matrix.custom.html",
                             "formatted_body": html,
+                            "openalph.thinking": True,
                         }
                         await self._room_send_with_retry(room_id, thinking_content)
 
@@ -1270,10 +1271,11 @@ class MatrixBot:
                                 '</details>'
                             )
                             content = {
-                                "msgtype": "m.openalph.thinking",
+                                "msgtype": "m.notice",
                                 "body": f"💭 Thinking\n\n{full_thinking}",
                                 "format": "org.matrix.custom.html",
                                 "formatted_body": html,
+                                "openalph.thinking": True,
                             }
                             await self._room_send_with_retry(room_id, content)
 
@@ -1470,9 +1472,9 @@ class MatrixBot:
         if _is_streaming_edit(event):
             return
 
-        # Skip thinking blocks from other agents (custom msgtype)
-        event_source = getattr(event, 'source', {}) or {}
-        if event_source.get("content", {}).get("msgtype") == "m.openalph.thinking":
+        # Skip thinking blocks from other agents (custom content field)
+        event_source = getattr(event, 'source', None) or {}
+        if event_source.get("content", {}).get("openalph.thinking") is True:
             return
 
         room_id = room.room_id
