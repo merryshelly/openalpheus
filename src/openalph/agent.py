@@ -201,6 +201,8 @@ class Agent:
         tool_calls: list[dict] | None,
         latency_ms: float,
         content_preview: str,
+        cache_read_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
     ) -> None:
         """Write a JSONL entry for this LLM turn.
 
@@ -220,6 +222,8 @@ class Agent:
                 "model": model,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
                 "tool_calls": tool_calls or [],
                 "latency_ms": latency_ms,
                 "content_preview": content_preview[:200] if content_preview else "",
@@ -346,6 +350,8 @@ class Agent:
                             tool_calls=None,
                             latency_ms=latency_ms,
                             content_preview=accumulated_text or response.content,
+                            cache_read_tokens=usage.cache_read_tokens,
+                            cache_creation_tokens=usage.cache_creation_tokens,
                         )
                         assistant_msg = {"role": "assistant", "content": accumulated_text or response.content}
                         if accumulated_thinking or response.thinking:
@@ -427,6 +433,8 @@ class Agent:
                         tool_calls=logged_tool_calls,
                         latency_ms=latency_ms,
                         content_preview=accumulated_text or response.content,
+                        cache_read_tokens=usage.cache_read_tokens,
+                        cache_creation_tokens=usage.cache_creation_tokens,
                     )
 
                     # Append tool results to history (truncated + wrapped) and notify
