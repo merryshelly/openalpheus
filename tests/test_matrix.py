@@ -81,7 +81,9 @@ def make_bot(agent=None, config=None, **overrides):
     bot._synced = True
     bot._active_rooms = set()
     bot._room_thinking = {}
+    bot._halted_rooms = set()
     bot._background_tasks = set()
+    bot._session_locks = {}
     bot.session_log = None
     bot.heartbeat = None
     for key, val in overrides.items():
@@ -702,11 +704,15 @@ class TestErrorSanitization:
 
         await bot._inject_heartbeat("!test:matrix.local")
 
-        bot.client.room_send.assert_awaited_once()
-        sent_content = bot.client.room_send.call_args[0][2]
-        sent_body = sent_content["body"]
-        assert sensitive_msg not in sent_body
-        assert "Heartbeat error" in sent_body
+        # _inject_heartbeat sends a notice ("💓 Heartbeat") then the error message,
+        # so expect 2 room_send calls. Verify no call leaks sensitive info.
+        assert bot.client.room_send.await_count >= 1
+        for call in bot.client.room_send.call_args_list:
+            sent_content = call[0][2]
+            assert sensitive_msg not in sent_content["body"]
+        # The last call should be the error notice
+        last_content = bot.client.room_send.call_args_list[-1][0][2]
+        assert "Heartbeat error" in last_content["body"]
 
 
 # --- Send Retry ---

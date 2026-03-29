@@ -40,6 +40,7 @@ from openalph.config import MatrixConfig
 from openalph.session import SessionLog
 from openalph.mention import mentions_me, is_gated, strip_mention, MentionCheckResult
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
+from openalph.umbral import UmbralManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,39 @@ def _sanitize_filename(name: str) -> str:
     name = name[:200]
     # Fallback if empty
     return name or "attachment"
+
+
+_STREAMING_CURSOR = " ▍"
+
+
+def _is_streaming_edit(event) -> bool:
+    """Return True if a Matrix event is an intermediate streaming edit.
+
+    Streaming delivery sends an initial message, edits it progressively
+    (each with a trailing cursor ▍), then sends a final cursor-free edit.
+
+    In multi-agent rooms, receivers should:
+      - Skip intermediate edits (cursor present)
+      - Skip the initial partial send (cursor present, not an edit)
+      - Accept the final edit (cursor absent) — this carries the full content
+
+    Returns True for events that should be **dropped** (intermediate edits
+    and initial cursor-bearing sends from other agents).
+    """
+    source = getattr(event, 'source', None) or {}
+    content = source.get("content", {})
+    relates_to = content.get("m.relates_to", {})
+    is_edit = relates_to.get("rel_type") == "m.replace"
+
+    body = getattr(event, 'body', '') or ''
+
+    if is_edit:
+        # Edit event — accept only the final edit (no cursor)
+        new_body = content.get("m.new_content", {}).get("body", "")
+        return new_body.endswith(_STREAMING_CURSOR)
+    else:
+        # Original send — skip if it has the streaming cursor
+        return body.endswith(_STREAMING_CURSOR)
 
 
 def _event_id_hash(event_id: str) -> str:
@@ -216,15 +250,22 @@ class MatrixBot:
                 config_path=Path(workspace) / "heartbeats.json",
                 callback=self._inject_heartbeat,
             )
+            self.umbral = UmbralManager(
+                config_path=Path(workspace) / "umbral.json",
+                callback=self._inject_umbral,
+            )
         else:
             self.session_log = None
             self.heartbeat = None
+            self.umbral = None
         self._running = False
         self._synced = False
         self._current_room = None
         self._active_rooms = set()
+        self._halted_rooms: set[str] = set()
         self._room_thinking = {}
         self._background_tasks: set[asyncio.Task] = set()
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -559,9 +600,199 @@ class MatrixBot:
             await self.send(room, "Cancelled.")
             await self._set_typing(room, False)
 
+    async def _run_heartbeat_turn(self, room_id: str, content: str) -> None:
+        """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
+
+        Extracted from _inject_heartbeat for reuse by _inject_umbral.
+        Raises on error — caller is responsible for error handling.
+        """
+        # Activate room if not already active
+        if room_id not in self._active_rooms:
+            await self._activate_room(room_id)
+
+        # -- tool-use callbacks (same as normal message path) --
+
+        async def _tool_notice(call_id, name, input_data, result, is_error):
+            status = "❌ error" if is_error else "✅"
+            detail = ""
+            if isinstance(input_data, dict):
+                for key in ("path", "file_path", "command", "query", "url"):
+                    if key in input_data:
+                        val = str(input_data[key])[:120]
+                        detail = f" `{val}`"
+                        break
+            try:
+                await self._set_typing(room_id, True)
+            except Exception:
+                pass
+            if name == "subagent" and isinstance(input_data, dict):
+                task_preview = input_data.get("task", "")[:500]
+                model_info = input_data.get("model", "default")
+                result_preview = str(result)[:2000] if result else ""
+                summary_line = f"🤖 subagent ({model_info}) {status}"
+                html = f'<b>{summary_line}</b>'
+                if task_preview:
+                    html += (
+                        f'\n<details><summary>📋 Task brief</summary>\n'
+                        f'<pre>{mistune.html(task_preview)}</pre></details>'
+                    )
+                if result_preview:
+                    html += (
+                        f'\n<details><summary>📨 Result</summary>\n'
+                        f'<pre>{mistune.html(result_preview)}</pre></details>'
+                    )
+                body_text = f"{summary_line}\n\nTask: {task_preview[:200]}"
+                content_msg = {
+                    "msgtype": "m.notice",
+                    "body": body_text,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": html,
+                }
+                try:
+                    await self._room_send_with_retry(room_id, content_msg)
+                except Exception:
+                    pass
+            else:
+                notice_body = f"🔧 {name}{detail} {status}"
+                try:
+                    await self.send_notice(room_id, notice_body)
+                except Exception:
+                    pass
+            _sl = getattr(self, 'session_log', None)
+            if _sl:
+                _sl.append(
+                    role="tool",
+                    sender=self.config.user_id,
+                    room=room_id,
+                    event_id=None,
+                    call_id=call_id,
+                    name=name,
+                    output=result,
+                    is_error=is_error,
+                )
+
+        async def _tool_intent(tool_calls, content_text):
+            _sl = getattr(self, 'session_log', None)
+            if _sl:
+                _sl.append(
+                    role="assistant",
+                    sender=self.config.user_id,
+                    room=room_id,
+                    event_id=None,
+                    content=content_text or "",
+                    tool_calls=[
+                        {"call_id": tc.id, "name": tc.name, "input": tc.input}
+                        for tc in tool_calls
+                    ],
+                )
+
+        # Process through agent
+        try:
+            await self._set_typing(room_id, True)
+
+            # Resolve thinking level: room override > config
+            _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
+            _thinking_buffer = []
+            _thinking_done = False
+
+            async def _thinking_delta(text: str, done: bool):
+                nonlocal _thinking_done
+                if not done:
+                    _thinking_buffer.append(text)
+                else:
+                    _thinking_done = True
+                    # Send thinking as <details> block
+                    full_thinking = "".join(_thinking_buffer)
+                    _thinking_buffer.clear()  # reset for next tool-loop iteration
+                    if full_thinking.strip():
+                        if len(full_thinking) > self.MAX_MESSAGE_CHARS:
+                            full_thinking = (
+                                full_thinking[:self.MAX_MESSAGE_CHARS]
+                                + "\n\n[truncated — full thinking in session JSONL]"
+                            )
+                        html = (
+                            '<details>\n<summary>💭 Thinking</summary>\n'
+                            f'{mistune.html(full_thinking)}'
+                            '</details>'
+                        )
+                        thinking_content = {
+                            "msgtype": "m.openalph.thinking",
+                            "body": f"💭 Thinking\n\n{full_thinking}",
+                            "format": "org.matrix.custom.html",
+                            "formatted_body": html,
+                        }
+                        await self._room_send_with_retry(room_id, thinking_content)
+
+            response = await self.agent.handle_input(
+                content,
+                room_id,
+                on_tool_call=_tool_notice,
+                on_tool_intent=_tool_intent,
+                thinking=_thinking_override,
+                on_thinking_delta=_thinking_delta,
+            )
+            if response and response.strip():
+                if self.session_log:
+                    _thinking_data = None
+                    _agent_history = self.agent.history(room_id)
+                    if _agent_history and _agent_history[-1].get("role") == "assistant":
+                        _thinking_data = _agent_history[-1].get("thinking")
+                    _log_kwargs = dict(
+                        role="assistant",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        content=response,
+                    )
+                    if _thinking_data:
+                        _log_kwargs["thinking"] = _thinking_data
+                    self.session_log.append(**_log_kwargs)
+                await self.send(room_id, response)
+            else:
+                # Model did tool work but returned empty text.  Retry once
+                # with a nudge — the model sees its own tool results in
+                # history and should produce the report it failed to emit.
+                logger.warning("Empty heartbeat response in %s — retrying once", room_id)
+                retry = await self.agent.handle_input(
+                    "[SYSTEM: Your previous heartbeat response was empty. "
+                    "Summarize your findings now.]",
+                    room_id,
+                    on_tool_call=_tool_notice,
+                    on_tool_intent=_tool_intent,
+                    thinking=_thinking_override,
+                    on_thinking_delta=_thinking_delta,
+                )
+                if retry and retry.strip():
+                    if self.session_log:
+                        _thinking_data = None
+                        _agent_history = self.agent.history(room_id)
+                        if _agent_history and _agent_history[-1].get("role") == "assistant":
+                            _thinking_data = _agent_history[-1].get("thinking")
+                        _log_kwargs = dict(
+                            role="assistant",
+                            sender=self.config.user_id,
+                            room=room_id,
+                            event_id=None,
+                            content=retry,
+                        )
+                        if _thinking_data:
+                            _log_kwargs["thinking"] = _thinking_data
+                        self.session_log.append(**_log_kwargs)
+                    await self.send(room_id, retry)
+                else:
+                    logger.warning("Empty heartbeat response in %s after retry — giving up", room_id)
+                    await self.send(room_id,
+                        "⚠️ **Empty heartbeat response** — the model returned no content "
+                        "after retry. This may indicate degeneration or a provider issue.")
+        finally:
+            await self._set_typing(room_id, False)
+
     async def _inject_heartbeat(self, room_id: str) -> None:
         """Process a heartbeat as if the agent received a wake message."""
         heartbeat_content = "Heartbeat: execute your WAKE instructions."
+
+        # Post to Matrix so the operator can see heartbeat triggers
+        await self.send_notice(room_id, "💓 Heartbeat")
 
         # Log to session JSONL
         if self.session_log:
@@ -574,34 +805,9 @@ class MatrixBot:
                 source="heartbeat",
             )
 
-        # Activate room if not already active
-        if room_id not in self._active_rooms:
-            await self._activate_room(room_id)
-
-        # Process through agent
         try:
-            await self._set_typing(room_id, True)
-            response = await self.agent.handle_input(heartbeat_content, room_id)
-            if response and response.strip():
-                if self.session_log:
-                    self.session_log.append(
-                        role="assistant",
-                        sender=self.config.user_id,
-                        room=room_id,
-                        event_id=None,
-                        content=response,
-                    )
-                await self.send(room_id, response)
-            else:
-                logger.warning("Empty heartbeat response in %s — not sending", room_id)
-                await self.send(room_id,
-                    "⚠️ **Empty heartbeat response** — the model returned no content. "
-                    "This may indicate degeneration or a provider issue.")
-        except ProviderError as e:
-            code = f" ({e.status_code})" if e.status_code else ""
-            logger.warning("Heartbeat provider error%s in %s: %s", code, room_id, e)
-            await self.send(room_id, f"⚠️ **Provider error** (heartbeat): {e}")
-        except AgentOverflowError as e:
+            await self._run_heartbeat_turn(room_id, heartbeat_content)
+        except AgentOverflowError:
             logger.warning("Context overflow in %s — auto-stopping heartbeat", room_id)
             await self.heartbeat.stop(room_id)
             await self.send(
@@ -609,11 +815,74 @@ class MatrixBot:
                 "⚠️ **Context overflow** — heartbeat auto-stopped for this room. "
                 "Start a new room to continue.",
             )
-        except Exception as e:
+        except ProviderError as e:
+            code = f" ({e.status_code})" if e.status_code else ""
+            logger.warning("Heartbeat provider error%s in %s: %s", code, room_id, e)
+            await self.send(room_id, f"⚠️ **Provider error** (heartbeat): {e}")
+        except Exception:
             logger.exception("Heartbeat processing error in %s", room_id)
             await self.send(room_id, "⚠️ Heartbeat error — check agent logs for details.")
-        finally:
-            await self._set_typing(room_id, False)
+
+    async def _inject_umbral(self, room_id: str) -> None:
+        """Execute an umbral turn: heartbeat + context rotation."""
+        heartbeat_content = "Heartbeat: execute your WAKE instructions."
+
+        await self.send_notice(room_id, "🌑 Umbral turn beginning")
+
+        if self.session_log:
+            self.session_log.append(
+                role="system",
+                sender=self.config.user_id,
+                room=room_id,
+                event_id=None,
+                content=heartbeat_content,
+                source="umbral",
+            )
+
+        try:
+            await self._run_heartbeat_turn(room_id, heartbeat_content)
+        except AgentOverflowError:
+            # Context was already too big — still archive+wipe (that's the point)
+            logger.warning("Context overflow during umbral in %s — archiving anyway", room_id)
+        except ProviderError as e:
+            code = f" ({e.status_code})" if e.status_code else ""
+            logger.warning("Umbral provider error%s in %s: %s", code, room_id, e)
+            await self.send(room_id, f"⚠️ **Provider error** during umbral turn: {e}")
+        except Exception:
+            logger.exception("Umbral turn processing error in %s", room_id)
+            await self.send(room_id, "⚠️ Umbral turn error — check agent logs. Archiving context.")
+
+        # Archive + wipe regardless of turn success (failed turns still consume context)
+        try:
+            archive_name = self.session_log.archive(room_id)
+            self.session_log.wipe(room_id)
+            self.session_log.append(
+                role="system",
+                sender=self.config.user_id,
+                room=room_id,
+                event_id=None,
+                event="umbral_reset",
+                detail=f"Context reset. Previous session archived to sessions/{archive_name}",
+            )
+            self.agent.reset_room(room_id)
+            self._active_rooms.discard(room_id)
+            await self.send_notice(
+                room_id,
+                "🌑 Umbral turn concluded — context reset. "
+                "Agent will not remember session history above this point.",
+            )
+        except FileNotFoundError:
+            logger.warning("Umbral archive: no session file for %s — nothing to rotate", room_id)
+            await self.send_notice(room_id, "🌑 Umbral turn concluded (no session to archive)")
+        except OSError as e:
+            # Archive failed — DO NOT wipe. Stop umbral. Alert operator.
+            logger.critical("Umbral archive failed for %s: %s — NOT wiping, stopping umbral", room_id, e)
+            await self.umbral.stop(room_id)
+            await self.send(
+                room_id,
+                f"🚨 **Umbral archive failed** — session preserved, umbral stopped. "
+                f"Manual intervention required. Error: {e}",
+            )
 
     async def _activate_room(self, room_id: str, room_name: str = ""):
         """Load session history on first message (lazy wake).
@@ -652,7 +921,7 @@ class MatrixBot:
                                 if ev_id and ev_id in known_ids:
                                     found_overlap = True
                                     break
-                                if hasattr(msg, 'body') and msg.sender != self.config.user_id:
+                                if hasattr(msg, 'body') and msg.sender != self.config.user_id and not _is_streaming_edit(msg):
                                     new_messages.append(msg)
 
                             if found_overlap or not response.end:
@@ -669,12 +938,19 @@ class MatrixBot:
                         # Append in chronological order (we collected newest-first)
                         for msg in reversed(new_messages):
                             ev_id = getattr(msg, 'event_id', None)
+                            # For final edit events, use replacement content
+                            msg_source = getattr(msg, 'source', {}) or {}
+                            msg_content = msg_source.get("content", {})
+                            if msg_content.get("m.relates_to", {}).get("rel_type") == "m.replace":
+                                msg_body = msg_content.get("m.new_content", {}).get("body", msg.body)
+                            else:
+                                msg_body = msg.body
                             session_log.append(
                                 role="user",
                                 sender=msg.sender,
                                 room=room_id,
                                 event_id=ev_id,
-                                content=msg.body,
+                                content=msg_body,
                             )
                         session_log.append(
                             role="system",
@@ -690,6 +966,34 @@ class MatrixBot:
                 history = self.agent.history(room_id)
                 history.clear()
                 history.extend(session_log.build_context(room_id))
+
+                # Restore per-room overrides (model, thinking) from session log.
+                # Scan all entries — last override wins (user may have switched multiple times).
+                _restored_model = None
+                _restored_thinking = None
+                for entry in existing:
+                    if entry.get("role") == "system":
+                        ev = entry.get("event")
+                        detail = entry.get("detail", "")
+                        if ev == "model_override" and detail:
+                            self.agent._room_models[room_id] = detail
+                            _restored_model = detail
+                        elif ev == "thinking_override" and detail:
+                            if not hasattr(self, "_room_thinking"):
+                                self._room_thinking = {}
+                            self._room_thinking[room_id] = detail
+                            _restored_thinking = detail
+
+                # Send session resume notice to Matrix
+                parts = [f"🔄 **Session resumed** — {len(existing)} prior entries"]
+                if _restored_model:
+                    parts.append(f"Model override: `{_restored_model}`")
+                if _restored_thinking:
+                    parts.append(f"Thinking: `{_restored_thinking}`")
+                try:
+                    await self.send_notice(room_id, " · ".join(parts))
+                except Exception:
+                    pass
             else:
                 # New room: start fresh, log session start
                 session_log.append(
@@ -815,6 +1119,17 @@ class MatrixBot:
                 room_name = getattr(room, 'name', '') or getattr(room, 'display_name', '') or room_id
                 await self._activate_room(room_id, room_name=room_name)
 
+            # Acquire per-room session lock to prevent interleaved JSONL writes.
+            # Holds from user-message append through handle_input (which triggers
+            # tool_intent and tool_notice JSONL writes) so a concurrent message
+            # cannot wedge its user entry between tool_calls and tool_results.
+            if not hasattr(self, '_session_locks'):
+                self._session_locks = {}
+            if room_id not in self._session_locks:
+                self._session_locks[room_id] = asyncio.Lock()
+            _session_lock = self._session_locks[room_id]
+            await _session_lock.acquire()
+
             # Append user message to session log (only for ungated rooms — gated already buffered above)
             if not gated:
                 if session_log:
@@ -842,17 +1157,47 @@ class MatrixBot:
                             val = str(input_data[key])[:120]
                             detail = f" `{val}`"
                             break
-                notice_body = f"🔧 {name}{detail} {status}"
                 # Refresh typing indicator — Matrix expires it after ~30s,
                 # so long tool loops look dead without this.
                 try:
                     await self._set_typing(room_id, True)
                 except Exception:
                     pass
-                try:
-                    await self.send_notice(room_id, notice_body)
-                except Exception:
-                    pass
+                # Subagent calls: show task brief (collapsed) on dispatch,
+                # and result summary (collapsed) on return
+                if name == "subagent" and isinstance(input_data, dict):
+                    task_preview = input_data.get("task", "")[:500]
+                    model_info = input_data.get("model", "default")
+                    result_preview = str(result)[:2000] if result else ""
+                    summary_line = f"🤖 subagent ({model_info}) {status}"
+                    html = f'<b>{summary_line}</b>'
+                    if task_preview:
+                        html += (
+                            f'\n<details><summary>📋 Task brief</summary>\n'
+                            f'<pre>{mistune.html(task_preview)}</pre></details>'
+                        )
+                    if result_preview:
+                        html += (
+                            f'\n<details><summary>📨 Result</summary>\n'
+                            f'<pre>{mistune.html(result_preview)}</pre></details>'
+                        )
+                    body_text = f"{summary_line}\n\nTask: {task_preview[:200]}"
+                    content = {
+                        "msgtype": "m.notice",
+                        "body": body_text,
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": html,
+                    }
+                    try:
+                        await self._room_send_with_retry(room_id, content)
+                    except Exception:
+                        pass
+                else:
+                    notice_body = f"🔧 {name}{detail} {status}"
+                    try:
+                        await self.send_notice(room_id, notice_body)
+                    except Exception:
+                        pass
                 # Append tool result to session log
                 _sl = getattr(self, 'session_log', None)
                 if _sl:
@@ -908,14 +1253,24 @@ class MatrixBot:
                         _thinking_done = True
                         # Send thinking as <details> block
                         full_thinking = "".join(_thinking_buffer)
+                        _thinking_buffer.clear()  # reset for next tool-loop iteration
                         if full_thinking.strip():
+                            # Truncate thinking to avoid M_TOO_LARGE on Matrix PDU limit.
+                            # HTML rendering roughly doubles size; cap raw text at MAX_MESSAGE_CHARS
+                            # to keep formatted message well under 65535 bytes.
+                            # Full thinking is preserved in session JSONL.
+                            if len(full_thinking) > self.MAX_MESSAGE_CHARS:
+                                full_thinking = (
+                                    full_thinking[:self.MAX_MESSAGE_CHARS]
+                                    + "\n\n[truncated — full thinking in session JSONL]"
+                                )
                             html = (
                                 '<details>\n<summary>💭 Thinking</summary>\n'
                                 f'{mistune.html(full_thinking)}'
                                 '</details>'
                             )
                             content = {
-                                "msgtype": "m.text",
+                                "msgtype": "m.openalph.thinking",
                                 "body": f"💭 Thinking\n\n{full_thinking}",
                                 "format": "org.matrix.custom.html",
                                 "formatted_body": html,
@@ -963,6 +1318,17 @@ class MatrixBot:
                         "⚠️ **Empty response** — the model returned no content. "
                         "This may indicate degeneration or a provider issue. "
                         "Try again or start a new room.")
+                # Check context capacity after successful turn
+                try:
+                    _status = self.agent.status(room_id)
+                    _pct = _status.get("context_pct", 0)
+                    if _pct >= 80:
+                        await self.send_notice(room_id,
+                            f"⚠️ Context at **{_pct}%** — "
+                            f"~{_status['context_tokens']:,} / {_status['context_max']:,} tokens. "
+                            f"Consider starting a new room soon.")
+                except Exception:
+                    pass
             except AgentOverflowError as e:
                 logger.warning("Context overflow in %s: %s", room_id, e)
                 await self.send(room_id,
@@ -980,6 +1346,14 @@ class MatrixBot:
                 await self._set_typing(room_id, False)
 
         finally:
+            # Release per-room session lock so queued messages can proceed.
+            # The lock was acquired before the user-message JSONL write and
+            # held through handle_input (which writes tool_intent / tool_notice
+            # / assistant entries), preventing interleaved JSONL writes.
+            if hasattr(self, '_session_locks'):
+                _sl = self._session_locks.get(room_id)
+                if _sl and _sl.locked():
+                    _sl.release()
             self._current_room = None
 
     async def _handle_media_message(self, room, event):
@@ -1091,8 +1465,28 @@ class MatrixBot:
         if event.sender == self.config.user_id:
             return
 
+        # Skip intermediate streaming edits and partial initial sends from
+        # other agents.  Accept final edits (full content, no cursor).
+        if _is_streaming_edit(event):
+            return
+
+        # Skip thinking blocks from other agents (custom msgtype)
+        event_source = getattr(event, 'source', {}) or {}
+        if event_source.get("content", {}).get("msgtype") == "m.openalph.thinking":
+            return
+
         room_id = room.room_id
-        body = event.body.strip()
+
+        # If room is halted via /stop, drop all incoming messages silently
+        if room_id in self._halted_rooms:
+            return
+
+        # For final edit events, use the replacement content (m.new_content)
+        event_content = event_source.get("content", {})
+        if event_content.get("m.relates_to", {}).get("rel_type") == "m.replace":
+            body = event_content.get("m.new_content", {}).get("body", event.body).strip()
+        else:
+            body = event.body.strip()
 
         # --- Mention gating (kdsn.60) ---
         gated = is_gated(self.config, room)
@@ -1140,7 +1534,17 @@ class MatrixBot:
 
         # --- Slash commands ---
         if body == "/stop":
+            self._halted_rooms.add(room_id)
             await self._cancel_current()
+            await self.send(room_id, "Stopped. Room halted \u2014 use `/resume` to re-enable.")
+            return
+
+        if body == "/resume":
+            if room_id in self._halted_rooms:
+                self._halted_rooms.discard(room_id)
+                await self.send(room_id, "Resumed.")
+            else:
+                await self.send(room_id, "Room wasn't halted.")
             return
 
         if body == "/showprompt":
@@ -1193,6 +1597,16 @@ class MatrixBot:
             if error:
                 await self.send(room_id, f"\u26a0\ufe0f {error}")
             else:
+                # Persist override so it survives process restarts
+                if self.session_log:
+                    self.session_log.append(
+                        role="system",
+                        sender=event.sender,
+                        room=room_id,
+                        event_id=None,
+                        event="model_override",
+                        detail=new_model,
+                    )
                 await self.send(room_id, f"Model switched to **{new_model}**")
             return
 
@@ -1214,6 +1628,16 @@ class MatrixBot:
                 await self.send(room_id, f"Invalid level. Use: {', '.join(valid_levels)}")
                 return
             self._room_thinking[room_id] = level
+            # Persist override so it survives process restarts
+            if self.session_log:
+                self.session_log.append(
+                    role="system",
+                    sender=event.sender,
+                    room=room_id,
+                    event_id=None,
+                    event="thinking_override",
+                    detail=level,
+                )
             await self.send(room_id, f"Thinking set to **{level}** for this room")
             return
 
@@ -1225,6 +1649,10 @@ class MatrixBot:
                     await self.send(room_id, "Invalid interval. Use e.g. `15m`, `1h`, `6h`.")
                 elif interval < 300:
                     await self.send(room_id, "Minimum interval is 5m.")
+                elif self.umbral and self.umbral.is_active(room_id):
+                    await self.send(room_id,
+                        "Stop the umbral timer first (`/umbral stop`) — "
+                        "umbral and heartbeat cannot run in the same room.")
                 else:
                     await self.heartbeat.start(room_id, interval)
                     human = format_interval(interval)
@@ -1249,6 +1677,48 @@ class MatrixBot:
                     await self.send(room_id, "\n".join(lines))
             else:
                 await self.send(room_id, "Usage: `/heartbeat start <interval>` | `/heartbeat stop` | `/heartbeat status`")
+            return
+
+        if body.startswith("/umbral"):
+            parts = body.split()
+            if len(parts) >= 3 and parts[1] == "start":
+                interval = parse_interval(parts[2])
+                if interval is None:
+                    await self.send(room_id, "Invalid interval. Use e.g. `30m`, `6h`.")
+                elif interval < 1800:
+                    await self.send(room_id, "Minimum interval is 30m.")
+                elif self.heartbeat and self.heartbeat.is_active(room_id):
+                    await self.send(room_id,
+                        "Stop the heartbeat first (`/heartbeat stop`) — "
+                        "umbral and heartbeat cannot run in the same room.")
+                else:
+                    await self.umbral.start(room_id, interval)
+                    human = format_interval(interval)
+                    await self.send(room_id, f"🌑 Umbral started: every {human} in this room.")
+            elif len(parts) >= 2 and parts[1] == "stop":
+                stopped = await self.umbral.stop(room_id)
+                if stopped:
+                    await self.send(room_id, "🌑 Umbral stopped.")
+                else:
+                    await self.send(room_id, "No umbral active in this room.")
+            elif len(parts) >= 2 and parts[1] == "status":
+                entries = self.umbral.status()
+                if not entries:
+                    await self.send(room_id, "No active umbral timers.")
+                else:
+                    lines = ["**Active umbral timers:**", ""]
+                    for e in entries:
+                        nio_room = self.client.rooms.get(e.room_id)
+                        name = (getattr(nio_room, 'name', '') or
+                                getattr(nio_room, 'display_name', '') or
+                                e.room_id) if nio_room else e.room_id
+                        lines.append(
+                            f"- **{name}** — every {format_interval(e.interval_seconds)}, "
+                            f"next in {format_interval(e.seconds_until_next)}")
+                    await self.send(room_id, "\n".join(lines))
+            else:
+                await self.send(room_id,
+                    "Usage: `/umbral start <interval>` | `/umbral stop` | `/umbral status`")
             return
 
         # Fire as background task so sync_forever can dispatch /stop during tool loops
@@ -1284,8 +1754,9 @@ class MatrixBot:
         joined = len(self.client.rooms) if hasattr(self.client, 'rooms') else '?'
         logger.info("Initial sync complete in %.0fms (%s rooms joined, lazy wake active)", _sync_ms, joined)
 
-        # Resume persisted heartbeats
+        # Resume persisted heartbeats and umbral timers
         await self.heartbeat.resume()
+        await self.umbral.resume()
 
         # Use sync_forever for the main sync loop
         await self.client.sync_forever(timeout=self.config.sync_timeout)
@@ -1299,4 +1770,5 @@ class MatrixBot:
         self._running = False
         await self._cancel_current()
         await self.heartbeat.shutdown()
+        await self.umbral.shutdown()
         await self.client.close()

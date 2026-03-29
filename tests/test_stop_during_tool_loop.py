@@ -58,7 +58,9 @@ def _make_bot():
     bot._synced = True
     bot._active_rooms = {"!room:matrix.local"}
     bot._room_thinking = {}
+    bot._halted_rooms = set()
     bot._background_tasks = set()
+    bot._session_locks = {}
     bot.session_log = MagicMock()
     bot.session_log.append = MagicMock()
     bot.session_log.build_context = MagicMock(return_value=[])

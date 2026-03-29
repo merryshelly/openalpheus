@@ -63,6 +63,8 @@ def _make_bot_with_session_log(known_event_ids):
     bot._current_room = None
     bot._synced = True
     bot._active_rooms = set()
+    bot._halted_rooms = set()
+    bot._session_locks = {}
 
     entries = [{"event_id": eid, "role": "user", "content": "old"} for eid in known_event_ids]
     if not entries:

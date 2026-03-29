@@ -96,6 +96,8 @@ class TestResetRemoval:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = {"!test:matrix.local"}  # Pre-activated to skip activation
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         event = make_room_message("@sb:matrix.local", "/reset")
         room = make_room("!test:matrix.local")
@@ -146,6 +148,8 @@ class TestLazyWake:
         bot.client = MagicMock()
         bot._synced = False
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         # Simulate initial sync delivering messages from multiple rooms
         room1 = make_room("!room1:local")
@@ -187,6 +191,8 @@ class TestLazyWake:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         # Mock room_messages to return historical messages
         history_response = MagicMock()
@@ -230,6 +236,8 @@ class TestLazyWake:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         history_response = MagicMock()
         history_response.chunk = []
@@ -274,6 +282,8 @@ class TestLazyWake:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         history_response = MagicMock()
         history_response.chunk = []
@@ -324,6 +334,8 @@ class TestHistoryLoadOnActivation:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         # Historical messages to load
         history_response = MagicMock()
@@ -371,6 +383,8 @@ class TestHistoryLoadOnActivation:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         # Mock returns reverse chronological order (newest first), matching real Matrix API
         history_response = MagicMock()
@@ -416,6 +430,8 @@ class TestHistoryLoadOnActivation:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         # Return a massive history
         huge_messages = [
@@ -475,6 +491,8 @@ class TestHistoryPagination:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         # First page returns messages + a pagination token
         page1 = MagicMock()
@@ -530,6 +548,8 @@ class TestHistoryPagination:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         empty_response = MagicMock()
         empty_response.chunk = []
@@ -568,6 +588,8 @@ class TestHistoryPagination:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
         bot.session_log = None  # force legacy path
 
         # Each call returns 100 messages with a truthy end token (simulates infinite pages)
@@ -611,6 +633,8 @@ class TestHistoryPagination:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
         bot.session_log = None  # force legacy path
 
         # First call returns messages + pagination token
@@ -661,6 +685,8 @@ class TestCommandsPostRefactor:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
         bot._cancel_current = AsyncMock()
 
         event = make_room_message("@sb:local", "/stop")
@@ -698,6 +724,8 @@ class TestCommandsPostRefactor:
         bot._current_room = None
         bot._synced = True
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         event = make_room_message("@sb:local", "/status")
         room = make_room("!room:local")
@@ -727,6 +755,8 @@ class TestStartupBehavior:
         bot.config = config
         bot.agent = agent
         bot._active_rooms = set()
+        bot._halted_rooms = set()
+        bot._session_locks = {}
 
         # After sync completes, no rooms should be active
         assert len(bot._active_rooms) == 0
