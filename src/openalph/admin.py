@@ -18,7 +18,7 @@ from openalph.config import CONFIG_DIR  # canonical definition in config.py
 SHARED_DIR = Path("/srv/openalph/shared")
 OPENALPH_GROUP = "openalph"
 
-_RESERVED_NAMES = {"root", "nobody", "daemon", "bin", "sys"}
+_RESERVED_NAMES = {"root", "nobody", "daemon", "bin", "sys", "all"}
 
 OPERATIONS_TEMPLATE = """\
 # OPERATIONS.md

@@ -87,15 +87,45 @@ def _systemctl(action: str, agent: str):
 
 
 def cmd_start(args):
-    _systemctl("start", args.agent)
+    if args.agent == "all":
+        agents = list_agents()
+        if not agents:
+            print("No agents found.", file=sys.stderr)
+            sys.exit(1)
+        for agent in agents:
+            print(f"Starting {agent}...")
+            _systemctl("start", agent)
+        print(f"Started {len(agents)} agent(s).")
+    else:
+        _systemctl("start", args.agent)
 
 
 def cmd_stop(args):
-    _systemctl("stop", args.agent)
+    if args.agent == "all":
+        agents = list_agents()
+        if not agents:
+            print("No agents found.", file=sys.stderr)
+            sys.exit(1)
+        for agent in agents:
+            print(f"Stopping {agent}...")
+            _systemctl("stop", agent)
+        print(f"Stopped {len(agents)} agent(s).")
+    else:
+        _systemctl("stop", args.agent)
 
 
 def cmd_restart(args):
-    _systemctl("restart", args.agent)
+    if args.agent == "all":
+        agents = list_agents()
+        if not agents:
+            print("No agents found.", file=sys.stderr)
+            sys.exit(1)
+        for agent in agents:
+            print(f"Restarting {agent}...")
+            _systemctl("restart", agent)
+        print(f"Restarted {len(agents)} agent(s).")
+    else:
+        _systemctl("restart", args.agent)
 
 
 def cmd_status(args):
