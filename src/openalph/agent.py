@@ -151,6 +151,15 @@ class Agent:
         self._truncation_retry = False
 
 
+    def reset_room(self, room_id: str) -> None:
+        """Clear in-memory history for a room.
+
+        Preserves model overrides (_room_models) and room locks (_room_locks).
+        Called by umbral after archive+wipe.
+        """
+        if room_id in self._rooms:
+            self._rooms[room_id].clear()
+
     def history(self, room_id: str) -> list[dict]:
         """Get or create history for a room."""
         if room_id not in self._rooms:

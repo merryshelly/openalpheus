@@ -13,6 +13,7 @@ import json
 import os
 import re
 import logging
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -172,6 +173,33 @@ class SessionLog:
                 except json.JSONDecodeError:
                     continue
         return last_id
+
+    def archive(self, room_id: str) -> str:
+        """Copy current session JSONL to timestamped archive.
+
+        Returns archive filename (relative to sessions dir).
+        Raises FileNotFoundError if no session file exists.
+        Raises OSError on copy failure.
+        """
+        source = self._session_path(room_id)
+        if not source.exists():
+            raise FileNotFoundError(f"No session file for {room_id}")
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive_name = f"{self._room_id_safe(room_id)}-{ts}.jsonl"
+        archive_path = self._sessions_dir / archive_name
+        shutil.copy2(source, archive_path)
+        return archive_name
+
+    def wipe(self, room_id: str) -> None:
+        """Truncate session JSONL to zero bytes.
+
+        Uses truncate rather than unlink so the path stays valid.
+        No-op if file doesn't exist.
+        """
+        path = self._session_path(room_id)
+        if path.exists():
+            path.write_text("")
 
     def build_context(self, room_id: str, *, skip_system: bool = True) -> list[dict]:
         """Build LLM conversation context from JSONL entries.
