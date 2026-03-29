@@ -202,11 +202,12 @@ class TestRouting:
 
         assert response.content == "Hello from Kimi"
 
-        # Verify client constructed with base_url
-        MockClient.assert_called_once_with(
-            api_key="sk-test",
-            base_url="https://openrouter.ai/api/v1",
-        )
+        # Verify client constructed with base_url and timeout
+        MockClient.assert_called_once()
+        call_kwargs = MockClient.call_args.kwargs
+        assert call_kwargs["api_key"] == "sk-test"
+        assert call_kwargs["base_url"] == "https://openrouter.ai/api/v1"
+        assert "timeout" in call_kwargs
 
         # Verify system message prepended to messages
         kw = client.chat.completions.create.call_args.kwargs
@@ -237,10 +238,11 @@ class TestRouting:
                 messages=[{"role": "user", "content": "Hi"}],
             )
 
-        MockClient.assert_called_once_with(
-            api_key="sk-test",
-            base_url="http://100.90.3.4:11434/v1",
-        )
+        MockClient.assert_called_once()
+        call_kwargs = MockClient.call_args.kwargs
+        assert call_kwargs["api_key"] == "sk-test"
+        assert call_kwargs["base_url"] == "http://100.90.3.4:11434/v1"
+        assert "timeout" in call_kwargs
         assert response.content == "Hello from Qwen"
 
 

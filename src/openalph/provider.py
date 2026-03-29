@@ -6,13 +6,17 @@ The adapter handles the differences in API shapes and response formats between p
 """
 
 import copy
+import logging
 from dataclasses import dataclass
 from typing import AsyncGenerator
 import json
 import re
 import anthropic
+import httpx
 import openai
 from openalph.config import AgentConfig, ProviderConfig, resolve_model
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
@@ -108,16 +112,22 @@ _client_cache: dict[tuple, object] = {}
 
 def _get_client(provider: ProviderConfig):
     """Get or create a cached provider client."""
+    timeout = getattr(provider, "timeout", 600.0)
     if provider.type == "anthropic":
-        key = ("anthropic", provider.api_key, None)
+        key = ("anthropic", provider.api_key, None, timeout)
         if key not in _client_cache:
-            _client_cache[key] = anthropic.AsyncAnthropic(api_key=provider.api_key)
+            _client_cache[key] = anthropic.AsyncAnthropic(
+                api_key=provider.api_key,
+                timeout=httpx.Timeout(timeout, connect=10.0),
+            )
         return _client_cache[key]
     elif provider.type == "openai":
-        key = ("openai", provider.api_key, provider.base_url)
+        key = ("openai", provider.api_key, provider.base_url, timeout)
         if key not in _client_cache:
             _client_cache[key] = openai.AsyncOpenAI(
-                api_key=provider.api_key, base_url=provider.base_url
+                api_key=provider.api_key,
+                base_url=provider.base_url,
+                timeout=httpx.Timeout(timeout, connect=10.0),
             )
         return _client_cache[key]
     else:
@@ -158,6 +168,7 @@ class Response:
     tool_calls: list[ToolCall] = None
     thinking: list[ThinkingBlock] = None
     degenerate: bool = False
+    generation_id: str = ""  # Provider-assigned ID (OpenRouter gen ID, Anthropic msg ID)
 
     def __post_init__(self):
         if self.tool_calls is None:
@@ -510,6 +521,7 @@ def _parse_anthropic_response(response) -> Response:
             cache_creation_tokens=response.usage.cache_creation_input_tokens,
         ),
         stop_reason=response.stop_reason,
+        generation_id=getattr(response, "id", "") or "",
     )
 
 
@@ -549,6 +561,7 @@ def _parse_openai_response(response) -> Response:
             output_tokens=response.usage.completion_tokens,
         ),
         stop_reason=response.choices[0].finish_reason,
+        generation_id=getattr(response, "id", "") or "",
     )
 
 
@@ -560,6 +573,8 @@ def _build_anthropic_kwargs(
     max_tokens: int,
     thinking_level: str,
     model_max_tokens: int = 200000,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> dict:
     """Build kwargs for Anthropic messages API."""
     api_kwargs = {
@@ -585,6 +600,13 @@ def _build_anthropic_kwargs(
             elif isinstance(msg_content, list) and msg_content:
                 msg_content[-1]["cache_control"] = {"type": "ephemeral"}
     
+    # Add sampling parameters (only when thinking is off — Anthropic disallows with thinking)
+    if thinking_level == "off":
+        if temperature is not None:
+            api_kwargs["temperature"] = temperature
+        if top_p is not None:
+            api_kwargs["top_p"] = top_p
+
     # Add thinking parameters if enabled
     if thinking_level != "off":
         if _supports_adaptive_thinking(api_model):
@@ -608,6 +630,8 @@ def _build_openai_kwargs(
     max_tokens: int,
     thinking_level: str,
     quirks: list[str],
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> dict:
     """Build kwargs for OpenAI chat completions API."""
     # Handle quirks
@@ -635,6 +659,12 @@ def _build_openai_kwargs(
     if provider_tools:
         api_kwargs["tools"] = provider_tools
     
+    # Add sampling parameters
+    if temperature is not None:
+        api_kwargs["temperature"] = temperature
+    if top_p is not None:
+        api_kwargs["top_p"] = top_p
+
     # Add reasoning effort for OpenRouter if thinking enabled
     if thinking_level != "off":
         api_kwargs["extra_body"] = {"reasoning": {"effort": thinking_level}}
@@ -684,6 +714,8 @@ async def stream(
             max_tokens=tokens,
             thinking_level=thinking_level,
             model_max_tokens=getattr(config, "model_max_tokens", 200000),
+            temperature=getattr(config, "temperature", None),
+            top_p=getattr(config, "top_p", None),
         )
         
         try:
@@ -759,6 +791,8 @@ async def stream(
             max_tokens=tokens,
             thinking_level=thinking_level,
             quirks=provider_cfg.quirks,
+            temperature=getattr(config, "temperature", None),
+            top_p=getattr(config, "top_p", None),
         )
         
         # Add streaming-specific kwargs
@@ -772,10 +806,15 @@ async def stream(
             accumulated_reasoning = ""
             usage = None
             stop_reason = None
+            generation_id = ""
             # Accumulate tool call data: index -> {"id": str, "name": str, "arguments": str}
             tool_call_accumulators: dict[int, dict] = {}
             
             async for chunk in response:
+                # Capture generation ID from first chunk
+                if not generation_id and getattr(chunk, "id", None):
+                    generation_id = chunk.id
+
                 # Handle usage chunk
                 if chunk.usage:
                     usage = Usage(
@@ -860,6 +899,7 @@ async def stream(
                 stop_reason=stop_reason or "",
                 tool_calls=response_tool_calls,
                 thinking=thinking_blocks,
+                generation_id=generation_id,
             )
             response_obj.content, response_obj.degenerate = _detect_and_truncate_degeneration(response_obj.content)
             
@@ -913,4 +953,14 @@ async def complete(
         if event.type == "done":
             response = event.response
     
+    if response and response.generation_id:
+        out_tokens = response.usage.output_tokens if response.usage else 0
+        has_content = bool(response.content and response.content.strip())
+        has_tools = bool(response.tool_calls)
+        logger.info(
+            "generation %s model=%s out=%d stop=%s content=%s tools=%s",
+            response.generation_id, response.model, out_tokens,
+            response.stop_reason, has_content, has_tools,
+        )
+
     return response

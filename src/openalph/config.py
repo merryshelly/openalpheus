@@ -49,6 +49,7 @@ class ProviderConfig:
     api_key: str       # resolved value
     base_url: str | None = None
     quirks: list[str] = field(default_factory=list)
+    timeout: float = 600.0  # HTTP read timeout in seconds (default matches SDK defaults)
 
 
 @dataclass
@@ -65,6 +66,8 @@ class AgentConfig:
     truncation_limit: int = 50000
     vision: bool = False
     thinking: str = "off"
+    temperature: float | None = None
+    top_p: float | None = None
     model_limits: dict[str, int] = field(default_factory=dict)
 
 
@@ -239,6 +242,20 @@ def load_config(path: Path) -> AgentConfig:
     if thinking not in valid_thinking:
         raise ConfigError(f"thinking must be one of {valid_thinking}, got: {thinking!r}")
 
+    # temperature defaults to None (provider default) if not specified
+    temperature = agent_section.get("temperature")
+    if temperature is not None:
+        if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
+            raise ConfigError("temperature must be a number between 0 and 2")
+        temperature = float(temperature)
+
+    # top_p defaults to None (provider default) if not specified
+    top_p = agent_section.get("top_p")
+    if top_p is not None:
+        if not isinstance(top_p, (int, float)) or top_p < 0 or top_p > 1:
+            raise ConfigError("top_p must be a number between 0 and 1")
+        top_p = float(top_p)
+
     # Validate workspace path
     try:
         workspace_path_str = workspace_section["path"]
@@ -285,12 +302,18 @@ def load_config(path: Path) -> AgentConfig:
         if not isinstance(quirks, list):
             quirks = []
         
+        timeout = section_data.get("timeout", 600.0)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ConfigError(f"timeout must be a positive number, got: {timeout!r}")
+        timeout = float(timeout)
+        
         providers[provider_key] = ProviderConfig(
             key=provider_key,
             type=provider_type,
             api_key=api_key,
             base_url=base_url,
             quirks=quirks,
+            timeout=timeout,
         )
 
     # Validate default_model references a configured provider
@@ -328,6 +351,8 @@ def load_config(path: Path) -> AgentConfig:
         truncation_limit=truncation_limit,
         vision=vision,
         thinking=thinking,
+        temperature=temperature,
+        top_p=top_p,
         model_limits=model_limits,
     )
 
