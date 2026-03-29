@@ -70,6 +70,7 @@ def make_bot(tmp_path):
 
     bot._synced = True
     bot.send = AsyncMock()
+    bot.send_notice = AsyncMock()
     bot._set_typing = AsyncMock()
     bot.session_log = None
 

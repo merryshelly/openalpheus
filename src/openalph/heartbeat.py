@@ -63,18 +63,28 @@ class HeartbeatManager:
         await self._persist()
 
     async def stop(self, room_id: str) -> bool:
-        """Stop a heartbeat. Returns False if none was active. Persists to disk."""
+        """Stop a heartbeat. Returns False if none was active. Persists to disk.
+
+        Safe to call from within the heartbeat callback itself (self-stop).
+        In that case we skip cancel/await (which would deadlock or silently
+        consume the CancelledError) and just clean up bookkeeping.  The
+        _heartbeat_loop detects removal from _tasks and exits on its own.
+        """
         if room_id not in self._tasks:
             return False
 
-        # Cancel the task
-        self._tasks[room_id].cancel()
-        try:
-            await self._tasks[room_id]
-        except asyncio.CancelledError:
-            pass
+        task = self._tasks[room_id]
+        self_stop = (asyncio.current_task() is task)
 
-        # Clean up
+        if not self_stop:
+            # External stop — cancel and wait for clean exit
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Clean up bookkeeping (loop checks _tasks to know it should exit)
         del self._tasks[room_id]
         del self._start_times[room_id]
         del self._intervals[room_id]
@@ -104,6 +114,10 @@ class HeartbeatManager:
             ))
 
         return entries
+
+    def is_active(self, room_id: str) -> bool:
+        """Return True if room has an active timer."""
+        return room_id in self._tasks and not self._tasks[room_id].done()
 
     async def resume(self) -> None:
         """Read config from disk, start timers for all persisted heartbeats.
@@ -153,6 +167,10 @@ class HeartbeatManager:
                     await self.callback(room_id)
                 except Exception:
                     logger.exception("Heartbeat callback error for %s", room_id)
+                # If stop() was called from inside the callback (self-stop),
+                # the bookkeeping is already cleaned up — just exit the loop.
+                if room_id not in self._tasks:
+                    break
         except asyncio.CancelledError:
             # Normal shutdown — don't propagate
             pass
