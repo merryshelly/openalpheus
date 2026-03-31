@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Awaitable
@@ -27,11 +28,11 @@ class UmbralManager:
         self.config_path = Path(config_path)
         self.callback = callback
         self._tasks: dict[str, asyncio.Task] = {}
-        self._start_times: dict[str, float] = {}
         self._intervals: dict[str, float] = {}
+        self._last_fired: dict[str, float] = {}
         self._processing: dict[str, bool] = {}
 
-    async def start(self, room_id: str, interval_seconds: int | float) -> None:
+    async def start(self, room_id: str, interval_seconds: int | float, *, _initial_delay: float | None = None) -> None:
         if interval_seconds <= 0:
             raise ValueError(f"interval_seconds must be positive, got {interval_seconds}")
         if room_id in self._tasks:
@@ -41,9 +42,11 @@ class UmbralManager:
             except asyncio.CancelledError:
                 pass
         self._intervals[room_id] = float(interval_seconds)
-        self._start_times[room_id] = asyncio.get_event_loop().time()
+        # Only set last_fired to now on fresh start (not resume)
+        if _initial_delay is None:
+            self._last_fired[room_id] = time.time()
         self._tasks[room_id] = asyncio.create_task(
-            self._umbral_loop(room_id, float(interval_seconds))
+            self._umbral_loop(room_id, float(interval_seconds), initial_delay=_initial_delay)
         )
         await self._persist()
 
@@ -59,21 +62,21 @@ class UmbralManager:
             except asyncio.CancelledError:
                 pass
         del self._tasks[room_id]
-        del self._start_times[room_id]
         del self._intervals[room_id]
+        self._last_fired.pop(room_id, None)
         self._processing.pop(room_id, None)
         await self._persist()
         return True
 
     def status(self) -> list[UmbralEntry]:
         entries = []
-        now = asyncio.get_event_loop().time()
+        now = time.time()
         for room_id, task in self._tasks.items():
             if task.done():
                 continue
             interval = self._intervals[room_id]
-            start_time = self._start_times[room_id]
-            elapsed = now - start_time
+            last = self._last_fired.get(room_id, now)
+            elapsed = now - last
             seconds_until_next = max(0, int(interval - (elapsed % interval)))
             entries.append(UmbralEntry(
                 room_id=room_id,
@@ -99,8 +102,21 @@ class UmbralManager:
                 continue
             room_id = entry.get("room_id")
             interval = entry.get("interval_seconds")
+            last_fired = entry.get("last_fired_at")
             if room_id and interval is not None:
-                await self.start(room_id, interval)
+                initial_delay = None
+                if last_fired is not None:
+                    elapsed = time.time() - last_fired
+                    remaining = interval - elapsed
+                    if remaining <= 0:
+                        # Missed fire — fire immediately (0.01s to yield event loop)
+                        initial_delay = 0.01
+                    else:
+                        # Clamp: if clock jumped backward, remaining > interval
+                        initial_delay = min(remaining, float(interval))
+                    # Preserve the persisted last_fired value
+                    self._last_fired[room_id] = last_fired
+                await self.start(room_id, interval, _initial_delay=initial_delay)
 
     async def shutdown(self) -> None:
         tasks = list(self._tasks.values())
@@ -109,14 +125,19 @@ class UmbralManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
-        self._start_times.clear()
         self._intervals.clear()
+        self._last_fired.clear()
         self._processing.clear()
 
-    async def _umbral_loop(self, room_id: str, interval_seconds: float) -> None:
+    async def _umbral_loop(self, room_id: str, interval_seconds: float, initial_delay: float | None = None) -> None:
         try:
+            first = True
             while True:
-                await asyncio.sleep(interval_seconds)
+                if first and initial_delay is not None:
+                    await asyncio.sleep(initial_delay)
+                else:
+                    await asyncio.sleep(interval_seconds)
+                first = False
                 if self._processing.get(room_id, False):
                     logger.warning("Umbral: skipping fire for %s — previous turn still processing", room_id)
                     continue
@@ -127,6 +148,9 @@ class UmbralManager:
                     logger.exception("Umbral callback error for %s", room_id)
                 finally:
                     self._processing[room_id] = False
+                # Update last_fired after each invocation
+                self._last_fired[room_id] = time.time()
+                await self._persist()
                 if room_id not in self._tasks:
                     break
         except asyncio.CancelledError:
@@ -134,7 +158,11 @@ class UmbralManager:
 
     async def _persist(self) -> None:
         data = [
-            {"room_id": room_id, "interval_seconds": self._intervals[room_id]}
+            {
+                "room_id": room_id,
+                "interval_seconds": self._intervals[room_id],
+                "last_fired_at": self._last_fired.get(room_id),
+            }
             for room_id in self._tasks
         ]
         tmp_path = self.config_path.with_suffix(".tmp")

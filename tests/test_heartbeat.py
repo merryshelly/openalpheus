@@ -392,3 +392,96 @@ class TestZeroIntervalRejection:
         hb = HeartbeatManager(tmp_path / "heartbeats.json", callback)
         with pytest.raises(ValueError, match="must be positive"):
             await hb.start("!room:test", -5)
+
+
+# --- Cadence Preservation ---
+
+
+class TestHeartbeatCadencePreservation:
+    """Cadence survives restart via last_fired_at persistence."""
+
+    @pytest.mark.asyncio
+    async def test_persist_includes_last_fired_at(self, tmp_path):
+        """start() + fire → JSON includes last_fired_at."""
+        config_path = tmp_path / "heartbeats.json"
+        callback = AsyncMock()
+        hb = HeartbeatManager(config_path, callback)
+        await hb.start("!room1:matrix.local", 0.1)
+        await asyncio.sleep(0.15)  # let it fire once
+        data = json.loads(config_path.read_text())
+        assert "last_fired_at" in data[0]
+        assert isinstance(data[0]["last_fired_at"], float)
+        await hb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_resume_calculates_remaining(self, tmp_path):
+        """resume() with recent last_fired_at waits remaining time, not full interval."""
+        config_path = tmp_path / "heartbeats.json"
+        import time
+        # Fired 0.05s ago, interval 0.2s → should fire in ~0.15s
+        config_path.write_text(json.dumps([
+            {"room_id": "!room1:matrix.local", "interval_seconds": 0.2,
+             "last_fired_at": time.time() - 0.05},
+        ]))
+        callback = AsyncMock()
+        hb = HeartbeatManager(config_path, callback)
+        await hb.resume()
+        # Should NOT have fired yet (only 0.05s in)
+        await asyncio.sleep(0.05)
+        assert callback.await_count == 0
+        # Should fire after remaining ~0.1s
+        await asyncio.sleep(0.15)
+        assert callback.await_count >= 1
+        await hb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_resume_fires_immediately_if_overdue(self, tmp_path):
+        """resume() with old last_fired_at fires almost immediately."""
+        config_path = tmp_path / "heartbeats.json"
+        import time
+        # Fired 10s ago, interval 0.1s → way overdue
+        config_path.write_text(json.dumps([
+            {"room_id": "!room1:matrix.local", "interval_seconds": 0.1,
+             "last_fired_at": time.time() - 10},
+        ]))
+        callback = AsyncMock()
+        hb = HeartbeatManager(config_path, callback)
+        await hb.resume()
+        await asyncio.sleep(0.1)
+        assert callback.await_count >= 1
+        await hb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_resume_without_last_fired_at_uses_full_interval(self, tmp_path):
+        """Old format JSON (no last_fired_at) → full interval, backward compatible."""
+        config_path = tmp_path / "heartbeats.json"
+        config_path.write_text(json.dumps([
+            {"room_id": "!room1:matrix.local", "interval_seconds": 0.2},
+        ]))
+        callback = AsyncMock()
+        hb = HeartbeatManager(config_path, callback)
+        await hb.resume()
+        # Should NOT fire for ~0.2s (full interval)
+        await asyncio.sleep(0.1)
+        assert callback.await_count == 0
+        await asyncio.sleep(0.15)
+        assert callback.await_count >= 1
+        await hb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_resume_clamps_clock_jump_backward(self, tmp_path):
+        """If last_fired_at is in the future (clock jump), clamp to full interval."""
+        config_path = tmp_path / "heartbeats.json"
+        import time
+        # last_fired_at in the future → remaining > interval → clamp
+        config_path.write_text(json.dumps([
+            {"room_id": "!room1:matrix.local", "interval_seconds": 0.2,
+             "last_fired_at": time.time() + 100},
+        ]))
+        callback = AsyncMock()
+        hb = HeartbeatManager(config_path, callback)
+        await hb.resume()
+        # Should clamp to full interval (~0.2s), not wait 100s
+        await asyncio.sleep(0.3)
+        assert callback.await_count >= 1
+        await hb.shutdown()

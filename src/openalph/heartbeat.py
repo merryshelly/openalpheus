@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Awaitable
@@ -34,10 +35,10 @@ class HeartbeatManager:
         self.config_path = Path(config_path)
         self.callback = callback
         self._tasks: dict[str, asyncio.Task] = {}
-        self._start_times: dict[str, float] = {}
         self._intervals: dict[str, float] = {}
+        self._last_fired: dict[str, float] = {}
 
-    async def start(self, room_id: str, interval_seconds: int | float) -> None:
+    async def start(self, room_id: str, interval_seconds: int | float, *, _initial_delay: float | None = None) -> None:
         """Start or replace a heartbeat for a room. Persists to disk."""
         if interval_seconds <= 0:
             raise ValueError(f"interval_seconds must be positive, got {interval_seconds}")
@@ -50,13 +51,16 @@ class HeartbeatManager:
             except asyncio.CancelledError:
                 pass
 
-        # Store interval and start time
+        # Store interval
         self._intervals[room_id] = float(interval_seconds)
-        self._start_times[room_id] = asyncio.get_event_loop().time()
+
+        # Only set last_fired to now on fresh start (not resume)
+        if _initial_delay is None:
+            self._last_fired[room_id] = time.time()
 
         # Create new task
         self._tasks[room_id] = asyncio.create_task(
-            self._heartbeat_loop(room_id, float(interval_seconds))
+            self._heartbeat_loop(room_id, float(interval_seconds), initial_delay=_initial_delay)
         )
 
         # Persist to disk
@@ -86,8 +90,8 @@ class HeartbeatManager:
 
         # Clean up bookkeeping (loop checks _tasks to know it should exit)
         del self._tasks[room_id]
-        del self._start_times[room_id]
         del self._intervals[room_id]
+        self._last_fired.pop(room_id, None)
 
         # Persist to disk
         await self._persist()
@@ -96,15 +100,15 @@ class HeartbeatManager:
     def status(self) -> list[HeartbeatEntry]:
         """Return all active heartbeats with next-fire time."""
         entries = []
-        now = asyncio.get_event_loop().time()
+        now = time.time()
 
         for room_id, task in self._tasks.items():
             if task.done():
                 continue
 
             interval = self._intervals[room_id]
-            start_time = self._start_times[room_id]
-            elapsed = now - start_time
+            last = self._last_fired.get(room_id, now)
+            elapsed = now - last
             seconds_until_next = max(0, int(interval - (elapsed % interval)))
 
             entries.append(HeartbeatEntry(
@@ -122,7 +126,8 @@ class HeartbeatManager:
     async def resume(self) -> None:
         """Read config from disk, start timers for all persisted heartbeats.
 
-        First fire is one full interval from resume (no drift tracking).
+        Uses last_fired_at to calculate remaining time so cadence survives restarts.
+        Falls back to full interval if last_fired_at is missing (old format).
         """
         if not self.config_path.exists():
             return
@@ -141,8 +146,21 @@ class HeartbeatManager:
                 continue
             room_id = entry.get("room_id")
             interval = entry.get("interval_seconds")
+            last_fired = entry.get("last_fired_at")
             if room_id and interval is not None:
-                await self.start(room_id, interval)
+                initial_delay = None
+                if last_fired is not None:
+                    elapsed = time.time() - last_fired
+                    remaining = interval - elapsed
+                    if remaining <= 0:
+                        # Missed fire — fire immediately (0.01s to yield event loop)
+                        initial_delay = 0.01
+                    else:
+                        # Clamp: if clock jumped backward, remaining > interval
+                        initial_delay = min(remaining, float(interval))
+                    # Preserve the persisted last_fired value
+                    self._last_fired[room_id] = last_fired
+                await self.start(room_id, interval, _initial_delay=initial_delay)
 
     async def shutdown(self) -> None:
         """Cancel all timers cleanly. Idempotent."""
@@ -155,18 +173,26 @@ class HeartbeatManager:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         self._tasks.clear()
-        self._start_times.clear()
         self._intervals.clear()
+        self._last_fired.clear()
 
-    async def _heartbeat_loop(self, room_id: str, interval_seconds: float) -> None:
+    async def _heartbeat_loop(self, room_id: str, interval_seconds: float, initial_delay: float | None = None) -> None:
         """Run heartbeat loop for a room."""
         try:
+            first = True
             while True:
-                await asyncio.sleep(interval_seconds)
+                if first and initial_delay is not None:
+                    await asyncio.sleep(initial_delay)
+                else:
+                    await asyncio.sleep(interval_seconds)
+                first = False
                 try:
                     await self.callback(room_id)
                 except Exception:
                     logger.exception("Heartbeat callback error for %s", room_id)
+                # Update last_fired after each successful invocation
+                self._last_fired[room_id] = time.time()
+                await self._persist()
                 # If stop() was called from inside the callback (self-stop),
                 # the bookkeeping is already cleaned up — just exit the loop.
                 if room_id not in self._tasks:
@@ -178,7 +204,11 @@ class HeartbeatManager:
     async def _persist(self) -> None:
         """Write current heartbeats to disk atomically."""
         data = [
-            {"room_id": room_id, "interval_seconds": self._intervals[room_id]}
+            {
+                "room_id": room_id,
+                "interval_seconds": self._intervals[room_id],
+                "last_fired_at": self._last_fired.get(room_id),
+            }
             for room_id in self._tasks
         ]
 
