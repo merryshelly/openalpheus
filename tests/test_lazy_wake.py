@@ -112,10 +112,9 @@ class TestResetRemoval:
         agent.handle_input.assert_awaited_once()
         assert agent.handle_input.await_args[0] == ("/reset", "!test:matrix.local")
 
-    def test_agent_has_no_reset_room_method(self):
-        """Agent class should not have a reset_room method."""
-        assert not hasattr(Agent, "reset_room"), \
-            "Agent.reset_room should be removed — new room = new session"
+    # reset_room removal test was here but premature — umbral still calls
+    # agent.reset_room() during context resets (matrix.py:910).  Revisit
+    # when umbral is refactored to use session-level reset instead.
 
 
 # --- Dead Code Removal ---

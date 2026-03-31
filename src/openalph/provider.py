@@ -575,11 +575,13 @@ def _build_anthropic_kwargs(
     model_max_tokens: int = 200000,
     temperature: float | None = None,
     top_p: float | None = None,
+    cache_ttl: str | None = None,
 ) -> dict:
     """Build kwargs for Anthropic messages API."""
+    _cc = {"type": "ephemeral", "ttl": cache_ttl} if cache_ttl else {"type": "ephemeral"}
     api_kwargs = {
         "model": api_model,
-        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "system": [{"type": "text", "text": system, "cache_control": _cc}],
         "messages": provider_messages,
         "max_tokens": max_tokens,
     }
@@ -596,9 +598,9 @@ def _build_anthropic_kwargs(
             api_kwargs["messages"][-1] = last_msg
             msg_content = last_msg.get("content")
             if isinstance(msg_content, str):
-                last_msg["content"] = [{"type": "text", "text": msg_content, "cache_control": {"type": "ephemeral"}}]
+                last_msg["content"] = [{"type": "text", "text": msg_content, "cache_control": _cc}]
             elif isinstance(msg_content, list) and msg_content:
-                msg_content[-1]["cache_control"] = {"type": "ephemeral"}
+                msg_content[-1]["cache_control"] = _cc
     
     # Add sampling parameters (only when thinking is off — Anthropic disallows with thinking)
     if thinking_level == "off":
@@ -632,6 +634,7 @@ def _build_openai_kwargs(
     quirks: list[str],
     temperature: float | None = None,
     top_p: float | None = None,
+    routing: dict | None = None,
 ) -> dict:
     """Build kwargs for OpenAI chat completions API."""
     # Handle quirks
@@ -665,9 +668,14 @@ def _build_openai_kwargs(
     if top_p is not None:
         api_kwargs["top_p"] = top_p
 
-    # Add reasoning effort for OpenRouter if thinking enabled
+    # Build extra_body incrementally
+    extra_body = {}
     if thinking_level != "off":
-        api_kwargs["extra_body"] = {"reasoning": {"effort": thinking_level}}
+        extra_body["reasoning"] = {"effort": thinking_level}
+    if routing:
+        extra_body["provider"] = routing
+    if extra_body:
+        api_kwargs["extra_body"] = extra_body
     
     return api_kwargs
 
@@ -680,6 +688,7 @@ async def stream(
     max_tokens: int | None = None,
     model: str | None = None,
     thinking: str | None = None,
+    cache_ttl: str | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """
     Stream completion events from Anthropic or OpenAI SDK based on config.providers.
@@ -716,6 +725,7 @@ async def stream(
             model_max_tokens=getattr(config, "model_max_tokens", 200000),
             temperature=getattr(config, "temperature", None),
             top_p=getattr(config, "top_p", None),
+            cache_ttl=cache_ttl,
         )
         
         try:
@@ -793,6 +803,7 @@ async def stream(
             quirks=provider_cfg.quirks,
             temperature=getattr(config, "temperature", None),
             top_p=getattr(config, "top_p", None),
+            routing=provider_cfg.routing,
         )
         
         # Add streaming-specific kwargs

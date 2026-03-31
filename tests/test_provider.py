@@ -14,7 +14,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.provider import complete, stream, Response, Usage, ThinkingBlock, StreamEvent, _convert_messages_for_anthropic
+from openalph.provider import complete, stream, Response, Usage, ThinkingBlock, StreamEvent, _convert_messages_for_anthropic, _build_openai_kwargs
 
 
 def make_provider(key="anthropic", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
@@ -746,3 +746,37 @@ class TestOpenAIReasoning:
             response = await complete(config=config, system='You are helpful.', messages=[{'role': 'user', 'content': 'Hello'}])
 
         assert response.thinking == []
+
+
+class TestBuildOpenaiKwargsRouting:
+
+    def _base_args(self, **overrides):
+        defaults = dict(
+            api_model="test/model",
+            system="sys",
+            provider_messages=[{"role": "user", "content": "hi"}],
+            provider_tools=None,
+            max_tokens=1024,
+            thinking_level="off",
+            quirks=[],
+        )
+        defaults.update(overrides)
+        return defaults
+
+    def test_routing_adds_provider_to_extra_body(self):
+        """routing dict appears as extra_body.provider."""
+        routing = {"quantizations": ["fp8", "fp16"]}
+        kw = _build_openai_kwargs(**self._base_args(routing=routing))
+        assert kw["extra_body"]["provider"] == routing
+
+    def test_no_routing_no_extra_body(self):
+        """Without routing or thinking, extra_body is absent."""
+        kw = _build_openai_kwargs(**self._base_args())
+        assert "extra_body" not in kw
+
+    def test_routing_and_thinking_both_in_extra_body(self):
+        """Both routing and thinking produce their keys in extra_body."""
+        routing = {"quantizations": ["fp8"]}
+        kw = _build_openai_kwargs(**self._base_args(thinking_level="high", routing=routing))
+        assert kw["extra_body"]["reasoning"] == {"effort": "high"}
+        assert kw["extra_body"]["provider"] == routing

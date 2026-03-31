@@ -50,6 +50,8 @@ class ProviderConfig:
     base_url: str | None = None
     quirks: list[str] = field(default_factory=list)
     timeout: float = 600.0  # HTTP read timeout in seconds (default matches SDK defaults)
+    cache_bust_notices: bool = False  # Emit in-room notice on full prompt cache miss
+    routing: dict | None = None  # OpenRouter provider routing preferences
 
 
 @dataclass
@@ -307,6 +309,14 @@ def load_config(path: Path) -> AgentConfig:
             raise ConfigError(f"timeout must be a positive number, got: {timeout!r}")
         timeout = float(timeout)
         
+        cache_bust_notices = section_data.get("cache_bust_notices", False)
+        if not isinstance(cache_bust_notices, bool):
+            raise ConfigError(f"cache_bust_notices must be a boolean")
+        
+        routing = section_data.get("routing")
+        if routing is not None and not isinstance(routing, dict):
+            raise ConfigError(f"routing must be a table/dict, got: {type(routing).__name__}")
+        
         providers[provider_key] = ProviderConfig(
             key=provider_key,
             type=provider_type,
@@ -314,6 +324,8 @@ def load_config(path: Path) -> AgentConfig:
             base_url=base_url,
             quirks=quirks,
             timeout=timeout,
+            cache_bust_notices=cache_bust_notices,
+            routing=routing,
         )
 
     # Validate default_model references a configured provider
