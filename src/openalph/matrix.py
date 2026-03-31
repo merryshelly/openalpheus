@@ -264,6 +264,7 @@ class MatrixBot:
         self._active_rooms = set()
         self._halted_rooms: set[str] = set()
         self._room_thinking = {}
+        self._room_cache_ttl = {}   # Room-scoped cache TTL overrides ("1h" or None)
         self._background_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
 
@@ -692,6 +693,7 @@ class MatrixBot:
 
             # Resolve thinking level: room override > config
             _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
+            _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
             _thinking_buffer = []
             _thinking_done = False
 
@@ -724,6 +726,42 @@ class MatrixBot:
                         }
                         await self._room_send_with_retry(room_id, thinking_content)
 
+            async def _cache_status(usage, model_str):
+                """Emit in-room notice on significant prompt cache miss if provider opted in."""
+                cr = usage.cache_read_tokens or 0
+                cc = usage.cache_creation_tokens or 0
+                # Only fire when a significant amount was re-cached
+                if cc < 10000:
+                    return
+                # Check if the provider has cache_bust_notices enabled
+                try:
+                    from openalph.config import resolve_model
+                    provider_cfg, _ = resolve_model(model_str, self.agent.config.providers)
+                    if not provider_cfg.cache_bust_notices:
+                        return
+                except Exception:
+                    return
+                # Calculate miss percentage
+                total = cr + cc
+                miss_pct = (cc / total * 100) if total > 0 else 100
+                # Format the notice
+                notice = f"⚠️ Cache warning — {cc:,} tokens written, {cr:,} read ({miss_pct:.0f}% uncached)"
+                try:
+                    await self.send_notice(room_id, notice)
+                except Exception:
+                    pass
+                # Log as system entry (excluded from LLM context)
+                _sl = getattr(self, 'session_log', None)
+                if _sl:
+                    _sl.append(
+                        role="system",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        event="cache_warning",
+                        detail=f"cache_read={cr} cache_creation={cc} miss_pct={miss_pct:.0f}",
+                    )
+
             response = await self.agent.handle_input(
                 content,
                 room_id,
@@ -731,6 +769,8 @@ class MatrixBot:
                 on_tool_intent=_tool_intent,
                 thinking=_thinking_override,
                 on_thinking_delta=_thinking_delta,
+                on_cache_status=_cache_status,
+                cache_ttl=_cache_ttl,
             )
             if response and response.strip():
                 if self.session_log:
@@ -762,6 +802,8 @@ class MatrixBot:
                     on_tool_intent=_tool_intent,
                     thinking=_thinking_override,
                     on_thinking_delta=_thinking_delta,
+                    on_cache_status=_cache_status,
+                    cache_ttl=_cache_ttl,
                 )
                 if retry and retry.strip():
                     if self.session_log:
@@ -972,6 +1014,7 @@ class MatrixBot:
                 # Scan all entries — last override wins (user may have switched multiple times).
                 _restored_model = None
                 _restored_thinking = None
+                _restored_cache_ttl = None
                 for entry in existing:
                     if entry.get("role") == "system":
                         ev = entry.get("event")
@@ -984,6 +1027,12 @@ class MatrixBot:
                                 self._room_thinking = {}
                             self._room_thinking[room_id] = detail
                             _restored_thinking = detail
+                        elif ev == "cache_ttl_override" and detail:
+                            if not hasattr(self, "_room_cache_ttl"):
+                                self._room_cache_ttl = {}
+                            if detail != "5m":
+                                self._room_cache_ttl[room_id] = detail
+                            _restored_cache_ttl = detail
 
                 # Send session resume notice to Matrix
                 parts = [f"🔄 **Session resumed** — {len(existing)} prior entries"]
@@ -991,6 +1040,8 @@ class MatrixBot:
                     parts.append(f"Model override: `{_restored_model}`")
                 if _restored_thinking:
                     parts.append(f"Thinking: `{_restored_thinking}`")
+                if _restored_cache_ttl:
+                    parts.append(f"Cache TTL: `{_restored_cache_ttl}`")
                 try:
                     await self.send_notice(room_id, " · ".join(parts))
                 except Exception:
@@ -1236,6 +1287,7 @@ class MatrixBot:
             try:
                 # Resolve thinking level: room override > config
                 _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
+                _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
                 callbacks = {"send_media": _upload_callback}
 
                 # Set up streaming delivery
@@ -1279,6 +1331,42 @@ class MatrixBot:
                             }
                             await self._room_send_with_retry(room_id, content)
 
+                async def _cache_status(usage, model_str):
+                    """Emit in-room notice on significant prompt cache miss if provider opted in."""
+                    cr = usage.cache_read_tokens or 0
+                    cc = usage.cache_creation_tokens or 0
+                    # Only fire when a significant amount was re-cached
+                    if cc < 10000:
+                        return
+                    # Check if the provider has cache_bust_notices enabled
+                    try:
+                        from openalph.config import resolve_model
+                        provider_cfg, _ = resolve_model(model_str, self.agent.config.providers)
+                        if not provider_cfg.cache_bust_notices:
+                            return
+                    except Exception:
+                        return
+                    # Calculate miss percentage
+                    total = cr + cc
+                    miss_pct = (cc / total * 100) if total > 0 else 100
+                    # Format the notice
+                    notice = f"⚠️ Cache warning — {cc:,} tokens written, {cr:,} read ({miss_pct:.0f}% uncached)"
+                    try:
+                        await self.send_notice(room_id, notice)
+                    except Exception:
+                        pass
+                    # Log as system entry (excluded from LLM context)
+                    _sl = getattr(self, 'session_log', None)
+                    if _sl:
+                        _sl.append(
+                            role="system",
+                            sender=self.config.user_id,
+                            room=room_id,
+                            event_id=None,
+                            event="cache_warning",
+                            detail=f"cache_read={cr} cache_creation={cc} miss_pct={miss_pct:.0f}",
+                        )
+
                 response = await self.agent.handle_input(
                         body, room_id,
                         on_tool_call=_tool_notice,
@@ -1287,6 +1375,8 @@ class MatrixBot:
                         on_thinking_delta=_thinking_delta,
                         thinking=_thinking_override,
                         callbacks=callbacks,
+                        on_cache_status=_cache_status,
+                        cache_ttl=_cache_ttl,
                     )
                 # Append assistant response to session log
                 if response and response.strip():
@@ -1637,6 +1727,52 @@ class MatrixBot:
                     detail=level,
                 )
             await self.send(room_id, f"Thinking set to **{level}** for this room")
+            return
+
+        if body.startswith("/cache"):
+            parts = body.split(None, 1)
+            if len(parts) < 2:
+                # Show current cache TTL
+                current = self._room_cache_ttl.get(room_id)
+                if current:
+                    await self.send(room_id, f"Cache TTL: **{current}** (override)")
+                else:
+                    await self.send(room_id, "Cache TTL: **5m** (default)")
+                return
+            value = parts[1].strip().lower()
+            if value == "off":
+                value = "5m"
+            valid_values = ("5m", "1h")
+            if value not in valid_values:
+                await self.send(room_id, f"Invalid value. Use: `/cache 1h`, `/cache 5m`, or `/cache off`")
+                return
+            # Check if current model uses Anthropic provider
+            try:
+                from openalph.config import resolve_model
+                model_str = self.agent.get_model(room_id)
+                provider_cfg, _ = resolve_model(model_str, self.agent.config.providers)
+                if provider_cfg.type != "anthropic":
+                    await self.send(room_id,
+                        f"⚠️ Cache TTL only applies to Anthropic providers. "
+                        f"Current model `{model_str}` uses **{provider_cfg.type}**.")
+                    return
+            except Exception:
+                pass  # If we can't resolve, allow the command anyway
+            if value == "5m":
+                self._room_cache_ttl.pop(room_id, None)
+            else:
+                self._room_cache_ttl[room_id] = value
+            # Persist to JSONL
+            if self.session_log:
+                self.session_log.append(
+                    role="system",
+                    sender=event.sender,
+                    room=room_id,
+                    event_id=None,
+                    event="cache_ttl_override",
+                    detail=value,
+                )
+            await self.send(room_id, f"Cache TTL set to **{value}** for this room")
             return
 
         if body.startswith("/heartbeat"):

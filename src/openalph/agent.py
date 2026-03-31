@@ -246,7 +246,8 @@ class Agent:
     async def handle_input(self, text: str, room_id: str = "_default", *,
                            on_tool_call=None, on_tool_intent=None, thinking: str | None = None,
                            callbacks: dict | None = None,
-                           on_text_delta=None, on_thinking_delta=None) -> str:
+                           on_text_delta=None, on_thinking_delta=None,
+                           on_cache_status=None, cache_ttl: str | None = None) -> str:
         """Process a user message and return the assistant's response.
 
         Appends the user message to room history, calls the LLM, appends the
@@ -307,6 +308,7 @@ class Agent:
                         tools=tools_arg,
                         model=self.get_model(room_id),
                         thinking=thinking,
+                        cache_ttl=cache_ttl,
                     ):
                         if event.type == "text":
                             accumulated_text += event.content
@@ -362,6 +364,11 @@ class Agent:
                             cache_read_tokens=usage.cache_read_tokens,
                             cache_creation_tokens=usage.cache_creation_tokens,
                         )
+                        if on_cache_status:
+                            try:
+                                await on_cache_status(usage, self.get_model(room_id))
+                            except Exception:
+                                pass  # Never let observability crash the agent
                         assistant_msg = {"role": "assistant", "content": accumulated_text or response.content}
                         if accumulated_thinking or response.thinking:
                             thinking_blocks = response.thinking if response.thinking else []
@@ -445,6 +452,11 @@ class Agent:
                         cache_read_tokens=usage.cache_read_tokens,
                         cache_creation_tokens=usage.cache_creation_tokens,
                     )
+                    if on_cache_status:
+                        try:
+                            await on_cache_status(usage, self.get_model(room_id))
+                        except Exception:
+                            pass  # Never let observability crash the agent
 
                     # Append tool results to history (truncated + wrapped) and notify
                     for tc, result in zip(active_tool_calls, results):
@@ -484,6 +496,7 @@ class Agent:
                         tools=None,  # no tools — force text response
                         model=self.get_model(room_id),
                         thinking=thinking,
+                        cache_ttl=cache_ttl,
                     ):
                         if event.type == "text":
                             summary_text += event.content
@@ -497,6 +510,11 @@ class Agent:
                     if summary_response:
                         self.total_input_tokens += summary_response.usage.input_tokens
                         self.total_output_tokens += summary_response.usage.output_tokens
+                        if on_cache_status:
+                            try:
+                                await on_cache_status(summary_response.usage, self.get_model(room_id))
+                            except Exception:
+                                pass  # Never let observability crash the agent
 
                     final_text = summary_text or (
                         summary_response.content if summary_response else
