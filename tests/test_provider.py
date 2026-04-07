@@ -748,7 +748,8 @@ class TestOpenAIReasoning:
         assert response.thinking == []
 
 
-class TestBuildOpenaiKwargsRouting:
+class TestBuildOpenaiKwargs:
+    """Tests for _build_openai_kwargs provider capability flags."""
 
     def _base_args(self, **overrides):
         defaults = dict(
@@ -763,6 +764,8 @@ class TestBuildOpenaiKwargsRouting:
         defaults.update(overrides)
         return defaults
 
+    # --- Routing ---
+
     def test_routing_adds_provider_to_extra_body(self):
         """routing dict appears as extra_body.provider."""
         routing = {"quantizations": ["fp8", "fp16"]}
@@ -775,8 +778,73 @@ class TestBuildOpenaiKwargsRouting:
         assert "extra_body" not in kw
 
     def test_routing_and_thinking_both_in_extra_body(self):
-        """Both routing and thinking produce their keys in extra_body."""
+        """Both routing and thinking produce their keys in extra_body (OpenRouter)."""
         routing = {"quantizations": ["fp8"]}
-        kw = _build_openai_kwargs(**self._base_args(thinking_level="high", routing=routing))
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="high", routing=routing, provider_key="openrouter",
+        ))
         assert kw["extra_body"]["reasoning"] == {"effort": "high"}
         assert kw["extra_body"]["provider"] == routing
+
+    # --- max_tokens vs max_completion_tokens ---
+
+    def test_openai_uses_max_completion_tokens(self):
+        """Direct OpenAI provider sends max_completion_tokens, not max_tokens."""
+        kw = _build_openai_kwargs(**self._base_args(provider_key="openai"))
+        assert "max_completion_tokens" in kw
+        assert kw["max_completion_tokens"] == 1024
+        assert "max_tokens" not in kw
+
+    def test_google_uses_max_tokens(self):
+        """Direct Google provider sends max_tokens (not max_completion_tokens)."""
+        kw = _build_openai_kwargs(**self._base_args(provider_key="google"))
+        assert "max_tokens" in kw
+        assert kw["max_tokens"] == 1024
+        assert "max_completion_tokens" not in kw
+
+    def test_openrouter_uses_max_tokens(self):
+        """OpenRouter proxy sends max_tokens."""
+        kw = _build_openai_kwargs(**self._base_args(provider_key="openrouter"))
+        assert "max_tokens" in kw
+        assert "max_completion_tokens" not in kw
+
+    def test_default_provider_uses_max_tokens(self):
+        """Unknown/empty provider_key defaults to max_tokens."""
+        kw = _build_openai_kwargs(**self._base_args())
+        assert "max_tokens" in kw
+        assert "max_completion_tokens" not in kw
+
+    # --- frequency_penalty ---
+
+    def test_google_omits_frequency_penalty(self):
+        """Direct Google provider does not send frequency_penalty."""
+        kw = _build_openai_kwargs(**self._base_args(provider_key="google"))
+        assert "frequency_penalty" not in kw
+
+    def test_openai_includes_frequency_penalty(self):
+        """Direct OpenAI provider sends frequency_penalty."""
+        kw = _build_openai_kwargs(**self._base_args(provider_key="openai"))
+        assert "frequency_penalty" in kw
+
+    # --- reasoning extra_body ---
+
+    def test_openrouter_includes_reasoning(self):
+        """OpenRouter sends reasoning in extra_body when thinking is on."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="high", provider_key="openrouter",
+        ))
+        assert kw["extra_body"]["reasoning"] == {"effort": "high"}
+
+    def test_openai_omits_reasoning(self):
+        """Direct OpenAI does not send reasoning extra_body."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="high", provider_key="openai",
+        ))
+        assert "extra_body" not in kw
+
+    def test_google_omits_reasoning(self):
+        """Direct Google does not send reasoning extra_body."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="high", provider_key="google",
+        ))
+        assert "extra_body" not in kw

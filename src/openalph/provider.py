@@ -635,8 +635,17 @@ def _build_openai_kwargs(
     temperature: float | None = None,
     top_p: float | None = None,
     routing: dict | None = None,
+    provider_key: str = "",
 ) -> dict:
     """Build kwargs for OpenAI chat completions API."""
+    # Provider capability flags — OpenRouter proxies handle unknown params gracefully,
+    # but direct APIs (OpenAI, Google) reject params they don't support.
+    _supports_frequency_penalty = provider_key not in ("google",)
+    _supports_reasoning_extra = provider_key in ("openrouter", "macstudio")
+    # OpenAI deprecated max_tokens in favor of max_completion_tokens (o1+, GPT-5+).
+    # Google and OpenRouter still use max_tokens.
+    _uses_max_completion_tokens = provider_key in ("openai",)
+
     # Handle quirks
     if "no_system_role" in quirks:
         # Fold system into first user message instead of separate system role
@@ -653,12 +662,14 @@ def _build_openai_kwargs(
         # Normal: prepend system message to messages list
         messages_with_system = [{"role": "system", "content": system}] + provider_messages
     
+    _token_key = "max_completion_tokens" if _uses_max_completion_tokens else "max_tokens"
     api_kwargs = {
         "model": api_model,
         "messages": messages_with_system,
-        "max_tokens": max_tokens,
-        "frequency_penalty": _DEFAULT_FREQUENCY_PENALTY,
+        _token_key: max_tokens,
     }
+    if _supports_frequency_penalty:
+        api_kwargs["frequency_penalty"] = _DEFAULT_FREQUENCY_PENALTY
     if provider_tools:
         api_kwargs["tools"] = provider_tools
     
@@ -668,9 +679,10 @@ def _build_openai_kwargs(
     if top_p is not None:
         api_kwargs["top_p"] = top_p
 
-    # Build extra_body incrementally
+    # Build extra_body incrementally — reasoning and provider routing are
+    # OpenRouter extensions, not part of the standard OpenAI API.
     extra_body = {}
-    if thinking_level != "off":
+    if thinking_level != "off" and _supports_reasoning_extra:
         extra_body["reasoning"] = {"effort": thinking_level}
     if routing:
         extra_body["provider"] = routing
@@ -804,6 +816,7 @@ async def stream(
             temperature=getattr(config, "temperature", None),
             top_p=getattr(config, "top_p", None),
             routing=provider_cfg.routing,
+            provider_key=provider_cfg.key,
         )
         
         # Add streaming-specific kwargs
