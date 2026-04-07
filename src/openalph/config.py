@@ -71,17 +71,35 @@ class AgentConfig:
     temperature: float | None = None
     top_p: float | None = None
     model_limits: dict[str, int] = field(default_factory=dict)
+    model_aliases: dict[str, str] = field(default_factory=dict)
 
 
-def resolve_model(model_str: str, providers: dict[str, ProviderConfig]) -> tuple[ProviderConfig, str]:
+def resolve_model(
+    model_str: str,
+    providers: dict[str, ProviderConfig],
+    aliases: dict[str, str] | None = None,
+) -> tuple[ProviderConfig, str]:
     """Returns (provider_config, api_model_name).
 
-    Model strings MUST be fully qualified: "<provider_key>/<api_model_name>".
+    If model_str contains no "/" and aliases is provided, look up alias first.
+    Otherwise model_str MUST be fully qualified: "<provider_key>/<api_model_name>".
     Split on the first "/". The prefix must match a key in providers.
     Everything after the first "/" is the API model name (may contain more slashes).
     """
     if not model_str:
         raise ValueError("Model string cannot be empty")
+
+    # Alias expansion: bare name (no "/") with aliases dict
+    if "/" not in model_str and aliases:
+        if model_str in aliases:
+            model_str = aliases[model_str]
+        else:
+            available = ", ".join(sorted(aliases.keys()))
+            raise ValueError(
+                f"Unknown model alias '{model_str}'. "
+                f"Available aliases: {available}"
+            )
+
     prefix, sep, remainder = model_str.partition("/")
     if not sep:
         raise ValueError(
@@ -347,6 +365,15 @@ def load_config(path: Path) -> AgentConfig:
                 if isinstance(limit, int) and limit > 0:
                     model_limits[model_name] = limit
 
+    # Parse optional [model_aliases] section
+    model_aliases = {}
+    if "model_aliases" in toml_data:
+        aliases_section = toml_data["model_aliases"]
+        if isinstance(aliases_section, dict):
+            for alias, target in aliases_section.items():
+                if isinstance(target, str):
+                    model_aliases[alias] = target
+
     # Parse optional [matrix] section
     matrix = _parse_matrix_config(toml_data)
 
@@ -366,6 +393,7 @@ def load_config(path: Path) -> AgentConfig:
         temperature=temperature,
         top_p=top_p,
         model_limits=model_limits,
+        model_aliases=model_aliases,
     )
 
 

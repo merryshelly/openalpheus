@@ -404,7 +404,11 @@ def cmd_showprompt(args):
         print(f"Failed to read config: {e}", file=sys.stderr)
         sys.exit(1)
 
-    prompt = assemble_prompt(workspace)
+    # Extract model aliases for prompt assembly
+    aliases_section = toml_data.get("model_aliases", {})
+    model_aliases = {k: v for k, v in aliases_section.items() if isinstance(v, str)}
+
+    prompt = assemble_prompt(workspace, model_aliases=model_aliases)
     if prompt:
         print(prompt)
     else:

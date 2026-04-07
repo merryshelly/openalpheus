@@ -138,7 +138,10 @@ class Agent:
         # Build the system prompt once at init — it won't change mid-conversation.
         # This reads workspace files (SOUL.md, OPERATOR.md, etc.) and builds a
         # skills index, all determined by the workspace directory in config.
-        self.system_prompt = assemble_prompt(config.workspace)
+        self.system_prompt = assemble_prompt(
+            config.workspace,
+            model_aliases=config.model_aliases,
+        )
         self._rooms: dict[str, list[dict]] = {}  # room_id → history
         self.total_input_tokens = 0
         self.total_output_tokens = 0
@@ -176,7 +179,7 @@ class Agent:
 
         # Validate the model can be resolved
         try:
-            resolve_model(model_str, self.config.providers)
+            resolve_model(model_str, self.config.providers, aliases=self.config.model_aliases)
         except ValueError as e:
             return str(e)
 

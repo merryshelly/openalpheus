@@ -99,6 +99,20 @@ def _event_id_hash(event_id: str) -> str:
     """
     return hashlib.sha256(event_id.encode()).hexdigest()[:16]
 
+def format_model_list(aliases: dict[str, str], current_model: str) -> str:
+    """Format model alias table for /model list output."""
+    lines = [f"**Current model:** `{current_model}`\n"]
+    if aliases:
+        lines.append("| Alias | Model |")
+        lines.append("|-------|-------|")
+        for alias in sorted(aliases):
+            marker = " ◀" if aliases[alias] == current_model else ""
+            lines.append(f"| `{alias}` | `{aliases[alias]}`{marker} |")
+    else:
+        lines.append("No model aliases configured.")
+    return "\n".join(lines)
+
+
 class StreamingDelivery:
     """Manages progressive message delivery via Matrix message edits."""
 
@@ -760,7 +774,7 @@ class MatrixBot:
                 # Check if the provider has cache_bust_notices enabled
                 try:
                     from openalph.config import resolve_model
-                    provider_cfg, _ = resolve_model(model_str, self.agent.config.providers)
+                    provider_cfg, _ = resolve_model(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases)
                     if not provider_cfg.cache_bust_notices:
                         return
                 except Exception:
@@ -1389,7 +1403,7 @@ class MatrixBot:
                     # Check if the provider has cache_bust_notices enabled
                     try:
                         from openalph.config import resolve_model
-                        provider_cfg, _ = resolve_model(model_str, self.agent.config.providers)
+                        provider_cfg, _ = resolve_model(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases)
                         if not provider_cfg.cache_bust_notices:
                             return
                     except Exception:
@@ -1726,9 +1740,15 @@ class MatrixBot:
         if body.startswith("/model"):
             parts = body.split(None, 1)
             if len(parts) < 2:
-                await self.send(room_id, "Usage: `/model <provider/model-name>`")
+                await self.send(room_id, "Usage: `/model <name-or-alias>` or `/model list`")
                 return
-            new_model = parts[1].strip()
+            arg = parts[1].strip()
+            if arg == "list":
+                current = self.agent.get_model(room_id)
+                output = format_model_list(self.agent.config.model_aliases, current)
+                await self.send(room_id, output)
+                return
+            new_model = arg
             error = self.agent.switch_model(new_model, room_id)
             if error:
                 await self.send(room_id, f"\u26a0\ufe0f {error}")
@@ -1798,7 +1818,7 @@ class MatrixBot:
             try:
                 from openalph.config import resolve_model
                 model_str = self.agent.get_model(room_id)
-                provider_cfg, _ = resolve_model(model_str, self.agent.config.providers)
+                provider_cfg, _ = resolve_model(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases)
                 if provider_cfg.type != "anthropic":
                     await self.send(room_id,
                         f"⚠️ Cache TTL only applies to Anthropic providers. "

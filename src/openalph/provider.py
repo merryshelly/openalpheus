@@ -710,7 +710,9 @@ async def stream(
     """
     # Resolve model string to provider and API model name
     model_str = model or config.default_model
-    provider_cfg, api_model = resolve_model(model_str, config.providers)
+    provider_cfg, api_model = resolve_model(
+        model_str, config.providers, aliases=config.model_aliases,
+    )
     
     # Convert messages to provider-native format
     provider_messages = _convert_messages_for_provider(messages, provider_cfg.type)
