@@ -547,7 +547,7 @@ def _parse_openai_response(response) -> Response:
     
     # Extract reasoning (OpenRouter extension) into thinking blocks
     thinking_blocks = []
-    reasoning = getattr(message, 'reasoning', None)
+    reasoning = getattr(message, 'reasoning', None) or getattr(message, 'reasoning_content', None)
     if isinstance(reasoning, str) and reasoning:
         thinking_blocks.append(ThinkingBlock(thinking=reasoning, signature=""))
 
@@ -844,7 +844,7 @@ async def stream(
                         accumulated_text += delta.content
                     
                     # Handle reasoning (OpenRouter extension)
-                    reasoning_text = getattr(delta, 'reasoning', None)
+                    reasoning_text = getattr(delta, 'reasoning', None) or getattr(delta, 'reasoning_content', None)
                     if isinstance(reasoning_text, str) and reasoning_text:
                         yield StreamEvent(type="thinking", content=reasoning_text)
                         accumulated_reasoning += reasoning_text

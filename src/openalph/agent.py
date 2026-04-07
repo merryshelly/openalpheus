@@ -368,7 +368,7 @@ class Agent:
                             try:
                                 await on_cache_status(usage, self.get_model(room_id))
                             except Exception:
-                                pass  # Never let observability crash the agent
+                                logger.error("on_cache_status callback failed", exc_info=True)
                         assistant_msg = {"role": "assistant", "content": accumulated_text or response.content}
                         if accumulated_thinking or response.thinking:
                             thinking_blocks = response.thinking if response.thinking else []
@@ -456,7 +456,7 @@ class Agent:
                         try:
                             await on_cache_status(usage, self.get_model(room_id))
                         except Exception:
-                            pass  # Never let observability crash the agent
+                            logger.error("on_cache_status callback failed", exc_info=True)
 
                     # Append tool results to history (truncated + wrapped) and notify
                     for tc, result in zip(active_tool_calls, results):
@@ -514,7 +514,7 @@ class Agent:
                             try:
                                 await on_cache_status(summary_response.usage, self.get_model(room_id))
                             except Exception:
-                                pass  # Never let observability crash the agent
+                                logger.error("on_cache_status callback failed", exc_info=True)
 
                     final_text = summary_text or (
                         summary_response.content if summary_response else

@@ -613,6 +613,8 @@ class MatrixBot:
 
         # -- tool-use callbacks (same as normal message path) --
 
+        _subagent_start_times: dict[str, float] = {}
+
         async def _tool_notice(call_id, name, input_data, result, is_error):
             status = "❌ error" if is_error else "✅"
             detail = ""
@@ -630,7 +632,17 @@ class MatrixBot:
                 task_preview = input_data.get("task", "")[:500]
                 model_info = input_data.get("model", "default")
                 result_preview = str(result)[:2000] if result else ""
-                summary_line = f"🤖 subagent ({model_info}) {status}"
+                # Calculate elapsed time if we have a start timestamp
+                elapsed_str = ""
+                start_ts = _subagent_start_times.pop(call_id, None)
+                if start_ts is not None:
+                    elapsed = time.monotonic() - start_ts
+                    if elapsed >= 60:
+                        mins, secs = divmod(int(elapsed), 60)
+                        elapsed_str = f" — {mins}m{secs:02d}s"
+                    else:
+                        elapsed_str = f" — {elapsed:.1f}s"
+                summary_line = f"🤖 subagent ({model_info}) {status}{elapsed_str}"
                 html = f'<b>{summary_line}</b>'
                 if task_preview:
                     html += (
@@ -673,6 +685,18 @@ class MatrixBot:
                 )
 
         async def _tool_intent(tool_calls, content_text):
+            # Emit Matrix notice for subagent dispatch
+            for tc in tool_calls:
+                if tc.name == "subagent" and isinstance(tc.input, dict):
+                    _subagent_start_times[tc.id] = time.monotonic()
+                    task_preview = tc.input.get("task", "")[:200]
+                    model_info = tc.input.get("model", "default")
+                    iters = tc.input.get("max_iterations", 200)
+                    notice = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters): {task_preview}"
+                    try:
+                        await self.send_notice(room_id, notice)
+                    except Exception:
+                        pass
             _sl = getattr(self, 'session_log', None)
             if _sl:
                 _sl.append(
@@ -748,8 +772,8 @@ class MatrixBot:
                 notice = f"⚠️ Cache warning — {cc:,} tokens written, {cr:,} read ({miss_pct:.0f}% uncached)"
                 try:
                     await self.send_notice(room_id, notice)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error("Cache warning send_notice failed in %s: %s", room_id, exc, exc_info=True)
                 # Log as system entry (excluded from LLM context)
                 _sl = getattr(self, 'session_log', None)
                 if _sl:
@@ -1197,6 +1221,8 @@ class MatrixBot:
             await self._set_typing(room_id, True)
 
             # Wire tool visibility for this turn
+            _subagent_start_times: dict[str, float] = {}
+
             async def _tool_notice(call_id, name, input_data, result, is_error):
                 # Show tool name + brief input context, but NEVER output
                 # (which may contain secrets from op read, API responses, etc.)
@@ -1221,7 +1247,17 @@ class MatrixBot:
                     task_preview = input_data.get("task", "")[:500]
                     model_info = input_data.get("model", "default")
                     result_preview = str(result)[:2000] if result else ""
-                    summary_line = f"🤖 subagent ({model_info}) {status}"
+                    # Calculate elapsed time if we have a start timestamp
+                    elapsed_str = ""
+                    start_ts = _subagent_start_times.pop(call_id, None)
+                    if start_ts is not None:
+                        elapsed = time.monotonic() - start_ts
+                        if elapsed >= 60:
+                            mins, secs = divmod(int(elapsed), 60)
+                            elapsed_str = f" — {mins}m{secs:02d}s"
+                        else:
+                            elapsed_str = f" — {elapsed:.1f}s"
+                    summary_line = f"🤖 subagent ({model_info}) {status}{elapsed_str}"
                     html = f'<b>{summary_line}</b>'
                     if task_preview:
                         html += (
@@ -1266,6 +1302,18 @@ class MatrixBot:
 
             # Wire tool intent logging (fires before tool execution)
             async def _tool_intent(tool_calls, content):
+                # Emit Matrix notice for subagent dispatch
+                for tc in tool_calls:
+                    if tc.name == "subagent" and isinstance(tc.input, dict):
+                        _subagent_start_times[tc.id] = time.monotonic()
+                        task_preview = tc.input.get("task", "")[:200]
+                        model_info = tc.input.get("model", "default")
+                        iters = tc.input.get("max_iterations", 200)
+                        notice = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters): {task_preview}"
+                        try:
+                            await self.send_notice(room_id, notice)
+                        except Exception:
+                            pass
                 _sl = getattr(self, 'session_log', None)
                 if _sl:
                     _sl.append(
@@ -1353,8 +1401,8 @@ class MatrixBot:
                     notice = f"⚠️ Cache warning — {cc:,} tokens written, {cr:,} read ({miss_pct:.0f}% uncached)"
                     try:
                         await self.send_notice(room_id, notice)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.error("Cache warning send_notice failed in %s: %s", room_id, exc, exc_info=True)
                     # Log as system entry (excluded from LLM context)
                     _sl = getattr(self, 'session_log', None)
                     if _sl:
