@@ -201,6 +201,33 @@ class SessionLog:
         if path.exists():
             path.write_text("")
 
+    def strippable_stats(self, room_id: str) -> tuple[int, int]:
+        """Count tool results not yet covered by a toolstrip marker.
+
+        Returns:
+            (count, total_chars) of tool result entries that would be
+            affected by a new /cache toolstrip command.
+        """
+        entries = self.read(room_id)
+
+        # Find the current strip boundary (max entry_index from any toolstrip
+        # marker), or -1 if none.
+        strip_boundary = -1
+        for entry in entries:
+            if entry.get("role") == "system" and entry.get("event") == "toolstrip":
+                idx = entry.get("entry_index", -1)
+                if idx > strip_boundary:
+                    strip_boundary = idx
+
+        count = 0
+        total_chars = 0
+        for entry_idx, entry in enumerate(entries):
+            if entry.get("role") == "tool" and entry_idx > strip_boundary:
+                count += 1
+                total_chars += len(entry.get("output", ""))
+
+        return count, total_chars
+
     def build_context(self, room_id: str, *, skip_system: bool = True) -> list[dict]:
         """Build LLM conversation context from JSONL entries.
 
@@ -220,7 +247,18 @@ class SessionLog:
         entries = self.read(room_id)
         context = []
 
+        # Scan for toolstrip markers to determine the strip boundary.
+        # The boundary is the maximum entry_index stored in any toolstrip
+        # system entry.  Entries at JSONL positions < boundary get lightweight
+        # placeholder content instead of full output.  -1 means no stripping.
+        strip_boundary = -1
         for entry in entries:
+            if entry.get("role") == "system" and entry.get("event") == "toolstrip":
+                idx = entry.get("entry_index", -1)
+                if idx > strip_boundary:
+                    strip_boundary = idx
+
+        for entry_idx, entry in enumerate(entries):
             role = entry.get("role")
 
             if role == "system":
@@ -246,24 +284,52 @@ class SessionLog:
                     # Rehydrate dicts back to ToolCall objects so the
                     # provider serialisation path (tc.id, tc.name, tc.input)
                     # works unchanged.
-                    msg["tool_calls"] = [
-                        ToolCall(
-                            id=tc.get("call_id") or tc.get("id", ""),
-                            name=tc.get("name", ""),
-                            input=tc.get("input", {}),
-                        )
-                        for tc in entry["tool_calls"]
-                    ]
+                    if strip_boundary >= 0 and entry_idx < strip_boundary:
+                        # Before the strip boundary: replace any large string
+                        # input values with compact placeholders.
+                        tool_calls = []
+                        for tc in entry["tool_calls"]:
+                            raw_input = tc.get("input", {})
+                            stripped_input = {
+                                k: (f"[stripped: {len(v)} chars]"
+                                    if isinstance(v, str) and len(v) > 500
+                                    else v)
+                                for k, v in raw_input.items()
+                            }
+                            tool_calls.append(ToolCall(
+                                id=tc.get("call_id") or tc.get("id", ""),
+                                name=tc.get("name", ""),
+                                input=stripped_input,
+                            ))
+                    else:
+                        tool_calls = [
+                            ToolCall(
+                                id=tc.get("call_id") or tc.get("id", ""),
+                                name=tc.get("name", ""),
+                                input=tc.get("input", {}),
+                            )
+                            for tc in entry["tool_calls"]
+                        ]
+                    msg["tool_calls"] = tool_calls
                 if entry.get("thinking"):
                     msg["thinking"] = entry["thinking"]
                 context.append(msg)
 
             elif role == "tool":
-                # Map call_id → tool_call_id to match agent.py format
+                # Map call_id → tool_call_id to match agent.py format.
+                # Before the strip boundary, replace full output with a
+                # lightweight placeholder (JSONL is never touched).
+                if strip_boundary >= 0 and entry_idx < strip_boundary:
+                    original_output = entry.get("output", "")
+                    name = entry.get("name", "tool")
+                    n = len(original_output)
+                    output = f"[stripped: {name} result, {n} chars]"
+                else:
+                    output = entry.get("output", "")
                 tool_entry = {
                     "role": "tool",
                     "tool_call_id": entry.get("call_id"),
-                    "content": entry.get("output", ""),
+                    "content": output,
                 }
                 if entry.get("is_error"):
                     tool_entry["is_error"] = True

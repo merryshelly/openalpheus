@@ -1817,6 +1817,14 @@ class MatrixBot:
                 f"| **Thinking** | {_thinking} |",
                 f"| **Cache TTL** | {_cache_ttl} |",
             ]
+            # Add strippable stats if session log available
+            if getattr(self, 'session_log', None):
+                try:
+                    s_count, s_chars = self.session_log.strippable_stats(room_id)
+                    if s_count > 0:
+                        lines.append(f"| **Strippable** | {s_count} tool results, ~{s_chars:,} chars |")
+                except Exception:
+                    pass
             await self.send(room_id, "\n".join(lines))
             return
 
@@ -1883,14 +1891,60 @@ class MatrixBot:
         if body.startswith("/cache"):
             parts = body.split(None, 1)
             if len(parts) < 2:
-                # Show current cache TTL
+                # Show current cache status: TTL + toolstrip state
                 current = self._room_cache_ttl.get(room_id)
-                if current:
-                    await self.send(room_id, f"Cache TTL: **{current}** (override)")
-                else:
-                    await self.send(room_id, "Cache TTL: **5m** (default)")
+                ttl_line = f"Cache TTL: **{current}** (override)" if current else "Cache TTL: **5m** (default)"
+                strip_line = "Toolstrip: none"
+                if self.session_log:
+                    entries = self.session_log.read(room_id)
+                    strip_markers = [
+                        e.get("entry_index", 0) for e in entries
+                        if e.get("role") == "system" and e.get("event") == "toolstrip"
+                    ]
+                    if strip_markers:
+                        boundary = max(strip_markers)
+                        # Count what was stripped
+                        stripped_count = sum(
+                            1 for i, e in enumerate(entries)
+                            if e.get("role") == "tool" and i < boundary
+                        )
+                        strip_line = f"Toolstrip: active at entry {boundary} ({stripped_count} tool results stripped)"
+                await self.send(room_id, f"{ttl_line}\n{strip_line}")
                 return
             value = parts[1].strip().lower()
+            if value == "toolstrip":
+                # /cache toolstrip — mark strip point
+                if self.session_log:
+                    entries = self.session_log.read(room_id)
+                    entry_count = len(entries)
+                    # Compute what will be stripped
+                    # Respect existing strip boundary
+                    existing_markers = [
+                        e.get("entry_index", 0) for e in entries
+                        if e.get("role") == "system" and e.get("event") == "toolstrip"
+                    ]
+                    existing_boundary = max(existing_markers) if existing_markers else -1
+                    new_count = 0
+                    new_chars = 0
+                    for i, e in enumerate(entries):
+                        if e.get("role") == "tool" and i > existing_boundary:
+                            new_count += 1
+                            new_chars += len(e.get("output", ""))
+                    # Append the marker
+                    self.session_log.append(
+                        role="system",
+                        sender=event.sender,
+                        room=room_id,
+                        event_id=None,
+                        event="toolstrip",
+                        entry_index=entry_count,
+                    )
+                    msg = f"Toolstrip applied. Stripped {new_count} tool results (~{new_chars:,} chars) from context."
+                    msg += "\n⚠️ Previously loaded skills were stripped — re-read any skills needed for ongoing work."
+                    await self.send(room_id, msg)
+                else:
+                    await self.send(room_id, "⚠️ No session log available.")
+                return
             if value == "off":
                 value = "5m"
             valid_values = ("5m", "1h")
