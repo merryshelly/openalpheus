@@ -126,7 +126,7 @@ class TestSystemPrompt:
 
     @pytest.mark.asyncio
     async def test_custom_system_prompt(self):
-        """Explicit system_prompt is used instead of default."""
+        """Explicit system_prompt is appended after safety preamble."""
         config = make_config()
         with patch(
             "openalph.tools.subagent.complete",
@@ -140,7 +140,14 @@ class TestSystemPrompt:
             )
 
         call_kwargs = mock_complete.call_args.kwargs
-        assert call_kwargs["system"] == "You are a code reviewer."
+        system = call_kwargs["system"]
+        # Custom prompt is included in the system prompt
+        assert "You are a code reviewer." in system
+        # Safety preamble is also present (if the preamble file exists)
+        # The custom prompt comes after the preamble, separated by ---
+        if "\n\n---\n\n" in system:
+            parts = system.split("\n\n---\n\n", 1)
+            assert parts[1] == "You are a code reviewer."
 
 
 class TestModelOverride:

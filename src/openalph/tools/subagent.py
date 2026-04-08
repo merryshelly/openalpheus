@@ -8,6 +8,7 @@ a circuit breaker limit (default 100 iterations).
 import asyncio
 import logging
 from dataclasses import replace
+from pathlib import Path
 
 from openalph.provider import complete
 from openalph.tools import ToolDef, ToolResult, tool_schemas, truncate_result, wrap_tool_result
@@ -16,6 +17,35 @@ from openalph.config import AgentConfig
 logger = logging.getLogger("openalph.subagent")
 
 MAX_ITERATIONS = 200
+
+# Safety preamble loaded once at import time — shared across all subagent invocations.
+# This file contains hard safety constraints that every subagent must follow.
+_PREAMBLE_PATH = Path("/srv/openalph/shared/skills/subagent-preamble.md")
+_SAFETY_PREAMBLE: str | None = None
+
+def _load_safety_preamble() -> str:
+    """Load the safety preamble from disk, caching after first read."""
+    global _SAFETY_PREAMBLE
+    if _SAFETY_PREAMBLE is None:
+        try:
+            _SAFETY_PREAMBLE = _PREAMBLE_PATH.read_text().strip()
+            logger.info("Loaded subagent safety preamble (%d chars)", len(_SAFETY_PREAMBLE))
+        except FileNotFoundError:
+            logger.warning("Subagent safety preamble not found at %s", _PREAMBLE_PATH)
+            _SAFETY_PREAMBLE = ""
+        except Exception as e:
+            logger.warning("Failed to load subagent safety preamble: %s", e)
+            _SAFETY_PREAMBLE = ""
+    return _SAFETY_PREAMBLE
+
+
+def _build_system_prompt(custom_prompt: str | None) -> str:
+    """Build the full system prompt: safety preamble + custom/default prompt."""
+    preamble = _load_safety_preamble()
+    user_part = custom_prompt if custom_prompt is not None else ""
+    if preamble and user_part:
+        return f"{preamble}\n\n---\n\n{user_part}"
+    return preamble or user_part or "You are a helpful assistant."
 
 
 async def run_subagent(
@@ -33,11 +63,15 @@ async def run_subagent(
     gets the parent's tools minus 'subagent' (max depth = 1). Iterates
     until a text response or the circuit breaker fires.
 
+    The safety preamble from /srv/openalph/shared/skills/subagent-preamble.md
+    is always prepended to the system prompt. Custom system prompts are
+    appended after the preamble.
+
     Args:
         task: The task description for the sub-agent
         config: Parent agent's configuration (API key, provider, model)
         tools: Parent's tool list (subagent tool will be filtered out)
-        system_prompt: Custom system prompt (default: "You are a helpful assistant.")
+        system_prompt: Custom system prompt (appended after safety preamble)
         model: Model override (default: use parent's model)
         max_tokens: Max tokens override (default: use parent's max_tokens)
         max_iterations: Max tool-call iterations (default: MAX_ITERATIONS)
@@ -45,8 +79,8 @@ async def run_subagent(
     Returns:
         ToolResult with the LLM's response content, or error description on failure
     """
-    # Use default system prompt if not provided
-    system = system_prompt if system_prompt is not None else "You are a helpful assistant."
+    # Build system prompt: safety preamble + custom/default
+    system = _build_system_prompt(system_prompt)
 
     # Handle model override by creating a new config with the overridden model
     if model is not None:

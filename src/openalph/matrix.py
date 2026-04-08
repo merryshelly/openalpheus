@@ -800,6 +800,27 @@ class MatrixBot:
                         detail=f"cache_read={cr} cache_creation={cc} miss_pct={miss_pct:.0f}",
                     )
 
+            async def _redaction_notice(tool_name, events):
+                """Emit in-room notice when credentials are redacted from tool output."""
+                for event in events:
+                    notice = f"🔒 Credential redacted in {tool_name} output: {event.pattern_name} ({event.char_count} chars)"
+                    try:
+                        await self.send_notice(room_id, notice)
+                    except Exception as exc:
+                        logger.error("Redaction notice failed in %s: %s", room_id, exc, exc_info=True)
+                    _sl = getattr(self, 'session_log', None)
+                    if _sl:
+                        _sl.append(
+                            role="system",
+                            sender=self.config.user_id,
+                            room=room_id,
+                            event_id=None,
+                            event="credential_redaction",
+                            detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
+                        )
+
+            callbacks = {"on_redaction": _redaction_notice}
+
             response = await self.agent.handle_input(
                 content,
                 room_id,
@@ -809,6 +830,7 @@ class MatrixBot:
                 on_thinking_delta=_thinking_delta,
                 on_cache_status=_cache_status,
                 cache_ttl=_cache_ttl,
+                callbacks=callbacks,
             )
             if response and response.strip():
                 if self.session_log:
@@ -870,7 +892,7 @@ class MatrixBot:
 
     async def _inject_heartbeat(self, room_id: str) -> None:
         """Process a heartbeat as if the agent received a wake message."""
-        heartbeat_content = "Heartbeat: execute your WAKE instructions."
+        heartbeat_content = "[Automated heartbeat — operator may not be present. Execute your WAKE instructions.]"
 
         # Post to Matrix so the operator can see heartbeat triggers
         await self.send_notice(room_id, "💓 Heartbeat")
@@ -906,7 +928,7 @@ class MatrixBot:
 
     async def _inject_umbral(self, room_id: str) -> None:
         """Execute an umbral turn: heartbeat + context rotation."""
-        heartbeat_content = "Heartbeat: execute your WAKE instructions."
+        heartbeat_content = "[Automated heartbeat — operator may not be present. Execute your WAKE instructions.]"
 
         await self.send_notice(room_id, "🌑 Umbral turn beginning")
 
@@ -1350,7 +1372,25 @@ class MatrixBot:
                 # Resolve thinking level: room override > config
                 _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
                 _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
-                callbacks = {"send_media": _upload_callback}
+                async def _redaction_notice(tool_name, events):
+                    """Emit in-room notice when credentials are redacted from tool output."""
+                    for event in events:
+                        notice = f"🔒 Credential redacted in {tool_name} output: {event.pattern_name} ({event.char_count} chars)"
+                        try:
+                            await self.send_notice(room_id, notice)
+                        except Exception as exc:
+                            logger.error("Redaction notice failed in %s: %s", room_id, exc, exc_info=True)
+                        if session_log:
+                            session_log.append(
+                                role="system",
+                                sender=self.config.user_id,
+                                room=room_id,
+                                event_id=None,
+                                event="credential_redaction",
+                                detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
+                            )
+
+                callbacks = {"send_media": _upload_callback, "on_redaction": _redaction_notice}
 
                 # Set up streaming delivery
                 streaming = StreamingDelivery(self, room_id)

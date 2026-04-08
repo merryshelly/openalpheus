@@ -461,7 +461,7 @@ async def execute_tool(
 
     if name == "shell":
         from .shell import run_shell
-        return await run_shell(
+        result = await run_shell(
             command=input["command"],
             cwd=input.get("cwd"),
             env=input.get("env"),
@@ -470,20 +470,20 @@ async def execute_tool(
         )
     elif name == "file_read":
         from .file import read_file
-        return await read_file(
+        result = await read_file(
             path=input["path"],
             offset=input.get("offset"),
             limit=input.get("limit"),
         )
     elif name == "file_write":
         from .file import write_file
-        return await write_file(
+        result = await write_file(
             path=input["path"],
             content=input["content"],
         )
     elif name == "file_edit":
         from .file import edit_file
-        return await edit_file(
+        result = await edit_file(
             path=input["path"],
             old_text=input["old_text"],
             new_text=input["new_text"],
@@ -495,21 +495,21 @@ async def execute_tool(
         if not api_key and "api_key_cmd" in tool_config:
             import subprocess
             try:
-                result = subprocess.run(
+                proc = subprocess.run(
                     tool_config["api_key_cmd"], shell=True,
                     capture_output=True, text=True, timeout=10,
                 )
-                if result.returncode != 0:
+                if proc.returncode != 0:
                     logger.warning(
                         "api_key_cmd returned exit code %d: %s",
-                        result.returncode, result.stderr.strip(),
+                        proc.returncode, proc.stderr.strip(),
                     )
-                api_key = result.stdout.strip()
+                api_key = proc.stdout.strip()
             except subprocess.TimeoutExpired:
                 logger.warning("api_key_cmd timed out after 10 seconds")
             except Exception as e:
                 logger.warning("api_key_cmd failed: %s", e)
-        return await web_search(
+        result = await web_search(
             query=input["query"],
             count=input.get("count", 5),
             api_key=api_key,
@@ -517,13 +517,13 @@ async def execute_tool(
         )
     elif name == "web_fetch":
         from .web import web_fetch
-        return await web_fetch(
+        result = await web_fetch(
             url=input["url"],
             max_chars=input.get("max_chars"),
         )
     elif name == "subagent":
         from .subagent import run_subagent
-        return await run_subagent(
+        result = await run_subagent(
             task=input["task"],
             config=agent_config,
             tools=tools,
@@ -534,7 +534,7 @@ async def execute_tool(
         )
     elif name == "memory_search":
         from .memory_search import run_memory_search
-        return await run_memory_search(
+        result = await run_memory_search(
             query=input["query"],
             config=tool_config,
             workspace=agent_config.workspace if hasattr(agent_config, "workspace") else Path("."),
@@ -543,7 +543,7 @@ async def execute_tool(
         )
     elif name == "send_media":
         from .media import send_media
-        return await send_media(
+        result = await send_media(
             path=input["path"],
             caption=input.get("caption"),
             max_upload_bytes=tool_config.get("max_upload_bytes", 20_971_520),
@@ -554,3 +554,21 @@ async def execute_tool(
             content=f"Unknown tool: {name}",
             is_error=True,
         )
+
+    # Redact credentials from tool output
+    from .security import redact_credentials as _redact_credentials
+    redacted_content, redaction_events = _redact_credentials(result.content)
+    if redaction_events:
+        result = ToolResult(content=redacted_content, is_error=result.is_error)
+        for event in redaction_events:
+            logger.warning(
+                "Credential redacted in %s output: %s (%d chars)",
+                name, event.pattern_name, event.char_count,
+            )
+        if callbacks and "on_redaction" in callbacks:
+            try:
+                await callbacks["on_redaction"](name, redaction_events)
+            except Exception as e:
+                logger.warning("on_redaction callback failed: %s", e)
+
+    return result
