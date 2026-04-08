@@ -234,6 +234,25 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "extra_paths": []
         }
     },
+    "context_status": {
+        "description": (
+            "Get agent self-monitoring data: context window usage, session age, "
+            "model info, token stats, and heartbeat state. Use to make decisions "
+            "about delegation, context management, and turn planning. No parameters "
+            "required — returns current status as JSON."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "room_id": {
+                    "type": "string",
+                    "description": "Room ID (injected by framework, do not set manually)"
+                }
+            },
+            "required": []
+        },
+        "config": {}
+    },
     "send_media": {
         "description": (
             "Send a file to the current Matrix room. Supports audio, images, "
@@ -541,6 +560,19 @@ async def execute_tool(
             max_results=input.get("max_results", 10),
             min_score=input.get("min_score", 0.1),
         )
+    elif name == "context_status":
+        import json as _json
+        cb = callbacks.get("context_status") if callbacks else None
+        if not cb:
+            return ToolResult(
+                content="context_status requires a callback from the matrix layer.",
+                is_error=True,
+            )
+        try:
+            status_data = await cb(input.get("room_id"))
+            result = ToolResult(content=_json.dumps(status_data, indent=2))
+        except Exception as e:
+            result = ToolResult(content=f"Failed to get context status: {e}", is_error=True)
     elif name == "send_media":
         from .media import send_media
         result = await send_media(

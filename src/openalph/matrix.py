@@ -847,7 +847,46 @@ class MatrixBot:
                             detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
                         )
 
-            callbacks = {"on_redaction": _redaction_notice}
+            async def _context_status_callback(req_room_id=None):
+                rid = req_room_id or room_id
+                status_data = self.agent.status(rid)
+                if getattr(self, 'session_log', None):
+                    entries = self.session_log.read(rid)
+                    if entries:
+                        from datetime import datetime, timezone
+                        first_ts = entries[0].get("ts", "")
+                        try:
+                            first_dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+                            age = (datetime.now(timezone.utc) - first_dt).total_seconds() / 60
+                            status_data["session_age_minutes"] = round(age)
+                        except (ValueError, TypeError):
+                            status_data["session_age_minutes"] = None
+                    else:
+                        status_data["session_age_minutes"] = None
+                else:
+                    status_data["session_age_minutes"] = None
+                hb = getattr(self, 'heartbeat', None)
+                if hb and hb.is_active(rid):
+                    hb_entries = hb.status()
+                    hb_entry = next((e for e in hb_entries if e.room_id == rid), None)
+                    if hb_entry:
+                        status_data["heartbeat_active"] = True
+                        status_data["heartbeat_interval_minutes"] = round(hb_entry.interval_seconds / 60)
+                        status_data["heartbeat_next_minutes"] = round(hb_entry.seconds_until_next / 60)
+                    else:
+                        status_data["heartbeat_active"] = False
+                        status_data["heartbeat_interval_minutes"] = None
+                        status_data["heartbeat_next_minutes"] = None
+                else:
+                    status_data["heartbeat_active"] = False
+                    status_data["heartbeat_interval_minutes"] = None
+                    status_data["heartbeat_next_minutes"] = None
+                return status_data
+
+            callbacks = {
+                "on_redaction": _redaction_notice,
+                "context_status": _context_status_callback,
+            }
 
             response = await self.agent.handle_input(
                 content,
@@ -1418,7 +1457,50 @@ class MatrixBot:
                                 detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
                             )
 
-                callbacks = {"send_media": _upload_callback, "on_redaction": _redaction_notice}
+                async def _context_status_callback(req_room_id=None):
+                    """Assemble context status data for the context_status tool."""
+                    rid = req_room_id or room_id
+                    status_data = self.agent.status(rid)
+                    # Session age
+                    if getattr(self, 'session_log', None):
+                        entries = self.session_log.read(rid)
+                        if entries:
+                            from datetime import datetime, timezone
+                            first_ts = entries[0].get("ts", "")
+                            try:
+                                first_dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+                                age = (datetime.now(timezone.utc) - first_dt).total_seconds() / 60
+                                status_data["session_age_minutes"] = round(age)
+                            except (ValueError, TypeError):
+                                status_data["session_age_minutes"] = None
+                        else:
+                            status_data["session_age_minutes"] = None
+                    else:
+                        status_data["session_age_minutes"] = None
+                    # Heartbeat state
+                    hb = getattr(self, 'heartbeat', None)
+                    if hb and hb.is_active(rid):
+                        hb_entries = hb.status()
+                        hb_entry = next((e for e in hb_entries if e.room_id == rid), None)
+                        if hb_entry:
+                            status_data["heartbeat_active"] = True
+                            status_data["heartbeat_interval_minutes"] = round(hb_entry.interval_seconds / 60)
+                            status_data["heartbeat_next_minutes"] = round(hb_entry.seconds_until_next / 60)
+                        else:
+                            status_data["heartbeat_active"] = False
+                            status_data["heartbeat_interval_minutes"] = None
+                            status_data["heartbeat_next_minutes"] = None
+                    else:
+                        status_data["heartbeat_active"] = False
+                        status_data["heartbeat_interval_minutes"] = None
+                        status_data["heartbeat_next_minutes"] = None
+                    return status_data
+
+                callbacks = {
+                    "send_media": _upload_callback,
+                    "on_redaction": _redaction_notice,
+                    "context_status": _context_status_callback,
+                }
 
                 # Set up streaming delivery
                 streaming = StreamingDelivery(self, room_id)
