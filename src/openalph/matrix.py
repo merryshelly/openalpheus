@@ -752,13 +752,23 @@ class MatrixBot:
             _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
             _thinking_buffer = []
             _thinking_done = False
+            _thinking_notified = False
 
             async def _thinking_delta(text: str, done: bool):
-                nonlocal _thinking_done
+                nonlocal _thinking_done, _thinking_notified
                 if not done:
                     _thinking_buffer.append(text)
+                    # Send a one-time notice on first thinking chunk
+                    if not _thinking_notified:
+                        _thinking_notified = True
+                        try:
+                            await self.send_notice(room_id, "💭 Thinking…")
+                            await self._set_typing(room_id, True)
+                        except Exception:
+                            pass
                 else:
                     _thinking_done = True
+                    _thinking_notified = False  # reset for next tool-loop iteration
                     # Send thinking as <details> block
                     full_thinking = "".join(_thinking_buffer)
                     _thinking_buffer.clear()  # reset for next tool-loop iteration
@@ -1414,16 +1424,26 @@ class MatrixBot:
                 streaming = StreamingDelivery(self, room_id)
                 _thinking_buffer = []
                 _thinking_done = False
+                _thinking_notified = False
 
                 async def _text_delta(text: str, done: bool):
                     await streaming.push(text, done=done)
 
                 async def _thinking_delta(text: str, done: bool):
-                    nonlocal _thinking_done
+                    nonlocal _thinking_done, _thinking_notified
                     if not done:
                         _thinking_buffer.append(text)
+                        # Send a one-time notice on first thinking chunk
+                        if not _thinking_notified:
+                            _thinking_notified = True
+                            try:
+                                await self.send_notice(room_id, "💭 Thinking…")
+                                await self._set_typing(room_id, True)
+                            except Exception:
+                                pass
                     else:
                         _thinking_done = True
+                        _thinking_notified = False  # reset for next tool-loop iteration
                         # Send thinking as <details> block
                         full_thinking = "".join(_thinking_buffer)
                         _thinking_buffer.clear()  # reset for next tool-loop iteration
@@ -1780,6 +1800,9 @@ class MatrixBot:
             bar_len = 20
             filled = round(bar_len * ctx_pct / 100)
             bar = "█" * filled + "░" * (bar_len - filled)
+            # Resolve room-scoped overrides
+            _thinking = getattr(self, '_room_thinking', {}).get(room_id) or self.agent.config.thinking
+            _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id) or "5m (default)"
             lines = [
                 f"### {status['name']}",
                 "",
@@ -1791,6 +1814,8 @@ class MatrixBot:
                 f"| **Session in** | {status['total_input_tokens']:,} tokens |",
                 f"| **Session out** | {status['total_output_tokens']:,} tokens |",
                 f"| **Tool calls** | {status['total_tool_calls']} |",
+                f"| **Thinking** | {_thinking} |",
+                f"| **Cache TTL** | {_cache_ttl} |",
             ]
             await self.send(room_id, "\n".join(lines))
             return
