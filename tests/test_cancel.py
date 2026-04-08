@@ -165,3 +165,52 @@ async def test_cancel_handles_task_raising_exception():
     await handler._cancel_current()  # must not propagate ValueError
 
     handler.send.assert_awaited_once_with("!room:example.org", "Cancelled.")
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_block_on_hung_task():
+    """_cancel_current() should return within timeout even if task is stuck.
+
+    Reproduces the unresponsive-agent failure mode: a sub-agent is stuck in
+    an httpx call that ignores cancellation. Without the timeout, _cancel_current
+    blocks the event loop indefinitely, making the agent completely dead.
+    """
+    handler = _make_handler()
+
+    # Gate that the test controls — lets us kill the hung task cleanly
+    kill_switch = asyncio.Event()
+
+    # Simulate a task stuck in a network call that ignores cancellation
+    async def hung_task():
+        try:
+            await asyncio.sleep(999)
+        except asyncio.CancelledError:
+            # Simulate stuck: catch the cancel and keep blocking
+            # until the test signals us to stop
+            await kill_switch.wait()
+
+    task = asyncio.ensure_future(hung_task())
+    await asyncio.sleep(0)  # let it start
+
+    mock_agent = MagicMock()
+    mock_agent.cancel.return_value = task
+    handler.agent = mock_agent
+    handler._current_room = "!room:example.org"
+
+    # Set a short timeout for the test
+    handler._CANCEL_TIMEOUT = 0.1
+
+    import time
+    start = time.monotonic()
+    await handler._cancel_current()
+    elapsed = time.monotonic() - start
+
+    # Should have returned quickly (within timeout + small margin), not hung
+    assert elapsed < 1.0, f"_cancel_current blocked for {elapsed:.1f}s"
+
+    # Should still have sent "Cancelled." despite timeout
+    handler.send.assert_awaited_once_with("!room:example.org", "Cancelled.")
+
+    # Clean up: release the hung task so it completes
+    kill_switch.set()
+    await asyncio.sleep(0)

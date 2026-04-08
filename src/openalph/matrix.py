@@ -588,12 +588,17 @@ class MatrixBot:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    _CANCEL_TIMEOUT = 5  # seconds to wait for cancelled task before abandoning
+
     async def _cancel_current(self):
         """Cancel any current in-flight work.
 
         - Cancel in-flight LLM call
         - Kill tool subprocesses
         - Send cancellation notice to room
+
+        Uses a timeout to prevent blocking the event loop if the cancelled
+        task is stuck (e.g., hung httpx call to a slow inference API).
         """
         # Capture room before cancellation — the task's finally block clears it
         room = self._current_room
@@ -602,14 +607,27 @@ class MatrixBot:
         if hasattr(self.agent, "cancel"):
             task = self.agent.cancel()
 
-        # Wait for the cancelled task to actually finish
+        # Wait for the cancelled task to finish, but not forever.
+        # If it doesn't die within _CANCEL_TIMEOUT, abandon it and move on.
+        # The room is halted anyway — the orphaned task will eventually
+        # finish or be cleaned up on process shutdown.
         if task:
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                done, _ = await asyncio.wait({task}, timeout=self._CANCEL_TIMEOUT)
+                if not done:
+                    logger.warning(
+                        "Cancelled task in %s did not finish within %ds — abandoning",
+                        room, self._CANCEL_TIMEOUT,
+                    )
+                else:
+                    # Retrieve the result to suppress "exception was never retrieved"
+                    for t in done:
+                        try:
+                            t.result()
+                        except (asyncio.CancelledError, Exception):
+                            pass
             except Exception:
-                pass  # Task may raise other errors during cancellation
+                pass  # Defensive — don't let cancel cleanup break the event loop
 
         if room:
             await self.send(room, "Cancelled.")
