@@ -116,8 +116,9 @@ class TestConfigSkeleton:
 
     def test_required_sections(self):
         parsed = tomllib.loads(generate_config_skeleton("watson"))
-        for section in ("agent", "provider", "workspace", "matrix"):
+        for section in ("agent", "providers", "workspace", "matrix"):
             assert section in parsed, f"Missing section: {section}"
+        assert "anthropic" in parsed["providers"], "Missing providers.anthropic sub-table"
 
     def test_agent_name_matches(self):
         parsed = tomllib.loads(generate_config_skeleton("watson"))
@@ -129,11 +130,11 @@ class TestConfigSkeleton:
 
     def test_matrix_user_id(self):
         parsed = tomllib.loads(generate_config_skeleton("babson"))
-        assert parsed["matrix"]["user_id"] == "@babson:matrix.local"
+        assert parsed["matrix"]["user_id"] == "@babson:CHANGE_ME"
 
     def test_api_key_cmd_in_agent_home(self):
         parsed = tomllib.loads(generate_config_skeleton("watson"))
-        assert "/home/oa-watson/" in parsed["provider"]["api_key_cmd"]
+        assert "/home/oa-watson/" in parsed["providers"]["anthropic"]["api_key_cmd"]
 
     def test_access_token_cmd_in_agent_home(self):
         parsed = tomllib.loads(generate_config_skeleton("watson"))
@@ -141,11 +142,24 @@ class TestConfigSkeleton:
 
     def test_model_is_placeholder(self):
         parsed = tomllib.loads(generate_config_skeleton("watson"))
-        assert parsed["agent"]["model"] == "CHANGE_ME"
+        assert parsed["agent"]["default_model"] == "CHANGE_ME"
 
     def test_validates_name(self):
         with pytest.raises(ValueError):
             generate_config_skeleton("INVALID")
+
+    def test_has_homeserver(self):
+        parsed = tomllib.loads(generate_config_skeleton("watson"))
+        assert parsed["matrix"]["homeserver"] == "http://localhost:4269"
+
+    def test_provider_type(self):
+        parsed = tomllib.loads(generate_config_skeleton("watson"))
+        assert parsed["providers"]["anthropic"]["type"] == "anthropic"
+
+    def test_has_max_tokens_defaults(self):
+        parsed = tomllib.loads(generate_config_skeleton("watson"))
+        assert "max_tokens" in parsed["agent"]
+        assert "model_max_tokens" in parsed["agent"]
 
 
 # ---------------------------------------------------------------------------

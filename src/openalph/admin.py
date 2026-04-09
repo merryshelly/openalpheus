@@ -123,17 +123,21 @@ def generate_config_skeleton(name: str) -> str:
     return f"""\
 [agent]
 name = "{name}"
-model = "CHANGE_ME"
+default_model = "CHANGE_ME"
+max_tokens = 8192
+model_max_tokens = 200000
 
-[provider]
-api_key_cmd = "{home}/secrets/api-key.sh"
+[providers.anthropic]
+type = "anthropic"
+api_key_cmd = "cat {home}/.config/provider-key"
 
 [workspace]
 path = "{home}/workspace"
 
 [matrix]
-user_id = "@{name}:matrix.local"
-access_token_cmd = "{home}/secrets/access-token.sh"
+homeserver = "http://localhost:4269"
+user_id = "@{name}:CHANGE_ME"
+access_token_cmd = "cat {home}/.config/matrix-token"
 """
 
 
