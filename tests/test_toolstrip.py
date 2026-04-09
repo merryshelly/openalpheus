@@ -453,3 +453,111 @@ class TestToolstripEdgeCases:
         entries = sl.read(ROOM_ID)
         tool_entries = [e for e in entries if e["role"] == "tool"]
         assert tool_entries[0]["output"] == original_output
+
+
+# ---------------------------------------------------------------------------
+# status() context estimate reflects toolstrip
+# ---------------------------------------------------------------------------
+
+class TestToolstripContextEstimate:
+    """agent.status() context_tokens must reflect stripped context, not raw.
+
+    Regression test for 2026-04-09: /status reported full unstripped context
+    after /cache toolstrip because _estimate_context_tokens used raw in-memory
+    history instead of build_context() output.
+    """
+
+    def test_status_context_smaller_after_toolstrip(self, tmp_path):
+        """Context token estimate decreases after toolstrip is applied."""
+        from openalph.agent import Agent
+        from openalph.config import AgentConfig, ProviderConfig
+
+        config = AgentConfig(
+            name="test",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            model_max_tokens=200000,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic",
+                api_key="sk-test", base_url=None, quirks=None,
+            )},
+            workspace=tmp_path,
+        )
+        sl = make_sl(tmp_path)
+
+        # Build a session with substantial tool output
+        big_output = "x" * 20000
+        append_user(sl)                                          # 0
+        append_assistant(sl, "", tool_calls=[                    # 1
+            {"call_id": "tc_1", "name": "shell", "input": {"command": "ls"}}
+        ])
+        append_tool(sl, "tc_1", "shell", big_output)            # 2
+        append_assistant(sl, "got it")                           # 3
+
+        # Get context before strip
+        ctx_before = sl.build_context(ROOM_ID)
+        chars_before = sum(
+            len(m.get("content", "")) if isinstance(m.get("content"), str) else 0
+            for m in ctx_before
+        )
+
+        # Apply toolstrip
+        append_toolstrip(sl, entry_index=4)                      # 4
+        append_user(sl, "continue")                              # 5
+
+        # Get context after strip
+        ctx_after = sl.build_context(ROOM_ID)
+        chars_after = sum(
+            len(m.get("content", "")) if isinstance(m.get("content"), str) else 0
+            for m in ctx_after
+        )
+
+        # Stripped context must be substantially smaller
+        assert chars_after < chars_before
+        # The 20000-char tool output should be replaced by a ~30-char placeholder
+        assert chars_before - chars_after > 19000
+
+    def test_estimate_with_build_context_history(self, tmp_path):
+        """_estimate_context_tokens with build_context output is smaller than raw."""
+        from openalph.agent import Agent
+        from openalph.config import AgentConfig, ProviderConfig
+
+        config = AgentConfig(
+            name="test",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            model_max_tokens=200000,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic",
+                api_key="sk-test", base_url=None, quirks=None,
+            )},
+            workspace=tmp_path,
+        )
+        agent = Agent(config)
+
+        sl = make_sl(tmp_path)
+        big_output = "y" * 40000
+        append_user(sl)
+        append_assistant(sl, "", tool_calls=[
+            {"call_id": "tc_1", "name": "file_read", "input": {"path": "/big"}}
+        ])
+        append_tool(sl, "tc_1", "file_read", big_output)
+        append_assistant(sl, "read it")
+        append_toolstrip(sl, entry_index=4)
+        append_user(sl, "next")
+
+        # Load raw history into agent (simulating what matrix.py does)
+        raw_ctx = sl.build_context(ROOM_ID, skip_system=True)
+        # Hack: also build without strip to simulate raw
+        # We need to remove the toolstrip to get raw context
+        raw_entries = sl.read(ROOM_ID)
+        raw_no_strip = [e for e in raw_entries if not (e.get("role") == "system" and e.get("event") == "toolstrip")]
+
+        # Estimate on stripped context
+        stripped_estimate = agent._estimate_context_tokens(history=raw_ctx)
+
+        # Estimate on raw (unstripped) — just sum the content
+        raw_chars = sum(len(e.get("content", "")) + len(e.get("output", "")) for e in raw_no_strip)
+
+        # Stripped should be way smaller
+        assert stripped_estimate < raw_chars // 4

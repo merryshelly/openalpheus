@@ -651,9 +651,14 @@ class Agent:
                 total_chars += len(tb.get("thinking", ""))
         return total_chars // 4
 
-    def status(self, room_id: str = "_default") -> dict:
-        """Snapshot of agent state for operator visibility."""
-        context_tokens = self._estimate_context_tokens(room_id)
+    def status(self, room_id: str = "_default", history: list[dict] | None = None) -> dict:
+        """Snapshot of agent state for operator visibility.
+
+        If history is provided (e.g. from session_log.build_context()),
+        use it for the context estimate instead of raw in-memory history.
+        This ensures toolstrip-aware context sizes.
+        """
+        context_tokens = self._estimate_context_tokens(room_id, history=history)
         model_max = self.config.model_max_tokens
         context_pct = round(context_tokens / model_max * 100) if model_max else 0
         return {

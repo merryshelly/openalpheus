@@ -1567,7 +1567,10 @@ class MatrixBot:
                         "Try again or start a new room.")
                 # Check context capacity after successful turn
                 try:
-                    _status = self.agent.status(room_id)
+                    _sh = None
+                    if getattr(self, 'session_log', None):
+                        _sh = self.session_log.build_context(room_id)
+                    _status = self.agent.status(room_id, history=_sh)
                     _pct = _status.get("context_pct", 0)
                     if _pct >= 80:
                         await self.send_notice(room_id,
@@ -1808,7 +1811,11 @@ class MatrixBot:
             return
 
         if body == "/status":
-            status = self.agent.status(room_id)
+            # Pass build_context output so the estimate reflects toolstrip
+            _status_history = None
+            if getattr(self, 'session_log', None):
+                _status_history = self.session_log.build_context(room_id)
+            status = self.agent.status(room_id, history=_status_history)
             ctx = status['context_tokens']
             ctx_max = status['context_max']
             ctx_pct = status['context_pct']
