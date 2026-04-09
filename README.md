@@ -1,124 +1,198 @@
-# OpenAlph
+# OpenAlpheus
 
-Purpose-built multi-agent AI platform. Matrix as transport, local JSONL as canonical session state, one process per agent.
+Self-hosted multi-agent harness for solo operators and small teams.
 
-Named for the pistol shrimp (genus *Alpheus*) — tiny crustacean, outsized impact.
+## What It Is
 
-## Status
+Named after the pistol shrimp (*Alpheus*) — a crustacean smaller than your thumb that generates shockwaves louder than a gunshot. 
 
-**Phase 5 complete.** 511 tests passing, ~3,300 LOC. Two test agents deployed on conduwuit.
+Tiny, self-contained, disproportionately effective.
 
-### What's Shipped
+OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix provides the transport layer. Local JSONL files hold session state. systemd manages the lifecycle. Three Python dependencies. No cloud except the ones you explicitly choose.
 
-| Phase | Feature | Status |
-|-------|---------|--------|
-| 1–3 | Core agent loop, providers, session persistence, tools | ✅ |
-| 4 | Multi-agent: Unix users, systemd, CLI (`new-agent`, `run`, `start/stop/restart`, `status`, `list`, `logs`) | ✅ |
-| 5.0 | Shared rooms: @mention gating, context hydration, per-room TOML overrides | ✅ |
-| 5.1 | Emergency fallback: `openalph chat <agent>`, `openalph showprompt <agent>`, prompt refactor | ✅ |
-| — | Per-room heartbeat timers (`/heartbeat start/stop/status`) | 🚧 In progress |
+**Status: v0.1.0 — early release.** Core is stable and tested (1,435+ tests). The interface may evolve.
+
+## Why
+
+All agent frameworks make tradeoffs. We optimized for:
+
+- **Control.** Full control of the system prompt. Your agent doesn't read a single character you didn't put there. Behavior is configured by editing markdown files — no code required.
+- **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
+- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Nine tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
+- **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
+- **Maintainability.** ~9,000 LOC. Full test coverage. Three dependencies: `anthropic`, `openai`, `matrix-nio`.
+- **Resilience.** Each agent runs as an isolated Unix process with its own filesystem. One agent can crash out, trash its workspace, and the others are unaffected.
+- **Focus.** Matrix is a mature protocol with an array of clients for mobile, desktop, web. No bespoke UI, no custom views to maintain.
+- **Transparency.** Session state is append-only text in JSONL, not a database. `grep` works. `cat` works. No migrations, no schema, no query language needed.
+
+## Quick Start
+
+One command takes a fresh Linux machine to a running agent:
+
+```bash
+curl -fsSL https://codeberg.org/merryshelly/openalpheus/raw/branch/main/install.sh | sudo bash
+```
+
+Non-interactive:
+
+```bash
+sudo OPENALPH_AGENT_NAME=myagent \
+     OPENALPH_PROVIDER=anthropic \
+     OPENALPH_API_KEY_FILE=/path/to/key \
+     OPENALPH_DOMAIN=myhost.tailnet.ts.net \
+     OPENALPH_TLS_MODE=tailscale \
+     bash install.sh
+```
+
+The installer handles Python venv, tuwunel (Matrix homeserver) in Docker, TLS via Caddy, Matrix account creation, agent Unix user + workspace + systemd unit, and Cinny web client.
+
+Connect with Cinny (web), Element (mobile), or any Matrix client. Create a room, invite the agent, start talking.
+
+## What You Get
+
+| Component | Detail |
+|-----------|--------|
+| Matrix homeserver | Tuwunel (Conduwuit fork), Docker-managed, registration locked after bootstrap |
+| Operator account | Your Matrix identity on the homeserver |
+| AI agent | Sandboxed Unix process, systemd-managed, dedicated user and workspace |
+| TLS | Caddy — Tailscale (homelab), Let's Encrypt (VPS), or BYO cert |
+| Web client | Cinny at your domain |
+| Workspace | `/home/oa-<name>/workspace/` with template prompt files, skills, and tools |
 
 ## Architecture
 
-- **Process model:** One process per agent, managed by systemd (`openalph@<agent>.service`)
-- **Communication:** Matrix (conduwuit) — rooms as sessions, membership as ACL
-- **Persistence:** Local JSONL per session (`<workspace>/sessions/<room-id-safe>.jsonl`) — canonical source of agent context state. Matrix is transport only.
-- **Context reconstruction:** Read local JSONL on wake; gap-fill from Matrix for any messages missed while offline
-- **Providers:** Anthropic SDK + OpenAI SDK (OpenRouter, Ollama)
-- **Isolation:** Unix users per agent, shared `openalph` group, per-agent workspaces
-- **Prompt assembly:** Workspace files injected in safety-first order (SAFETY → SOUL → OPERATOR → WAKE → ENVIRONMENT → OPERATIONS). No hardcoded content — all behavior defined by workspace files.
-- **Language:** Python 3.11+
-- **License:** AGPL-3.0
+### Process Model
+
+One Unix process per agent. Each runs as a dedicated user in the `openalph` group, managed by a systemd template unit (`openalph@<name>.service`). Kernel-enforced isolation between agents.
+
+### Communication
+
+Matrix rooms are sessions. Room membership is the ACL — any room member can message the agent. Multiple agents can share a room; they respond only when @mentioned (context hydration on mention).
+
+### Session State
+
+Local append-only JSONL files are the source of truth. Matrix is transport only. On wake, the agent gap-fills from Matrix for messages missed while offline.
+
+### Prompt Assembly
+
+Six workspace markdown files assembled at process start:
+
+**SAFETY → SOUL → OPERATOR → WAKE → ENVIRONMENT → OPERATIONS**
+
+Skills are listed by name in the prompt; the agent reads their content on demand. No hardcoded behavior — everything lives in workspace files the operator controls.
+
+### Tools
+
+Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
+
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `web_search`, `web_fetch`, `subagent`, `memory_search`, `send_media`.
+
+### Providers
+
+Anthropic (native SDK) and OpenAI-compatible (OpenRouter, vLLM, llama.cpp, etc). Multiple providers per agent. Switch models at runtime via `/model` or configure aliases in TOML.
+
+### Memory
+
+Hybrid semantic + keyword search over workspace files. Nomic-embed-text embeddings combined with BM25 ranking.
+
+### Security
+
+Credential redaction (10 pattern types) applied to all tool output before it enters agent context. Tool results wrapped with injection defense. Unix user isolation is kernel-enforced. Homeserver registration locked after bootstrap.
 
 ## Source Tree
 
 ```
 src/openalph/
-├── admin.py          # new-agent scaffolding: user, workspace, config, systemd
-├── agent.py          # Agent loop, tool dispatch, cancellation, circuit breaker (25 iter)
-├── cli.py            # CLI: new-agent, run, start/stop/restart, status, list, logs, chat, showprompt
-├── config.py         # TOML loader, AgentConfig + MatrixConfig, API key resolution
-├── matrix.py         # Matrix client, sync loop, lazy wake, mention gating, commands, typing
-├── mention.py        # Pure mention detection + room gating (no async/nio dependencies)
-├── prompt.py         # System prompt assembly from workspace files + skills index
-├── provider.py       # Anthropic + OpenAI routing, response normalization, tool schema conversion
-├── session.py        # SessionLog: append-only JSONL, context-build, overflow handling
+├── admin.py           Agent scaffolding (user, workspace, config, systemd)
+├── agent.py           Agent loop, tool dispatch, streaming, circuit breaker
+├── cli.py             CLI entry points
+├── config.py          TOML config, API key resolution
+├── heartbeat.py       Per-room recurring timers
+├── matrix.py          Matrix client, sync, mention gating, slash commands
+├── mention.py         Mention detection + room gating
+├── prompt.py          System prompt assembly from workspace files
+├── provider.py        Anthropic + OpenAI routing, streaming, error handling
+├── session.py         Append-only JSONL, context rebuild, overflow
+├── umbral.py          Recurring context rotation (archive + wipe + reset)
+├── memory/
+│   ├── chunker.py     Document chunking
+│   ├── embeddings.py  Embedding generation
+│   ├── indexer.py     Index construction
+│   └── search.py      Hybrid semantic + keyword search
 └── tools/
-    ├── __init__.py   # Registry, discovery (workspace/tools/*.toml), dispatch, truncation
-    ├── shell.py      # Stateless subprocess (explicit cwd/env/timeout, defaults to agent home)
-    ├── file.py       # read/write/edit with path resolution
-    ├── web.py        # search (Brave) + fetch (HTML→text)
-    └── subagent.py   # Multi-turn sub-agent with parent's tools (minus subagent)
+    ├── __init__.py    Registry, discovery, dispatch, truncation
+    ├── file.py        file_read, file_write, file_edit
+    ├── media.py       Send files to Matrix rooms
+    ├── memory_search.py  Hybrid search tool
+    ├── security.py    Credential redaction (10 patterns)
+    ├── shell.py       Subprocess execution
+    ├── subagent.py    Multi-turn sub-agent with tool access
+    └── web.py         Web search (Brave) + fetch (HTML→text)
 ```
 
-## How to Run
+~9,000 LOC source. 1,435+ tests. 3 runtime dependencies: `anthropic`, `openai`, `matrix-nio`.
 
-```bash
-# Install
-pip install -e .
+## Prerequisites
 
-# Create a new agent (interactive — creates Unix user, workspace, config, systemd unit)
-sudo openalph new-agent myagent
+- Debian 12+ or Ubuntu 22.04+ (amd64 or arm64)
+- Docker 24+
+- Python 3.11+ with pip
+- systemd 249+
+- An LLM API key (Anthropic recommended, or any OpenAI-compatible provider)
+- TLS: Tailscale (auto-provisioned), a public domain (Let's Encrypt via Caddy), or your own cert/key pair
 
-# Start via systemd
-sudo systemctl start openalph@myagent
+See [INSTALL.md](INSTALL.md) for detailed requirements and manual setup.
 
-# Or run in foreground (dev mode)
-openalph run myagent
+## Post-Bootstrap
 
-# Emergency CLI chat (no Matrix dependency)
-openalph chat myagent
+| Task | How |
+|------|-----|
+| Customize identity | Edit `SOUL.md` in agent workspace |
+| Configure behavior | Edit `OPERATIONS.md`, `ENVIRONMENT.md`, etc. |
+| Add skills | Place markdown files in `workspace/skills/` |
+| Add tools | Place `.toml` files in `workspace/tools/` |
+| Add another agent | `sudo openalph new-agent <name>` |
 
-# View assembled system prompt + tools
-openalph showprompt myagent
+All prompt changes require a restart: `sudo systemctl restart openalph@<name>`
+
+See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
+
+## In-Room Commands
+
+| Command | Effect |
+|---------|--------|
+| `/status` | Model, context usage, token counts |
+| `/model <provider/model>` | Switch model for this room |
+| `/thinking <off\|low\|medium\|high>` | Set extended thinking level |
+| `/heartbeat start <interval>` | Start recurring timer (e.g., `5m`, `1h`) |
+| `/heartbeat stop` | Stop heartbeat |
+| `/umbral start <interval>` | Start recurring context rotation (min 30m) |
+| `/umbral stop` | Stop context rotation |
+| `/cache 1h` | Extended Anthropic prompt cache TTL |
+| `/stop` | Cancel current processing |
+| `/resume` | Re-enable after `/stop` |
+
+## CLI
+
+```
+openalph new-agent <name>    Create agent (user, workspace, config, systemd)
+openalph run <name>          Run agent in foreground (debug)
+openalph restart <name>      Restart agent
+openalph status <name>       Show agent status
+openalph logs <name>         Follow agent logs
+openalph showprompt <name>   Display assembled system prompt
 ```
 
-Minimal config (`/etc/openalph/agents/myagent.toml`):
+## Security
 
-```toml
-[agent]
-name = "myagent"
-model = "claude-haiku-4-5-20251001"
+- **Process isolation:** Each agent runs as a dedicated Unix user. Kernel-enforced boundaries.
+- **Credential redaction:** 10 pattern types (API keys, tokens, passwords, etc.) scrubbed from all tool output before reaching agent context.
+- **Tool result wrapping:** Injection defense on all tool returns.
+- **Locked registration:** Homeserver registration disabled after bootstrap. No open federation by default.
+- **No telemetry:** Nothing leaves your machine except LLM API calls and Matrix federation (if you enable it).
 
-[provider]
-type = "anthropic"
-api_key_cmd = "cat /home/oa-myagent/.config/anthropic-key"
+## License
 
-[workspace]
-path = "/home/oa-myagent/workspace"
+[AGPL-3.0](LICENSE)
 
-[matrix]
-homeserver = "http://matrix.local:6167"
-user_id = "@myagent:matrix.local"
-device_id = "OPENALPH"
-access_token_cmd = "cat /home/oa-myagent/.config/matrix-token"
-```
-
-## Matrix Commands
-
-| Command | Description |
-|---------|-------------|
-| `/stop` | Cancel in-flight agent work |
-| `/status` | Show agent model, context usage, turn count |
-| `/showprompt` | Display full assembled system prompt + tool list |
-| `/reset` | Clear agent context for this room |
-| `/heartbeat start <interval>` | Start recurring heartbeat (e.g. `6h`, `15m`) |
-| `/heartbeat stop` | Stop heartbeat in current room |
-| `/heartbeat status` | List all active heartbeats |
-
-All slash commands bypass @mention gating in shared rooms.
-
-## How to Test
-
-```bash
-pytest                        # all 511 tests
-pytest tests/test_matrix.py   # Matrix integration
-pytest tests/test_gating.py   # mention gating unit tests
-pytest tests/test_matrix_gating.py  # gating integration
-pytest -x                     # stop on first failure
-```
-
-## Repo
-
-- **Codeberg:** https://codeberg.org/merryshelly/openalph (private)
-- **Planning docs:** `~/.openclaw/workspace/memory/projects/openalph/`
+**Repository:** [codeberg.org/merryshelly/openalpheus](https://codeberg.org/merryshelly/openalpheus)
