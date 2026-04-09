@@ -177,6 +177,25 @@ class TestSessionLogAppend:
         assert e["event"] == "session_start"
         assert e["detail"] == "Gap-filled 3 messages"
 
+    def test_session_start_with_system_prompt(self, tmp_path):
+        """session_start entries can carry the assembled system prompt."""
+        sl = make_session_log(tmp_path)
+        prompt = "## SAFETY.md\nDon't be evil\n\n## SOUL.md\nYou are a cat."
+        sl.append(
+            role="system",
+            sender=AGENT_USER,
+            room=ROOM_ID,
+            event_id=None,
+            event="session_start",
+            detail="New room, starting fresh",
+            system_prompt=prompt,
+        )
+
+        entries = sl.read(ROOM_ID)
+        assert len(entries) == 1
+        assert entries[0]["system_prompt"] == prompt
+        assert entries[0]["event"] == "session_start"
+
 
 class TestSessionLogRead:
 

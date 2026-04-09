@@ -1174,13 +1174,15 @@ class MatrixBot:
                 except Exception:
                     pass
             else:
-                # New room: start fresh, log session start
+                # New room: start fresh, log session start + system prompt
+                prompt = getattr(self.agent, "system_prompt", None)
                 session_log.append(
                     role="system",
                     sender=self.config.user_id,
                     room=room_id,
                     event="session_start",
                     detail="New room, starting fresh",
+                    **({"system_prompt": prompt} if isinstance(prompt, str) else {}),
                 )
         else:
             # Fallback: paginate Matrix history (legacy path for tests without session_log)

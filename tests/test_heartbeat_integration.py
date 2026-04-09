@@ -92,6 +92,7 @@ def make_bot(tmp_path):
 
     agent = MagicMock()
     agent.config = agent_config
+    agent.system_prompt = "test system prompt"
     agent.handle_input = AsyncMock(return_value="Agent response")
     agent.status = MagicMock(return_value={
         "name": "watson",
