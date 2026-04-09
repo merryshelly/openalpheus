@@ -123,6 +123,15 @@ async def run_subagent(
         except Exception as log_exc:
             logger.warning("Failed to write subagent log: %s", log_exc)
 
+    def _estimate_context_tokens(msgs: list[dict]) -> int:
+        """Estimate token count from messages list (1 token ≈ 4 chars)."""
+        total_chars = 0
+        for msg in msgs:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+        return total_chars // 4
+
     # Build conversation starting with task as user message
     messages = [{"role": "user", "content": task}]
 
@@ -131,6 +140,7 @@ async def run_subagent(
     total_output_tokens = 0
     total_tool_calls = 0
     completed_iterations = 0
+    peak_context_tokens = 0
 
     try:
         for iteration in range(iteration_limit):
@@ -158,6 +168,7 @@ async def run_subagent(
                     "total_tool_calls": total_tool_calls,
                     "total_input_tokens": total_input_tokens,
                     "total_output_tokens": total_output_tokens,
+                    "peak_context_tokens": peak_context_tokens,
                     "elapsed_seconds": round(elapsed, 3),
                     "model": config.default_model,
                     "task": task,
@@ -208,6 +219,9 @@ async def run_subagent(
 
             tools_called = [tc.name for tc in response.tool_calls]
             total_tool_calls += len(tools_called)
+            context_tokens = _estimate_context_tokens(messages)
+            if context_tokens > peak_context_tokens:
+                peak_context_tokens = context_tokens
             iter_elapsed = time.time() - iter_start
             _append_log({
                 "event": "iteration",
@@ -216,6 +230,7 @@ async def run_subagent(
                 "errors": error_count,
                 "input_tokens": response.usage.input_tokens if response.usage else 0,
                 "output_tokens": response.usage.output_tokens if response.usage else 0,
+                "context_tokens": context_tokens,
                 "elapsed_seconds": round(iter_elapsed, 3),
             })
             completed_iterations += 1
@@ -237,6 +252,7 @@ async def run_subagent(
             "total_tool_calls": total_tool_calls,
             "total_input_tokens": total_input_tokens,
             "total_output_tokens": total_output_tokens,
+            "peak_context_tokens": peak_context_tokens,
             "elapsed_seconds": round(elapsed, 3),
             "model": config.default_model,
             "task": task,
@@ -272,6 +288,7 @@ async def run_subagent(
             "total_tool_calls": total_tool_calls,
             "total_input_tokens": total_input_tokens,
             "total_output_tokens": total_output_tokens,
+            "peak_context_tokens": peak_context_tokens,
             "elapsed_seconds": round(elapsed, 3),
             "model": config.default_model,
             "task": task,

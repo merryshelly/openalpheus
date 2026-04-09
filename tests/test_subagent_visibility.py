@@ -311,6 +311,79 @@ class TestSubagentLogFile:
         assert summary["model"] == "openrouter/kimi-k2.5"
 
     @pytest.mark.asyncio
+    async def test_iteration_entry_records_context_tokens(self, tmp_path):
+        """Iteration entries include estimated context size in tokens."""
+        config = make_config(workspace=tmp_path)
+        responses = [
+            tool_response(tool_name="shell", tool_id="tc_1"),
+            text_response("done"),
+        ]
+        with patch("openalph.tools.subagent.complete", new_callable=AsyncMock,
+                    side_effect=responses):
+            with patch("openalph.tools.execute_tool", new_callable=AsyncMock,
+                       return_value=ToolResult(content="x" * 400)):
+                await run_subagent("do stuff", config, tools=make_tools())
+
+        log_dir = tmp_path / "logs" / "subagents"
+        log_file = list(log_dir.glob("*.jsonl"))[0]
+        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+
+        iteration_entry = [l for l in lines if l["event"] == "iteration"][0]
+        assert "context_tokens" in iteration_entry
+        assert iteration_entry["context_tokens"] > 0
+
+    @pytest.mark.asyncio
+    async def test_summary_records_peak_context_tokens(self, tmp_path):
+        """Summary entry includes peak context token estimate."""
+        config = make_config(workspace=tmp_path)
+        responses = [
+            tool_response(tool_name="shell", tool_id="tc_1"),
+            tool_response(tool_name="shell", tool_id="tc_2"),
+            text_response("done"),
+        ]
+        with patch("openalph.tools.subagent.complete", new_callable=AsyncMock,
+                    side_effect=responses):
+            with patch("openalph.tools.execute_tool", new_callable=AsyncMock,
+                       return_value=ToolResult(content="y" * 800)):
+                await run_subagent("growing context", config, tools=make_tools())
+
+        log_dir = tmp_path / "logs" / "subagents"
+        log_file = list(log_dir.glob("*.jsonl"))[0]
+        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+
+        summary = lines[-1]
+        assert "peak_context_tokens" in summary
+        assert summary["peak_context_tokens"] > 0
+
+        # Peak should be >= the last iteration's context tokens
+        iterations = [l for l in lines if l["event"] == "iteration"]
+        assert summary["peak_context_tokens"] >= iterations[-1]["context_tokens"]
+
+    @pytest.mark.asyncio
+    async def test_peak_context_grows_with_iterations(self, tmp_path):
+        """Context tokens should grow across iterations as messages accumulate."""
+        config = make_config(workspace=tmp_path)
+        responses = [
+            tool_response(tool_name="shell", tool_id="tc_1"),
+            tool_response(tool_name="shell", tool_id="tc_2"),
+            text_response("done"),
+        ]
+        with patch("openalph.tools.subagent.complete", new_callable=AsyncMock,
+                    side_effect=responses):
+            with patch("openalph.tools.execute_tool", new_callable=AsyncMock,
+                       return_value=ToolResult(content="output " * 50)):
+                await run_subagent("multi-step", config, tools=make_tools())
+
+        log_dir = tmp_path / "logs" / "subagents"
+        log_file = list(log_dir.glob("*.jsonl"))[0]
+        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+
+        iterations = [l for l in lines if l["event"] == "iteration"]
+        assert len(iterations) == 2
+        # Second iteration should have more context than first
+        assert iterations[1]["context_tokens"] > iterations[0]["context_tokens"]
+
+    @pytest.mark.asyncio
     async def test_log_summary_includes_task(self, tmp_path):
         """Summary entry records the task description."""
         config = make_config(workspace=tmp_path)
