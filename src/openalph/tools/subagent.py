@@ -158,12 +158,46 @@ async def run_subagent(
                 total_input_tokens += response.usage.input_tokens or 0
                 total_output_tokens += response.usage.output_tokens or 0
 
-            # Text response — done
+            # Text response — check for truncation before accepting
             if not response.tool_calls:
+                # If the model was cut off by max_tokens, it may have been
+                # about to issue a tool call. Inject a continuation prompt
+                # and loop instead of returning truncated output.
+                if response.stop_reason in ("max_tokens", "length"):
+                    logger.warning(
+                        "Sub-agent response truncated (stop_reason=%s) at iteration %d, "
+                        "injecting continuation prompt",
+                        response.stop_reason, iteration,
+                    )
+                    _append_log({
+                        "event": "truncation_recovery",
+                        "iteration": iteration,
+                        "stop_reason": response.stop_reason,
+                        "truncated_content_length": len(response.content),
+                    })
+                    # Preserve the truncated text and ask the model to continue
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content,
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM: Your previous response was truncated by the token limit "
+                            "(stop_reason=" + response.stop_reason + "). You were cut off mid-output. "
+                            "Do NOT repeat what you already said. Continue from where you left off, "
+                            "and use tools (file_write, shell, etc.) for any large content instead of "
+                            "generating it inline.]"
+                        ),
+                    })
+                    completed_iterations += 1
+                    continue
+
                 elapsed = time.time() - run_start
                 _append_log({
                     "event": "summary",
                     "status": "completed",
+                    "stop_reason": response.stop_reason,
                     "total_iterations": completed_iterations,
                     "total_tool_calls": total_tool_calls,
                     "total_input_tokens": total_input_tokens,
@@ -228,6 +262,7 @@ async def run_subagent(
                 "iteration": iteration,
                 "tools_called": tools_called,
                 "errors": error_count,
+                "stop_reason": response.stop_reason,
                 "input_tokens": response.usage.input_tokens if response.usage else 0,
                 "output_tokens": response.usage.output_tokens if response.usage else 0,
                 "context_tokens": context_tokens,

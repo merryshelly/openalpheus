@@ -724,9 +724,22 @@ class MatrixBot:
                     task_preview = tc.input.get("task", "")
                     model_info = tc.input.get("model", "default")
                     iters = tc.input.get("max_iterations", 200)
-                    notice = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters): {task_preview}"
+                    summary = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters)"
+                    html = f'<b>{summary}</b>'
+                    if task_preview:
+                        html += (
+                            f'\n<details><summary>📋 Task brief</summary>\n'
+                            f'{mistune.html(task_preview)}</details>'
+                        )
+                    body_text = f"{summary}: {task_preview[:200]}"
+                    dispatch_msg = {
+                        "msgtype": "m.notice",
+                        "body": body_text,
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": html,
+                    }
                     try:
-                        await self.send_notice(room_id, notice)
+                        await self._room_send_with_retry(room_id, dispatch_msg)
                     except Exception:
                         pass
             _sl = getattr(self, 'session_log', None)
@@ -1414,9 +1427,22 @@ class MatrixBot:
                         task_preview = tc.input.get("task", "")
                         model_info = tc.input.get("model", "default")
                         iters = tc.input.get("max_iterations", 200)
-                        notice = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters): {task_preview}"
+                        summary = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters)"
+                        html = f'<b>{summary}</b>'
+                        if task_preview:
+                            html += (
+                                f'\n<details><summary>📋 Task brief</summary>\n'
+                                f'{mistune.html(task_preview)}</details>'
+                            )
+                        body_text = f"{summary}: {task_preview[:200]}"
+                        dispatch_msg = {
+                            "msgtype": "m.notice",
+                            "body": body_text,
+                            "format": "org.matrix.custom.html",
+                            "formatted_body": html,
+                        }
                         try:
-                            await self.send_notice(room_id, notice)
+                            await self._room_send_with_retry(room_id, dispatch_msg)
                         except Exception:
                             pass
                 _sl = getattr(self, 'session_log', None)

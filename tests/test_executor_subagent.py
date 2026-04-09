@@ -8,6 +8,7 @@ Multi-turn LLM call via provider.complete(). Sub-agents get the parent's
 tools minus 'subagent' (preventing recursion). Circuit breaker at 10 iterations.
 """
 
+import json
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 from pathlib import Path
@@ -439,3 +440,198 @@ class TestErrorHandling:
 
         assert result.is_error is False
         assert "failed" in result.content.lower()
+
+
+
+def truncated_response(content="I was about to use a tool but got cut off..."):
+    """Response truncated by max_tokens — no tool calls emitted."""
+    return Response(
+        content=content,
+        tool_calls=[],
+        model="claude-sonnet-4-20250514",
+        usage=Usage(input_tokens=100, output_tokens=4096),
+        stop_reason="max_tokens",
+    )
+
+
+class TestTruncationRecovery:
+
+    def _make_workspace(self, tmp_path):
+        """Create a workspace directory with log subdirs and return a config."""
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        return make_config(workspace=ws)
+
+    @pytest.mark.asyncio
+    async def test_truncation_triggers_continuation(self, tmp_path):
+        """Truncated response (max_tokens) triggers a continuation loop.
+
+        First call returns truncated text. Second call returns normal text.
+        Verify: result is successful, complete() called twice, and the
+        second call's messages include the continuation prompt.
+        """
+        config = self._make_workspace(tmp_path)
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=[
+                truncated_response("partial output"),
+                text_response("Here is the full answer."),
+            ],
+        ) as mock_complete:
+            result = await run_subagent("Do something", config)
+
+        assert result.is_error is False
+        assert "full answer" in result.content
+        assert mock_complete.call_count == 2
+
+        # Second call should have continuation prompt in messages
+        second_call_kwargs = mock_complete.call_args_list[1].kwargs
+        messages = second_call_kwargs["messages"]
+        # Messages: user task, assistant (truncated), user (continuation prompt)
+        assert len(messages) == 3
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "partial output"
+        assert messages[2]["role"] == "user"
+        assert "truncated" in messages[2]["content"].lower() or "stop_reason" in messages[2]["content"]
+
+    @pytest.mark.asyncio
+    async def test_truncation_length_stop_reason(self, tmp_path):
+        """OpenAI-style stop_reason='length' also triggers recovery."""
+        config = self._make_workspace(tmp_path)
+
+        length_response = Response(
+            content="cut off by length",
+            tool_calls=[],
+            model="claude-sonnet-4-20250514",
+            usage=Usage(input_tokens=100, output_tokens=4096),
+            stop_reason="length",
+        )
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=[
+                length_response,
+                text_response("Continued successfully."),
+            ],
+        ) as mock_complete:
+            result = await run_subagent("Do something", config)
+
+        assert result.is_error is False
+        assert "Continued successfully" in result.content
+        assert mock_complete.call_count == 2
+
+        # Verify continuation prompt references the stop_reason
+        second_messages = mock_complete.call_args_list[1].kwargs["messages"]
+        assert second_messages[2]["role"] == "user"
+        assert "length" in second_messages[2]["content"]
+
+    @pytest.mark.asyncio
+    async def test_truncation_then_tool_use(self, tmp_path):
+        """Truncated response → continuation → tool use → final text."""
+        config = self._make_workspace(tmp_path)
+        tools = make_tools()
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=[
+                truncated_response("I need to write a file but—"),
+                tool_response("file_write", {"path": "/tmp/out.txt", "content": "data"}, "tc_1"),
+                text_response("Done, wrote the file."),
+            ],
+        ) as mock_complete, patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="ok"),
+        ):
+            result = await run_subagent("Write a file", config, tools=tools)
+
+        assert result.is_error is False
+        assert "Done" in result.content
+        assert mock_complete.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_not_affected(self, tmp_path):
+        """Normal end_turn response returns immediately — no extra calls."""
+        config = self._make_workspace(tmp_path)
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            return_value=text_response("Normal response"),
+        ) as mock_complete:
+            result = await run_subagent("Quick question", config)
+
+        assert result.is_error is False
+        assert "Normal response" in result.content
+        assert mock_complete.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_truncation_counts_as_iteration(self, tmp_path):
+        """Truncation recovery increments the iteration counter.
+
+        With max_iterations=2: first response truncated (iteration 0,
+        increments completed_iterations to 1), second response uses a tool
+        (iteration 1, increments to 2) → circuit breaker fires.
+        """
+        config = self._make_workspace(tmp_path)
+        tools = make_tools()
+
+        async def _mock_complete(*args, **kwargs):
+            call_num = _mock_complete.call_count
+            _mock_complete.call_count += 1
+            if call_num == 0:
+                return truncated_response("truncated...")
+            elif kwargs.get("tools") is not None:
+                return tool_response("shell", {"command": "echo hi"})
+            else:
+                # Summary call (tools=None)
+                return text_response("Here is what I did so far.")
+
+        _mock_complete.call_count = 0
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            side_effect=_mock_complete,
+        ), patch(
+            "openalph.tools.execute_tool",
+            new_callable=AsyncMock,
+            return_value=ToolResult(content="hi"),
+        ):
+            result = await run_subagent("Work", config, tools=tools, max_iterations=2)
+
+        assert result.is_error is True
+        assert "limit" in result.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_completed_summary_includes_stop_reason(self, tmp_path):
+        """Normal completion writes a summary log entry with stop_reason."""
+        config = self._make_workspace(tmp_path)
+
+        with patch(
+            "openalph.tools.subagent.complete",
+            new_callable=AsyncMock,
+            return_value=text_response("All done."),
+        ):
+            await run_subagent("Quick task", config)
+
+        # Find the JSONL log file
+        log_dir = Path(config.workspace) / "logs" / "subagents"
+        log_files = list(log_dir.glob("*.jsonl"))
+        assert len(log_files) >= 1, f"Expected JSONL log file in {log_dir}"
+
+        # Read the log and find the summary entry
+        log_entries = []
+        for lf in log_files:
+            for line in lf.read_text().strip().splitlines():
+                log_entries.append(json.loads(line))
+
+        summary_entries = [e for e in log_entries if e.get("event") == "summary"]
+        assert len(summary_entries) >= 1, "Expected a summary log entry"
+        summary = summary_entries[-1]
+        assert "stop_reason" in summary, f"Summary missing stop_reason: {summary}"
+        assert summary["stop_reason"] == "end_turn"
