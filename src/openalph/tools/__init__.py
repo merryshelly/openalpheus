@@ -488,7 +488,7 @@ async def execute_tool(
             command=input["command"],
             cwd=shell_cwd,
             env=input.get("env"),
-            timeout=tool_config.get("default_timeout", 30),
+            timeout=input.get("timeout") or tool_config.get("default_timeout", 30),
             max_output=tool_config.get("max_output", 50000),
         )
     elif name == "file_read":
