@@ -10,3 +10,4 @@ build/
 models/
 *.backup
 *.bak
+tmp/
