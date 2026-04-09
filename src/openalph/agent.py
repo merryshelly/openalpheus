@@ -420,13 +420,15 @@ class Agent:
                                 tool_config = t.config
                                 break
 
+                        # Thread call_id through for subagent log cross-referencing
+                        tc_callbacks = {**(callbacks or {}), "call_id": tc.id}
                         tool_coros.append(execute_tool(
                             name=tc.name,
                             input=tc.input,
                             tool_config=tool_config,
                             agent_config=self.config,
                             tools=self.tools,
-                            callbacks=callbacks,
+                            callbacks=tc_callbacks,
                         ))
 
                     results = await asyncio.gather(*tool_coros)

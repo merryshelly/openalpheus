@@ -554,6 +554,7 @@ async def execute_tool(
             model=input.get("model"),
             max_tokens=input.get("max_tokens"),
             max_iterations=input.get("max_iterations"),
+            call_id=callbacks.get("call_id") if callbacks else None,
         )
     elif name == "memory_search":
         from .memory_search import run_memory_search

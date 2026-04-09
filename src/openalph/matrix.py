@@ -661,9 +661,9 @@ class MatrixBot:
             except Exception:
                 pass
             if name == "subagent" and isinstance(input_data, dict):
-                task_preview = input_data.get("task", "")[:500]
+                task_preview = input_data.get("task", "")
                 model_info = input_data.get("model", "default")
-                result_preview = str(result)[:2000] if result else ""
+                result_preview = str(result) if result else ""
                 # Calculate elapsed time if we have a start timestamp
                 elapsed_str = ""
                 start_ts = _subagent_start_times.pop(call_id, None)
@@ -679,12 +679,12 @@ class MatrixBot:
                 if task_preview:
                     html += (
                         f'\n<details><summary>📋 Task brief</summary>\n'
-                        f'<pre>{mistune.html(task_preview)}</pre></details>'
+                        f'{mistune.html(task_preview)}</details>'
                     )
                 if result_preview:
                     html += (
                         f'\n<details><summary>📨 Result</summary>\n'
-                        f'<pre>{mistune.html(result_preview)}</pre></details>'
+                        f'{mistune.html(result_preview)}</details>'
                     )
                 body_text = f"{summary_line}\n\nTask: {task_preview[:200]}"
                 content_msg = {
@@ -721,7 +721,7 @@ class MatrixBot:
             for tc in tool_calls:
                 if tc.name == "subagent" and isinstance(tc.input, dict):
                     _subagent_start_times[tc.id] = time.monotonic()
-                    task_preview = tc.input.get("task", "")[:200]
+                    task_preview = tc.input.get("task", "")
                     model_info = tc.input.get("model", "default")
                     iters = tc.input.get("max_iterations", 200)
                     notice = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters): {task_preview}"
@@ -1347,9 +1347,9 @@ class MatrixBot:
                 # Subagent calls: show task brief (collapsed) on dispatch,
                 # and result summary (collapsed) on return
                 if name == "subagent" and isinstance(input_data, dict):
-                    task_preview = input_data.get("task", "")[:500]
+                    task_preview = input_data.get("task", "")
                     model_info = input_data.get("model", "default")
-                    result_preview = str(result)[:2000] if result else ""
+                    result_preview = str(result) if result else ""
                     # Calculate elapsed time if we have a start timestamp
                     elapsed_str = ""
                     start_ts = _subagent_start_times.pop(call_id, None)
@@ -1365,12 +1365,12 @@ class MatrixBot:
                     if task_preview:
                         html += (
                             f'\n<details><summary>📋 Task brief</summary>\n'
-                            f'<pre>{mistune.html(task_preview)}</pre></details>'
+                            f'{mistune.html(task_preview)}</details>'
                         )
                     if result_preview:
                         html += (
                             f'\n<details><summary>📨 Result</summary>\n'
-                            f'<pre>{mistune.html(result_preview)}</pre></details>'
+                            f'{mistune.html(result_preview)}</details>'
                         )
                     body_text = f"{summary_line}\n\nTask: {task_preview[:200]}"
                     content = {
@@ -1409,7 +1409,7 @@ class MatrixBot:
                 for tc in tool_calls:
                     if tc.name == "subagent" and isinstance(tc.input, dict):
                         _subagent_start_times[tc.id] = time.monotonic()
-                        task_preview = tc.input.get("task", "")[:200]
+                        task_preview = tc.input.get("task", "")
                         model_info = tc.input.get("model", "default")
                         iters = tc.input.get("max_iterations", 200)
                         notice = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters): {task_preview}"

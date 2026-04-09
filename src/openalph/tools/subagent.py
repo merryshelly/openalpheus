@@ -6,7 +6,11 @@ a circuit breaker limit (default 100 iterations).
 """
 
 import asyncio
+import json
 import logging
+import os
+import re
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -48,6 +52,11 @@ def _build_system_prompt(custom_prompt: str | None) -> str:
     return preamble or user_part or "You are a helpful assistant."
 
 
+def _sanitize_call_id(call_id: str) -> str:
+    """Replace non-alphanumeric characters with underscores for safe filenames."""
+    return re.sub(r"[^a-zA-Z0-9]", "_", call_id)
+
+
 async def run_subagent(
     task: str,
     config: AgentConfig,
@@ -56,6 +65,7 @@ async def run_subagent(
     model: str | None = None,
     max_tokens: int | None = None,
     max_iterations: int | None = None,
+    call_id: str | None = None,
 ) -> ToolResult:
     """Execute a multi-turn LLM call as a sub-agent.
 
@@ -75,6 +85,7 @@ async def run_subagent(
         model: Model override (default: use parent's model)
         max_tokens: Max tokens override (default: use parent's max_tokens)
         max_iterations: Max tool-call iterations (default: MAX_ITERATIONS)
+        call_id: Optional identifier for cross-referencing logs (default: generated from timestamp)
 
     Returns:
         ToolResult with the LLM's response content, or error description on failure
@@ -93,11 +104,37 @@ async def run_subagent(
     sub_tools = [t for t in (tools or []) if t.name != "subagent"]
     tools_arg = sub_tools if sub_tools else None
 
+    # Set up JSONL log file
+    run_start = time.time()
+    ts = int(run_start)
+    if call_id is None:
+        safe_call_id = str(ts)
+    else:
+        safe_call_id = _sanitize_call_id(call_id)
+    log_filename = f"{ts}-{safe_call_id}.jsonl"
+    log_dir = Path(config.workspace) / "logs" / "subagents"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = log_dir / log_filename
+
+    def _append_log(entry: dict) -> None:
+        try:
+            with open(log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as log_exc:
+            logger.warning("Failed to write subagent log: %s", log_exc)
+
     # Build conversation starting with task as user message
     messages = [{"role": "user", "content": task}]
 
+    # Tracking counters
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_tool_calls = 0
+    completed_iterations = 0
+
     try:
         for iteration in range(iteration_limit):
+            iter_start = time.time()
             response = await complete(
                 config=config,
                 system=system,
@@ -106,8 +143,25 @@ async def run_subagent(
                 max_tokens=max_tokens,
             )
 
+            # Accumulate token counts
+            if response.usage:
+                total_input_tokens += response.usage.input_tokens or 0
+                total_output_tokens += response.usage.output_tokens or 0
+
             # Text response — done
             if not response.tool_calls:
+                elapsed = time.time() - run_start
+                _append_log({
+                    "event": "summary",
+                    "status": "completed",
+                    "total_iterations": completed_iterations,
+                    "total_tool_calls": total_tool_calls,
+                    "total_input_tokens": total_input_tokens,
+                    "total_output_tokens": total_output_tokens,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "model": config.default_model,
+                    "task": task,
+                })
                 return ToolResult(content=response.content, is_error=False)
 
             # Tool calls — execute and loop
@@ -136,7 +190,10 @@ async def run_subagent(
 
             results = await asyncio.gather(*tool_coros)
 
+            error_count = 0
             for tc, result in zip(response.tool_calls, results):
+                if result.is_error:
+                    error_count += 1
                 truncated = truncate_result(result.content, config.truncation_limit)
                 wrapped = wrap_tool_result(truncated, tc.name, tc.id)
                 messages.append({
@@ -149,6 +206,20 @@ async def run_subagent(
                              tc.name, "error" if result.is_error else "ok",
                              len(wrapped))
 
+            tools_called = [tc.name for tc in response.tool_calls]
+            total_tool_calls += len(tools_called)
+            iter_elapsed = time.time() - iter_start
+            _append_log({
+                "event": "iteration",
+                "iteration": iteration,
+                "tools_called": tools_called,
+                "errors": error_count,
+                "input_tokens": response.usage.input_tokens if response.usage else 0,
+                "output_tokens": response.usage.output_tokens if response.usage else 0,
+                "elapsed_seconds": round(iter_elapsed, 3),
+            })
+            completed_iterations += 1
+
         # Circuit breaker — request summary from the model
         logger.warning("Sub-agent tool call limit (%d) reached", iteration_limit)
         limit_notice = (
@@ -157,6 +228,19 @@ async def run_subagent(
             "Do NOT attempt further tool calls.]"
         )
         messages.append({"role": "user", "content": limit_notice})
+
+        elapsed = time.time() - run_start
+        _append_log({
+            "event": "summary",
+            "status": "circuit_breaker",
+            "total_iterations": completed_iterations,
+            "total_tool_calls": total_tool_calls,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "elapsed_seconds": round(elapsed, 3),
+            "model": config.default_model,
+            "task": task,
+        })
 
         try:
             summary = await complete(
@@ -180,4 +264,17 @@ async def run_subagent(
             )
 
     except Exception as e:
+        elapsed = time.time() - run_start
+        _append_log({
+            "event": "summary",
+            "status": "error",
+            "total_iterations": completed_iterations,
+            "total_tool_calls": total_tool_calls,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "elapsed_seconds": round(elapsed, 3),
+            "model": config.default_model,
+            "task": task,
+            "error": str(e),
+        })
         return ToolResult(content=f"Sub-agent error: {e}", is_error=True)
