@@ -403,6 +403,15 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
 
 def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
     """Convert normalized messages to OpenAI format."""
+    # Strip thinking from all assistant messages — provider-specific field
+    # that most OpenAI-compatible APIs reject.  Same rationale as Anthropic:
+    # thinking already influenced the response; replaying wastes context.
+    messages = [
+        {k: v for k, v in msg.items() if k != "thinking"}
+        if msg.get("role") == "assistant" else msg
+        for msg in messages
+    ]
+
     result = []
     for msg in messages:
         role = msg.get("role")

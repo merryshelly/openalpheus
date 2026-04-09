@@ -21,10 +21,12 @@ from openalph.provider import (
     Response,
     Usage,
     ThinkingBlock,
+    ToolCall,
     _supports_adaptive_thinking,
     _thinking_effort,
     _thinking_budget,
     _convert_messages_for_anthropic,
+    _convert_messages_for_openai,
     _parse_anthropic_response,
 )
 
@@ -996,6 +998,97 @@ class TestSessionThinkingPersistence:
         context = log.build_context(room_id)
         assistant_msg = [m for m in context if m["role"] == "assistant"][0]
         assert assistant_msg.get("thinking") is None or assistant_msg.get("thinking") == []
+
+
+# ---------------------------------------------------------------------------
+# OpenAI message conversion: thinking stripped
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIThinkingStripping:
+    """Thinking blocks must be stripped from assistant messages for OpenAI-compatible APIs.
+
+    Fireworks, Together, and other OpenAI-compatible providers reject unknown fields.
+    The thinking field in session history must not leak into the wire format.
+    Regression test for 2026-04-09 Fireworks 400 Bad Request incident.
+    """
+
+    def test_thinking_stripped_from_simple_assistant(self):
+        """Assistant message with thinking and no tool_calls."""
+        messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {
+                "role": "assistant",
+                "content": "4",
+                "thinking": [{"thinking": "Simple arithmetic", "signature": ""}],
+            },
+        ]
+        result = _convert_messages_for_openai(messages)
+        assistant = [m for m in result if m["role"] == "assistant"][0]
+        assert "thinking" not in assistant
+        assert assistant["content"] == "4"
+
+    def test_thinking_stripped_with_tool_calls(self):
+        """Assistant message with both thinking and tool_calls."""
+        messages = [
+            {"role": "user", "content": "Read my file"},
+            {
+                "role": "assistant",
+                "content": "",
+                "thinking": [{"thinking": "I should read the file", "signature": "sig1"}],
+                "tool_calls": [
+                    ToolCall(id="tc1", name="file_read", input={"path": "/tmp/test"}),
+                ],
+            },
+        ]
+        result = _convert_messages_for_openai(messages)
+        assistant = [m for m in result if m["role"] == "assistant"][0]
+        assert "thinking" not in assistant
+        assert len(assistant["tool_calls"]) == 1
+        assert assistant["tool_calls"][0]["function"]["name"] == "file_read"
+
+    def test_no_thinking_key_unchanged(self):
+        """Messages without thinking key pass through normally."""
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+        ]
+        result = _convert_messages_for_openai(messages)
+        assistant = [m for m in result if m["role"] == "assistant"][0]
+        assert assistant == {"role": "assistant", "content": "Hello"}
+
+    def test_user_messages_not_affected(self):
+        """Only assistant messages are stripped; user messages pass through."""
+        messages = [
+            {"role": "user", "content": "Hi", "extra_field": "should_stay"},
+            {"role": "assistant", "content": "Hello", "thinking": [{"thinking": "x", "signature": ""}]},
+        ]
+        result = _convert_messages_for_openai(messages)
+        user = [m for m in result if m["role"] == "user"][0]
+        assert "extra_field" in user
+
+    def test_multiple_assistant_messages_all_stripped(self):
+        """All assistant messages in a conversation have thinking stripped."""
+        messages = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1", "thinking": [{"thinking": "t1", "signature": ""}]},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "A2", "thinking": [{"thinking": "t2", "signature": ""}]},
+        ]
+        result = _convert_messages_for_openai(messages)
+        assistants = [m for m in result if m["role"] == "assistant"]
+        for a in assistants:
+            assert "thinking" not in a
+
+    def test_empty_thinking_list_stripped(self):
+        """Even an empty thinking list is stripped (clean wire format)."""
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello", "thinking": []},
+        ]
+        result = _convert_messages_for_openai(messages)
+        assistant = [m for m in result if m["role"] == "assistant"][0]
+        assert "thinking" not in assistant
 
 
 # ---------------------------------------------------------------------------
