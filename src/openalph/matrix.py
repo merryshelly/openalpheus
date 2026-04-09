@@ -633,33 +633,40 @@ class MatrixBot:
             await self.send(room, "Cancelled.")
             await self._set_typing(room, False)
 
-    async def _run_heartbeat_turn(self, room_id: str, content: str) -> None:
-        """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
+    def _make_tool_callbacks(self, room_id: str):
+        """Create tool-use callback closures bound to a specific room.
 
-        Extracted from _inject_heartbeat for reuse by _inject_umbral.
-        Raises on error — caller is responsible for error handling.
+        Returns a ``(_tool_notice, _tool_intent)`` tuple suitable for passing
+        to the agent's ``process`` call.  Both closures share a private
+        ``_subagent_start_times`` dict so that elapsed-time tracking works
+        across the intent→notice lifecycle.
+
+        This factory exists to eliminate the duplicated closure definitions
+        that previously lived in both the heartbeat and streaming message
+        code paths.
         """
-        # Activate room if not already active
-        if room_id not in self._active_rooms:
-            await self._activate_room(room_id)
-
-        # -- tool-use callbacks (same as normal message path) --
-
         _subagent_start_times: dict[str, float] = {}
 
         async def _tool_notice(call_id, name, input_data, result, is_error):
+            # Show tool name + brief input context, but NEVER output
+            # (which may contain secrets from op read, API responses, etc.)
             status = "❌ error" if is_error else "✅"
             detail = ""
             if isinstance(input_data, dict):
+                # Pick the most informative input field per tool type
                 for key in ("path", "file_path", "command", "query", "url"):
                     if key in input_data:
                         val = str(input_data[key])[:120]
                         detail = f" `{val}`"
                         break
+            # Refresh typing indicator — Matrix expires it after ~30s,
+            # so long tool loops look dead without this.
             try:
                 await self._set_typing(room_id, True)
             except Exception:
                 pass
+            # Subagent calls: show task brief (collapsed) on dispatch,
+            # and result summary (collapsed) on return
             if name == "subagent" and isinstance(input_data, dict):
                 task_preview = input_data.get("task", "")
                 model_info = input_data.get("model", "default")
@@ -703,6 +710,7 @@ class MatrixBot:
                     await self.send_notice(room_id, notice_body)
                 except Exception:
                     pass
+            # Append tool result to session log
             _sl = getattr(self, 'session_log', None)
             if _sl:
                 _sl.append(
@@ -755,6 +763,21 @@ class MatrixBot:
                         for tc in tool_calls
                     ],
                 )
+
+        return _tool_notice, _tool_intent
+
+    async def _run_heartbeat_turn(self, room_id: str, content: str) -> None:
+        """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
+
+        Extracted from _inject_heartbeat for reuse by _inject_umbral.
+        Raises on error — caller is responsible for error handling.
+        """
+        # Activate room if not already active
+        if room_id not in self._active_rooms:
+            await self._activate_room(room_id)
+
+        # -- tool-use callbacks (same as normal message path) --
+        _tool_notice, _tool_intent = self._make_tool_callbacks(room_id)
 
         # Process through agent
         try:
@@ -1339,125 +1362,7 @@ class MatrixBot:
             await self._set_typing(room_id, True)
 
             # Wire tool visibility for this turn
-            _subagent_start_times: dict[str, float] = {}
-
-            async def _tool_notice(call_id, name, input_data, result, is_error):
-                # Show tool name + brief input context, but NEVER output
-                # (which may contain secrets from op read, API responses, etc.)
-                status = "❌ error" if is_error else "✅"
-                detail = ""
-                if isinstance(input_data, dict):
-                    # Pick the most informative input field per tool type
-                    for key in ("path", "file_path", "command", "query", "url"):
-                        if key in input_data:
-                            val = str(input_data[key])[:120]
-                            detail = f" `{val}`"
-                            break
-                # Refresh typing indicator — Matrix expires it after ~30s,
-                # so long tool loops look dead without this.
-                try:
-                    await self._set_typing(room_id, True)
-                except Exception:
-                    pass
-                # Subagent calls: show task brief (collapsed) on dispatch,
-                # and result summary (collapsed) on return
-                if name == "subagent" and isinstance(input_data, dict):
-                    task_preview = input_data.get("task", "")
-                    model_info = input_data.get("model", "default")
-                    result_preview = str(result) if result else ""
-                    # Calculate elapsed time if we have a start timestamp
-                    elapsed_str = ""
-                    start_ts = _subagent_start_times.pop(call_id, None)
-                    if start_ts is not None:
-                        elapsed = time.monotonic() - start_ts
-                        if elapsed >= 60:
-                            mins, secs = divmod(int(elapsed), 60)
-                            elapsed_str = f" — {mins}m{secs:02d}s"
-                        else:
-                            elapsed_str = f" — {elapsed:.1f}s"
-                    summary_line = f"🤖 subagent ({model_info}) {status}{elapsed_str}"
-                    html = f'<b>{summary_line}</b>'
-                    if task_preview:
-                        html += (
-                            f'\n<details><summary>📋 Task brief</summary>\n'
-                            f'{mistune.html(task_preview)}</details>'
-                        )
-                    if result_preview:
-                        html += (
-                            f'\n<details><summary>📨 Result</summary>\n'
-                            f'{mistune.html(result_preview)}</details>'
-                        )
-                    body_text = f"{summary_line}\n\nTask: {task_preview[:200]}"
-                    content = {
-                        "msgtype": "m.notice",
-                        "body": body_text,
-                        "format": "org.matrix.custom.html",
-                        "formatted_body": html,
-                    }
-                    try:
-                        await self._room_send_with_retry(room_id, content)
-                    except Exception:
-                        pass
-                else:
-                    notice_body = f"🔧 {name}{detail} {status}"
-                    try:
-                        await self.send_notice(room_id, notice_body)
-                    except Exception:
-                        pass
-                # Append tool result to session log
-                _sl = getattr(self, 'session_log', None)
-                if _sl:
-                    _sl.append(
-                        role="tool",
-                        sender=self.config.user_id,
-                        room=room_id,
-                        event_id=None,
-                        call_id=call_id,
-                        name=name,
-                        output=result,
-                        is_error=is_error,
-                    )
-
-            # Wire tool intent logging (fires before tool execution)
-            async def _tool_intent(tool_calls, content):
-                # Emit Matrix notice for subagent dispatch
-                for tc in tool_calls:
-                    if tc.name == "subagent" and isinstance(tc.input, dict):
-                        _subagent_start_times[tc.id] = time.monotonic()
-                        task_preview = tc.input.get("task", "")
-                        model_info = tc.input.get("model", "default")
-                        iters = tc.input.get("max_iterations", 200)
-                        summary = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters)"
-                        html = f'<b>{summary}</b>'
-                        if task_preview:
-                            html += (
-                                f'\n<details><summary>📋 Task brief</summary>\n'
-                                f'{mistune.html(task_preview)}</details>'
-                            )
-                        body_text = f"{summary}: {task_preview[:200]}"
-                        dispatch_msg = {
-                            "msgtype": "m.notice",
-                            "body": body_text,
-                            "format": "org.matrix.custom.html",
-                            "formatted_body": html,
-                        }
-                        try:
-                            await self._room_send_with_retry(room_id, dispatch_msg)
-                        except Exception:
-                            pass
-                _sl = getattr(self, 'session_log', None)
-                if _sl:
-                    _sl.append(
-                        role="assistant",
-                        sender=self.config.user_id,
-                        room=room_id,
-                        event_id=None,
-                        content=content or "",
-                        tool_calls=[
-                            {"call_id": tc.id, "name": tc.name, "input": tc.input}
-                            for tc in tool_calls
-                        ],
-                    )
+            _tool_notice, _tool_intent = self._make_tool_callbacks(room_id)
 
             # Create upload callback for send_media tool
             async def _upload_callback(file_path, content_type, filename, caption=None):
