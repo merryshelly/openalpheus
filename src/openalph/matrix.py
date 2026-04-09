@@ -1734,7 +1734,7 @@ class MatrixBot:
         else:
             body = event.body.strip()
 
-        # --- Mention gating (kdsn.60) ---
+        # --- Mention gating ---
         gated = is_gated(self.config, room)
 
         if gated:
@@ -1771,7 +1771,7 @@ class MatrixBot:
         # --- End mention gating ---
 
         # Lazy wake: ensure room is activated before processing any command so that
-        # _process_message and slash commands both see full room history (kdsn.79).
+        # _process_message and slash commands both see full room history.
         if not hasattr(self, '_active_rooms'):
             self._active_rooms = set()
         if room_id not in self._active_rooms:

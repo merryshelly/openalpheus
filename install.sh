@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # OpenAlph Bootstrap Script — Steps 0-3
-# Workspace: workspace-kdsn.93.4
+
 # =============================================================================
 #
 # This script performs the following steps:
@@ -829,7 +829,7 @@ EOF
 
 # =============================================================================
 # STEP 6 — CREATE MATRIX ACCOUNTS (also covers Steps 9 & 11)
-# Workspace: workspace-kdsn.93.7
+
 # =============================================================================
 #
 # This file is sourced by install.sh after tuwunel is deployed (Step 4).
@@ -1317,7 +1317,7 @@ OVERRIDE_EOF
 
 # =============================================================================
 # OpenAlph Bootstrap Script — Steps 7, 8, 10, 12
-# Workspace: workspace-kdsn.93.8
+
 # =============================================================================
 #
 # This file provides four functions that handle agent installation:

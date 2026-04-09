@@ -6,7 +6,7 @@ max_tokens = 4096
 [provider]
 type = "openai"
 api_key = "ollama"
-base_url = "http://10.0.20.104:11434/v1"
+base_url = "http://localhost:11434/v1"
 
 [workspace]
 path = "/tmp/test-workspace"

@@ -8,7 +8,7 @@ max_tokens = 8192
 type = "anthropic"
 # Exactly one of: api_key, api_key_env, api_key_cmd
 # api_key = "sk-ant-..."                          # direct (not recommended)
-api_key_cmd = "op read op://shelly/anthropic/api-key"  # shell command
+api_key_cmd = "op read op://<your-vault>/anthropic/api-key"  # shell command
 # api_key_env = "ANTHROPIC_API_KEY"               # env var
 
 [workspace]
@@ -41,7 +41,7 @@ path = "/home/merry/.openalph/workspace"
 # [provider]
 # type = "openai"
 # api_key = "ollama"
-# base_url = "http://100.90.3.4:11434/v1"
+# base_url = "http://<your-host>:11434/v1"
 #
 # [workspace]
 # path = "/home/coldharbor/.openalph/workspace"

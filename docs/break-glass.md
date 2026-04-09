@@ -12,10 +12,10 @@ Stop the affected agent(s). This is safe — agents reconnect cleanly on restart
 
 ```bash
 # Stop one agent
-sudo systemctl stop openalph@merry
+sudo systemctl stop openalph@<name>
 
 # Stop all agents
-sudo systemctl stop openalph@merry openalph@watson openalph@babson openalph@saw
+sudo systemctl stop openalph@agent1 openalph@agent2 openalph@agent3
 
 # Nuclear: stop everything
 sudo systemctl stop 'openalph@*'
@@ -32,7 +32,7 @@ cd /opt/openalph
 git log --oneline -20
 ```
 
-Look for the last commit before the bad change. Commits have descriptive messages with bead IDs (e.g., `feat: tool result wrapping (kdsn.39)`).
+Look for the last commit before the bad change. Commits have descriptive messages.
 
 If you know which file is broken but not which commit:
 
@@ -92,10 +92,10 @@ If tests pass, you're ready to restart. If tests fail, you may need to go furthe
 
 ```bash
 # Start one agent
-sudo systemctl start openalph@merry
+sudo systemctl start openalph@<name>
 
 # Start all agents
-sudo systemctl start openalph@merry openalph@watson openalph@babson openalph@saw
+sudo systemctl start openalph@agent1 openalph@agent2 openalph@agent3
 
 # Verify they're running
 systemctl status 'openalph@*' --no-pager
@@ -108,7 +108,7 @@ systemctl status 'openalph@*' --no-pager
 Send a test message in Matrix. Check the journal for errors:
 
 ```bash
-journalctl -u openalph@merry -n 50 --no-pager
+journalctl -u openalph@<name> -n 50 --no-pager
 ```
 
 ---
@@ -132,8 +132,8 @@ journalctl -u openalph@merry -n 50 --no-pager
 
 ## Emergency Contacts
 
-If Merry is the one misbehaving, she can't help you debug herself. Options:
+If the orchestrator is the one misbehaving, it can't help you debug itself. Options:
 
-- Read the journal directly: `journalctl -u openalph@merry -f`
-- Talk to another agent (Watson, Babson) to investigate
-- SSH to diodati and work manually
+- Read the journal directly: `journalctl -u openalph@<name> -f`
+- Talk to another agent to investigate
+- SSH to the host and work manually

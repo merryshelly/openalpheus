@@ -49,7 +49,7 @@ Each agent runs as a dedicated Unix user (`oa-<name>`) in the `openalph` group. 
 
 ### Orchestrator Privileges (Merry Only)
 
-The orchestrator has a differentiated security profile from domain agents. Merry's systemd unit override (`/etc/systemd/system/openalph@merry.service.d/override.conf`) disables the hardening restrictions that domain agents keep:
+The orchestrator has a differentiated security profile from domain agents. The orchestrator's systemd unit override (`/etc/systemd/system/openalph@<orchestrator>.service.d/override.conf`) disables the hardening restrictions that domain agents keep:
 
 - `NoNewPrivileges=no` — allows sudo escalation
 - `ProtectHome=no` — allows access to all home directories

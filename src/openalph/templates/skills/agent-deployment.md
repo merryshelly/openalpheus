@@ -412,7 +412,7 @@ Five systems need to know about the new agent. **All five must be updated** befo
 File: `scripts/warden-check.sh`, line ~161
 
 ```bash
-local agents=(merry watson babson saw florin <name>)
+local agents=(agent1 agent2 <name>)
 ```
 
 ### 2. Checksum Watchdog — SAFETY.md Monitoring
@@ -432,7 +432,7 @@ Then rebaseline: `bash scripts/checksum-watchdog.sh --rebaseline`
 File: `/srv/openalph/shared/bin/archivist.py`, line 32
 
 ```python
-AGENTS = ["merry", "watson", "florin", "babson", "saw", "wonmun", "<name>"]
+AGENTS = ["agent1", "agent2", "<name>"]
 ```
 
 ### 4. Escape Pod Backup
