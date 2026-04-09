@@ -480,9 +480,13 @@ async def execute_tool(
 
     if name == "shell":
         from .shell import run_shell
+        # Default cwd to workspace so relative paths match file tools
+        shell_cwd = input.get("cwd")
+        if shell_cwd is None and hasattr(agent_config, "workspace"):
+            shell_cwd = str(agent_config.workspace)
         result = await run_shell(
             command=input["command"],
-            cwd=input.get("cwd"),
+            cwd=shell_cwd,
             env=input.get("env"),
             timeout=tool_config.get("default_timeout", 30),
             max_output=tool_config.get("max_output", 50000),
