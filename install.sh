@@ -1155,7 +1155,7 @@ OVERRIDE_EOF
                 continue
             fi
             # Matrix localparts: lowercase a-z, 0-9, -, ., _, =, /
-            if ! printf '%s' "${OP_USER}" | grep -qE '^[a-z0-9._=\-/]+$'; then
+            if ! printf '%s' "${OP_USER}" | grep -qE '^[a-z0-9._=/-]+$'; then
                 warn "Username '${OP_USER}' contains invalid characters."
                 warn "Matrix localparts may only contain: a-z 0-9 - . _ = /"
                 continue
@@ -1221,7 +1221,7 @@ OVERRIDE_EOF
                 warn "Agent name cannot be empty. Please try again."
                 continue
             fi
-            if ! printf '%s' "${AGENT_NAME}" | grep -qE '^[a-z0-9._=\-/]+$'; then
+            if ! printf '%s' "${AGENT_NAME}" | grep -qE '^[a-z0-9._=/-]+$'; then
                 warn "Agent name '${AGENT_NAME}' contains invalid characters."
                 warn "Matrix localparts may only contain: a-z 0-9 - . _ = /"
                 continue
