@@ -126,6 +126,22 @@ step0_safety_preamble() {
     }
 
     # -------------------------------------------------------------------------
+    # Interactive read helper — always reads from /dev/tty so that
+    # `curl | bash` works correctly. Fails clearly if no TTY is available
+    # and the caller hasn't provided the value via environment variable.
+    # -------------------------------------------------------------------------
+    _prompt_read() {
+        if [[ -e /dev/tty ]]; then
+            read "$@" </dev/tty
+        else
+            error "Interactive input required but no TTY is available."
+            error "For non-interactive install, set the required environment variables."
+            error "See: ${OPENALPH_DOCS}/src/branch/main/INSTALL.md"
+            exit 1
+        fi
+    }
+
+    # -------------------------------------------------------------------------
     # Banner
     # -------------------------------------------------------------------------
     printf "\n"
@@ -534,7 +550,7 @@ step5_setup_tls() {
         echo "      You have a cert and key file already."
         echo ""
         local choice
-        read -r -p "Choice [1]: " choice
+        _prompt_read -r -p "Choice [1]: " choice
         choice="${choice:-1}"
 
         case "${choice}" in
@@ -617,7 +633,7 @@ step5_setup_tls() {
         info "TLS mode: Let's Encrypt (automatic ACME)"
 
         if [[ -z "${OPENALPH_DOMAIN:-}" ]]; then
-            read -r -p "Enter your domain name (e.g. matrix.example.com): " OPENALPH_DOMAIN
+            _prompt_read -r -p "Enter your domain name (e.g. matrix.example.com): " OPENALPH_DOMAIN
         fi
 
         if [[ -z "${OPENALPH_DOMAIN}" ]]; then
@@ -637,19 +653,19 @@ step5_setup_tls() {
         info "TLS mode: custom certificate"
 
         if [[ -z "${OPENALPH_TLS_CERT:-}" ]]; then
-            read -r -p "Path to certificate file (.crt or .pem): " CERT_PATH
+            _prompt_read -r -p "Path to certificate file (.crt or .pem): " CERT_PATH
         else
             CERT_PATH="${OPENALPH_TLS_CERT}"
         fi
 
         if [[ -z "${OPENALPH_TLS_KEY:-}" ]]; then
-            read -r -p "Path to private key file (.key): " KEY_PATH
+            _prompt_read -r -p "Path to private key file (.key): " KEY_PATH
         else
             KEY_PATH="${OPENALPH_TLS_KEY}"
         fi
 
         if [[ -z "${OPENALPH_DOMAIN:-}" ]]; then
-            read -r -p "Domain name (as in the certificate's CN/SAN): " OPENALPH_DOMAIN
+            _prompt_read -r -p "Domain name (as in the certificate's CN/SAN): " OPENALPH_DOMAIN
         fi
 
         # Validate files exist before proceeding
@@ -1133,7 +1149,7 @@ OVERRIDE_EOF
         # Interactive mode: prompt
         while true; do
             printf "\n"
-            read -r -p "  Operator username (e.g. alice): " OP_USER
+            _prompt_read -r -p "  Operator username (e.g. alice): " OP_USER
             if [[ -z "${OP_USER}" ]]; then
                 warn "Username cannot be empty. Please try again."
                 continue
@@ -1148,7 +1164,7 @@ OVERRIDE_EOF
         done
 
         while true; do
-            read -rs -p "  Password: " OP_PASS
+            _prompt_read -rs -p "  Password: " OP_PASS
             printf "\n"
             if [[ -z "${OP_PASS}" ]]; then
                 warn "Password cannot be empty. Please try again."
@@ -1158,7 +1174,7 @@ OVERRIDE_EOF
                 warn "Password must be at least 8 characters."
                 continue
             fi
-            read -rs -p "  Confirm password: " _op_pass_confirm
+            _prompt_read -rs -p "  Confirm password: " _op_pass_confirm
             printf "\n"
             if [[ "${OP_PASS}" != "${_op_pass_confirm}" ]]; then
                 warn "Passwords do not match. Please try again."
@@ -1200,7 +1216,7 @@ OVERRIDE_EOF
         info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
         while true; do
-            read -r -p "  Agent name (e.g. merry): " AGENT_NAME
+            _prompt_read -r -p "  Agent name (e.g. merry): " AGENT_NAME
             if [[ -z "${AGENT_NAME}" ]]; then
                 warn "Agent name cannot be empty. Please try again."
                 continue
@@ -1472,7 +1488,7 @@ step8_create_agent() {
             exit 1
         fi
         echo ""
-        read -r -p "Agent name (lowercase letters, numbers, hyphens; e.g. 'myagent'): " AGENT_NAME
+        _prompt_read -r -p "Agent name (lowercase letters, numbers, hyphens; e.g. 'myagent'): " AGENT_NAME
     fi
 
     # ── Validation rules ──────────────────────────────────────────────────────
@@ -1547,7 +1563,7 @@ step8_create_agent() {
         echo "  [3] Local / OpenAI-compatible (Ollama, vLLM, etc.)"
         echo ""
         local _prov_choice
-        read -r -p "Choice [1]: " _prov_choice
+        _prompt_read -r -p "Choice [1]: " _prov_choice
         _prov_choice="${_prov_choice:-1}"
 
         case "${_prov_choice}" in
@@ -1604,7 +1620,7 @@ step8_create_agent() {
             exit 1
         fi
         echo ""
-        read -rs -p "API key: " API_KEY
+        _prompt_read -rs -p "API key: " API_KEY
         echo ""   # newline after hidden input
         if [[ -z "${API_KEY}" ]]; then
             error "API key cannot be empty."
@@ -1623,7 +1639,7 @@ step8_create_agent() {
                 exit 1
             fi
             echo ""
-            read -r -p "Base URL (e.g. http://localhost:11434/v1): " BASE_URL
+            _prompt_read -r -p "Base URL (e.g. http://localhost:11434/v1): " BASE_URL
         fi
         if [[ -z "${BASE_URL}" ]]; then
             error "Base URL is required for local/OpenAI-compatible providers."
@@ -1650,7 +1666,7 @@ step8_create_agent() {
             echo "  OpenRouter default:  anthropic/claude-sonnet-4"
             echo "  Local default:       (uses whatever your server provides)"
             echo ""
-            read -r -p "Model [default]: " MODEL
+            _prompt_read -r -p "Model [default]: " MODEL
         fi
         # If still empty after prompt (or non-interactive), apply defaults below
     fi
