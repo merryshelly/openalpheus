@@ -10,7 +10,7 @@ Tiny, self-contained, disproportionately effective.
 
 OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix provides the transport layer. Local JSONL files hold session state. systemd manages the lifecycle. Four direct Python dependencies. No cloud except the ones you explicitly choose.
 
-**Status: v0.1.0 — early release.** Core is stable and tested (1,435+ tests). The interface may evolve.
+**Status: v0.1.1 — early release.** Core is stable and tested (1,435+ tests). The interface may evolve.
 
 ## Why
 

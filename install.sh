@@ -24,7 +24,7 @@ set -euo pipefail
 # CONSTANTS
 # =============================================================================
 
-readonly OPENALPH_VERSION="${OPENALPH_VERSION:-v0.1.0}"
+readonly OPENALPH_VERSION="${OPENALPH_VERSION:-v0.1.1}"
 readonly OPENALPH_REPO="https://codeberg.org/merryshelly/openalph.git"
 
 readonly REQUIRED_PYTHON_MAJOR=3
