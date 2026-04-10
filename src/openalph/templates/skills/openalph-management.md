@@ -157,7 +157,7 @@ Agent configs live at `/etc/openalph/agents/<name>.toml`. They are **operator-ma
 ```toml
 [agent]
 name = "<name>"
-default_model = "anthropic/claude-sonnet-4"
+default_model = "anthropic/claude-sonnet-4-6"
 max_tokens = 8192
 model_max_tokens = 200000
 max_iterations = 50

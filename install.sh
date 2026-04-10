@@ -1753,8 +1753,8 @@ step8_create_agent() {
             echo "Model selection (press Enter for default)"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
-            echo "  Anthropic default:   anthropic/claude-sonnet-4"
-            echo "  OpenRouter default:  anthropic/claude-sonnet-4"
+            echo "  Anthropic default:   anthropic/claude-sonnet-4-6"
+            echo "  OpenRouter default:  anthropic/claude-sonnet-4-6"
             echo "  Local default:       (uses whatever your server provides)"
             echo ""
             _prompt_read -r -p "Model [default]: " MODEL
@@ -1768,16 +1768,16 @@ step8_create_agent() {
             # TOML stores "anthropic/<model>" — strip any leading "anthropic/" the
             # user may have typed to avoid doubling up.
             if [[ -z "${MODEL}" ]]; then
-                MODEL="claude-sonnet-4"
+                MODEL="claude-sonnet-4-6"
             fi
             # Normalise: strip accidental leading provider prefix
             MODEL="${MODEL#anthropic/}"
             ;;
         openrouter)
-            # OpenRouter models are already namespaced (e.g. anthropic/claude-sonnet-4).
-            # Default: anthropic/claude-sonnet-4
+            # OpenRouter models are already namespaced (e.g. anthropic/claude-sonnet-4-6).
+            # Default: anthropic/claude-sonnet-4-6
             if [[ -z "${MODEL}" ]]; then
-                MODEL="anthropic/claude-sonnet-4"
+                MODEL="anthropic/claude-sonnet-4-6"
             fi
             ;;
         local)
@@ -1860,14 +1860,14 @@ step8_create_agent() {
             if [[ -n "${MODEL}" ]]; then
                 DEFAULT_MODEL_LINE="default_model = \"anthropic/${MODEL}\""
             else
-                DEFAULT_MODEL_LINE="default_model = \"anthropic/claude-sonnet-4\""
+                DEFAULT_MODEL_LINE="default_model = \"anthropic/claude-sonnet-4-6\""
             fi
             ;;
         openrouter)
             if [[ -n "${MODEL}" ]]; then
                 DEFAULT_MODEL_LINE="default_model = \"openrouter/${MODEL}\""
             else
-                DEFAULT_MODEL_LINE="default_model = \"openrouter/anthropic/claude-sonnet-4\""
+                DEFAULT_MODEL_LINE="default_model = \"openrouter/anthropic/claude-sonnet-4-6\""
             fi
             ;;
         local)

@@ -461,9 +461,9 @@ Common choices:
 
 | Model | `default_model` | `model_max_tokens` | Use Case |
 |-------|-----------------|-------------------|----------|
-| Claude Opus 4 | `anthropic/claude-opus-4` | 200000 | Highest capability |
-| Claude Sonnet 4 | `anthropic/claude-sonnet-4` | 200000 | Balanced |
-| Claude Haiku 4 | `anthropic/claude-haiku-4` | 200000 | Fast and cheap |
+| Claude Opus 4 | `anthropic/claude-opus-4-6` | 200000 | Highest capability |
+| Claude Sonnet 4 | `anthropic/claude-sonnet-4-6` | 200000 | Balanced |
+| Claude Haiku 4 | `anthropic/claude-haiku-4-5-20251001` | 200000 | Fast and cheap |
 | GLM-5 | `openrouter/z-ai/glm-5` | 131072 | Default for domain agents |
 | Local model | `local/your-model` | 131072 | Zero cost, local inference |
 

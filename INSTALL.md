@@ -122,7 +122,7 @@ Every prompt, in order. All can be skipped via environment variables (§4).
 
 **Base URL** — local provider only (e.g. `http://localhost:11434/v1`).
 
-**Model** — press Enter for default (`claude-sonnet-4` for Anthropic). Changeable later.
+**Model** — press Enter for default (`claude-sonnet-4-6` for Anthropic). Changeable later.
 
 **If it fails:** fix the issue and re-run. Use `--force` to overwrite existing agent resources: `sudo bash install.sh --force`
 
