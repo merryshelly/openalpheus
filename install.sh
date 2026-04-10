@@ -225,6 +225,18 @@ step1_preflight_checks() {
     fi
 
     # -------------------------------------------------------------------------
+    # Python venv module (required for isolated install)
+    # On Debian/Ubuntu, this is a separate package: python3.XX-venv
+    # -------------------------------------------------------------------------
+    if python3 -m venv --help &>/dev/null 2>&1; then
+        _pf_pass "Python venv module" "available"
+    else
+        _pf_fail "Python venv module not found" \
+            "Install it: apt-get install -y python3-venv (or python3.XX-venv for your Python version)"
+        (( _failures++ ))
+    fi
+
+    # -------------------------------------------------------------------------
     # Docker >= 24
     # -------------------------------------------------------------------------
     if command -v docker &>/dev/null; then
@@ -394,8 +406,12 @@ step2_install_openalph() {
 
     # Use a dedicated venv to avoid PEP 668 (externally-managed-environment)
     # on Debian 12+/13 and Ubuntu 23.04+
-    if [[ ! -d "${_venv_dir}" ]]; then
+    # Create or repair the virtual environment.
+    # A previous failed run may have left a directory without a working pip,
+    # so we check the actual binary rather than just the directory.
+    if [[ ! -x "${_venv_dir}/bin/pip" ]]; then
         info "Creating Python virtual environment at ${_venv_dir}..."
+        rm -rf "${_venv_dir}"
         python3 -m venv "${_venv_dir}"
     fi
 
