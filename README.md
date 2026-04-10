@@ -8,7 +8,7 @@ Named after the pistol shrimp (*Alpheus*) — a crustacean smaller than your thu
 
 Tiny, self-contained, disproportionately effective.
 
-OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix provides the transport layer. Local JSONL files hold session state. systemd manages the lifecycle. Three Python dependencies. No cloud except the ones you explicitly choose.
+OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix provides the transport layer. Local JSONL files hold session state. systemd manages the lifecycle. Four direct Python dependencies. No cloud except the ones you explicitly choose.
 
 **Status: v0.1.0 — early release.** Core is stable and tested (1,435+ tests). The interface may evolve.
 
@@ -20,7 +20,7 @@ All agent frameworks make tradeoffs. We optimized for:
 - **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
 - **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Nine tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
 - **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
-- **Maintainability.** ~9,000 LOC. Full test coverage. Three dependencies: `anthropic`, `openai`, `matrix-nio`.
+- **Maintainability.** ~9,000 LOC. Full test coverage. Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
 - **Resilience.** Each agent runs as an isolated Unix process with its own filesystem. One agent can crash out, trash its workspace, and the others are unaffected.
 - **Focus.** Matrix is a mature protocol with an array of clients for mobile, desktop, web. No bespoke UI, no custom views to maintain.
 - **Transparency.** Session state is append-only text in JSONL, not a database. `grep` works. `cat` works. No migrations, no schema, no query language needed.
@@ -130,7 +130,7 @@ src/openalph/
     └── web.py         Web search (Brave) + fetch (HTML→text)
 ```
 
-~9,000 LOC source. 1,435+ tests. 3 runtime dependencies: `anthropic`, `openai`, `matrix-nio`.
+~9,000 LOC source. 1,435+ tests. 4 direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
 
 ## Prerequisites
 
