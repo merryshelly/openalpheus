@@ -130,8 +130,12 @@ step0_safety_preamble() {
     # `curl | bash` works correctly. Fails clearly if no TTY is available
     # and the caller hasn't provided the value via environment variable.
     # -------------------------------------------------------------------------
+    _has_tty() {
+        [[ -e /dev/tty ]]
+    }
+
     _prompt_read() {
-        if [[ -e /dev/tty ]]; then
+        if _has_tty; then
             read "$@" </dev/tty
         else
             error "Interactive input required but no TTY is available."
@@ -1482,8 +1486,8 @@ step8_create_agent() {
     local AGENT_NAME="${OPENALPH_AGENT_NAME:-}"
 
     if [[ -z "${AGENT_NAME}" ]]; then
-        if [[ ! -t 0 ]]; then
-            error "OPENALPH_AGENT_NAME is not set and stdin is not a terminal."
+        if ! _has_tty; then
+            error "OPENALPH_AGENT_NAME is not set and no TTY is available."
             error "Set OPENALPH_AGENT_NAME=<name> for non-interactive use."
             exit 1
         fi
@@ -1547,8 +1551,8 @@ step8_create_agent() {
     local PROVIDER="${OPENALPH_PROVIDER:-}"
 
     if [[ -z "${PROVIDER}" ]]; then
-        if [[ ! -t 0 ]]; then
-            error "OPENALPH_PROVIDER is not set and stdin is not a terminal."
+        if ! _has_tty; then
+            error "OPENALPH_PROVIDER is not set and no TTY is available."
             error "Set OPENALPH_PROVIDER=anthropic|openrouter|local for non-interactive use."
             exit 1
         fi
@@ -1615,8 +1619,8 @@ step8_create_agent() {
 
     elif [[ "${PROVIDER}" != "local" ]]; then
         # Interactive prompt — hidden input
-        if [[ ! -t 0 ]]; then
-            error "No API key provided (OPENALPH_API_KEY or OPENALPH_API_KEY_FILE) and stdin is not a terminal."
+        if ! _has_tty; then
+            error "No API key provided (OPENALPH_API_KEY or OPENALPH_API_KEY_FILE) and no TTY is available."
             exit 1
         fi
         echo ""
@@ -1633,8 +1637,8 @@ step8_create_agent() {
 
     if [[ "${PROVIDER}" == "local" ]]; then
         if [[ -z "${BASE_URL}" ]]; then
-            if [[ ! -t 0 ]]; then
-                error "OPENALPH_BASE_URL is not set and stdin is not a terminal."
+            if ! _has_tty; then
+                error "OPENALPH_BASE_URL is not set and no TTY is available."
                 error "Set OPENALPH_BASE_URL=http://localhost:11434/v1 for non-interactive use."
                 exit 1
             fi
@@ -1655,7 +1659,7 @@ step8_create_agent() {
     local MODEL="${OPENALPH_MODEL:-}"
 
     if [[ -z "${MODEL}" ]]; then
-        if [[ -t 0 ]]; then
+        if _has_tty; then
             # Interactive: show defaults and prompt
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
