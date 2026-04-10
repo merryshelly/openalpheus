@@ -2069,6 +2069,11 @@ ${OPENALPH_DOMAIN} {
         reverse_proxy 127.0.0.1:4269
     }
 
+    # Well-known discovery — Matrix clients query this to find the homeserver
+    handle /.well-known/matrix/* {
+        reverse_proxy 127.0.0.1:4269
+    }
+
     # Synapse-compatible admin API (used by some Matrix tools)
     handle /_synapse/* {
         reverse_proxy 127.0.0.1:4269
