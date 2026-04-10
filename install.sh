@@ -120,9 +120,11 @@ step0_safety_preamble() {
     }
 
     _pf_warn() {
-        # $1 = label, $2 = warning message
+        # $1 = label, $2 = warning message (optional)
         printf "  ${CLR_YELLOW}[!]${CLR_RESET} ${CLR_BOLD}%s${CLR_RESET}\n" "$1"
-        printf "      ${CLR_YELLOW}→${CLR_RESET} %s\n" "$2"
+        if [[ -n "${2:-}" ]]; then
+            printf "      ${CLR_YELLOW}→${CLR_RESET} %s\n" "$2"
+        fi
     }
 
     # -------------------------------------------------------------------------
