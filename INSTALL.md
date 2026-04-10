@@ -4,7 +4,7 @@ Detailed installation, configuration, and operation guide. For a quick overview,
 
 ## 1. Prerequisites
 
-Everything below must be in place before running `install.sh`. The installer's preflight checks will catch gaps — but installing the missing pieces is your job.
+The installer auto-installs most system dependencies (curl, jq, python3-venv, Docker, Caddy). You only need to ensure the following before running `install.sh`:
 
 ### Operating System
 
@@ -19,6 +19,8 @@ systemctl --version | head -1                         # systemd (need 249+)
 Debian 12 ships systemd 252, Ubuntu 22.04 ships 249. Below 249 → need a newer OS.
 
 ### Python 3.11+
+
+Python is the one dependency the installer **will not** auto-install — version upgrades are complex and distro-specific. Debian 12+ and Ubuntu 24.04+ ship with Python 3.11+ out of the box.
 
 ```bash
 python3 --version
@@ -38,30 +40,17 @@ sudo apt install -y python3.11 python3.11-venv python3.11-dev
 sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 ```
 
-### pip
+### Auto-Installed Dependencies
 
-```bash
-pip3 --version    # or: python3 -m pip --version
-```
-If missing: `sudo apt install -y python3-pip`. The installer uses a venv at `/opt/openalph-venv/` to avoid PEP 668 issues on modern Debian/Ubuntu — pip just needs to exist.
+The following are installed automatically by the installer if missing. No manual action needed:
 
-### Docker 24+ with Compose v2
+- **curl** — installed via `apt-get`
+- **jq** — installed via `apt-get`
+- **python3-venv** — installed via `apt-get` (versioned package, e.g. `python3.12-venv`)
+- **Docker 24+ with Compose v2** — installed via Docker's official convenience script ([get.docker.com](https://get.docker.com))
+- **Caddy** — installed from the official Caddy APT repository
 
-Tuwunel (Matrix homeserver) runs in Docker. **Do not** use `apt install docker.io` — it's outdated.
-
-Install from the official repository:
-- **Debian:** https://docs.docker.com/engine/install/debian/
-- **Ubuntu:** https://docs.docker.com/engine/install/ubuntu/
-
-```bash
-docker --version          # need 24+
-docker compose version    # need v2+
-sudo docker run --rm hello-world   # verify it works
-```
-
-### curl and jq
-
-Usually pre-installed. If not: `sudo apt install -y curl jq`
+> **Note:** If Docker is already installed but below version 24, the installer will **not** auto-upgrade it — upgrading Docker is left to the user. See https://docs.docker.com/engine/install/
 
 ### TLS — Choose One
 
@@ -105,7 +94,7 @@ Minimum 500 MB free (hard fail). Recommended 2 GB+ (Docker images ~500 MB, works
 curl -fsSL https://codeberg.org/merryshelly/openalpheus/raw/branch/main/install.sh | sudo bash
 ```
 
-What it does: (1) verifies prerequisites, (2) installs OpenAlpheus into `/opt/openalph-venv/`, (3) deploys tuwunel via Docker, (4) configures TLS via Caddy, (5) creates Matrix accounts, (6) creates your agent (Unix user + workspace + systemd unit), (7) serves Cinny web client.
+What it does: (1) auto-installs missing system dependencies (curl, jq, Docker, Caddy, etc.) and verifies prerequisites, (2) installs OpenAlpheus into `/opt/openalph-venv/`, (3) deploys tuwunel via Docker, (4) configures TLS via Caddy, (5) creates Matrix accounts, (6) creates your agent (Unix user + workspace + systemd unit), (7) serves Cinny web client.
 
 Total time: 2–5 minutes (Docker image pull is the bottleneck). Log written to `/tmp/openalph-bootstrap-<timestamp>.log`.
 

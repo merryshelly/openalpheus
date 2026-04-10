@@ -6,7 +6,7 @@
 #
 # This script performs the following steps:
 #   Step 0 — Safety preamble: logging, color helpers, confirmation prompt
-#   Step 1 — Preflight checks: Python, pip, Docker, systemd, curl, ports, disk
+#   Step 1 — Preflight checks: auto-install missing deps, verify Python, Docker, systemd, etc.
 #   Step 2 — Install OpenAlph via pip from Codeberg
 #   Step 3 — Create system group and shared directory structure
 #
@@ -156,7 +156,7 @@ step0_safety_preamble() {
     printf "╚══════════════════════════════════════════════════════════╝\n"
     printf "${CLR_RESET}\n"
     printf "This script will:\n"
-    printf "  1. Verify system dependencies (Python, Docker, systemd, etc.)\n"
+    printf "  1. Check and auto-install system dependencies (Docker, Caddy, etc.)\n"
     printf "  2. Install OpenAlph ${OPENALPH_VERSION} from ${OPENALPH_REPO}\n"
     printf "  3. Create the '${OPENALPH_GROUP}' system group and shared directory tree\n"
     printf "\n"
@@ -180,6 +180,8 @@ step0_safety_preamble() {
 
 # =============================================================================
 # STEP 1 — PREFLIGHT CHECKS
+# Auto-installs missing deps where safe (curl, jq, venv, Docker, Caddy).
+# Checks without auto-install: Python 3.11+ (complex), systemd (OS-level).
 # Runs all checks, collects results, then fails if any check failed.
 # =============================================================================
 
@@ -187,6 +189,7 @@ step1_preflight_checks() {
     step "Step 1 — Preflight Checks"
 
     local _failures=0
+    local _apt_updated=0
 
     # -------------------------------------------------------------------------
     # Helper: compare two dot-separated version strings.
@@ -206,7 +209,55 @@ step1_preflight_checks() {
     }
 
     # -------------------------------------------------------------------------
-    # Python 3 >= 3.11
+    # Helper: ensure apt-get update has been run (at most once)
+    # -------------------------------------------------------------------------
+    _ensure_apt_updated() {
+        if (( _apt_updated == 0 )); then
+            apt-get update -qq >/dev/null 2>&1
+            _apt_updated=1
+        fi
+    }
+
+    # -------------------------------------------------------------------------
+    # curl (checked first — needed for Docker convenience script + Caddy)
+    # -------------------------------------------------------------------------
+    if command -v curl &>/dev/null; then
+        _curl_ver="$(curl --version 2>&1 | awk 'NR==1{print $2}')"
+        _pf_pass "curl ${_curl_ver}" ""
+    else
+        _pf_warn "curl not found — installing..."
+        _ensure_apt_updated
+        if apt-get install -y curl >/dev/null 2>&1 && command -v curl &>/dev/null; then
+            _curl_ver="$(curl --version 2>&1 | awk 'NR==1{print $2}')"
+            _pf_pass "curl ${_curl_ver}" "(auto-installed)"
+        else
+            _pf_fail "curl install failed" \
+                "Could not install curl. Run: apt-get install -y curl"
+            (( _failures++ ))
+        fi
+    fi
+
+    # -------------------------------------------------------------------------
+    # jq (required for Matrix API JSON parsing)
+    # -------------------------------------------------------------------------
+    if command -v jq &>/dev/null; then
+        _jq_ver="$(jq --version 2>&1 || echo "unknown")"
+        _pf_pass "jq ${_jq_ver}" ""
+    else
+        _pf_warn "jq not found — installing..."
+        _ensure_apt_updated
+        if apt-get install -y jq >/dev/null 2>&1 && command -v jq &>/dev/null; then
+            _jq_ver="$(jq --version 2>&1 || echo "unknown")"
+            _pf_pass "jq ${_jq_ver}" "(auto-installed)"
+        else
+            _pf_fail "jq install failed" \
+                "Could not install jq. Run: apt-get install -y jq"
+            (( _failures++ ))
+        fi
+    fi
+
+    # -------------------------------------------------------------------------
+    # Python 3 >= 3.11 (not auto-installed — version upgrades are complex)
     # -------------------------------------------------------------------------
     if command -v python3 &>/dev/null; then
         _py_raw="$(python3 --version 2>&1)"          # e.g. "Python 3.13.2"
@@ -216,13 +267,35 @@ step1_preflight_checks() {
             _pf_pass "Python ${_py_ver}" "(${_py_path})"
         else
             _pf_fail "Python ${_py_ver}" \
-                "Python >= ${REQUIRED_PYTHON_MAJOR}.${REQUIRED_PYTHON_MINOR} required. Found: ${_py_ver}"
+                "Python >= ${REQUIRED_PYTHON_MAJOR}.${REQUIRED_PYTHON_MINOR} required. Found: ${_py_ver}. Ubuntu 22.04: use deadsnakes PPA."
             (( _failures++ ))
         fi
     else
         _pf_fail "Python 3 not found" \
-            "Install Python 3.11+: https://www.python.org/downloads/"
+            "Install Python 3.11+: https://www.python.org/downloads/ (Ubuntu 22.04: use deadsnakes PPA)"
         (( _failures++ ))
+    fi
+
+    # -------------------------------------------------------------------------
+    # Python venv module (required for isolated install)
+    # On Debian/Ubuntu, this is a separate package: python3.XX-venv
+    # -------------------------------------------------------------------------
+    if python3 -m venv --help &>/dev/null 2>&1; then
+        _pf_pass "Python venv module" "available"
+    else
+        _py_minor="$(python3 --version 2>&1 | awk '{print $2}' | cut -d. -f2)"
+        _venv_pkg="python3.${_py_minor}-venv"
+        _pf_warn "Python venv module not found — installing..."
+        _ensure_apt_updated
+        if apt-get install -y "${_venv_pkg}" >/dev/null 2>&1 && python3 -m venv --help &>/dev/null 2>&1; then
+            _pf_pass "Python venv module" "(auto-installed via ${_venv_pkg})"
+        elif apt-get install -y python3-venv >/dev/null 2>&1 && python3 -m venv --help &>/dev/null 2>&1; then
+            _pf_pass "Python venv module" "(auto-installed via python3-venv)"
+        else
+            _pf_fail "Python venv module install failed" \
+                "Could not install venv. Run: apt-get install -y ${_venv_pkg} (or python3-venv)"
+            (( _failures++ ))
+        fi
     fi
 
     # -------------------------------------------------------------------------
@@ -245,19 +318,7 @@ step1_preflight_checks() {
     fi
 
     # -------------------------------------------------------------------------
-    # Python venv module (required for isolated install)
-    # On Debian/Ubuntu, this is a separate package: python3.XX-venv
-    # -------------------------------------------------------------------------
-    if python3 -m venv --help &>/dev/null 2>&1; then
-        _pf_pass "Python venv module" "available"
-    else
-        _pf_fail "Python venv module not found" \
-            "Install it: apt-get install -y python3-venv (or python3.XX-venv for your Python version)"
-        (( _failures++ ))
-    fi
-
-    # -------------------------------------------------------------------------
-    # Docker >= 24
+    # Docker >= 24 (auto-install via official convenience script if missing)
     # -------------------------------------------------------------------------
     if command -v docker &>/dev/null; then
         _docker_raw="$(docker --version 2>&1)"       # e.g. "Docker version 27.1.1, build ..."
@@ -267,17 +328,33 @@ step1_preflight_checks() {
             _pf_pass "Docker ${_docker_ver}" ""
         else
             _pf_fail "Docker ${_docker_ver}" \
-                "Docker >= ${REQUIRED_DOCKER_MAJOR} required. Upgrade: ${DOCKER_INSTALL_DOCS}"
+                "Docker >= ${REQUIRED_DOCKER_MAJOR} required but ${_docker_ver} found. Upgrade: ${DOCKER_INSTALL_DOCS}"
             (( _failures++ ))
         fi
     else
-        _pf_fail "Docker not found" \
-            "Install Docker: ${DOCKER_INSTALL_DOCS}"
-        (( _failures++ ))
+        _pf_warn "Docker not found — installing..."
+        info "Installing Docker via official convenience script (https://get.docker.com)..."
+        if curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 && command -v docker &>/dev/null; then
+            _docker_raw="$(docker --version 2>&1)"
+            _docker_ver="$(echo "$_docker_raw" | grep -oP '\d+\.\d+\.\d+' | head -1)"
+            _docker_major="$(echo "$_docker_ver" | cut -d. -f1)"
+            if (( _docker_major >= REQUIRED_DOCKER_MAJOR )); then
+                _pf_pass "Docker ${_docker_ver}" "(auto-installed)"
+            else
+                _pf_fail "Docker ${_docker_ver}" \
+                    "Docker convenience script installed ${_docker_ver} but >= ${REQUIRED_DOCKER_MAJOR} required. Upgrade: ${DOCKER_INSTALL_DOCS}"
+                (( _failures++ ))
+            fi
+        else
+            _pf_fail "Docker install failed" \
+                "Could not install Docker via https://get.docker.com. Install manually: ${DOCKER_INSTALL_DOCS}"
+            (( _failures++ ))
+        fi
     fi
 
     # -------------------------------------------------------------------------
     # Docker Compose v2+ (plugin — `docker compose version`)
+    # Included with official Docker install; fail with hint if missing.
     # -------------------------------------------------------------------------
     if docker compose version &>/dev/null 2>&1; then
         _dc_ver="$(docker compose version 2>&1 | grep -oP 'v?\d+\.\d+\.\d+' | head -1)"
@@ -296,7 +373,7 @@ step1_preflight_checks() {
     fi
 
     # -------------------------------------------------------------------------
-    # systemd >= 249
+    # systemd >= 249 (not auto-installed — requires a supported OS)
     # -------------------------------------------------------------------------
     if command -v systemctl &>/dev/null; then
         _systemd_ver="$(systemctl --version 2>&1 | awk 'NR==1{print $2}')"
@@ -314,27 +391,29 @@ step1_preflight_checks() {
     fi
 
     # -------------------------------------------------------------------------
-    # curl (any version — just needs to be present)
+    # Caddy (auto-install from official APT repository if missing)
     # -------------------------------------------------------------------------
-    if command -v curl &>/dev/null; then
-        _curl_ver="$(curl --version 2>&1 | awk 'NR==1{print $2}')"
-        _pf_pass "curl ${_curl_ver}" ""
+    if command -v caddy &>/dev/null; then
+        _caddy_ver="$(caddy version 2>&1 | awk '{print $1}' || echo "unknown")"
+        _pf_pass "Caddy ${_caddy_ver}" ""
     else
-        _pf_fail "curl not found" \
-            "Install curl: apt-get install -y curl"
-        (( _failures++ ))
-    fi
-
-    # -------------------------------------------------------------------------
-    # jq (required for Matrix API JSON parsing)
-    # -------------------------------------------------------------------------
-    if command -v jq &>/dev/null; then
-        _jq_ver="$(jq --version 2>&1 || echo "unknown")"
-        _pf_pass "jq ${_jq_ver}" ""
-    else
-        _pf_fail "jq not found" \
-            "Install jq: apt-get install -y jq"
-        (( _failures++ ))
+        _pf_warn "Caddy not found — installing..."
+        _ensure_apt_updated
+        if apt-get install -y debian-keyring debian-archive-keyring apt-transport-https >/dev/null 2>&1 \
+            && curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
+                gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
+            && curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
+                tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null \
+            && apt-get update -qq >/dev/null 2>&1 \
+            && apt-get install -y caddy >/dev/null 2>&1 \
+            && command -v caddy &>/dev/null; then
+            _caddy_ver="$(caddy version 2>&1 | awk '{print $1}' || echo "unknown")"
+            _pf_pass "Caddy ${_caddy_ver}" "(auto-installed)"
+        else
+            _pf_fail "Caddy install failed" \
+                "Could not install Caddy. See: https://caddyserver.com/docs/install#debian-ubuntu-raspbian"
+            (( _failures++ ))
+        fi
     fi
 
     # -------------------------------------------------------------------------
@@ -516,21 +595,6 @@ step3_create_group_and_dirs() {
 
 step5_setup_tls() {
     step "Step 5" "Configuring TLS..."
-
-    # ── Install Caddy (idempotent) ────────────────────────────────────────────
-    if ! command -v caddy &>/dev/null; then
-        info "Installing Caddy from official APT repository..."
-        apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl >/dev/null 2>&1
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
-            gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
-            tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-        apt-get update -qq >/dev/null 2>&1
-        apt-get install -y caddy >/dev/null 2>&1
-        success "Caddy installed."
-    else
-        info "Caddy already installed, skipping installation."
-    fi
 
     # ── Determine TLS mode ────────────────────────────────────────────────────
     local tls_mode="${OPENALPH_TLS_MODE:-}"

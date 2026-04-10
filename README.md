@@ -135,13 +135,13 @@ src/openalph/
 ## Prerequisites
 
 - Debian 12+ or Ubuntu 22.04+ (amd64 or arm64)
-- Docker 24+
-- Python 3.11+ with pip
-- systemd 249+
+- Python 3.11+ (pre-installed on Debian 12+ and Ubuntu 24.04+)
 - An LLM API key (Anthropic recommended, or any OpenAI-compatible provider)
-- TLS: Tailscale (auto-provisioned), a public domain (Let's Encrypt via Caddy), or your own cert/key pair
+- TLS: Tailscale (homelab), a public domain (VPS), or your own cert/key pair
 
-See [INSTALL.md](INSTALL.md) for detailed requirements and manual setup.
+Docker, Caddy, and other system dependencies are auto-installed if missing.
+
+See [INSTALL.md](INSTALL.md) for detailed requirements.
 
 ## Post-Bootstrap
 
