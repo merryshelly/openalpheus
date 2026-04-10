@@ -282,16 +282,19 @@ step1_preflight_checks() {
     # Python venv module (required for isolated install)
     # On Debian/Ubuntu, this is a separate package: python3.XX-venv
     # -------------------------------------------------------------------------
-    if python3 -m venv --help &>/dev/null 2>&1; then
+    # The check must test ensurepip, not just 'venv --help'. The venv module
+    # exists in the Python stdlib, but actually creating a venv requires
+    # ensurepip, which is in the separate python3.XX-venv package on Debian/Ubuntu.
+    if python3 -c "import ensurepip" &>/dev/null 2>&1; then
         _pf_pass "Python venv module" "available"
     else
         _py_minor="$(python3 --version 2>&1 | awk '{print $2}' | cut -d. -f2)"
         _venv_pkg="python3.${_py_minor}-venv"
         _pf_warn "Python venv module not found — installing..."
         _ensure_apt_updated
-        if apt-get install -y "${_venv_pkg}" >/dev/null 2>&1 && python3 -m venv --help &>/dev/null 2>&1; then
+        if apt-get install -y "${_venv_pkg}" >/dev/null 2>&1 && python3 -c "import ensurepip" &>/dev/null 2>&1; then
             _pf_pass "Python venv module" "(auto-installed via ${_venv_pkg})"
-        elif apt-get install -y python3-venv >/dev/null 2>&1 && python3 -m venv --help &>/dev/null 2>&1; then
+        elif apt-get install -y python3-venv >/dev/null 2>&1 && python3 -c "import ensurepip" &>/dev/null 2>&1; then
             _pf_pass "Python venv module" "(auto-installed via python3-venv)"
         else
             _pf_fail "Python venv module install failed" \
