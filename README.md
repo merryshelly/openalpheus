@@ -172,6 +172,14 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | `/stop` | Cancel current processing |
 | `/resume` | Re-enable after `/stop` |
 
+> **Client note:** Some Matrix clients intercept `/` commands for their own features. If a slash command isn't reaching the agent:
+>
+> | Client | How to send |
+> |--------|-------------|
+> | **Cinny** | `/command` — works directly |
+> | **Element Desktop** | `//command` — the first `/` escapes Element's own command handler |
+> | **Element X** (mobile) | `/command` — works directly |
+
 ## CLI
 
 ```
