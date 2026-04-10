@@ -145,7 +145,7 @@ Every prompt, in order. All can be skipped via environment variables (§4).
 | `OPENALPH_API_KEY` | API key directly ⚠️ | string | unset |
 | `OPENALPH_BASE_URL` | Local inference URL | URL | unset |
 | `OPENALPH_MODEL` | Model name | string | provider default |
-| `OPENALPH_VERSION` | Version to install | git tag | `v0.1.1` |
+| `OPENALPH_VERSION` | Version to install | git tag | `v0.1.2` |
 | `OPENALPH_FORCE` | Overwrite existing | `true` | `false` |
 
 ⚠️ `OPENALPH_API_KEY` is visible in `/proc/<pid>/environ`. Prefer `OPENALPH_API_KEY_FILE` — write key to a file (mode 600) and pass the path.
