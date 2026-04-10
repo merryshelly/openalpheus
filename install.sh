@@ -299,7 +299,7 @@ step1_preflight_checks() {
     fi
 
     # -------------------------------------------------------------------------
-    # pip
+    # pip (auto-install via python3-pip if missing)
     # -------------------------------------------------------------------------
     _pip_cmd=""
     if command -v pip3 &>/dev/null; then
@@ -312,9 +312,27 @@ step1_preflight_checks() {
         _pip_ver="$($_pip_cmd --version 2>&1 | awk '{print $2}')"
         _pf_pass "pip ${_pip_ver}" "(${_pip_cmd})"
     else
-        _pf_fail "pip not found" \
-            "Install pip: https://pip.pypa.io/en/stable/installation/"
-        (( _failures++ ))
+        _pf_warn "pip not found — installing..."
+        _ensure_apt_updated
+        if apt-get install -y python3-pip >/dev/null 2>&1; then
+            if command -v pip3 &>/dev/null; then
+                _pip_cmd="pip3"
+            elif python3 -m pip --version &>/dev/null 2>&1; then
+                _pip_cmd="python3 -m pip"
+            fi
+            if [[ -n "$_pip_cmd" ]]; then
+                _pip_ver="$($_pip_cmd --version 2>&1 | awk '{print $2}')"
+                _pf_pass "pip ${_pip_ver}" "(auto-installed)"
+            else
+                _pf_fail "pip install succeeded but pip not found on PATH" \
+                    "Try: python3 -m pip --version"
+                (( _failures++ ))
+            fi
+        else
+            _pf_fail "pip install failed" \
+                "Could not install python3-pip. Run: apt-get install -y python3-pip"
+            (( _failures++ ))
+        fi
     fi
 
     # -------------------------------------------------------------------------
