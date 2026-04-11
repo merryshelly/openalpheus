@@ -82,6 +82,12 @@ If 443 is occupied (nginx, apache, etc.), stop the service before running the in
 
 Have the key ready. For automated installs, write it to a file and use `OPENALPH_API_KEY_FILE`.
 
+### Brave Search API Key (optional)
+
+The `web_search` tool uses the [Brave Search API](https://brave.com/search/api/) to perform web searches. A free tier is available. Without it, your agent can still fetch and read specific URLs via `web_fetch`, but cannot perform general web searches.
+
+The installer will prompt for this key. You can skip it and add one later by editing `workspace/tools/web_search.toml`.
+
 ### Disk Space
 
 Minimum 500 MB free (hard fail). Recommended 2 GB+ (Docker images ~500 MB, workspaces grow). Check: `df -h /var/lib/docker`
@@ -124,6 +130,8 @@ Every prompt, in order. All can be skipped via environment variables (§4).
 
 **Model** — press Enter for default (`claude-sonnet-4-6` for Anthropic). Changeable later.
 
+**Brave Search API key** — optional. Enables the `web_search` tool. Press Enter to skip. Get a free key at https://brave.com/search/api/.
+
 **If it fails:** fix the issue and re-run. Use `--force` to overwrite existing agent resources: `sudo bash install.sh --force`
 
 ---
@@ -145,6 +153,8 @@ Every prompt, in order. All can be skipped via environment variables (§4).
 | `OPENALPH_API_KEY` | API key directly ⚠️ | string | unset |
 | `OPENALPH_BASE_URL` | Local inference URL | URL | unset |
 | `OPENALPH_MODEL` | Model name | string | provider default |
+| `OPENALPH_BRAVE_API_KEY_FILE` | Path to Brave Search key file | file path | unset |
+| `OPENALPH_BRAVE_API_KEY` | Brave Search key directly | string | unset |
 | `OPENALPH_VERSION` | Version to install | git tag | `v0.1.2` |
 | `OPENALPH_FORCE` | Overwrite existing | `true` | `false` |
 

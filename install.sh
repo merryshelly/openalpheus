@@ -1471,6 +1471,8 @@ OVERRIDE_EOF
 #   OPENALPH_API_KEY_FILE    — path to file containing the key (preferred)
 #   OPENALPH_BASE_URL        — base URL for local/OpenAI-compatible provider
 #   OPENALPH_MODEL           — model override (uses provider default if unset)
+#   OPENALPH_BRAVE_API_KEY   — Brave Search API key (optional, for web_search tool)
+#   OPENALPH_BRAVE_API_KEY_FILE — path to file containing the Brave key (preferred)
 #
 # The agent's Matrix access token must already exist at /tmp/openalph-agent-token
 # (written by step 6).
@@ -1794,6 +1796,43 @@ step8_create_agent() {
     fi
 
     # =========================================================================
+    # 6b. Brave Search API key (optional — for web_search tool)
+    # =========================================================================
+
+    local BRAVE_KEY=""
+
+    if [[ -n "${OPENALPH_BRAVE_API_KEY_FILE:-}" ]]; then
+        if [[ -f "${OPENALPH_BRAVE_API_KEY_FILE}" ]]; then
+            BRAVE_KEY="$(< "${OPENALPH_BRAVE_API_KEY_FILE}")"
+            info "Brave Search API key loaded from file."
+        else
+            warn "OPENALPH_BRAVE_API_KEY_FILE does not exist: ${OPENALPH_BRAVE_API_KEY_FILE} — skipping."
+        fi
+    elif [[ -n "${OPENALPH_BRAVE_API_KEY:-}" ]]; then
+        BRAVE_KEY="${OPENALPH_BRAVE_API_KEY}"
+    elif _has_tty; then
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Web Search (optional)"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "  The web_search tool requires a Brave Search API key."
+        echo "  Free tier: https://brave.com/search/api/"
+        echo ""
+        echo "  Without it, your agent can still fetch specific URLs (web_fetch)"
+        echo "  but cannot perform general web searches."
+        echo ""
+        _prompt_read -rs -p "Brave Search API key (Enter to skip): " BRAVE_KEY
+        echo ""   # newline after hidden input
+    fi
+
+    if [[ -n "${BRAVE_KEY}" ]]; then
+        info "Brave Search API key provided — web_search will be configured."
+    else
+        info "No Brave Search API key — web_search will be disabled. You can add one later."
+    fi
+
+    # =========================================================================
     # 7. Store API key securely under the agent home
     # =========================================================================
 
@@ -2017,6 +2056,19 @@ print(pathlib.Path(openalph.templates.__file__).parent)
     for tool in shell file_read file_write file_edit web_search web_fetch subagent memory_search send_media; do
         touch "${TOOLS_DIR}/${tool}.toml"
     done
+
+    # If a Brave Search API key was provided, configure web_search.toml
+    if [[ -n "${BRAVE_KEY:-}" ]]; then
+        local _brave_key_path="${AGENT_HOME}/.config/brave-search-key"
+        printf '%s' "${BRAVE_KEY}" > "${_brave_key_path}"
+        chown "oa-${AGENT_NAME}:openalph" "${_brave_key_path}"
+        chmod 600 "${_brave_key_path}"
+        cat > "${TOOLS_DIR}/web_search.toml" << EOF
+[config]
+api_key_cmd = "cat ${_brave_key_path}"
+EOF
+        BRAVE_KEY="<cleared>"
+    fi
 
     chown -R "oa-${AGENT_NAME}:openalph" "${TOOLS_DIR}"
 
