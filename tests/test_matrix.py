@@ -336,8 +336,8 @@ class TestCommands:
         session_log.build_context.return_value = loaded_history
 
         # agent.status counts turns from agent.history
-        def _status(room_id):
-            hist = agent.history(room_id)
+        def _status(room_id, history=None):
+            hist = history if history is not None else agent.history(room_id)
             turns = sum(1 for m in hist if m["role"] == "user")
             return {
                 "name": "test", "model": "claude-3", "turns": turns,
@@ -360,7 +360,7 @@ class TestCommands:
             await asyncio.gather(*bot._background_tasks)
 
         # Should have called agent.status with the correct room
-        agent.status.assert_called_once_with(room_id)
+        agent.status.assert_called_once_with(room_id, history=loaded_history)
         # The status response used loaded history, so turns > 0
         call_args = bot.client.room_send.call_args
         assert call_args is not None, "Expected room_send to be called"

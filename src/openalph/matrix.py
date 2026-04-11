@@ -919,7 +919,12 @@ class MatrixBot:
                     status_data["heartbeat_next_minutes"] = None
                 return status_data
 
+            # Upload callback for send_media tool (same as interactive path)
+            async def _upload_callback(file_path, content_type, filename, caption=None):
+                await self.upload_and_send(room_id, file_path, content_type, filename, caption)
+
             callbacks = {
+                "send_media": _upload_callback,
                 "on_redaction": _redaction_notice,
                 "context_status": _context_status_callback,
             }
