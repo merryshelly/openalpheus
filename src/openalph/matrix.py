@@ -1961,6 +1961,10 @@ class MatrixBot:
                         event="toolstrip",
                         entry_index=entry_count,
                     )
+                    # Refresh in-memory history to reflect the strip
+                    history = self.agent.history(room_id)
+                    history.clear()
+                    history.extend(self.session_log.build_context(room_id))
                     msg = f"Toolstrip applied. Stripped {new_count} tool results (~{new_chars:,} chars) from context."
                     msg += "\n⚠️ Previously loaded skills were stripped — re-read any skills needed for ongoing work."
                     await self.send(room_id, msg)

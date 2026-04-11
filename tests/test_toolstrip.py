@@ -561,3 +561,207 @@ class TestToolstripContextEstimate:
 
         # Stripped should be way smaller
         assert stripped_estimate < raw_chars // 4
+
+
+# ---------------------------------------------------------------------------
+# Regression: /cache toolstrip must refresh agent in-memory history
+# ---------------------------------------------------------------------------
+
+class TestToolstripRefreshesInMemoryHistory:
+    """Regression: /cache toolstrip must refresh agent in-memory history.
+
+    Before the fix, /cache toolstrip wrote the marker to the JSONL session log
+    but never updated the agent's in-memory history list. Subsequent API calls
+    therefore still sent the full unstripped tool outputs.
+
+    The fix adds three lines in matrix.py after the marker is appended:
+        history = self.agent.history(room_id)
+        history.clear()
+        history.extend(self.session_log.build_context(room_id))
+
+    These tests verify the expected semantics of that fix.
+    """
+
+    def test_in_memory_history_reflects_strip_after_rebuild(self, tmp_path):
+        """After rebuild from build_context, tool results appear stripped."""
+        from openalph.agent import Agent
+        from openalph.config import AgentConfig, ProviderConfig
+
+        config = AgentConfig(
+            name="test",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            model_max_tokens=200000,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic",
+                api_key="sk-test", base_url=None, quirks=None,
+            )},
+            workspace=tmp_path,
+        )
+        agent = Agent(config)
+        sl = make_sl(tmp_path)
+
+        # Build a session with a large tool result
+        big_output = "z" * 10000
+        append_user(sl, "do something")             # 0
+        append_assistant(sl, "", tool_calls=[        # 1
+            {"call_id": "tc_1", "name": "shell", "input": {"command": "bigcmd"}}
+        ])
+        append_tool(sl, "tc_1", "shell", big_output) # 2
+        append_assistant(sl, "done")                 # 3
+
+        # Simulate what matrix.py does before the fix: load history from
+        # build_context without any toolstrip yet applied
+        pre_strip_ctx = sl.build_context(ROOM_ID)
+        history = agent.history(ROOM_ID)
+        history.clear()
+        history.extend(pre_strip_ctx)
+
+        # Confirm the full output is in the in-memory history
+        pre_tool_msgs = [m for m in agent.history(ROOM_ID) if m["role"] == "tool"]
+        assert len(pre_tool_msgs) == 1
+        assert big_output in pre_tool_msgs[0]["content"]
+
+        # Now apply toolstrip marker to session log (simulates /cache toolstrip)
+        entry_count = len(sl.read(ROOM_ID))  # = 4
+        append_toolstrip(sl, entry_index=entry_count)  # 4
+        append_user(sl, "continue")                    # 5
+
+        # Apply the fix: rebuild in-memory history from build_context
+        history = agent.history(ROOM_ID)
+        history.clear()
+        history.extend(sl.build_context(ROOM_ID))
+
+        # Tool results should now be stripped placeholders, not full output
+        post_tool_msgs = [m for m in agent.history(ROOM_ID) if m["role"] == "tool"]
+        assert len(post_tool_msgs) == 1
+        assert "[stripped:" in post_tool_msgs[0]["content"]
+        assert big_output not in post_tool_msgs[0]["content"]
+
+    def test_in_memory_history_is_same_object_as_agent_history(self, tmp_path):
+        """history() returns the same mutable list — clear+extend updates it in place."""
+        from openalph.agent import Agent
+        from openalph.config import AgentConfig, ProviderConfig
+
+        config = AgentConfig(
+            name="test",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            model_max_tokens=200000,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic",
+                api_key="sk-test", base_url=None, quirks=None,
+            )},
+            workspace=tmp_path,
+        )
+        agent = Agent(config)
+
+        # Populate history
+        agent.history(ROOM_ID).append({"role": "user", "content": "hello"})
+        agent.history(ROOM_ID).append({"role": "assistant", "content": "hi"})
+
+        # Get the reference and mutate it
+        h = agent.history(ROOM_ID)
+        h.clear()
+        h.extend([{"role": "user", "content": "new"}])
+
+        # The agent's history should now reflect the mutation
+        assert len(agent.history(ROOM_ID)) == 1
+        assert agent.history(ROOM_ID)[0]["content"] == "new"
+
+    def test_in_memory_history_reduces_context_size_after_strip(self, tmp_path):
+        """After the rebuild, total context chars are substantially reduced."""
+        from openalph.agent import Agent
+        from openalph.config import AgentConfig, ProviderConfig
+
+        config = AgentConfig(
+            name="test",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            model_max_tokens=200000,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic",
+                api_key="sk-test", base_url=None, quirks=None,
+            )},
+            workspace=tmp_path,
+        )
+        agent = Agent(config)
+        sl = make_sl(tmp_path)
+
+        big_output = "q" * 50000
+        append_user(sl, "run")                        # 0
+        append_assistant(sl, "", tool_calls=[          # 1
+            {"call_id": "tc_1", "name": "shell", "input": {"command": "bigrun"}}
+        ])
+        append_tool(sl, "tc_1", "shell", big_output)  # 2
+        append_assistant(sl, "finished")               # 3
+
+        # Load pre-strip history
+        history = agent.history(ROOM_ID)
+        history.clear()
+        history.extend(sl.build_context(ROOM_ID))
+
+        def total_chars(h):
+            total = 0
+            for m in h:
+                c = m.get("content", "")
+                total += len(c) if isinstance(c, str) else 0
+            return total
+
+        chars_before = total_chars(agent.history(ROOM_ID))
+
+        # Apply strip marker and rebuild
+        append_toolstrip(sl, entry_index=4)
+        append_user(sl, "next step")
+
+        history = agent.history(ROOM_ID)
+        history.clear()
+        history.extend(sl.build_context(ROOM_ID))
+
+        chars_after = total_chars(agent.history(ROOM_ID))
+
+        # Should be dramatically smaller
+        assert chars_after < chars_before
+        assert chars_before - chars_after > 49000  # 50000-char output → ~50-char placeholder
+
+    def test_new_messages_after_strip_are_preserved_in_history(self, tmp_path):
+        """Messages added after the toolstrip marker are present in rebuilt history."""
+        from openalph.agent import Agent
+        from openalph.config import AgentConfig, ProviderConfig
+
+        config = AgentConfig(
+            name="test",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            model_max_tokens=200000,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic",
+                api_key="sk-test", base_url=None, quirks=None,
+            )},
+            workspace=tmp_path,
+        )
+        agent = Agent(config)
+        sl = make_sl(tmp_path)
+
+        append_user(sl, "old question")                # 0
+        append_assistant(sl, "old answer")             # 1
+        append_toolstrip(sl, entry_index=2)            # 2
+        append_user(sl, "new question after strip")    # 3
+        append_assistant(sl, "new answer after strip") # 4
+
+        # Rebuild history (simulating the fix)
+        history = agent.history(ROOM_ID)
+        history.clear()
+        history.extend(sl.build_context(ROOM_ID))
+
+        user_msgs = [m for m in agent.history(ROOM_ID) if m["role"] == "user"]
+        assistant_msgs = [m for m in agent.history(ROOM_ID) if m["role"] == "assistant"]
+
+        # All user and assistant messages should be present
+        contents = [m["content"] for m in user_msgs]
+        assert "old question" in contents
+        assert "new question after strip" in contents
+
+        a_contents = [m["content"] for m in assistant_msgs]
+        assert "old answer" in a_contents
+        assert "new answer after strip" in a_contents
