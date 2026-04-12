@@ -386,6 +386,49 @@ class TestFalsePositiveResistance:
         assert "AAAAC3NzaC1" in result
 
 
+class TestPDFHexFalsePositives:
+    """PDF binary content contains hex strings in angle brackets that are not secrets."""
+
+    def test_pdf_xref_id_not_redacted(self):
+        """PDF cross-reference /ID entries use <hex> delimiters — not secrets."""
+        text = '/ID[<A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0A1B2C3D4E5F6A7B8C9D0><66785F64DD1BC04CAD6CA0ECFC9542C6>]'
+        result, events = redact_credentials(text)
+        # Neither hex string should be redacted
+        hex_events = [e for e in events if e.pattern_name == "generic_hex"]
+        assert len(hex_events) == 0
+        assert "REDACTED" not in result
+
+    def test_pdf_linearized_hex_not_redacted(self):
+        """Longer PDF hex content inside angle brackets passes through."""
+        hex_96 = "A1B2C3D4" * 12  # 96 chars
+        text = f'/Filter/FlateDecode/ID[<{hex_96}>]/Index[442 58]'
+        result, events = redact_credentials(text)
+        hex_events = [e for e in events if e.pattern_name == "generic_hex"]
+        assert len(hex_events) == 0
+
+    def test_bare_hex_still_redacted(self):
+        """Hex strings NOT in angle brackets are still caught."""
+        hex_64 = "a1b2c3d4" * 8
+        text = f"token={hex_64}"
+        result, events = redact_credentials(text)
+        assert hex_64 not in result
+        assert "[REDACTED:hex_secret]" in result
+
+    def test_pdf_raw_binary_with_hex_ids(self):
+        """Realistic PDF binary fragment with multiple hex IDs."""
+        text = (
+            '%PDF-1.7\r\n'
+            '442 0 obj\r<</Linearized 1/L 189140/O 444/E 154504>>\r\n'
+            '<</DecodeParms<</Columns 5/Predictor 12>>'
+            '/Filter/FlateDecode'
+            '/ID[<' + 'AB' * 24 + '><' + 'CD' * 24 + '>]'  # Two 48-char hex IDs
+            '/Index[442 58]>>'
+        )
+        result, events = redact_credentials(text)
+        hex_events = [e for e in events if e.pattern_name == "generic_hex"]
+        assert len(hex_events) == 0
+
+
 # ---------------------------------------------------------------------------
 # Multiple credentials in one output
 # ---------------------------------------------------------------------------

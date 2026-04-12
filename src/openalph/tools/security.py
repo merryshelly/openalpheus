@@ -82,7 +82,7 @@ CREDENTIAL_PATTERNS: list[dict] = [
     },
     {
         "name": "generic_hex",
-        "pattern": re.compile(r"\b[0-9a-fA-F]{48,}\b"),
+        "pattern": re.compile(r"(?<!<)\b[0-9a-fA-F]{48,}\b"),
         "redaction_label": "[REDACTED:hex_secret]",
     },
 ]
