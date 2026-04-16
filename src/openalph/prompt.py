@@ -76,7 +76,7 @@ def assemble_prompt(
     skills_dir = workspace / "skills"
     if skills_dir.exists():
         # Only include .md files, ignore others
-        skill_files = [f.stem for f in skills_dir.iterdir() if f.suffix == ".md"]
+        skill_files = [f.name for f in skills_dir.iterdir() if f.suffix == ".md"]
         if skill_files:
             prompt_parts.append("## Skills")
             for skill_name in sorted(skill_files):

@@ -76,7 +76,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read"
+                    "description": "Path to the file to read (relative paths resolve from workspace root — use skills/foo.md, not workspace/skills/foo.md)"
                 },
                 "offset": {
                     "type": "integer",
@@ -98,7 +98,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write"
+                    "description": "Path to the file to write (relative paths resolve from workspace root — use skills/foo.md, not workspace/skills/foo.md)"
                 },
                 "content": {
                     "type": "string",
@@ -116,7 +116,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to edit"
+                    "description": "Path to the file to edit (relative paths resolve from workspace root — use skills/foo.md, not workspace/skills/foo.md)"
                 },
                 "old_text": {
                     "type": "string",
@@ -264,7 +264,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to send (relative to workspace)"
+                    "description": "Path to the file to send (relative paths resolve from workspace root — use tmp/foo.png, not workspace/tmp/foo.png)"
                 },
                 "caption": {
                     "type": "string",
