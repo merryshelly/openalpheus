@@ -594,7 +594,7 @@ class TestPromptCaching:
         assert len(system) == 1
         assert system[0]["type"] == "text"
         assert system[0]["text"] == "You are a test agent."
-        assert system[0]["cache_control"] == {"type": "ephemeral"}
+        assert system[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     @pytest.mark.asyncio
     async def test_last_user_message_has_cache_control(self):
@@ -628,7 +628,7 @@ class TestPromptCaching:
         # Last user message should have cache_control on its content
         assert isinstance(last_user["content"], list)
         last_block = last_user["content"][-1]
-        assert last_block["cache_control"] == {"type": "ephemeral"}
+        assert last_block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     @pytest.mark.asyncio
     async def test_openai_no_cache_control(self):

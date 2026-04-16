@@ -18,11 +18,11 @@ class TestBuildAnthropicKwargsCacheTTL:
             cache_ttl=cache_ttl,
         )
 
-    def test_default_5m_cache_control(self):
-        """Without cache_ttl, cache_control is plain ephemeral (5m default)."""
+    def test_default_1h_cache_control(self):
+        """Without cache_ttl, cache_control defaults to 1h ephemeral."""
         kwargs = self._build()
         system_cc = kwargs["system"][0]["cache_control"]
-        assert system_cc == {"type": "ephemeral"}
+        assert system_cc == {"type": "ephemeral", "ttl": "1h"}
         # Check last message too
         last_msg = kwargs["messages"][-1]
         content = last_msg["content"]
@@ -30,7 +30,7 @@ class TestBuildAnthropicKwargsCacheTTL:
             msg_cc = content[-1]["cache_control"]
         else:
             msg_cc = content[-1]["cache_control"]
-        assert msg_cc == {"type": "ephemeral"}
+        assert msg_cc == {"type": "ephemeral", "ttl": "1h"}
 
     def test_1h_cache_control(self):
         """With cache_ttl='1h', cache_control includes ttl field."""
@@ -48,7 +48,7 @@ class TestBuildAnthropicKwargsCacheTTL:
         """Explicitly passing None is same as omitting."""
         kwargs = self._build(cache_ttl=None)
         system_cc = kwargs["system"][0]["cache_control"]
-        assert system_cc == {"type": "ephemeral"}
+        assert system_cc == {"type": "ephemeral", "ttl": "1h"}
 
     def test_list_content_with_1h(self):
         """When last user message has list content, cache_control gets ttl."""
@@ -164,12 +164,12 @@ class TestCacheSlashCommand:
                 value = "5m"
             assert value in ("5m", "1h")
 
-    def test_off_becomes_5m(self):
-        """'off' is an alias for '5m'."""
+    def test_off_becomes_1h(self):
+        """'off' is an alias for '1h'."""
         value = "off"
         if value == "off":
-            value = "5m"
-        assert value == "5m"
+            value = "1h"
+        assert value == "1h"
 
     def test_invalid_values_rejected(self):
         """Random strings are not valid."""

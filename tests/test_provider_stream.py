@@ -689,7 +689,7 @@ class TestAnthropicStream:
             {
                 "type": "text",
                 "text": "You are helpful.",
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
         ]
         assert kw["max_tokens"] == 4096
@@ -721,7 +721,7 @@ class TestAnthropicStream:
         assert last_msg["content"] == [
             {
                 "type": "text", "text": "Second",
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
         ]
 

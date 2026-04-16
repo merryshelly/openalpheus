@@ -278,7 +278,7 @@ class MatrixBot:
         self._active_rooms = set()
         self._halted_rooms: set[str] = set()
         self._room_thinking = {}
-        self._room_cache_ttl = {}   # Room-scoped cache TTL overrides ("1h" or None)
+        self._room_cache_ttl = {}   # Room-scoped cache TTL overrides (e.g. "5m"; default is "1h")
         self._background_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
 
@@ -1198,7 +1198,7 @@ class MatrixBot:
                         elif ev == "cache_ttl_override" and detail:
                             if not hasattr(self, "_room_cache_ttl"):
                                 self._room_cache_ttl = {}
-                            if detail != "5m":
+                            if detail != "1h":
                                 self._room_cache_ttl[room_id] = detail
                             _restored_cache_ttl = detail
 
@@ -1829,7 +1829,7 @@ class MatrixBot:
             bar = "█" * filled + "░" * (bar_len - filled)
             # Resolve room-scoped overrides
             _thinking = getattr(self, '_room_thinking', {}).get(room_id) or self.agent.config.thinking
-            _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id) or "5m (default)"
+            _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id) or "1h (default)"
             lines = [
                 f"### {status['name']}",
                 "",
@@ -1920,7 +1920,7 @@ class MatrixBot:
             if len(parts) < 2:
                 # Show current cache status: TTL + toolstrip state
                 current = self._room_cache_ttl.get(room_id)
-                ttl_line = f"Cache TTL: **{current}** (override)" if current else "Cache TTL: **5m** (default)"
+                ttl_line = f"Cache TTL: **{current}** (override)" if current else "Cache TTL: **1h** (default)"
                 strip_line = "Toolstrip: none"
                 if self.session_log:
                     entries = self.session_log.read(room_id)
@@ -1977,7 +1977,7 @@ class MatrixBot:
                     await self.send(room_id, "⚠️ No session log available.")
                 return
             if value == "off":
-                value = "5m"
+                value = "1h"
             valid_values = ("5m", "1h")
             if value not in valid_values:
                 await self.send(room_id, f"Invalid value. Use: `/cache 1h`, `/cache 5m`, or `/cache off`")
@@ -1994,7 +1994,7 @@ class MatrixBot:
                     return
             except Exception:
                 pass  # If we can't resolve, allow the command anyway
-            if value == "5m":
+            if value == "1h":
                 self._room_cache_ttl.pop(room_id, None)
             else:
                 self._room_cache_ttl[room_id] = value

@@ -587,7 +587,7 @@ def _build_anthropic_kwargs(
     cache_ttl: str | None = None,
 ) -> dict:
     """Build kwargs for Anthropic messages API."""
-    _cc = {"type": "ephemeral", "ttl": cache_ttl} if cache_ttl else {"type": "ephemeral"}
+    _cc = {"type": "ephemeral", "ttl": cache_ttl or "1h"}
     api_kwargs = {
         "model": api_model,
         "system": [{"type": "text", "text": system, "cache_control": _cc}],
