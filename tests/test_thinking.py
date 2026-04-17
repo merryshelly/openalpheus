@@ -202,6 +202,21 @@ class TestSupportsAdaptiveThinking:
     def test_empty_string(self):
         assert _supports_adaptive_thinking("") is False
 
+    def test_opus_4_7(self):
+        assert _supports_adaptive_thinking("claude-opus-4-7-20260401") is True
+
+    def test_opus_4_7_no_date(self):
+        assert _supports_adaptive_thinking("claude-opus-4-7") is True
+
+    def test_opus_4_5(self):
+        assert _supports_adaptive_thinking("claude-opus-4-5-20250220") is True
+
+    def test_mythos(self):
+        assert _supports_adaptive_thinking("claude-mythos-preview-20260401") is True
+
+    def test_mythos_bare(self):
+        assert _supports_adaptive_thinking("claude-mythos") is True
+
 
 # ---------------------------------------------------------------------------
 # Effort / budget mapping
@@ -219,6 +234,12 @@ class TestThinkingEffort:
 
     def test_high(self):
         assert _thinking_effort("high") == "high"
+
+    def test_xhigh(self):
+        assert _thinking_effort("xhigh") == "xhigh"
+
+    def test_max(self):
+        assert _thinking_effort("max") == "max"
 
 
 class TestThinkingBudget:
@@ -245,6 +266,16 @@ class TestThinkingBudget:
         assert max_tok == 200000
         # budget should be adjusted so there's room for output
         assert budget <= 200000 - 1024  # at least 1024 for output
+
+    def test_max_falls_back_to_high_budget(self):
+        budget, max_tok = _thinking_budget("max", base_max_tokens=8192, model_max_tokens=200000)
+        assert budget == 16384
+        assert max_tok == 8192 + 16384
+
+    def test_xhigh_falls_back_to_high_budget(self):
+        budget, max_tok = _thinking_budget("xhigh", base_max_tokens=8192, model_max_tokens=200000)
+        assert budget == 16384
+        assert max_tok == 8192 + 16384
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +523,102 @@ class TestAdaptiveThinkingAPICall:
         assert "thinking" not in kw
         assert "output_config" not in kw
 
+    @pytest.mark.asyncio
+    async def test_adaptive_thinking_max_opus47(self):
+        """thinking=max on Opus 4.7 sends effort=max."""
+        config = make_config(
+            default_model="anthropic/claude-opus-4-7-20260401",
+            thinking="max",
+        )
+        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
+            client = MockClient.return_value
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
+            )
+            await complete(
+                config=config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+        kw = client.messages.stream.call_args.kwargs
+        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["output_config"] == {"effort": "max"}
+
+    @pytest.mark.asyncio
+    async def test_adaptive_thinking_xhigh_opus47(self):
+        """thinking=xhigh on Opus 4.7 sends effort=xhigh."""
+        config = make_config(
+            default_model="anthropic/claude-opus-4-7-20260401",
+            thinking="xhigh",
+        )
+        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
+            client = MockClient.return_value
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
+            )
+            await complete(
+                config=config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+        kw = client.messages.stream.call_args.kwargs
+        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["output_config"] == {"effort": "xhigh"}
+
+    @pytest.mark.asyncio
+    async def test_adaptive_thinking_max_on_opus46(self):
+        """thinking=max on Opus 4.6 uses adaptive path (max is supported)."""
+        config = make_config(
+            default_model="anthropic/claude-opus-4-6-20250605",
+            thinking="max",
+        )
+        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
+            client = MockClient.return_value
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
+            )
+            await complete(
+                config=config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+        kw = client.messages.stream.call_args.kwargs
+        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["output_config"] == {"effort": "max"}
+
+    @pytest.mark.asyncio
+    async def test_adaptive_thinking_max_mythos(self):
+        """thinking=max on Mythos sends effort=max."""
+        config = make_config(
+            default_model="anthropic/claude-mythos-preview-20260401",
+            thinking="max",
+        )
+        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
+            client = MockClient.return_value
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
+            )
+            await complete(
+                config=config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+        kw = client.messages.stream.call_args.kwargs
+        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["output_config"] == {"effort": "max"}
+
 
 # ---------------------------------------------------------------------------
 # Anthropic API call: budget-based thinking
@@ -555,6 +682,84 @@ class TestBudgetThinkingAPICall:
         kw = client.messages.stream.call_args.kwargs
         assert kw["thinking"] == {"type": "enabled", "budget_tokens": 2048}
         assert kw["max_tokens"] == 8192 + 2048
+
+
+# ---------------------------------------------------------------------------
+# New effort levels on old (non-adaptive) models
+# ---------------------------------------------------------------------------
+
+
+class TestNewLevelsOnOldModels:
+    """max and xhigh fall back to budget-based thinking on pre-4.5 models."""
+
+    @pytest.mark.asyncio
+    async def test_max_on_old_model_uses_budget(self):
+        config = make_config(
+            default_model="anthropic/claude-3-5-sonnet-20241022",
+            thinking="max",
+        )
+        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
+            client = MockClient.return_value
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
+            )
+            await complete(
+                config=config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+        kw = client.messages.stream.call_args.kwargs
+        assert kw["thinking"] == {"type": "enabled", "budget_tokens": 16384}
+
+    @pytest.mark.asyncio
+    async def test_xhigh_on_old_model_uses_budget(self):
+        config = make_config(
+            default_model="anthropic/claude-3-5-sonnet-20241022",
+            thinking="xhigh",
+        )
+        with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
+            client = MockClient.return_value
+            final_msg = mock_anthropic_response_with_thinking()
+            client.messages.stream = MagicMock(
+                return_value=MockAnthropicStream(
+                    [_make_text_event("Hello"), _make_message_stop()],
+                    final_message=final_msg
+                )
+            )
+            await complete(
+                config=config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+        kw = client.messages.stream.call_args.kwargs
+        assert kw["thinking"] == {"type": "enabled", "budget_tokens": 16384}
+
+    @pytest.mark.asyncio
+    async def test_fallback_logs_warning(self, caplog):
+        """Warning logged when max/xhigh falls back to budget."""
+        import logging
+        config = make_config(
+            default_model="anthropic/claude-3-5-sonnet-20241022",
+            thinking="max",
+        )
+        with caplog.at_level(logging.WARNING, logger="openalph.provider"):
+            with patch("openalph.provider.anthropic.AsyncAnthropic") as MockClient:
+                client = MockClient.return_value
+                final_msg = mock_anthropic_response_with_thinking()
+                client.messages.stream = MagicMock(
+                    return_value=MockAnthropicStream(
+                        [_make_text_event("Hello"), _make_message_stop()],
+                        final_message=final_msg
+                    )
+                )
+                await complete(
+                    config=config, system="Test",
+                    messages=[{"role": "user", "content": "Hi"}],
+                )
+        assert any("max" in r.message and "budget" in r.message.lower()
+                    for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +1095,7 @@ path = "/tmp/test"
             load_config(tmp_path / "agent.toml")
 
     def test_thinking_all_valid_values(self, tmp_path):
-        for val in ("off", "low", "medium", "high"):
+        for val in ("off", "low", "medium", "high", "xhigh", "max"):
             (tmp_path / "agent.toml").write_text(f"""
 [agent]
 name = "test"

@@ -582,6 +582,30 @@ class TestThinkingCommand:
         call_kwargs = bot.agent.handle_input.call_args.kwargs
         assert call_kwargs.get("thinking") == "high"
 
+    @pytest.mark.asyncio
+    async def test_thinking_set_max(self):
+        """/thinking max sets room-level override."""
+        bot = self._make_bot()
+        event = make_room_message("@sb:matrix.local", "/thinking max")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+        assert bot._room_thinking["!test:matrix.local"] == "max"
+
+    @pytest.mark.asyncio
+    async def test_thinking_set_xhigh(self):
+        """/thinking xhigh sets room-level override."""
+        bot = self._make_bot()
+        event = make_room_message("@sb:matrix.local", "/thinking xhigh")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+        assert bot._room_thinking["!test:matrix.local"] == "xhigh"
+
 
 # --- Typing Indicator ---
 

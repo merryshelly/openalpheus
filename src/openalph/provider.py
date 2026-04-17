@@ -195,12 +195,24 @@ class StreamEvent:
 
 
 def _supports_adaptive_thinking(model_id: str) -> bool:
-    """Returns True for claude-opus-4-6 and claude-sonnet-4-6 variants."""
-    return "opus-4-6" in model_id or "sonnet-4-6" in model_id
+    """Returns True for models that support adaptive thinking (type=adaptive + effort).
+
+    Supported: opus-4-6, sonnet-4-6, opus-4-7, opus-4-5, mythos.
+    """
+    return (
+        "opus-4-5" in model_id
+        or "opus-4-6" in model_id
+        or "sonnet-4-6" in model_id
+        or "opus-4-7" in model_id
+        or "mythos" in model_id
+    )
 
 
 def _thinking_effort(level: str) -> str:
-    """Map config thinking level to Anthropic effort. low→low, medium→medium, high→high."""
+    """Map config thinking level to Anthropic effort value.
+
+    Direct 1:1 mapping: low→low, medium→medium, high→high, xhigh→xhigh, max→max.
+    """
     return level  # Direct mapping
 
 
@@ -626,6 +638,12 @@ def _build_anthropic_kwargs(
             api_kwargs["output_config"] = {"effort": _thinking_effort(thinking_level)}
         else:
             # Budget-based thinking for older models
+            if thinking_level in ("max", "xhigh"):
+                logger.warning(
+                    "Thinking level %r requires adaptive thinking but model %r "
+                    "uses budget-based thinking; falling back to high budget (16384 tokens).",
+                    thinking_level, api_model,
+                )
             budget, adjusted_max = _thinking_budget(thinking_level, max_tokens, model_max_tokens)
             api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             api_kwargs["max_tokens"] = adjusted_max

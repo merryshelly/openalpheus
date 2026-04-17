@@ -848,3 +848,17 @@ class TestBuildOpenaiKwargs:
             thinking_level="high", provider_key="google",
         ))
         assert "extra_body" not in kw
+
+    def test_openrouter_reasoning_max(self):
+        """OpenRouter sends reasoning=max in extra_body."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="max", provider_key="openrouter",
+        ))
+        assert kw["extra_body"]["reasoning"] == {"effort": "max"}
+
+    def test_openrouter_reasoning_xhigh(self):
+        """OpenRouter sends reasoning=xhigh in extra_body."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="xhigh", provider_key="openrouter",
+        ))
+        assert kw["extra_body"]["reasoning"] == {"effort": "xhigh"}

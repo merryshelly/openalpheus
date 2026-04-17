@@ -258,7 +258,7 @@ def load_config(path: Path) -> AgentConfig:
 
     # thinking defaults to "off" if not specified
     thinking = agent_section.get("thinking", "off")
-    valid_thinking = ("off", "low", "medium", "high")
+    valid_thinking = ("off", "low", "medium", "high", "xhigh", "max")
     if thinking not in valid_thinking:
         raise ConfigError(f"thinking must be one of {valid_thinking}, got: {thinking!r}")
 

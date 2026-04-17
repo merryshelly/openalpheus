@@ -1897,7 +1897,7 @@ class MatrixBot:
                 await self.send(room_id, f"Thinking: **{current}** ({source})")
                 return
             level = parts[1].strip().lower()
-            valid_levels = ("off", "low", "medium", "high")
+            valid_levels = ("off", "low", "medium", "high", "xhigh", "max")
             if level not in valid_levels:
                 await self.send(room_id, f"Invalid level. Use: {', '.join(valid_levels)}")
                 return
