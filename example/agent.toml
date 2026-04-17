@@ -1,47 +1,141 @@
-# Example: Anthropic agent
+# OpenAlpheus agent config — example
+#
+# This file lives at /etc/openalph/agents/<name>.toml and is owned by root.
+# The agent process (running as Unix user oa-<name>) cannot read its own config.
+#
+# The `openalph new-agent <name>` command writes a skeleton of this shape
+# automatically. You normally edit an existing file rather than writing one
+# from scratch — this example is a reference for what each section does.
+#
+# After any edit: sudo systemctl restart openalph@<name>
+
+# -----------------------------------------------------------------------------
+# [agent] — core agent settings
+# -----------------------------------------------------------------------------
 [agent]
 name = "merry"
-model = "claude-sonnet-4-20250514"
+
+# Must be fully qualified as "<provider-key>/<model-id>", where <provider-key>
+# matches a [providers.<key>] section below. Or use a bare alias name if you
+# define [model_aliases] (see bottom of file).
+default_model = "anthropic/claude-sonnet-4-6"
+
+# Per-response output cap. Model-dependent; 8192 is a safe default for Claude.
 max_tokens = 8192
 
-[provider]
+# Context window size for the chosen model. When session history exceeds this,
+# the agent raises ContextOverflowError (hard error — open a new Matrix room).
+# Claude Sonnet 4.6 supports 200k; Opus 4.7 supports 1M; local models vary.
+model_max_tokens = 200000
+
+# Optional. Enable to process images sent to Matrix rooms as vision inputs.
+# vision = false
+
+# Optional. Extended thinking level. Valid: "off", "low", "medium", "high",
+# "xhigh", "max". "xhigh" requires Opus 4.7+; "max" requires Opus 4.5+,
+# Sonnet 4.6, or Mythos.
+# thinking = "off"
+
+# -----------------------------------------------------------------------------
+# [providers.<key>] — one or more LLM providers
+# -----------------------------------------------------------------------------
+# You can configure multiple providers and switch between them at runtime with
+# the /model slash command. The <key> in [providers.<key>] is what appears in
+# default_model and /model as "<key>/<model-id>".
+#
+# API key resolution precedence: api_key > api_key_env > api_key_cmd.
+# api_key_cmd runs via shell with a 10-second timeout. Prefer api_key_cmd
+# pointing at a secrets manager (1Password, pass, etc.) over api_key_env
+# (which leaks into the process environment) or api_key (which bakes the
+# secret into a root-owned file).
+
+[providers.anthropic]
 type = "anthropic"
-# Exactly one of: api_key, api_key_env, api_key_cmd
-# api_key = "sk-ant-..."                          # direct (not recommended)
-api_key_cmd = "op read op://<your-vault>/anthropic/api-key"  # shell command
-# api_key_env = "ANTHROPIC_API_KEY"               # env var
+# Pick ONE of these three:
+# api_key = "sk-ant-..."                                    # direct (avoid)
+# api_key_env = "ANTHROPIC_API_KEY"                         # env var
+api_key_cmd = "cat /home/oa-merry/.config/anthropic-key"    # file read
+# Or via 1Password:
+# api_key_cmd = "op read 'op://<your-vault>/anthropic/credential'"
 
+# Optional. Emit an in-room m.notice when a large cache-creation API call
+# writes without reading any cached tokens. Useful for spotting cache busts
+# on expensive providers.
+# cache_bust_notices = true
+
+# -----------------------------------------------------------------------------
+# [workspace] — where the agent's prompts, skills, tools, and sessions live
+# -----------------------------------------------------------------------------
+# `openalph new-agent` creates a Unix user "oa-<name>" with a home at
+# /home/oa-<name>/ and a workspace at /home/oa-<name>/workspace/. Keep this
+# path aligned with that user's home unless you know what you're changing.
 [workspace]
-path = "/home/merry/.openalph/workspace"
+path = "/home/oa-merry/workspace"
 
-# ---
+# -----------------------------------------------------------------------------
+# [matrix] — Matrix homeserver connection
+# -----------------------------------------------------------------------------
+# Without a [matrix] section the agent has no way to receive messages.
+# The installer provisions tuwunel at http://127.0.0.1:4269 by default.
+[matrix]
+homeserver = "http://127.0.0.1:4269"
+user_id = "@merry:your-domain.example"
+device_id = "OPENALPH"
+# Pick ONE: password / password_env / password_cmd, or access_token / etc.
+# The installer writes an access token file to the agent's config dir.
+access_token_cmd = "cat /home/oa-merry/.config/matrix-token"
 
-# Example: OpenRouter agent
-# [agent]
-# name = "babson"
-# model = "moonshotai/kimi-k2.5"
-# max_tokens = 8192
+# Optional per-room overrides. This is NOT an allowlist — agents auto-join
+# any room they are invited to. Use this only to change gating behavior
+# on a specific room (e.g., force @mention requirement on a small DM).
+# [matrix.rooms."!roomid:your-domain.example"]
+# require_mention = true
+
+# =============================================================================
+# ADDITIONAL PROVIDER EXAMPLES
+# =============================================================================
+# Uncomment and edit any of the blocks below to add a second or third provider.
+# You can switch between them at runtime with `/model <key>/<model-id>`.
+
+# -----------------------------------------------------------------------------
+# Ollama — local inference, no API key, zero marginal cost
+# -----------------------------------------------------------------------------
+# Install Ollama: https://ollama.com/download
+# Pull a model:   ollama pull qwen3:235b-a22b
+# Then uncomment:
 #
-# [provider]
+# [providers.ollama]
 # type = "openai"
-# api_key_env = "OPENROUTER_API_KEY"
-# base_url = "https://openrouter.ai/api/v1"
+# base_url = "http://localhost:11434/v1"
+# api_key = "ollama"                     # Ollama ignores the key but one is required
 #
-# [workspace]
-# path = "/home/babson/.openalph/workspace"
+# Reference with: default_model = "ollama/qwen3:235b-a22b"
 
-# ---
-
-# Example: Ollama agent (local)
-# [agent]
-# name = "coldharbor"
-# model = "qwen3:235b-a22b"
-# max_tokens = 4096
+# -----------------------------------------------------------------------------
+# Fireworks — hosted open models (Kimi, GLM, DeepSeek, Llama) in FP8
+# -----------------------------------------------------------------------------
+# Get an API key at https://fireworks.ai/
+# Model IDs follow the pattern: accounts/fireworks/models/<model-slug>
 #
-# [provider]
+# [providers.fireworks]
 # type = "openai"
-# api_key = "ollama"
-# base_url = "http://<your-host>:11434/v1"
+# base_url = "https://api.fireworks.ai/inference/v1"
+# api_key_cmd = "cat /home/oa-merry/.config/fireworks-key"
 #
-# [workspace]
-# path = "/home/coldharbor/.openalph/workspace"
+# Reference with:
+#   default_model = "fireworks/accounts/fireworks/models/kimi-k2p5"
+#   default_model = "fireworks/accounts/fireworks/models/glm-5p1"
+
+# =============================================================================
+# [model_aliases] — OPTIONAL short names for models
+# =============================================================================
+# If you configure multiple providers, typing full model strings gets old.
+# Aliases let you write `default_model = "sonnet"` or `/model opus` instead of
+# the full "<provider>/<model-id>" path.
+
+# [model_aliases]
+# sonnet = "anthropic/claude-sonnet-4-6"
+# opus = "anthropic/claude-opus-4-7"
+# haiku = "anthropic/claude-haiku-4-5-20251001"
+# kimi = "fireworks/accounts/fireworks/models/kimi-k2p5"
+# local = "ollama/qwen3:235b-a22b"
