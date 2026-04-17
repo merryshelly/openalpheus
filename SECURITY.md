@@ -18,7 +18,7 @@ OpenAlpheus is designed for **single-tenant, operator-controlled environments**.
 - End-to-end encryption (TLS protects transport; no Matrix E2EE yet)
 - Hostile network actors beyond what TLS handles
 - Supply chain attacks on dependencies (standard pip trust model)
-- Adversarial model providers (if your LLM provider is hostile, you have bigger problems)
+- Adversarial model providers or intermediaries — inference provisioning is the operator's responsibility (see recommendations below)
 
 ## Layers of Defense
 
@@ -136,6 +136,7 @@ API keys are never stored in TOML config. The `api_key_cmd` field runs a shell c
 - **Review and customize SAFETY.md** for your use case and threat model.
 - **Don't invite untrusted users to agent rooms.** Room membership is the only access gate.
 - **Review JSONL session logs** periodically — they're your audit trail.
+- **Choose inference providers carefully.** Any LLM provider, router, or proxy in your request path has plaintext access to every prompt, tool call, and response — no existing API protocol enforces cryptographic integrity between client and upstream model. Recent measurement research ([Liu et al., "Your Agent Is Mine," arXiv:2604.08407](https://arxiv.org/abs/2604.08407), 2026) found, across 428 routers sampled from public marketplaces: 9 actively injecting malicious code into responses, 2 using adaptive evasion triggers, 17 exfiltrating canary credentials, and 1 draining a honeypot ETH private key. Prefer direct first-party endpoints (Anthropic, OpenAI, Google, etc.) over aggregators and resellers unless you have specific reason to trust their operators and supply chain. For highest assurance, run local inference (llama.cpp, vllm, etc.) — you control the entire path.
 
 ## Further Reading
 
