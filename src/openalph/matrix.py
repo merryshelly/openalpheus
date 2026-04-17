@@ -11,6 +11,7 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 import asyncio
 import hashlib
 import logging
+import tempfile
 import time
 from pathlib import Path
 
@@ -1799,8 +1800,8 @@ class MatrixBot:
             return
 
         if body == "/showprompt":
+            # Assemble the full prompt (system prompt + tool list).
             parts = [self.agent.system_prompt]
-            # Append tool list
             if self.agent.tools:
                 parts.append("\n## Available Tools (passed via API, not in prompt)\n")
                 for tool in self.agent.tools:
@@ -1810,9 +1811,61 @@ class MatrixBot:
                         line += f"\n  Parameters: {params}"
                     parts.append(line)
             output = "\n".join(parts)
-            if len(output) > 65000:
-                output = output[:65000] + "\n\n... (truncated)"
-            await self.send(room_id, f"```\n{output}\n```")
+
+            # Count prompt files present, skills indexed, and tools available
+            # for the inline summary. Use config.workspace as the source of truth.
+            workspace = Path(self.agent.config.workspace)
+            prompt_files = [
+                "SAFETY.md", "SOUL.md", "OPERATOR.md",
+                "WAKE.md", "ENVIRONMENT.md", "OPERATIONS.md",
+            ]
+            file_count = sum(1 for f in prompt_files if (workspace / f).exists())
+            skills_dir = workspace / "skills"
+            skill_count = (
+                sum(1 for f in skills_dir.iterdir() if f.suffix == ".md")
+                if skills_dir.exists() else 0
+            )
+            tool_count = len(self.agent.tools) if self.agent.tools else 0
+
+            summary = (
+                f"📋 System prompt: {len(output):,} chars · "
+                f"{file_count} prompt files · "
+                f"{skill_count} skills · "
+                f"{tool_count} tools"
+            )
+
+            # Write prompt to a temp .md file and upload as attachment.
+            # Uploading as a file bypasses Markdown rendering entirely, so
+            # fenced code blocks inside the prompt render correctly on
+            # download rather than colliding with the wrapper fence.
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".md",
+                    prefix=f"system-prompt-{self.agent.config.name}-",
+                    delete=False,
+                    encoding="utf-8",
+                ) as tf:
+                    tf.write(output)
+                    tmp_path = Path(tf.name)
+
+                await self.send_notice(room_id, summary)
+                try:
+                    await self.upload_and_send(
+                        room_id,
+                        tmp_path,
+                        "text/markdown",
+                        f"system-prompt-{self.agent.config.name}.md",
+                        caption=f"System prompt ({self.agent.config.name})",
+                    )
+                finally:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+            except Exception as exc:
+                logger.exception("showprompt failed: %s", exc)
+                await self.send(room_id, f"{summary}\n\n⚠️ Upload failed: {exc}")
             return
 
         if body == "/status":

@@ -522,8 +522,14 @@ class TestMentionScopedCommands:
 
     @pytest.mark.asyncio
     async def test_mentioned_showprompt_responds(self, tmp_path):
-        """@watson /showprompt → Watson shows prompt."""
+        """@watson /showprompt → Watson sends summary notice + uploads prompt file.
+
+        The prompt is delivered as a .md attachment to bypass Markdown
+        rendering issues (inner fenced code blocks collide with an outer
+        fence, producing garbled output in Matrix clients).
+        """
         bot, agent = make_bot(tmp_path)
+        bot.upload_and_send = AsyncMock()
         room = make_room("!group:matrix.local", 3)
         event = make_event(
             "@alice:matrix.local",
@@ -538,8 +544,29 @@ class TestMentionScopedCommands:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        bot.send.assert_called_once()
-        assert "Test prompt" in bot.send.call_args[0][1]
+        # Summary goes out as an m.notice with size + counts.
+        # (A session-resume notice may also fire on room activation — match ours.)
+        summary_calls = [
+            c for c in bot.send_notice.call_args_list
+            if "System prompt" in c[0][1]
+        ]
+        assert len(summary_calls) == 1, f"Expected exactly one summary notice, got {bot.send_notice.call_args_list}"
+        summary = summary_calls[0][0][1]
+        assert "chars" in summary
+        assert "skills" in summary
+        assert "tools" in summary
+
+        # Full prompt is uploaded as a .md attachment.
+        bot.upload_and_send.assert_called_once()
+        up_args = bot.upload_and_send.call_args
+        assert up_args[0][0] == "!group:matrix.local"        # room
+        tmp_path_arg = up_args[0][1]
+        assert isinstance(tmp_path_arg, Path)
+        assert up_args[0][2] == "text/markdown"              # content type
+        assert up_args[0][3].endswith(".md")                 # filename
+
+        # Inline send() (the plain-text fallback path) must NOT fire on success.
+        bot.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mentioned_heartbeat_start(self, tmp_path):
