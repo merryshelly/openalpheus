@@ -709,7 +709,9 @@ class TestCommandsPostRefactor:
             "context_tokens": 8000,
             "context_max": 200000,
             "context_pct": 4,
-            "total_input_tokens": 1000,
+            "uncached_input_tokens": 1000,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
             "total_output_tokens": 500,
             "total_tool_calls": 3,
         }

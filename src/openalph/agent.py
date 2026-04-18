@@ -143,7 +143,9 @@ class Agent:
             model_aliases=config.model_aliases,
         )
         self._rooms: dict[str, list[dict]] = {}  # room_id → history
-        self.total_input_tokens = 0
+        self.uncached_input_tokens = 0
+        self.cache_read_tokens = 0
+        self.cache_creation_tokens = 0
         self.total_output_tokens = 0
         self.total_tool_calls = 0
         # Discover tools from workspace/tools/ directory
@@ -349,7 +351,9 @@ class Agent:
 
                     latency_ms = (time.monotonic() - start_time) * 1000
 
-                    self.total_input_tokens += response.usage.input_tokens
+                    self.uncached_input_tokens += response.usage.input_tokens
+                    self.cache_read_tokens += response.usage.cache_read_tokens or 0
+                    self.cache_creation_tokens += response.usage.cache_creation_tokens or 0
                     self.total_output_tokens += response.usage.output_tokens
                     usage = response.usage
 
@@ -513,7 +517,9 @@ class Agent:
                                 await on_text_delta("", done=True)
 
                     if summary_response:
-                        self.total_input_tokens += summary_response.usage.input_tokens
+                        self.uncached_input_tokens += summary_response.usage.input_tokens
+                        self.cache_read_tokens += summary_response.usage.cache_read_tokens or 0
+                        self.cache_creation_tokens += summary_response.usage.cache_creation_tokens or 0
                         self.total_output_tokens += summary_response.usage.output_tokens
                         if on_cache_status:
                             try:
@@ -668,7 +674,9 @@ class Agent:
             "context_tokens": context_tokens,
             "context_max": model_max,
             "context_pct": context_pct,
-            "total_input_tokens": self.total_input_tokens,
+            "uncached_input_tokens": self.uncached_input_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tool_calls": self.total_tool_calls,
         }

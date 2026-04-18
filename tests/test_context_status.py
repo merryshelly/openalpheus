@@ -69,7 +69,7 @@ class TestContextStatusExecution:
             "context_tokens": 10000,
             "context_max": 200000,
             "context_pct": 5,
-            "total_input_tokens": 50000,
+            "uncached_input_tokens": 50000,
             "total_output_tokens": 15000,
             "total_tool_calls": 12,
         }
@@ -94,7 +94,7 @@ class TestContextStatusExecution:
             "context_tokens": 5000,
             "context_max": 200000,
             "context_pct": 3,
-            "total_input_tokens": 20000,
+            "uncached_input_tokens": 20000,
             "total_output_tokens": 8000,
             "total_tool_calls": 7,
         }
@@ -119,7 +119,7 @@ class TestContextStatusExecution:
             "context_tokens": 80000,
             "context_max": 200000,
             "context_pct": 40,
-            "total_input_tokens": 100000,
+            "uncached_input_tokens": 100000,
             "total_output_tokens": 30000,
             "total_tool_calls": 25,
         }
@@ -148,7 +148,7 @@ class TestContextStatusExecution:
             "context_tokens": 1000,
             "context_max": 200000,
             "context_pct": 1,
-            "total_input_tokens": 2000,
+            "uncached_input_tokens": 2000,
             "total_output_tokens": 500,
             "total_tool_calls": 0,
         }
@@ -174,7 +174,7 @@ class TestContextStatusExecution:
             "context_tokens": 10000,
             "context_max": 200000,
             "context_pct": 5,
-            "total_input_tokens": 50000,
+            "uncached_input_tokens": 50000,
             "total_output_tokens": 15000,
             "total_tool_calls": 12,
         }
@@ -186,7 +186,7 @@ class TestContextStatusExecution:
             callbacks={"context_status": AsyncMock(return_value=status_data)},
         )
         data = json.loads(result.content)
-        assert data["total_input_tokens"] == 50000
+        assert data["uncached_input_tokens"] == 50000
         assert data["total_output_tokens"] == 15000
         assert data["total_tool_calls"] == 12
         assert data["turns"] == 5
@@ -202,7 +202,7 @@ class TestContextStatusExecution:
             "context_tokens": 10000,
             "context_max": 200000,
             "context_pct": 5,
-            "total_input_tokens": 50000,
+            "uncached_input_tokens": 50000,
             "total_output_tokens": 15000,
             "total_tool_calls": 12,
             "heartbeat_active": True,
@@ -232,7 +232,7 @@ class TestContextStatusExecution:
             "context_tokens": 3000,
             "context_max": 200000,
             "context_pct": 2,
-            "total_input_tokens": 5000,
+            "uncached_input_tokens": 5000,
             "total_output_tokens": 2000,
             "total_tool_calls": 1,
             "heartbeat_active": False,
@@ -262,7 +262,7 @@ class TestContextStatusExecution:
             "context_tokens": 10000,
             "context_max": 200000,
             "context_pct": 5,
-            "total_input_tokens": 50000,
+            "uncached_input_tokens": 50000,
             "total_output_tokens": 15000,
             "total_tool_calls": 12,
             "session_age_minutes": 45,
@@ -318,7 +318,7 @@ class TestContextStatusExecution:
             "context_tokens": 3000,
             "context_max": 200000,
             "context_pct": 2,
-            "total_input_tokens": 5000,
+            "uncached_input_tokens": 5000,
             "total_output_tokens": 2000,
             "total_tool_calls": 1,
             "room_id": "!abc123:example.com",
@@ -346,7 +346,7 @@ class TestContextStatusExecution:
             "context_tokens": 5000,
             "context_max": 200000,
             "context_pct": 3,
-            "total_input_tokens": 20000,
+            "uncached_input_tokens": 20000,
             "total_output_tokens": 8000,
             "total_tool_calls": 7,
             "umbral_active": True,
@@ -376,7 +376,7 @@ class TestContextStatusExecution:
             "context_tokens": 1000,
             "context_max": 200000,
             "context_pct": 1,
-            "total_input_tokens": 2000,
+            "uncached_input_tokens": 2000,
             "total_output_tokens": 500,
             "total_tool_calls": 0,
             "umbral_active": False,
@@ -396,6 +396,36 @@ class TestContextStatusExecution:
         assert data["umbral_next_minutes"] is None
 
 
+    @pytest.mark.asyncio
+    async def test_contains_cache_breakdown(self, tmp_path):
+        """Result includes uncached/cache_read/cache_creation breakdown."""
+        config = _make_config(workspace=tmp_path)
+        status_data = {
+            "name": "test-agent",
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "turns": 5,
+            "context_tokens": 10000,
+            "context_max": 200000,
+            "context_pct": 5,
+            "uncached_input_tokens": 1500,
+            "cache_read_tokens": 80000,
+            "cache_creation_tokens": 5000,
+            "total_output_tokens": 3000,
+            "total_tool_calls": 7,
+        }
+        result = await execute_tool(
+            name="context_status",
+            input={},
+            tool_config={},
+            agent_config=config,
+            callbacks={"context_status": AsyncMock(return_value=status_data)},
+        )
+        data = json.loads(result.content)
+        assert data["uncached_input_tokens"] == 1500
+        assert data["cache_read_tokens"] == 80000
+        assert data["cache_creation_tokens"] == 5000
+
+
 class TestBuildContextStatus:
     """Tests for MatrixBot._build_context_status — the callback body factored out."""
 
@@ -411,7 +441,7 @@ class TestBuildContextStatus:
             "context_tokens": 10000,
             "context_max": 200000,
             "context_pct": 5,
-            "total_input_tokens": 50000,
+            "uncached_input_tokens": 50000,
             "total_output_tokens": 15000,
             "total_tool_calls": 12,
         }

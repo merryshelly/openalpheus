@@ -136,7 +136,9 @@ async def run_subagent(
     messages = [{"role": "user", "content": task}]
 
     # Tracking counters
-    total_input_tokens = 0
+    uncached_input_tokens = 0
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
     total_output_tokens = 0
     total_tool_calls = 0
     completed_iterations = 0
@@ -155,7 +157,9 @@ async def run_subagent(
 
             # Accumulate token counts
             if response.usage:
-                total_input_tokens += response.usage.input_tokens or 0
+                uncached_input_tokens += response.usage.input_tokens or 0
+                cache_read_tokens += response.usage.cache_read_tokens or 0
+                cache_creation_tokens += response.usage.cache_creation_tokens or 0
                 total_output_tokens += response.usage.output_tokens or 0
 
             # Text response — check for truncation before accepting
@@ -200,7 +204,9 @@ async def run_subagent(
                     "stop_reason": response.stop_reason,
                     "total_iterations": completed_iterations,
                     "total_tool_calls": total_tool_calls,
-                    "total_input_tokens": total_input_tokens,
+                    "uncached_input_tokens": uncached_input_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
                     "total_output_tokens": total_output_tokens,
                     "peak_context_tokens": peak_context_tokens,
                     "elapsed_seconds": round(elapsed, 3),
@@ -285,7 +291,9 @@ async def run_subagent(
             "status": "circuit_breaker",
             "total_iterations": completed_iterations,
             "total_tool_calls": total_tool_calls,
-            "total_input_tokens": total_input_tokens,
+            "uncached_input_tokens": uncached_input_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
             "total_output_tokens": total_output_tokens,
             "peak_context_tokens": peak_context_tokens,
             "elapsed_seconds": round(elapsed, 3),
@@ -321,7 +329,9 @@ async def run_subagent(
             "status": "error",
             "total_iterations": completed_iterations,
             "total_tool_calls": total_tool_calls,
-            "total_input_tokens": total_input_tokens,
+            "uncached_input_tokens": uncached_input_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
             "total_output_tokens": total_output_tokens,
             "peak_context_tokens": peak_context_tokens,
             "elapsed_seconds": round(elapsed, 3),

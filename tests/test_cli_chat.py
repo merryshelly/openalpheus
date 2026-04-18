@@ -90,7 +90,9 @@ def mock_agent():
         "context_tokens": 1200,
         "context_max": 200000,
         "context_pct": 1,
-        "total_input_tokens": 500,
+        "uncached_input_tokens": 500,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
         "total_output_tokens": 700,
         "total_tool_calls": 3,
     }

@@ -4,7 +4,7 @@ Interface contract:
     Agent(config: AgentConfig) — initializes with config, assembles system prompt, empty history
     Agent.handle_input(text: str) -> str — sends message, returns response content
     Agent.history — list of {"role": ..., "content": ...} dicts
-    Agent.total_input_tokens / total_output_tokens — cumulative usage
+    Agent.uncached_input_tokens / total_output_tokens — cumulative usage
     Agent.status() -> dict — model, turns, token counts
 """
 
@@ -83,7 +83,7 @@ class TestAgentInit:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        assert agent.total_input_tokens == 0
+        assert agent.uncached_input_tokens == 0
         assert agent.total_output_tokens == 0
 
 
@@ -185,7 +185,7 @@ class TestTokenTracking:
             mock.side_effect = make_stream_events("B", input_tokens=200, output_tokens=80)
             await agent.handle_input("Second")
 
-        assert agent.total_input_tokens == 300
+        assert agent.uncached_input_tokens == 300
         assert agent.total_output_tokens == 130
 
 
@@ -201,7 +201,7 @@ class TestStatus:
         status = agent.status()
         assert status["model"] == "anthropic/claude-sonnet-4-20250514"
         assert status["turns"] == 0
-        assert status["total_input_tokens"] == 0
+        assert status["uncached_input_tokens"] == 0
         assert status["total_output_tokens"] == 0
 
     @pytest.mark.asyncio
@@ -215,7 +215,7 @@ class TestStatus:
 
         status = agent.status()
         assert status["turns"] == 1
-        assert status["total_input_tokens"] == 50
+        assert status["uncached_input_tokens"] == 50
         assert status["total_output_tokens"] == 20
         assert status["model"] == "anthropic/claude-sonnet-4-20250514"
         assert "name" in status
@@ -260,7 +260,7 @@ class TestSessionScopedUsage:
     def test_counters_start_at_zero(self, tmp_path):
         config = make_config(tmp_path)
         agent = Agent(config)
-        assert agent.total_input_tokens == 0
+        assert agent.uncached_input_tokens == 0
         assert agent.total_output_tokens == 0
         assert agent.total_tool_calls == 0
 
@@ -273,7 +273,7 @@ class TestSessionScopedUsage:
             f.write(json.dumps({"input_tokens": 999, "output_tokens": 888, "tool_calls": []}) + "\n")
         config = make_config(tmp_path)
         agent = Agent(config)
-        assert agent.total_input_tokens == 0
+        assert agent.uncached_input_tokens == 0
         assert agent.total_output_tokens == 0
 
     @pytest.mark.asyncio
@@ -287,14 +287,14 @@ class TestSessionScopedUsage:
             mock.side_effect = make_stream_events("B", input_tokens=200, output_tokens=80)
             await agent.handle_input("Second")
 
-        assert agent.total_input_tokens == 300
+        assert agent.uncached_input_tokens == 300
         assert agent.total_output_tokens == 130
 
     def test_status_reflects_session_counters(self, tmp_path):
         config = make_config(tmp_path)
         agent = Agent(config)
         s = agent.status()
-        assert s["total_input_tokens"] == 0
+        assert s["uncached_input_tokens"] == 0
         assert s["total_output_tokens"] == 0
         assert s["total_tool_calls"] == 0
 

@@ -265,7 +265,9 @@ class TestCommands:
             "context_tokens": 8000,
             "context_max": 200000,
             "context_pct": 4,
-            "total_input_tokens": 1000,
+            "uncached_input_tokens": 1000,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
             "total_output_tokens": 500,
             "total_tool_calls": 3,
         }
@@ -295,7 +297,7 @@ class TestCommands:
         agent.status.return_value = {
             "name": "test", "model": "claude-3", "turns": 0,
             "context_tokens": 0, "context_max": 200000, "context_pct": 0,
-            "total_input_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
+            "uncached_input_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
         }
 
         bot = make_bot(agent, config)
@@ -342,7 +344,7 @@ class TestCommands:
             return {
                 "name": "test", "model": "claude-3", "turns": turns,
                 "context_tokens": 100, "context_max": 200000, "context_pct": 0,
-                "total_input_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
+                "uncached_input_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
             }
         agent.status.side_effect = _status
 
@@ -390,7 +392,7 @@ class TestCommands:
         agent.status.return_value = {
             "name": "test", "model": "test-model", "turns": 0,
             "context_tokens": 0, "context_max": 200000, "context_pct": 0,
-            "total_input_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
+            "uncached_input_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "total_output_tokens": 0, "total_tool_calls": 0,
         }
         bot = make_bot(agent)
         room = MagicMock()

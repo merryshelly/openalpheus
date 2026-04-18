@@ -100,7 +100,7 @@ def make_bot(tmp_path):
     agent.status = MagicMock(return_value={
         "name": "saw", "model": "claude-sonnet-4-20250514",
         "context_tokens": 1000, "context_max": 200000, "context_pct": 0,
-        "turns": 5, "total_input_tokens": 5000, "total_output_tokens": 2000,
+        "turns": 5, "uncached_input_tokens": 5000, "cache_read_tokens": 0, "cache_creation_tokens": 0, "total_output_tokens": 2000,
         "total_tool_calls": 3,
     })
     agent.history = MagicMock(return_value=[])

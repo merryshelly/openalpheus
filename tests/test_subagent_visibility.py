@@ -202,7 +202,7 @@ class TestSubagentLogFile:
         lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
 
         summary = lines[-1]
-        assert summary["total_input_tokens"] == 150
+        assert summary["uncached_input_tokens"] == 150
         assert summary["total_output_tokens"] == 75
 
     @pytest.mark.asyncio

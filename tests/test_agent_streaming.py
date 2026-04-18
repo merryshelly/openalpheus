@@ -570,7 +570,7 @@ class TestBackwardCompat:
                     ])):
             await agent.handle_input("Hello")
 
-        assert agent.total_input_tokens == 150
+        assert agent.uncached_input_tokens == 150
         assert agent.total_output_tokens == 30
 
     @pytest.mark.asyncio
@@ -592,7 +592,7 @@ class TestBackwardCompat:
 
             await agent.handle_input("Do it")
 
-        assert agent.total_input_tokens == 300
+        assert agent.uncached_input_tokens == 300
         assert agent.total_output_tokens == 60
 
     @pytest.mark.asyncio
@@ -685,5 +685,5 @@ class TestStatusWithStreaming:
 
         status = agent.status()
         assert status["turns"] == 1
-        assert status["total_input_tokens"] == 50
+        assert status["uncached_input_tokens"] == 50
         assert status["total_output_tokens"] == 20

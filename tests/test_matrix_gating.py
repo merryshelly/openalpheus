@@ -109,7 +109,9 @@ def make_bot(tmp_path, rooms=None):
         "context_max": 200000,
         "context_pct": 0,
         "turns": 5,
-        "total_input_tokens": 5000,
+        "uncached_input_tokens": 5000,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
         "total_output_tokens": 2000,
         "total_tool_calls": 3,
     })
