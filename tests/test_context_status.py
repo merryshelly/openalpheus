@@ -302,3 +302,195 @@ class TestContextStatusExecution:
             callbacks=None,
         )
         assert result.is_error is True
+
+    # ------------------------------------------------------------------
+    # New tests: room identity fields
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_contains_room_identity(self, tmp_path):
+        """status_data room_id and room_name pass through to JSON result."""
+        config = _make_config(workspace=tmp_path)
+        status_data = {
+            "name": "test-agent",
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "turns": 2,
+            "context_tokens": 3000,
+            "context_max": 200000,
+            "context_pct": 2,
+            "total_input_tokens": 5000,
+            "total_output_tokens": 2000,
+            "total_tool_calls": 1,
+            "room_id": "!abc123:example.com",
+            "room_name": "Dev Channel",
+        }
+        result = await execute_tool(
+            name="context_status",
+            input={},
+            tool_config={},
+            agent_config=config,
+            callbacks={"context_status": AsyncMock(return_value=status_data)},
+        )
+        data = json.loads(result.content)
+        assert data["room_id"] == "!abc123:example.com"
+        assert data["room_name"] == "Dev Channel"
+
+    @pytest.mark.asyncio
+    async def test_contains_umbral_fields(self, tmp_path):
+        """status_data umbral fields pass through to JSON result when active."""
+        config = _make_config(workspace=tmp_path)
+        status_data = {
+            "name": "test-agent",
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "turns": 3,
+            "context_tokens": 5000,
+            "context_max": 200000,
+            "context_pct": 3,
+            "total_input_tokens": 20000,
+            "total_output_tokens": 8000,
+            "total_tool_calls": 7,
+            "umbral_active": True,
+            "umbral_interval_minutes": 240,
+            "umbral_next_minutes": 180,
+        }
+        result = await execute_tool(
+            name="context_status",
+            input={},
+            tool_config={},
+            agent_config=config,
+            callbacks={"context_status": AsyncMock(return_value=status_data)},
+        )
+        data = json.loads(result.content)
+        assert data["umbral_active"] is True
+        assert data["umbral_interval_minutes"] == 240
+        assert data["umbral_next_minutes"] == 180
+
+    @pytest.mark.asyncio
+    async def test_umbral_null_when_inactive(self, tmp_path):
+        """Umbral fields are null when no umbral timer is active."""
+        config = _make_config(workspace=tmp_path)
+        status_data = {
+            "name": "test-agent",
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "turns": 1,
+            "context_tokens": 1000,
+            "context_max": 200000,
+            "context_pct": 1,
+            "total_input_tokens": 2000,
+            "total_output_tokens": 500,
+            "total_tool_calls": 0,
+            "umbral_active": False,
+            "umbral_interval_minutes": None,
+            "umbral_next_minutes": None,
+        }
+        result = await execute_tool(
+            name="context_status",
+            input={},
+            tool_config={},
+            agent_config=config,
+            callbacks={"context_status": AsyncMock(return_value=status_data)},
+        )
+        data = json.loads(result.content)
+        assert data["umbral_active"] is False
+        assert data["umbral_interval_minutes"] is None
+        assert data["umbral_next_minutes"] is None
+
+
+class TestBuildContextStatus:
+    """Tests for MatrixBot._build_context_status — the callback body factored out."""
+
+    def _make_bot(self):
+        """Create a minimal MatrixBot-like object for testing _build_context_status."""
+        from openalph.matrix import MatrixBot
+
+        agent = MagicMock()
+        agent.status.return_value = {
+            "name": "test-agent",
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "turns": 5,
+            "context_tokens": 10000,
+            "context_max": 200000,
+            "context_pct": 5,
+            "total_input_tokens": 50000,
+            "total_output_tokens": 15000,
+            "total_tool_calls": 12,
+        }
+
+        # Build a minimal bot without triggering __init__ (avoids Matrix connection)
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.agent = agent
+        bot.config = MagicMock()
+        bot.config.user_id = "@bot:example.com"
+        bot.session_log = None
+        bot.heartbeat = None
+        bot.umbral = None
+        bot.client = None
+        return bot
+
+    def test_returns_dict_with_basic_fields(self):
+        """_build_context_status returns a dict with the base agent status fields."""
+        bot = self._make_bot()
+        result = bot._build_context_status("!room:example.com")
+        assert isinstance(result, dict)
+        assert result["name"] == "test-agent"
+        assert result["turns"] == 5
+
+    def test_room_id_always_populated(self):
+        """room_id field is always set from the rid argument."""
+        bot = self._make_bot()
+        result = bot._build_context_status("!myroom:server.com")
+        assert result["room_id"] == "!myroom:server.com"
+
+    def test_room_name_none_when_no_client(self):
+        """room_name is None when client is not set."""
+        bot = self._make_bot()
+        bot.client = None
+        result = bot._build_context_status("!room:example.com")
+        assert result["room_name"] is None
+
+    def test_room_name_from_client(self):
+        """room_name comes from client.rooms[rid].named_room_name()."""
+        bot = self._make_bot()
+        mock_room = MagicMock()
+        mock_room.named_room_name.return_value = "My Test Room"
+        mock_client = MagicMock()
+        mock_client.rooms = {"!room:example.com": mock_room}
+        bot.client = mock_client
+        result = bot._build_context_status("!room:example.com")
+        assert result["room_name"] == "My Test Room"
+        mock_room.named_room_name.assert_called_once_with()
+
+    def test_umbral_null_when_no_umbral(self):
+        """umbral fields are all null/False when umbral manager is absent."""
+        bot = self._make_bot()
+        bot.umbral = None
+        result = bot._build_context_status("!room:example.com")
+        assert result["umbral_active"] is False
+        assert result["umbral_interval_minutes"] is None
+        assert result["umbral_next_minutes"] is None
+
+    def test_umbral_fields_when_active(self):
+        """umbral fields populated when umbral is active with an entry for this room."""
+        bot = self._make_bot()
+        mock_entry = MagicMock()
+        mock_entry.room_id = "!room:example.com"
+        mock_entry.interval_seconds = 14400  # 240 min
+        mock_entry.seconds_until_next = 10800  # 180 min
+        mock_umbral = MagicMock()
+        mock_umbral.is_active.return_value = True
+        mock_umbral.status.return_value = [mock_entry]
+        bot.umbral = mock_umbral
+        result = bot._build_context_status("!room:example.com")
+        assert result["umbral_active"] is True
+        assert result["umbral_interval_minutes"] == 240
+        assert result["umbral_next_minutes"] == 180
+
+    def test_heartbeat_null_when_no_heartbeat(self):
+        """heartbeat fields are all null/False when heartbeat manager is absent (regression)."""
+        bot = self._make_bot()
+        bot.heartbeat = None
+        result = bot._build_context_status("!room:example.com")
+        assert result["heartbeat_active"] is False
+        assert result["heartbeat_interval_minutes"] is None
+        assert result["heartbeat_next_minutes"] is None
+
