@@ -1366,17 +1366,27 @@ class MatrixBot:
                              room_id, mention.method)
 
             # Context hydration for gated rooms (regardless of who handled gating)
+            # After hydration, history already contains the current user message
+            # (written to JSONL in _handle_room_message before this path).
+            # Record that fact so we can skip the re-append in handle_input.
+            user_already_in_history = False
             if gated and room_id in self._active_rooms and self.session_log:
                 history = self.agent.history(room_id)
                 history.clear()
                 history.extend(self.session_log.build_context(room_id))
                 logger.info("Hydrated context for %s: %d entries", room_id, len(history))
+                user_already_in_history = True
             # --- End mention gating ---
 
             # Lazy wake: activate room on first live message
             if room_id not in self._active_rooms:
                 room_name = getattr(room, 'name', '') or getattr(room, 'display_name', '') or room_id
                 await self._activate_room(room_id, room_name=room_name)
+                # _activate_room hydrates history from JSONL (which already includes
+                # the current user message for gated rooms).  Mark it so handle_input
+                # does not re-append.
+                if gated and self.session_log:
+                    user_already_in_history = True
 
             # Acquire per-room session lock to prevent interleaved JSONL writes.
             # Holds from user-message append through handle_input (which triggers
@@ -1538,6 +1548,7 @@ class MatrixBot:
                         callbacks=callbacks,
                         on_cache_status=_cache_status,
                         cache_ttl=_cache_ttl,
+                        append_user=not user_already_in_history,
                     )
                 # Append assistant response to session log
                 if response and response.strip():

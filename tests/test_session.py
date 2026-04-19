@@ -531,7 +531,7 @@ class TestMatrixBotIntegration:
         bot._active_rooms.add(ROOM_ID)
 
         # Simulate agent calling on_tool_call
-        async def fake_handle_input(body, room_id, *, on_tool_call=None, on_tool_intent=None, on_text_delta=None, on_thinking_delta=None, thinking=None, callbacks=None, on_cache_status=None, cache_ttl=None):
+        async def fake_handle_input(body, room_id, *, on_tool_call=None, on_tool_intent=None, on_text_delta=None, on_thinking_delta=None, thinking=None, callbacks=None, on_cache_status=None, cache_ttl=None, append_user=True):
             if on_tool_call:
                 await on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)
             return "Done"
@@ -560,7 +560,7 @@ class TestMatrixBotIntegration:
         bot._active_rooms.add(ROOM_ID)
 
         # Simulate agent emitting tool intent then returning
-        async def fake_handle_input(body, room_id, *, on_tool_call=None, on_tool_intent=None, on_text_delta=None, on_thinking_delta=None, thinking=None, callbacks=None, on_cache_status=None, cache_ttl=None):
+        async def fake_handle_input(body, room_id, *, on_tool_call=None, on_tool_intent=None, on_text_delta=None, on_thinking_delta=None, thinking=None, callbacks=None, on_cache_status=None, cache_ttl=None, append_user=True):
             if on_tool_intent:
                 # Simulate ToolCall objects
                 tc = MagicMock()

@@ -252,7 +252,8 @@ class Agent:
                            on_tool_call=None, on_tool_intent=None, thinking: str | None = None,
                            callbacks: dict | None = None,
                            on_text_delta=None, on_thinking_delta=None,
-                           on_cache_status=None, cache_ttl: str | None = None) -> str:
+                           on_cache_status=None, cache_ttl: str | None = None,
+                           append_user: bool = True) -> str:
         """Process a user message and return the assistant's response.
 
         Appends the user message to room history, calls the LLM, appends the
@@ -262,6 +263,11 @@ class Agent:
         Args:
             text: User message
             room_id: Room identifier for per-room history isolation
+            append_user: If True (default), append the user message to history
+                before calling the LLM.  Set False when the caller (e.g. the
+                gated-room path in matrix.py) has already written the message
+                to JSONL and hydrated history from it, so we do not duplicate
+                the entry in the wire payload.
             on_text_delta: Optional callback(text: str, done: bool) for text streaming
             on_thinking_delta: Optional callback(text: str, done: bool) for thinking streaming
         """
@@ -274,14 +280,20 @@ class Agent:
                 # Build user content (may expand image media tags if vision enabled)
                 content = _build_user_content(text, self.config)
 
-                # Check for context overflow before appending user message
+                # Check for context overflow before appending user message.
+                # When append_user=False the message is already in history (hydrated
+                # from JSONL by the gated-room path), so don't double-count it.
                 content_tokens = self._estimate_content_tokens(content)
-                context_tokens = self._estimate_context_tokens(room_id) + content_tokens
+                context_tokens = self._estimate_context_tokens(room_id) + (
+                    content_tokens if append_user else 0
+                )
                 available = self.config.model_max_tokens - self.config.max_tokens
                 if context_tokens > available:
                     raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
 
-                history.append({"role": "user", "content": content})
+                if append_user:
+                    history.append({"role": "user", "content": content})
+                # else: caller already appended via JSONL → build_context → history.extend
 
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):

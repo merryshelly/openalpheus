@@ -259,6 +259,40 @@ def _convert_tools_for_provider(tools: list | None, provider_type: str) -> list[
     return result
 
 
+def _dedup_trailing_user(messages: list[dict]) -> list[dict]:
+    """Belt-and-suspenders guard: drop a duplicate trailing user message.
+
+    If the last two messages are both role="user" with identical content,
+    remove the last one and log a WARNING.  This catches any regression where
+    the gated-room path accidentally re-appends the triggering message.
+
+    Non-duplicate consecutive user messages (different content or different
+    roles) pass through unchanged.
+
+    Args:
+        messages: Normalised message list (not yet converted to provider format).
+
+    Returns:
+        Same list, minus the duplicate tail entry if one was detected.
+    """
+    if len(messages) < 2:
+        return messages
+    last = messages[-1]
+    prev = messages[-2]
+    if (
+        last.get("role") == "user"
+        and prev.get("role") == "user"
+        and last.get("content") == prev.get("content")
+    ):
+        logger.warning(
+            "Deduped trailing user message — possible gated-room race. "
+            "Content snippet: %r",
+            str(last.get("content", ""))[:120],
+        )
+        return messages[:-1]
+    return messages
+
+
 def _convert_messages_for_provider(messages: list[dict], provider_type: str) -> list[dict]:
     """Convert normalized message history to provider-native format.
     
@@ -291,6 +325,11 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
     Stripping is safe: the thinking already influenced the response and
     replaying it wastes context tokens.
     """
+    # Belt-and-suspenders: drop duplicate trailing user message if present.
+    # The gated-room path should prevent this via append_user=False, but we
+    # guard here as a defence-in-depth measure against future regressions.
+    messages = _dedup_trailing_user(messages)
+
     # Strip thinking from all assistant messages before conversion
     messages = [
         {k: v for k, v in msg.items() if k != "thinking"}
@@ -415,6 +454,11 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
 
 def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
     """Convert normalized messages to OpenAI format."""
+    # Belt-and-suspenders: drop duplicate trailing user message if present.
+    # The gated-room path should prevent this via append_user=False, but we
+    # guard here as a defence-in-depth measure against future regressions.
+    messages = _dedup_trailing_user(messages)
+
     # Strip thinking from all assistant messages — provider-specific field
     # that most OpenAI-compatible APIs reject.  Same rationale as Anthropic:
     # thinking already influenced the response; replaying wastes context.
