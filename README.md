@@ -18,7 +18,7 @@ All agent frameworks make tradeoffs. We optimized for:
 
 - **Control.** Full control of the system prompt. Your agent doesn't read a single character you didn't put there. Behavior is configured by editing markdown files — no code required.
 - **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
-- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Nine tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
+- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Ten tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
 - **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
 - **Maintainability.** ~9,000 LOC. Full test coverage. Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
 - **Resilience.** Each agent runs as an isolated Unix process with its own filesystem. One agent can crash out, trash its workspace, and the others are unaffected.
@@ -85,7 +85,7 @@ Skills are listed by name in the prompt; the agent reads their content on demand
 
 Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
 
-Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `web_search`\*, `web_fetch`, `subagent`, `memory_search`, `send_media`.
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `web_search`\*, `web_fetch`, `subagent`, `memory_search`, `send_media`, `context_status`.
 
 \*`web_search` requires a [Brave Search API key](https://brave.com/search/api/) configured in `workspace/tools/web_search.toml`. Without it, the tool is available but returns an error. `web_fetch` (direct URL fetching) works without any API key.
 
