@@ -172,6 +172,7 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | `/umbral stop` | Stop context rotation |
 | `/cache <1h\|5m\|off>` | Anthropic prompt cache TTL (default `1h`) |
 | `/cache toolstrip` | Reclaim context by replacing old tool outputs with placeholders |
+| `/timesense <on\|off>` | Prepend timestamp to every user message in LLM context (off by default) |
 | `/stop` | Cancel current processing |
 | `/resume` | Re-enable after `/stop` |
 
