@@ -1135,3 +1135,160 @@ class TestEmptyResponseGuard:
             await asyncio.gather(*bot._background_tasks)
 
         bot.client.room_send.assert_awaited_once()
+
+# --- Timesense Command ---
+
+
+class TestTimesenseCommand:
+    """Tests for /timesense command — per-room timestamp injection toggle."""
+
+    def _make_bot(self):
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.config = MagicMock()
+        agent.config.thinking = "off"
+
+        bot = make_bot(agent, config)
+        bot._room_timesense = {}
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_timesense_show_default(self):
+        """/timesense with no args shows off (default) when no override set."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/timesense")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "off (default)" in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_timesense_show_override(self):
+        """/timesense with no args shows on when override is set."""
+        bot = self._make_bot()
+        bot._room_timesense["!test:matrix.local"] = True
+
+        event = make_room_message("@sb:matrix.local", "/timesense")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "on" in sent.get("body", "")
+        assert "off" not in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_timesense_set_on(self):
+        """/timesense on sets _room_timesense[room_id] = True."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/timesense on")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert bot._room_timesense.get("!test:matrix.local") is True
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "on" in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_timesense_set_off(self):
+        """/timesense off removes room from _room_timesense."""
+        bot = self._make_bot()
+        bot._room_timesense["!test:matrix.local"] = True
+
+        event = make_room_message("@sb:matrix.local", "/timesense off")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert "!test:matrix.local" not in bot._room_timesense
+
+    @pytest.mark.asyncio
+    async def test_timesense_invalid_rejected(self):
+        """/timesense banana returns an error message."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/timesense banana")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert "!test:matrix.local" not in bot._room_timesense
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "Invalid" in sent.get("body", "")
+
+    @pytest.mark.asyncio
+    async def test_timesense_does_not_reach_agent(self):
+        """/timesense on does not trigger agent.handle_input."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/timesense on")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        bot.agent.handle_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_timesense_case_insensitive(self):
+        """/timesense ON is normalized to lowercase 'on'."""
+        bot = self._make_bot()
+
+        event = make_room_message("@sb:matrix.local", "/timesense ON")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert bot._room_timesense.get("!test:matrix.local") is True
+
+    @pytest.mark.asyncio
+    async def test_timesense_injection_in_handle_input(self):
+        """When timesense is on, handle_input receives timestamped body."""
+        bot = self._make_bot()
+        bot.agent.handle_input = AsyncMock(return_value="OK")
+        bot._active_rooms = {"!test:matrix.local"}
+        bot._room_timesense["!test:matrix.local"] = True
+        bot.session_log = None
+
+        event = make_room_message("@sb:matrix.local", "hello world")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+        room.users = {"@sb:matrix.local": MagicMock(), "@merry:matrix.local": MagicMock()}
+
+        await bot._handle_room_message(room, event)
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        # handle_input should have been called with timestamped body
+        bot.agent.handle_input.assert_awaited_once()
+        call_args = bot.agent.handle_input.call_args
+        injected_body = call_args[0][0]  # first positional arg
+        assert injected_body.startswith("[")
+        assert "hello world" in injected_body
+        import re
+        assert re.match(r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} \w+\]', injected_body)

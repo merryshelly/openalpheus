@@ -280,6 +280,7 @@ class MatrixBot:
         self._halted_rooms: set[str] = set()
         self._room_thinking = {}
         self._room_cache_ttl = {}   # Room-scoped cache TTL overrides (e.g. "5m"; default is "1h")
+        self._room_timesense = {}   # Room-scoped timesense toggle (prepend timestamp to user messages)
         self._background_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
 
@@ -891,6 +892,12 @@ class MatrixBot:
             async def _upload_callback(file_path, content_type, filename, caption=None):
                 await self.upload_and_send(room_id, file_path, content_type, filename, caption)
 
+            # Timesense: prepend timestamp to heartbeat content
+            if getattr(self, '_room_timesense', {}).get(room_id):
+                from datetime import datetime, timezone
+                _ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+                content = f"[{_ts}] {content}"
+
             callbacks = {
                 "send_media": _upload_callback,
                 "on_redaction": _redaction_notice,
@@ -1220,6 +1227,7 @@ class MatrixBot:
                 _restored_model = None
                 _restored_thinking = None
                 _restored_cache_ttl = None
+                _restored_timesense = None
                 for entry in existing:
                     if entry.get("role") == "system":
                         ev = entry.get("event")
@@ -1238,6 +1246,12 @@ class MatrixBot:
                             if detail != "1h":
                                 self._room_cache_ttl[room_id] = detail
                             _restored_cache_ttl = detail
+                        elif ev == "timesense_override" and detail:
+                            if not hasattr(self, "_room_timesense"):
+                                self._room_timesense = {}
+                            if detail == "on":
+                                self._room_timesense[room_id] = True
+                            _restored_timesense = detail
 
                 # Send session resume notice to Matrix
                 parts = [f"🔄 **Session resumed** — {len(existing)} prior entries"]
@@ -1247,6 +1261,8 @@ class MatrixBot:
                     parts.append(f"Thinking: `{_restored_thinking}`")
                 if _restored_cache_ttl:
                     parts.append(f"Cache TTL: `{_restored_cache_ttl}`")
+                if _restored_timesense:
+                    parts.append(f"Timesense: `{_restored_timesense}`")
                 try:
                     await self.send_notice(room_id, " · ".join(parts))
                 except Exception:
@@ -1411,6 +1427,11 @@ class MatrixBot:
                     )
 
             # Regular message: process through agent
+            # Timesense: prepend timestamp to user message for LLM context
+            if getattr(self, '_room_timesense', {}).get(room_id):
+                from datetime import datetime, timezone
+                _ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+                body = f"[{_ts}] {body}"
             await self._set_typing(room_id, True)
 
             # Wire tool visibility for this turn
@@ -1909,6 +1930,7 @@ class MatrixBot:
                 f"| **Tool calls** | {status['total_tool_calls']} |",
                 f"| **Thinking** | {_thinking} |",
                 f"| **Cache TTL** | {_cache_ttl} |",
+                f"| **Timesense** | {'on' if getattr(self, '_room_timesense', {}).get(room_id) else 'off'} |",
             ]
             # Add strippable stats if session log available
             if getattr(self, 'session_log', None):
@@ -2075,6 +2097,36 @@ class MatrixBot:
                     detail=value,
                 )
             await self.send(room_id, f"Cache TTL set to **{value}** for this room")
+            return
+
+        if body.startswith("/timesense"):
+            parts = body.split(None, 1)
+            if len(parts) < 2:
+                # Show current state
+                current = self._room_timesense.get(room_id, False)
+                state = "on" if current else "off (default)"
+                await self.send(room_id, f"Timesense: **{state}**")
+                return
+            value = parts[1].strip().lower()
+            if value not in ("on", "off"):
+                await self.send(room_id, "Invalid value. Use: `/timesense on` or `/timesense off`")
+                return
+            enabled = (value == "on")
+            if enabled:
+                self._room_timesense[room_id] = True
+            else:
+                self._room_timesense.pop(room_id, None)
+            # Persist to JSONL
+            if self.session_log:
+                self.session_log.append(
+                    role="system",
+                    sender=event.sender,
+                    room=room_id,
+                    event_id=None,
+                    event="timesense_override",
+                    detail=value,
+                )
+            await self.send(room_id, f"Timesense set to **{value}** for this room")
             return
 
         if body.startswith("/heartbeat"):
