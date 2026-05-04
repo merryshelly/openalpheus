@@ -348,8 +348,8 @@ class TestThinkingBlockDataclass:
 class TestThinkingRoundTripping:
     """Thinking blocks in history must be sent back to the API."""
 
-    def test_assistant_with_thinking_blocks_stripped(self):
-        """Thinking blocks are stripped before conversion (JSONL can't guarantee fidelity)."""
+    def test_assistant_with_thinking_blocks_preserved(self):
+        """Thinking blocks with valid signatures are preserved in conversion."""
         messages = [
             {"role": "user", "content": "What is 2+2?"},
             {
@@ -363,13 +363,15 @@ class TestThinkingRoundTripping:
         ]
         result = _convert_messages_for_anthropic(messages)
 
-        # Thinking stripped — assistant message should be plain string content
+        # Thinking preserved — content is a list with thinking block and text block
         assistant = result[1]
         assert assistant["role"] == "assistant"
-        assert assistant["content"] == "4"
+        assert isinstance(assistant["content"], list)
+        assert {"type": "thinking", "thinking": "Simple arithmetic", "signature": "sigABC"} in assistant["content"]
+        assert {"type": "text", "text": "4"} in assistant["content"]
 
-    def test_empty_signature_stripped_with_rest(self):
-        """Thinking blocks with empty signatures are stripped like all others."""
+    def test_empty_signature_demoted_to_text(self):
+        """Thinking blocks with empty signatures are demoted to text blocks."""
         messages = [
             {"role": "user", "content": "Hello"},
             {
@@ -382,10 +384,12 @@ class TestThinkingRoundTripping:
         ]
         result = _convert_messages_for_anthropic(messages)
         assistant = result[1]
-        assert assistant["content"] == "Hi"
+        assert isinstance(assistant["content"], list)
+        assert {"type": "text", "text": "Some aborted thought"} in assistant["content"]
+        assert {"type": "text", "text": "Hi"} in assistant["content"]
 
-    def test_none_signature_stripped_with_rest(self):
-        """Thinking blocks with None signatures are stripped like all others."""
+    def test_none_signature_demoted_to_text(self):
+        """Thinking blocks with None signatures are demoted to text blocks."""
         messages = [
             {"role": "user", "content": "Hello"},
             {
@@ -398,7 +402,9 @@ class TestThinkingRoundTripping:
         ]
         result = _convert_messages_for_anthropic(messages)
         assistant = result[1]
-        assert assistant["content"] == "Hi"
+        assert isinstance(assistant["content"], list)
+        assert {"type": "text", "text": "Incomplete thought"} in assistant["content"]
+        assert {"type": "text", "text": "Hi"} in assistant["content"]
 
     def test_no_thinking_key_unchanged(self):
         """Assistant messages without thinking key work as before."""
@@ -409,8 +415,8 @@ class TestThinkingRoundTripping:
         result = _convert_messages_for_anthropic(messages)
         assert result[1] == {"role": "assistant", "content": "Hello"}
 
-    def test_thinking_stripped_tool_calls_preserved(self):
-        """Thinking stripped but tool_calls still convert to tool_use blocks."""
+    def test_thinking_preserved_with_tool_calls(self):
+        """Thinking preserved and tool_calls still convert to tool_use blocks."""
         from openalph.provider import ToolCall
         messages = [
             {"role": "user", "content": "Read my file"},
@@ -430,7 +436,7 @@ class TestThinkingRoundTripping:
         assert isinstance(assistant["content"], list)
 
         types = [b["type"] for b in assistant["content"]]
-        assert "thinking" not in types
+        assert "thinking" in types
         assert "tool_use" in types
 
 # Anthropic API call: adaptive thinking
@@ -464,7 +470,7 @@ class TestAdaptiveThinkingAPICall:
             )
 
         kw = client.messages.stream.call_args.kwargs
-        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kw["output_config"] == {"effort": "high"}
         # max_tokens should still be set
         assert "max_tokens" in kw
@@ -493,7 +499,7 @@ class TestAdaptiveThinkingAPICall:
             )
 
         kw = client.messages.stream.call_args.kwargs
-        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kw["output_config"] == {"effort": "low"}
 
     @pytest.mark.asyncio
@@ -544,7 +550,7 @@ class TestAdaptiveThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
         kw = client.messages.stream.call_args.kwargs
-        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kw["output_config"] == {"effort": "max"}
 
     @pytest.mark.asyncio
@@ -568,7 +574,7 @@ class TestAdaptiveThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
         kw = client.messages.stream.call_args.kwargs
-        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kw["output_config"] == {"effort": "xhigh"}
 
     @pytest.mark.asyncio
@@ -592,7 +598,7 @@ class TestAdaptiveThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
         kw = client.messages.stream.call_args.kwargs
-        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kw["output_config"] == {"effort": "max"}
 
     @pytest.mark.asyncio
@@ -616,7 +622,7 @@ class TestAdaptiveThinkingAPICall:
                 messages=[{"role": "user", "content": "Hi"}],
             )
         kw = client.messages.stream.call_args.kwargs
-        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kw["output_config"] == {"effort": "max"}
 
 
@@ -1004,7 +1010,7 @@ class TestThinkingOverride:
             )
 
         kw = client.messages.stream.call_args.kwargs
-        assert kw["thinking"] == {"type": "adaptive"}
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kw["output_config"] == {"effort": "high"}
 
     @pytest.mark.asyncio

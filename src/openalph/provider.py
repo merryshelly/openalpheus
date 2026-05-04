@@ -319,23 +319,19 @@ def _convert_messages_for_provider(messages: list[dict], provider_type: str) -> 
 def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
     """Convert normalized messages to Anthropic format.
 
-    Thinking blocks are stripped from all assistant messages.  Anthropic
-    cryptographically signs thinking blocks and rejects any modification,
-    but JSONL round-tripping cannot guarantee byte-perfect fidelity.
-    Stripping is safe: the thinking already influenced the response and
-    replaying it wastes context tokens.
+    Thinking blocks are preserved on all assistant messages and passed back
+    to the API verbatim.  Per Anthropic docs, the API automatically filters
+    thinking blocks, uses the relevant ones to preserve reasoning, and only
+    bills for the blocks shown to Claude.  On Opus 4.5+ models, the server
+    actively retains prior-turn thinking in context.
+
+    Signatures are base64 strings (pure ASCII) and survive JSONL round-tripping
+    without corruption.
     """
     # Belt-and-suspenders: drop duplicate trailing user message if present.
     # The gated-room path should prevent this via append_user=False, but we
     # guard here as a defence-in-depth measure against future regressions.
     messages = _dedup_trailing_user(messages)
-
-    # Strip thinking from all assistant messages before conversion
-    messages = [
-        {k: v for k, v in msg.items() if k != "thinking"}
-        if msg.get("role") == "assistant" else msg
-        for msg in messages
-    ]
 
     result = []
     for msg in messages:
@@ -677,8 +673,10 @@ def _build_anthropic_kwargs(
     # Add thinking parameters if enabled
     if thinking_level != "off":
         if _supports_adaptive_thinking(api_model):
-            # Adaptive thinking for Opus/Sonnet 4-6
-            api_kwargs["thinking"] = {"type": "adaptive"}
+            # Adaptive thinking for Opus/Sonnet 4-6+
+            # Always request summarized display — Opus 4.7+ and Mythos
+            # default to "omitted" (empty thinking field, signature only).
+            api_kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
             api_kwargs["output_config"] = {"effort": _thinking_effort(thinking_level)}
         else:
             # Budget-based thinking for older models
