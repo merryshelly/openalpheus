@@ -50,7 +50,7 @@ CREDENTIAL_PATTERNS: list[dict] = [
     },
     {
         "name": "openai_api_key",
-        "pattern": re.compile(r"sk-(?!ant-)(?!or-)[a-zA-Z0-9_-]{20,}"),
+        "pattern": re.compile(r"\bsk-(?!ant-)(?!or-)[a-zA-Z0-9_-]{20,}"),
         "redaction_label": "[REDACTED:api_key]",
     },
     {

@@ -369,6 +369,23 @@ class TestFalsePositiveResistance:
         result, events = redact_credentials(text)
         assert result == text
 
+    def test_url_with_risk_slug_untouched(self):
+        """URL slugs containing words ending in 'sk' followed by hyphens should
+        not trigger the OpenAI key pattern. 'risk-parameter-updates-...' matches
+        sk-[a-zA-Z0-9_-]{20,} without a word boundary anchor."""
+        urls = [
+            "https://governance.aave.com/t/arfc-chaos-labs-risk-parameter-updates-gno-on-v3-gnosis/17340",
+            "https://governance.aave.com/t/chaos-labs-risk-stewards-increase-supply-and-borrow-caps/21146",
+            "https://example.com/docs/task-management-system-overview-and-guide",
+            "https://example.com/flask-session-configuration-guide-for-developers",
+        ]
+        for url in urls:
+            result, events = redact_credentials(url)
+            assert result == url, f"URL was incorrectly redacted: {url} -> {result}"
+            assert len(events) == 0, f"Unexpected redaction events for: {url}"
+
+
+
     def test_uuid_untouched(self):
         """UUIDs are hex but have dashes and are 36 chars total (32 hex)."""
         text = "id: 550e8400-e29b-41d4-a716-446655440000"
