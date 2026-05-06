@@ -136,21 +136,26 @@ class UmbralManager:
                 if first and initial_delay is not None:
                     await asyncio.sleep(initial_delay)
                 else:
-                    await asyncio.sleep(interval_seconds)
+                    # Drift-free: sleep only remaining time since last fire,
+                    # so callback duration doesn’t push the next fire later.
+                    last = self._last_fired.get(room_id, time.time() - interval_seconds)
+                    elapsed = time.time() - last
+                    remaining = interval_seconds - elapsed
+                    await asyncio.sleep(max(remaining, 0.01))
                 first = False
                 if self._processing.get(room_id, False):
                     logger.warning("Umbral: skipping fire for %s — previous turn still processing", room_id)
                     continue
                 self._processing[room_id] = True
+                # Record fire time BEFORE callback to prevent drift
+                self._last_fired[room_id] = time.time()
+                await self._persist()
                 try:
                     await self.callback(room_id)
                 except Exception:
                     logger.exception("Umbral callback error for %s", room_id)
                 finally:
                     self._processing[room_id] = False
-                # Update last_fired after each invocation
-                self._last_fired[room_id] = time.time()
-                await self._persist()
                 if room_id not in self._tasks:
                     break
         except asyncio.CancelledError:

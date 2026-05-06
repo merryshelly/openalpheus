@@ -426,3 +426,33 @@ class TestUmbralCadencePreservation:
         await asyncio.sleep(0.3)
         assert callback.await_count >= 1
         await um.shutdown()
+
+
+class TestUmbralDriftPrevention:
+    """Verify callback duration does not cause timer drift."""
+
+    @pytest.mark.asyncio
+    async def test_no_drift_from_callback_duration(self, tmp_path):
+        """Fire-to-fire interval stays close to requested interval despite slow callback."""
+        import time as _time
+        fire_times = []
+
+        async def timed_callback(room_id):
+            fire_times.append(_time.time())
+            await asyncio.sleep(0.05)  # simulate 50ms processing
+
+        um = UmbralManager(tmp_path / "umbral.json", timed_callback)
+        await um.start("!room1:matrix.local", 0.15)
+        await asyncio.sleep(0.55)
+
+        assert len(fire_times) >= 3, f"Expected >=3 fires, got {len(fire_times)}"
+        for i in range(1, len(fire_times)):
+            delta = fire_times[i] - fire_times[i - 1]
+            # Without fix: delta ~0.20 (0.15 interval + 0.05 callback)
+            # With fix: delta ~0.15 (callback absorbed into interval)
+            assert delta < 0.18, (
+                f"Drift detected: fire interval {i} was {delta:.3f}s "
+                f"(expected ~0.15s, threshold 0.18s)"
+            )
+
+        await um.shutdown()
