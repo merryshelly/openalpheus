@@ -1291,4 +1291,4 @@ class TestTimesenseCommand:
         assert injected_body.startswith("[")
         assert "hello world" in injected_body
         import re
-        assert re.match(r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} \w+\]', injected_body)
+        assert re.match(r'\[\w+, \w+ \d{1,2}, \d{4} . \d{2}:\d{2} \w+\]', injected_body)

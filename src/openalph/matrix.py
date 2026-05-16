@@ -895,7 +895,7 @@ class MatrixBot:
             # Timesense: prepend timestamp to heartbeat content
             if getattr(self, '_room_timesense', {}).get(room_id):
                 from datetime import datetime, timezone
-                _ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+                _ts = datetime.now(timezone.utc).astimezone().strftime("%A, %B %d, %Y — %H:%M %Z")
                 content = f"[{_ts}] {content}"
 
             callbacks = {
@@ -1430,7 +1430,7 @@ class MatrixBot:
             # Timesense: prepend timestamp to user message for LLM context
             if getattr(self, '_room_timesense', {}).get(room_id):
                 from datetime import datetime, timezone
-                _ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+                _ts = datetime.now(timezone.utc).astimezone().strftime("%A, %B %d, %Y — %H:%M %Z")
                 body = f"[{_ts}] {body}"
             await self._set_typing(room_id, True)
 
