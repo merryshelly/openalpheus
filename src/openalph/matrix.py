@@ -1937,7 +1937,8 @@ class MatrixBot:
                 try:
                     s_count, s_chars = self.session_log.strippable_stats(room_id)
                     if s_count > 0:
-                        lines.append(f"| **Strippable** | {s_count} tool results, ~{s_chars:,} chars |")
+                        s_tokens = s_chars // 4
+                        lines.append(f"| **Strippable** | {s_count} tool results, ~{s_tokens:,} tokens |")
                 except Exception:
                     pass
             await self.send(room_id, "\n".join(lines))

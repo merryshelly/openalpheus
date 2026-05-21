@@ -30,6 +30,10 @@ MEDIA_TAG_RE = re.compile(r'\[media:\s*(.+?)\s+\(([^,]+),\s*([^)]+)\)\]')
 # Approximate tokens per raw image byte (base64 decoded)
 IMAGE_TOKENS_PER_BYTE = 1 / 750
 
+# Wire format overhead per tool interaction (JSON envelope chars not in content)
+_TOOL_CALL_OVERHEAD_CHARS = 80   # {"type":"tool_use","id":"...","name":"...","input":}
+_TOOL_RESULT_OVERHEAD_CHARS = 80  # {"type":"tool_result","tool_use_id":"...","content":}
+
 
 def _build_user_content(text: str, config: AgentConfig) -> str | list[dict]:
     """Build user message content, expanding image media tags when vision is enabled.
@@ -150,6 +154,13 @@ class Agent:
         self.total_tool_calls = 0
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
+        # Pre-compute tool definition cost for token estimation.
+        # Tool schemas are sent with every API call via the tools parameter.
+        self._tool_defs_chars = 0
+        if self.tools:
+            for t in self.tools:
+                params_chars = len(json.dumps(t.parameters)) if isinstance(t.parameters, dict) else 0
+                self._tool_defs_chars += len(t.name) + len(t.description) + params_chars
         self._current_task: asyncio.Task | None = None
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._room_models: dict[str, str] = {}  # room_id → model override
@@ -646,6 +657,7 @@ class Agent:
         If history is provided, use that instead of looking up by room_id.
         """
         total_chars = len(self.system_prompt)
+        total_chars += self._tool_defs_chars
         msgs = history if history is not None else self.history(room_id)
         for msg in msgs:
             content = msg.get("content", "")
@@ -663,10 +675,14 @@ class Agent:
                         total_chars += int(decoded_bytes * IMAGE_TOKENS_PER_BYTE * 4)
             # Tool calls have input dicts — estimate their JSON size
             for tc in msg.get("tool_calls", []):
-                total_chars += len(str(tc.input))
+                total_chars += len(str(tc.input)) + _TOOL_CALL_OVERHEAD_CHARS
             # Thinking blocks can be large — include in estimate
             for tb in msg.get("thinking", []):
                 total_chars += len(tb.get("thinking", ""))
+                total_chars += len(tb.get("signature", ""))
+            # Wire envelope overhead for tool result messages
+            if msg.get("role") == "tool":
+                total_chars += _TOOL_RESULT_OVERHEAD_CHARS
         return total_chars // 4
 
     def status(self, room_id: str = "_default", history: list[dict] | None = None) -> dict:
