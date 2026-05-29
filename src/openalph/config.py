@@ -15,6 +15,7 @@ from pathlib import Path
 import os
 import subprocess
 import tomllib
+import logging
 
 
 class ConfigError(Exception):
@@ -24,6 +25,7 @@ class ConfigError(Exception):
 
 # System-wide config directory for per-agent TOML files
 CONFIG_DIR = Path("/etc/openalph/agents")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -300,6 +302,8 @@ def load_config(path: Path) -> AgentConfig:
     except KeyError:
         raise ConfigError("Missing required field: agent.default_model")
     
+    skipped_providers = []
+    skipped_errors = {}
     for section_name, section_data in providers_sections.items():
         provider_key = section_name.split(".", 1)[1]
         
@@ -309,7 +313,13 @@ def load_config(path: Path) -> AgentConfig:
         if provider_type not in ("anthropic", "openai"):
             raise ConfigError(f"Invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
         
-        api_key = _resolve_api_key(section_data)
+        try:
+            api_key = _resolve_api_key(section_data)
+        except ConfigError as e:
+            logger.warning("Skipping provider '%s': %s", provider_key, e)
+            skipped_providers.append(provider_key)
+            skipped_errors[provider_key] = str(e)
+            continue
         
         base_url = section_data.get("base_url")
         if provider_type == "openai":
@@ -346,11 +356,47 @@ def load_config(path: Path) -> AgentConfig:
             routing=routing,
         )
 
+    # Check if any providers loaded at all
+    if not providers:
+        skipped_msg = ", ".join(
+            f"{k} ({skipped_errors[k]})" for k in skipped_providers
+        ) if skipped_providers else "none configured"
+        raise ConfigError(
+            f"No providers loaded successfully. Skipped: {skipped_msg}"
+        )
+
+    # Log provider status
+    active = ", ".join(sorted(providers.keys()))
+    if skipped_providers:
+        skipped = ", ".join(skipped_providers)
+        logger.info("Providers loaded: %s (skipped: %s)", active, skipped)
+    else:
+        logger.info("Providers loaded: %s", active)
+
+    # Parse optional [model_aliases] section (needed for default_model validation)
+    model_aliases = {}
+    if "model_aliases" in toml_data:
+        aliases_section = toml_data["model_aliases"]
+        if isinstance(aliases_section, dict):
+            for alias, target in aliases_section.items():
+                if isinstance(target, str):
+                    model_aliases[alias] = target
+
     # Validate default_model references a configured provider
-    if "/" in default_model:
-        provider_prefix = default_model.split("/", 1)[0]
+    # Resolve through aliases if default_model is a bare name
+    resolved_default = default_model
+    if "/" not in default_model and default_model in model_aliases:
+        resolved_default = model_aliases[default_model]
+
+    if "/" in resolved_default:
+        provider_prefix = resolved_default.split("/", 1)[0]
         if provider_prefix not in providers:
             available = ", ".join(sorted(providers.keys()))
+            if provider_prefix in skipped_providers:
+                raise ConfigError(
+                    f"default_model '{default_model}' requires provider '{provider_prefix}' "
+                    f"which failed to load. Available providers: {available}"
+                )
             raise ConfigError(
                 f"default_model '{default_model}' references provider '{provider_prefix}' "
                 f"which is not configured. Available providers: {available}"
@@ -364,15 +410,6 @@ def load_config(path: Path) -> AgentConfig:
             for model_name, limit in model_limits_section.items():
                 if isinstance(limit, int) and limit > 0:
                     model_limits[model_name] = limit
-
-    # Parse optional [model_aliases] section
-    model_aliases = {}
-    if "model_aliases" in toml_data:
-        aliases_section = toml_data["model_aliases"]
-        if isinstance(aliases_section, dict):
-            for alias, target in aliases_section.items():
-                if isinstance(target, str):
-                    model_aliases[alias] = target
 
     # Parse optional [matrix] section
     matrix = _parse_matrix_config(toml_data)
