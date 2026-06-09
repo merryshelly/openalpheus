@@ -217,6 +217,18 @@ class TestSupportsAdaptiveThinking:
     def test_mythos_bare(self):
         assert _supports_adaptive_thinking("claude-mythos") is True
 
+    def test_opus_4_8(self):
+        assert _supports_adaptive_thinking("claude-opus-4-8") is True
+
+    def test_mythos_5(self):
+        assert _supports_adaptive_thinking("claude-mythos-5") is True
+
+    def test_fable(self):
+        assert _supports_adaptive_thinking("claude-fable-5") is True
+
+    def test_fable_with_provider_prefix(self):
+        assert _supports_adaptive_thinking("anthropic/claude-fable-5") is True
+
 
 # ---------------------------------------------------------------------------
 # Effort / budget mapping

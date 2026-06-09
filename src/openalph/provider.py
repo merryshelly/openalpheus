@@ -197,7 +197,7 @@ class StreamEvent:
 def _supports_adaptive_thinking(model_id: str) -> bool:
     """Returns True for models that support adaptive thinking (type=adaptive + effort).
 
-    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, sonnet-4-6, mythos.
+    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, sonnet-4-6, mythos, fable.
     """
     return (
         "opus-4-5" in model_id
@@ -206,6 +206,7 @@ def _supports_adaptive_thinking(model_id: str) -> bool:
         or "opus-4-7" in model_id
         or "opus-4-8" in model_id
         or "mythos" in model_id
+        or "fable" in model_id
     )
 
 
