@@ -5,6 +5,8 @@ Tool registry, discovery, schema generation, and result truncation.
 
 import logging
 import os
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,103 @@ from typing import Any
 import tomllib
 
 logger = logging.getLogger(__name__)
+
+
+# --- API key resolution cache ---
+#
+# web_search resolves its api_key via api_key_cmd (typically `op read op://...`),
+# which makes a network call to the secret store (e.g. 1Password) on every
+# invocation. Without caching, high search volume — e.g. parallel sub-agents each
+# firing web_search — exhausts the service-account rate limit; the command then
+# returns empty and web_search fails with "no API key configured" even though the
+# credential is correct. Provider keys avoid this by resolving once at config load
+# (config.py); this cache gives the same protection to per-call tool resolution.
+_DEFAULT_API_KEY_CACHE_TTL = 3600.0  # seconds; also bounds max staleness after a credential rotation
+_API_KEY_RETRY_BACKOFF = 60.0  # seconds to keep serving a stale key before retrying a failing api_key_cmd
+
+# api_key_cmd string -> (resolved_key, expiry_monotonic)
+_api_key_cache: dict[str, tuple[str, float]] = {}
+
+
+def _resolve_cached_api_key(cmd: str, ttl: float | None = None) -> str:
+    """Resolve an API key via a shell command, with in-memory TTL caching.
+
+    Behaviour:
+      * Cache hit (within TTL): return the cached key without running the command.
+      * Miss/expired: run the command; cache and return stdout only if the command
+        SUCCEEDED (exit 0) with non-empty output.
+      * Empty/failed resolution: if a previous value is cached (even if expired),
+        return it (stale-while-error) so a transient throttle does not break the
+        tool, and back off re-resolution for _API_KEY_RETRY_BACKOFF seconds so a
+        sustained outage doesn't re-run a doomed (event-loop-blocking) subprocess
+        on every call; otherwise return "".
+
+    A nonzero exit code is treated as failure: the command's stdout is never used
+    or cached as a key (avoids caching error text), and a known-good stale value is
+    preferred. Only successful, non-empty results are cached, so a transient failure
+    is never negative-cached. The clock is read exactly once per call (before the
+    subprocess), so the TTL is measured from call start.
+
+    Note: if the credential is rotated while resolution is throttled, stale-while-
+    error serves the old (now-invalid) key until re-resolution succeeds, producing
+    API auth errors rather than "no API key configured". Under sustained throttle
+    during a planned rotation, lower api_key_cache_ttl or restart the agent.
+
+    Args:
+        cmd: Shell command that prints the API key to stdout.
+        ttl: Cache lifetime in seconds. None uses _DEFAULT_API_KEY_CACHE_TTL.
+             ttl <= 0 disables hit-caching (re-resolves each call); negative values
+             are clamped to 0. The stale-while-error fallback always applies.
+
+    Returns:
+        The resolved API key, a cached value, or "" if unavailable.
+    """
+    if ttl is None:
+        ttl = _DEFAULT_API_KEY_CACHE_TTL
+    if ttl < 0:
+        logger.warning("api_key_cache_ttl=%s is negative; treating as 0", ttl)
+        ttl = 0
+
+    now = time.monotonic()
+    cached = _api_key_cache.get(cmd)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+
+    key = ""
+    try:
+        proc = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "api_key_cmd returned exit code %d: %s",
+                proc.returncode, proc.stderr.strip(),
+            )
+        else:
+            key = proc.stdout.strip()
+    except subprocess.TimeoutExpired:
+        logger.warning("api_key_cmd timed out after 10 seconds")
+    except Exception as e:
+        logger.warning("api_key_cmd failed: %s", e)
+
+    if key:
+        _api_key_cache[cmd] = (key, now + ttl)
+        return key
+
+    # Resolution failed or returned empty. Fall back to a prior value if we have
+    # one (stale-while-error) so a transient throttle doesn't break the tool.
+    if cached is not None:
+        if ttl > 0:
+            # Back off: keep serving the stale key for a short window instead of
+            # re-running the failing (event-loop-blocking) subprocess every call.
+            _api_key_cache[cmd] = (cached[0], now + min(_API_KEY_RETRY_BACKOFF, ttl))
+        logger.warning(
+            "api_key_cmd resolution failed; serving cached key "
+            "(stale-while-error, %.0fs past expiry)",
+            max(0.0, now - cached[1]),
+        )
+        return cached[0]
+    return ""
 
 
 @dataclass
@@ -513,25 +612,16 @@ async def execute_tool(
         )
     elif name == "web_search":
         from .web import web_search
-        # Resolve api_key: direct value or via api_key_cmd
+        # Resolve api_key: direct value, or via api_key_cmd with TTL caching.
+        # Caching avoids a per-call hit to the secret store (e.g. 1Password),
+        # which under burst load exhausts the service-account rate limit and
+        # makes web_search fail with "no API key configured".
         api_key = tool_config.get("api_key", "")
         if not api_key and "api_key_cmd" in tool_config:
-            import subprocess
-            try:
-                proc = subprocess.run(
-                    tool_config["api_key_cmd"], shell=True,
-                    capture_output=True, text=True, timeout=10,
-                )
-                if proc.returncode != 0:
-                    logger.warning(
-                        "api_key_cmd returned exit code %d: %s",
-                        proc.returncode, proc.stderr.strip(),
-                    )
-                api_key = proc.stdout.strip()
-            except subprocess.TimeoutExpired:
-                logger.warning("api_key_cmd timed out after 10 seconds")
-            except Exception as e:
-                logger.warning("api_key_cmd failed: %s", e)
+            api_key = _resolve_cached_api_key(
+                tool_config["api_key_cmd"],
+                tool_config.get("api_key_cache_ttl"),
+            )
         result = await web_search(
             query=input["query"],
             count=input.get("count", 5),
