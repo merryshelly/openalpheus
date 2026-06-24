@@ -216,7 +216,10 @@ class TestToolCallWireOverhead:
         # chars: system_prompt + result_content + overhead
         system_chars = len(agent.system_prompt)
         min_chars = system_chars + len(result_content) + _TOOL_RESULT_OVERHEAD_CHARS
-        assert estimate * 4 >= min_chars
+        # _estimate_context_tokens floors with total_chars // 4, so compare against
+        # the floored lower bound — multiplying the floored estimate back by 4 can
+        # lose up to 3 chars (cf. test_tool_call_wire_overhead's same-pitfall note).
+        assert estimate >= min_chars // 4
 
     def test_tool_result_overhead_vs_non_tool_message(self, tmp_path):
         """A tool-role message gives a higher estimate than a user message of same length."""
