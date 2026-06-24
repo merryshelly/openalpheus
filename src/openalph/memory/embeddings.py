@@ -35,6 +35,10 @@ class EmbeddingProvider:
         self.base_url = base_url  # kept for interface compatibility
         self._llm = None
         self._load_failed = False
+        # llama.cpp Llama objects are NOT thread-safe. Concurrent
+        # create_embedding() on a shared instance corrupts the context -> SIGSEGV.
+        # Serialize all embedding work (and the lazy model load) per provider.
+        self._lock = asyncio.Lock()
 
     def _ensure_model(self):
         """Lazy-load the GGUF model. Returns the Llama instance or None."""
@@ -71,10 +75,11 @@ class EmbeddingProvider:
         Runs in a thread pool to avoid blocking the async event loop.
         """
         try:
-            llm = self._ensure_model()
-            if llm is None:
-                return None
-            result = await asyncio.to_thread(self._create_embedding, llm, text)
+            async with self._lock:
+                llm = self._ensure_model()
+                if llm is None:
+                    return None
+                result = await asyncio.to_thread(self._create_embedding, llm, text)
             return result["data"][0]["embedding"]
         except Exception as e:
             logger.warning("Embedding failed: %s", e)
@@ -102,10 +107,11 @@ class EmbeddingProvider:
         if not texts:
             return []
         try:
-            llm = self._ensure_model()
-            if llm is None:
-                return [None] * len(texts)
-            return await asyncio.to_thread(self._embed_batch_sync, llm, texts)
+            async with self._lock:
+                llm = self._ensure_model()
+                if llm is None:
+                    return [None] * len(texts)
+                return await asyncio.to_thread(self._embed_batch_sync, llm, texts)
         except Exception as e:
             logger.warning("Batch embedding failed: %s", e)
             return [None] * len(texts)
