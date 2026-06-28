@@ -16,7 +16,7 @@ from pathlib import Path
 
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
-from openalph.provider import complete, stream, StreamEvent
+from openalph.provider import complete, stream, StreamEvent, ThinkingBlock
 from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result
 
 logger = logging.getLogger(__name__)
@@ -228,6 +228,7 @@ class Agent:
         content_preview: str,
         cache_read_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
+        stop_reason: str = "",
     ) -> None:
         """Write a JSONL entry for this LLM turn.
 
@@ -251,6 +252,7 @@ class Agent:
                 "cache_creation_tokens": cache_creation_tokens,
                 "tool_calls": tool_calls or [],
                 "latency_ms": latency_ms,
+                "stop_reason": stop_reason,
                 "content_preview": content_preview[:200] if content_preview else "",
             }
 
@@ -306,6 +308,16 @@ class Agent:
                     history.append({"role": "user", "content": content})
                 # else: caller already appended via JSONL → build_context → history.extend
 
+                # Resolve the effective thinking level once (param overrides config).
+                # This may be lowered to "off" mid-loop as a one-shot recovery when
+                # extended thinking consumes the entire output budget (empty text with
+                # stop_reason == "max_tokens"). See the retry logic in the text branch.
+                effective_thinking = (
+                    thinking if thinking is not None
+                    else getattr(self.config, "thinking", "off")
+                )
+                retried_without_thinking = False
+
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
                     # Check for context overflow before calling the API (tool results may push over)
@@ -335,7 +347,7 @@ class Agent:
                         messages=list(history),
                         tools=tools_arg,
                         model=self.get_model(room_id),
-                        thinking=thinking,
+                        thinking=effective_thinking,
                         cache_ttl=cache_ttl,
                     ):
                         if event.type == "text":
@@ -369,7 +381,7 @@ class Agent:
                             messages=list(history),
                             tools=tools_arg,
                             model=self.get_model(room_id),
-                            thinking=thinking,
+                            thinking=effective_thinking,
                         )
 
                     latency_ms = (time.monotonic() - start_time) * 1000
@@ -383,6 +395,7 @@ class Agent:
                     # Check if response has tool calls
                     if not tool_calls and not response.tool_calls:
                         # Text response - log and return
+                        final_text = accumulated_text or response.content
                         self._log_turn(
                             room_id=room_id,
                             model=self.get_model(room_id),
@@ -390,16 +403,43 @@ class Agent:
                             output_tokens=usage.output_tokens,
                             tool_calls=None,
                             latency_ms=latency_ms,
-                            content_preview=accumulated_text or response.content,
+                            content_preview=final_text,
                             cache_read_tokens=usage.cache_read_tokens,
                             cache_creation_tokens=usage.cache_creation_tokens,
+                            stop_reason=response.stop_reason,
                         )
                         if on_cache_status:
                             try:
                                 await on_cache_status(usage, self.get_model(room_id))
                             except Exception:
                                 logger.error("on_cache_status callback failed", exc_info=True)
-                        assistant_msg = {"role": "assistant", "content": accumulated_text or response.content}
+
+                        # Recovery: extended thinking can consume the entire output
+                        # budget, yielding empty text with stop_reason == "max_tokens"
+                        # (the model "thought" until it hit max_tokens and never wrote
+                        # an answer). Retry once with thinking disabled so the full
+                        # budget is available for output. Single attempt only; if
+                        # thinking is already off we cannot reduce it further, and a
+                        # non-empty (merely truncated) answer is kept as-is.
+                        if (
+                            not (final_text or "").strip()
+                            and response.stop_reason == "max_tokens"
+                            and effective_thinking != "off"
+                            and not retried_without_thinking
+                        ):
+                            retried_without_thinking = True
+                            effective_thinking = "off"
+                            # This attempt's token usage and _log_turn entry already
+                            # fired above — both reflect a real API call and are kept.
+                            logger.warning(
+                                "Empty response in %s (stop_reason=max_tokens — extended "
+                                "thinking consumed the entire %d-token output budget); "
+                                "retrying once with thinking disabled",
+                                room_id, usage.output_tokens,
+                            )
+                            continue
+
+                        assistant_msg = {"role": "assistant", "content": final_text}
                         if accumulated_thinking or response.thinking:
                             thinking_blocks = response.thinking if response.thinking else []
                             if accumulated_thinking and not thinking_blocks:
@@ -409,7 +449,7 @@ class Agent:
                                 for tb in thinking_blocks
                             ]
                         history.append(assistant_msg)
-                        return accumulated_text or response.content
+                        return final_text
 
                     # Use tool_calls from stream or from response
                     active_tool_calls = tool_calls if tool_calls else response.tool_calls
@@ -483,6 +523,7 @@ class Agent:
                         content_preview=accumulated_text or response.content,
                         cache_read_tokens=usage.cache_read_tokens,
                         cache_creation_tokens=usage.cache_creation_tokens,
+                        stop_reason=response.stop_reason,
                     )
                     if on_cache_status:
                         try:
@@ -527,7 +568,11 @@ class Agent:
                         messages=list(history),
                         tools=None,  # no tools — force text response
                         model=self.get_model(room_id),
-                        thinking=thinking,
+                        # Force thinking off for the forced summary: it must produce
+                        # visible output, and extended thinking here could consume the
+                        # whole budget and return empty with no recovery path (the same
+                        # failure the in-loop retry guards against).
+                        thinking="off",
                         cache_ttl=cache_ttl,
                     ):
                         if event.type == "text":
