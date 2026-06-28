@@ -47,6 +47,13 @@ class TestBuildFtsQuery:
         result = build_fts_query('say "hello" world')
         assert result is not None
 
+    def test_tokens_joined_with_or(self):
+        """Multi-term queries join with OR so partial matches still rank (not AND)."""
+        result = build_fts_query("validator monitoring gnosis")
+        assert result is not None
+        assert " OR " in result
+        assert " AND " not in result
+
 
 class TestBm25RankToScore:
 
@@ -130,6 +137,20 @@ class TestMergeHybridResults:
             vector=[], keyword=[], vector_weight=0.7, text_weight=0.3
         )
         assert results == []
+
+    def test_duplicate_location_deduped(self):
+        """Same (path, start_line, end_line) under different ids collapses to one."""
+        vector = [
+            {"id": "x1", "path": "dup.md", "start_line": 10, "end_line": 20,
+             "snippet": "dup", "source": "memory", "vector_score": 0.9},
+            {"id": "x2", "path": "dup.md", "start_line": 10, "end_line": 20,
+             "snippet": "dup", "source": "memory", "vector_score": 0.4},
+        ]
+        results = merge_hybrid_results(
+            vector=vector, keyword=[], vector_weight=1.0, text_weight=0.0
+        )
+        assert len(results) == 1
+        assert results[0].score == pytest.approx(0.9)
 
 
 class TestTemporalDecay:

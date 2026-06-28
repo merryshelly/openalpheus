@@ -18,9 +18,14 @@ class SearchResult:
 def build_fts_query(raw: str) -> str | None:
     """Convert natural language query to FTS5 MATCH query.
     
-    Extract alphanumeric tokens, quote each, join with AND.
+    Extract alphanumeric tokens, quote each, join with OR.
     Returns None if no valid tokens.
-    Example: "validator monitoring" -> '"validator" AND "monitoring"'
+    Example: "validator monitoring" -> '"validator" OR "monitoring"'
+
+    OR (not AND) because callers — especially Claude-family models and the open
+    models distilled from them — tend to issue "grab bag of nouns" queries. AND
+    requires every term in one chunk (near-zero recall for multi-term queries);
+    OR lets BM25 rank by coverage + IDF and reinforces the vector arm.
     """
     # Extract alphanumeric tokens using regex
     tokens = re.findall(r'[\w]+', raw)
@@ -30,8 +35,8 @@ def build_fts_query(raw: str) -> str | None:
     # Strip any quotes from tokens to prevent FTS5 injection, then quote each
     quoted_tokens = [f'"{token}"' for token in tokens]
     
-    # Join with AND
-    return " AND ".join(quoted_tokens)
+    # Join with OR (see docstring — accommodates grab-bag-of-nouns queries)
+    return " OR ".join(quoted_tokens)
 
 
 def bm25_rank_to_score(rank: float) -> float:
@@ -84,7 +89,20 @@ def merge_hybrid_results(vector: list[dict], keyword: list[dict],
     
     # Sort by score descending
     results.sort(key=lambda r: r.score, reverse=True)
-    return results
+
+    # Dedup by location (path, start_line, end_line). The index can hold the same
+    # chunk under multiple ids (re-index churn / orphaned rows), which otherwise
+    # surfaces as duplicate hits. Results are already sorted desc, so the first
+    # instance seen per location is the highest-scoring one.
+    deduped: list[SearchResult] = []
+    seen: set = set()
+    for r in results:
+        key = (r.path, r.start_line, r.end_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    return deduped
 
 
 def apply_temporal_decay(results: list[SearchResult], half_life_days: float,
