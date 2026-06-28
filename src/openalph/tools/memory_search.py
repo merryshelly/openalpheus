@@ -148,14 +148,20 @@ async def run_memory_search(
                 (query_blob, model_name, max_results * 3),
             ).fetchall()
             for row in rows:
+                dist = row[6]
+                if dist is None:
+                    # NULL/malformed embedding (e.g. dimension mismatch). Such rows sort
+                    # FIRST under "ORDER BY dist ASC" — skipping them avoids crashing on
+                    # "1.0 - None", which previously zeroed out ALL vector results.
+                    continue
                 vector_results.append({
                     "id": row[0], "path": row[1], "source": row[2],
                     "start_line": row[3], "end_line": row[4],
                     "snippet": row[5][:500],
-                    "vector_score": max(0, 1.0 - row[6]),
+                    "vector_score": max(0, 1.0 - dist),
                 })
         except Exception as e:
-            logger.debug("Vector search unavailable: %s", e)
+            logger.warning("Vector search failed: %s", e)
 
     # If no vector results, use text_weight=1.0
     if not vector_results:

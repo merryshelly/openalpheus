@@ -196,6 +196,21 @@ class MemoryIndexer:
         # Delete chunks for stale paths
         removed_count = 0
         for stale_path in stale_paths:
+            # Clean the vec table too, else embeddings for deleted files linger as
+            # orphans (chunks_vec rows with no matching chunk). Collect ids first.
+            old_ids = [r[0] for r in self.db.execute(
+                "SELECT id FROM chunks WHERE path = ? AND model = ?",
+                (stale_path, self.model_name)
+            ).fetchall()]
+            if old_ids:
+                try:
+                    placeholders = ",".join("?" for _ in old_ids)
+                    self.db.execute(
+                        f"DELETE FROM chunks_vec WHERE id IN ({placeholders})",
+                        old_ids
+                    )
+                except Exception:
+                    pass  # chunks_vec may not exist if sqlite-vec not loaded
             cursor = self.db.execute(
                 "DELETE FROM chunks WHERE path = ? AND model = ?",
                 (stale_path, self.model_name)
