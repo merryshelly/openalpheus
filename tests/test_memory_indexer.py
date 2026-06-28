@@ -304,3 +304,63 @@ class TestIndexAll:
         stats2 = await indexer.index_all([tmp_path / "memory"])
         assert stats2.files_indexed == 0  # nothing changed
         conn.close()
+
+
+class TestEmbeddingDimensionGuard:
+    """Indexer rejects malformed (wrong-dimension) embeddings at write time: the
+    chunk is still indexed for keyword search but gets no vector, and the
+    rejection is logged loudly (regression guard for the silent-corruption bug)."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_embedding_skipped_and_logged(self, tmp_path, caplog):
+        import logging as _logging
+
+        def _bad_embedder(dims=5):  # vec table is dim 4; 5 is malformed
+            embedder = MagicMock()
+            embedder.model = "test-model"
+
+            async def mock_embed(text):
+                return [0.1] * dims
+
+            async def mock_embed_batch(texts):
+                return [[0.1] * dims for _ in texts]
+
+            embedder.embed = mock_embed
+            embedder.embed_batch = mock_embed_batch
+            return embedder
+
+        f = tmp_path / "test.md"
+        f.write_text("## Section\nContent long enough to meet the minimum chunk size threshold for testing purposes here.")
+
+        conn = init_db(tmp_path / "test.db", dimensions=4)
+        indexer = MemoryIndexer(conn, _bad_embedder(), "test-model")
+        info = FileInfo(path=str(f), mtime=os.path.getmtime(str(f)))
+
+        with caplog.at_level(_logging.WARNING):
+            count = await indexer.index_file(info)
+
+        # Chunk is still indexed (keyword-searchable) ...
+        assert count >= 1
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] >= 1
+        # ... but with NO stored vector (malformed embedding rejected) ...
+        non_null = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
+        assert non_null == 0
+        # ... and the rejection was logged loudly.
+        assert "malformed embedding" in caplog.text.lower()
+        conn.close()
+
+    @pytest.mark.asyncio
+    async def test_valid_embedding_is_stored(self, tmp_path):
+        f = tmp_path / "test.md"
+        f.write_text("## Section\nContent long enough to meet the minimum chunk size threshold for testing purposes here.")
+
+        conn = init_db(tmp_path / "test.db", dimensions=4)
+        indexer = MemoryIndexer(conn, _make_embedder_mock(dims=4), "test-model")
+        info = FileInfo(path=str(f), mtime=os.path.getmtime(str(f)))
+        await indexer.index_file(info)
+
+        non_null = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
+        assert non_null >= 1
+        conn.close()

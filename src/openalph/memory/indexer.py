@@ -4,6 +4,7 @@ Ties together the chunker, embeddings, and schema modules.
 """
 
 import hashlib
+import logging
 import os
 import struct
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from pathlib import Path
 import sqlite3
 
 from openalph.memory.chunker import chunk_file
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,6 +41,16 @@ class MemoryIndexer:
         self.db = db
         self.embedder = embedder
         self.model_name = model_name
+
+    def _expected_dim(self) -> int | None:
+        """Embedding width the vec table was built for (from _config), else None."""
+        try:
+            row = self.db.execute(
+                "SELECT value FROM _config WHERE key = 'dimensions'"
+            ).fetchone()
+            return int(row[0]) if row else None
+        except Exception:
+            return None
 
     def scan_files(self, paths: list[Path]) -> list[FileInfo]:
         """Scan paths for .md files. Paths can be directories (recursive) or individual files.
@@ -92,19 +105,18 @@ class MemoryIndexer:
         Returns number of chunks created."""
         # Read file content
         text = Path(file_info.path).read_text()
-        
+
         # Chunk the file
         chunks = chunk_file(text, file_info.path)
-        
+
         if not chunks:
             return 0
-        
+
         # Embed all chunk texts
         texts = [c.text for c in chunks]
         embeddings = await self.embedder.embed_batch(texts)
-        
-        # Delete old chunks for this file
-        # Also delete from vec table if it exists
+
+        # Delete old chunks for this file (and their vec rows if the table exists)
         try:
             old_ids = [row[0] for row in self.db.execute(
                 "SELECT id FROM chunks WHERE path = ? AND model = ?",
@@ -122,26 +134,36 @@ class MemoryIndexer:
             "DELETE FROM chunks WHERE path = ? AND model = ?",
             (file_info.path, self.model_name)
         )
-        
+
+        # Validate embedding dimensions once. A wrong-width vector is rejected by
+        # sqlite-vec or (worse) stored as an un-queryable row whose distance comes
+        # back NULL and breaks vector search. Treat a malformed embedding as "no
+        # embedding": the chunk is still indexed for keyword search, it just gets
+        # no vector. Logged loudly so corruption is never silent again.
+        expected_dim = self._expected_dim()
+        emb_bytes_list: list[bytes | None] = []
+        for idx in range(len(chunks)):
+            emb = embeddings[idx] if idx < len(embeddings) else None
+            if emb is None:
+                emb_bytes_list.append(None)
+            elif expected_dim is not None and len(emb) != expected_dim:
+                logger.warning(
+                    "Skipping malformed embedding for %s (chunk %d): got dim %d, expected %d",
+                    file_info.path, idx, len(emb), expected_dim,
+                )
+                emb_bytes_list.append(None)
+            else:
+                emb_bytes_list.append(struct.pack(f"{len(emb)}f", *emb))
+
         # Insert new chunks
         for i, chunk in enumerate(chunks):
-            # Generate ID: hash of path:start_line
             chunk_id = hashlib.sha256(
                 f"{file_info.path}:{chunk.start_line}:{i}".encode()
             ).hexdigest()
-            
-            # Get embedding for this chunk (may be None)
-            emb = embeddings[i] if i < len(embeddings) else None
-            
-            # Convert embedding to bytes if present
-            if emb is not None:
-                emb_bytes = struct.pack(f'{len(emb)}f', *emb)
-            else:
-                emb_bytes = None
-            
-            # Insert chunk
+            emb_bytes = emb_bytes_list[i]
+
             self.db.execute(
-                """INSERT INTO chunks 
+                """INSERT INTO chunks
                    (id, path, start_line, end_line, text, source, model, file_mtime, embedding)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
@@ -156,23 +178,22 @@ class MemoryIndexer:
                     emb_bytes
                 )
             )
-        
-        # Insert embeddings into vec table for KNN search
+
+        # Insert embeddings into vec table for KNN search (skip None/malformed)
         try:
             for i, chunk in enumerate(chunks):
-                emb = embeddings[i] if i < len(embeddings) else None
-                if emb is not None:
+                emb_bytes = emb_bytes_list[i]
+                if emb_bytes is not None:
                     chunk_id = hashlib.sha256(
                         f"{file_info.path}:{chunk.start_line}:{i}".encode()
                     ).hexdigest()
-                    emb_bytes = struct.pack(f"{len(emb)}f", *emb)
                     self.db.execute(
                         "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
                         (chunk_id, emb_bytes)
                     )
         except Exception:
             pass  # chunks_vec may not exist if sqlite-vec not loaded
-        
+
         self.db.commit()
         return len(chunks)
 
