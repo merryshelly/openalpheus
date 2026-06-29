@@ -232,6 +232,26 @@ def _thinking_budget(level: str, base_max_tokens: int, model_max_tokens: int) ->
         budget = max(0, max_tokens - 1024)
     return budget, max_tokens
 
+
+def _model_output_cap(api_model: str) -> int | None:
+    """Maximum output tokens (max_tokens) a model's API will accept.
+
+    Anthropic hard-400s when max_tokens exceeds the model's cap (verified
+    2026-06-29: Haiku 4.5 = 64000). Fireworks / local OpenAI-compatible servers
+    tolerate over-cap values (verified: glm-5p2 and kimi-k2p6 accepted
+    max_tokens=200000), so they return None (no clamp needed).
+
+    Returns the cap in tokens, or None if unknown / no clamp required.
+    """
+    m = api_model.lower()
+    if "haiku-4-5" in m:
+        return 64000
+    if ("sonnet-4-6" in m or "opus-4-6" in m or "opus-4-7" in m
+            or "opus-4-8" in m or "fable" in m):
+        return 128000
+    return None
+
+
 def _convert_tools_for_provider(tools: list | None, provider_type: str) -> list[dict] | None:
     """Convert ToolDef list to provider-native format.
     
@@ -691,7 +711,14 @@ def _build_anthropic_kwargs(
             budget, adjusted_max = _thinking_budget(thinking_level, max_tokens, model_max_tokens)
             api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             api_kwargs["max_tokens"] = adjusted_max
-    
+
+    # Clamp to the model output cap; Anthropic 400s if max_tokens exceeds it
+    # (Haiku 4.5 = 64000). Matters for sub-agent dispatch, which inherits the
+    # parent max_tokens (64K parent -> Haiku sub = 64K + 16K budget = 80K > 64K).
+    _cap = _model_output_cap(api_model)
+    if _cap is not None:
+        api_kwargs["max_tokens"] = min(api_kwargs["max_tokens"], _cap)
+
     return api_kwargs
 
 
@@ -759,7 +786,13 @@ def _build_openai_kwargs(
         extra_body["provider"] = routing
     if extra_body:
         api_kwargs["extra_body"] = extra_body
-    
+
+    # Clamp to model output cap (defensive; OpenAI-compatible providers we use
+    # tolerate over-cap max_tokens, so _model_output_cap returns None for them).
+    _cap = _model_output_cap(api_model)
+    if _cap is not None:
+        api_kwargs[_token_key] = min(api_kwargs[_token_key], _cap)
+
     return api_kwargs
 
 

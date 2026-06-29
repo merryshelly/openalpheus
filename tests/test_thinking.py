@@ -25,6 +25,9 @@ from openalph.provider import (
     _supports_adaptive_thinking,
     _thinking_effort,
     _thinking_budget,
+    _model_output_cap,
+    _build_anthropic_kwargs,
+    _build_openai_kwargs,
     _convert_messages_for_anthropic,
     _convert_messages_for_openai,
     _parse_anthropic_response,
@@ -1332,3 +1335,57 @@ class TestResponseThinkingField:
         )
         assert len(r.thinking) == 1
         assert r.thinking[0].thinking == "hmm"
+
+
+class TestModelOutputCap:
+    """Output-token caps + clamping. Prevents Anthropic 400s on over-cap
+    max_tokens, notably for sub-agent dispatch (inherits parent's max_tokens)."""
+
+    def test_haiku_cap(self):
+        assert _model_output_cap("claude-haiku-4-5-20251001") == 64000
+
+    def test_opus_sonnet_fable_cap(self):
+        assert _model_output_cap("claude-opus-4-8") == 128000
+        assert _model_output_cap("claude-sonnet-4-6") == 128000
+        assert _model_output_cap("claude-fable-5") == 128000
+
+    def test_unknown_models_return_none(self):
+        assert _model_output_cap("accounts/fireworks/models/glm-5p2") is None
+        assert _model_output_cap("accounts/fireworks/models/kimi-k2p6") is None
+        assert _model_output_cap("macstudio/qwen3.5-397b") is None
+
+    def test_anthropic_budget_model_clamped(self):
+        # Haiku (budget): 64000 + 16384 budget = 80384, clamped to 64000.
+        kw = _build_anthropic_kwargs(
+            "claude-haiku-4-5-20251001", "sys",
+            [{"role": "user", "content": "hi"}], None, 64000, "high",
+            model_max_tokens=200000,
+        )
+        assert kw["max_tokens"] == 64000
+
+    def test_anthropic_under_cap_not_raised(self):
+        # Haiku 32000 + 16384 = 48384, under cap -> unchanged (clamp never raises).
+        kw = _build_anthropic_kwargs(
+            "claude-haiku-4-5-20251001", "sys",
+            [{"role": "user", "content": "hi"}], None, 32000, "high",
+            model_max_tokens=200000,
+        )
+        assert kw["max_tokens"] == 48384
+
+    def test_anthropic_adaptive_model_clamped(self):
+        # Opus (adaptive): passthrough 200000 clamped to 128000.
+        kw = _build_anthropic_kwargs(
+            "claude-opus-4-8", "sys",
+            [{"role": "user", "content": "hi"}], None, 200000, "max",
+            model_max_tokens=1048576,
+        )
+        assert kw["max_tokens"] == 128000
+
+    def test_openai_fireworks_not_clamped(self):
+        # Fireworks tolerant -> None cap -> over-cap value preserved.
+        kw = _build_openai_kwargs(
+            "accounts/fireworks/models/kimi-k2p6", "sys",
+            [{"role": "user", "content": "hi"}], None, 200000, "high", [],
+            provider_key="fireworks",
+        )
+        assert kw["max_tokens"] == 200000
