@@ -403,6 +403,7 @@ See "Fixing Orphaned Heartbeats" in the Heartbeat System section above.
 | `/resume` | Re-enable a halted room |
 | `/heartbeat start <interval>` | Start periodic heartbeat (e.g., `5m`, `1h`) |
 | `/heartbeat stop` | Stop heartbeat for this room |
+| `/steer <message>` | Inject a mid-turn steering note into the **active** turn (real-time steering). Logged + delivered to the agent at the next tool-call boundary as a user message. Requires an active turn; deposits without interrupting. |
 
 All overrides (`/model`, `/thinking`, `/cache`) are room-scoped, persisted to JSONL, and restored on session resume. They self-clean when the session ends.
 

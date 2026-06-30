@@ -175,6 +175,7 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | `/cache <1h\|5m\|off>` | Anthropic prompt cache TTL (default `1h`) |
 | `/cache toolstrip` | Reclaim context by replacing old tool outputs with placeholders |
 | `/timesense <on\|off>` | Prepend timestamp to every user message in LLM context (off by default) |
+| `/steer <message>` | Inject a mid-turn steering note into the **active** turn (real-time steering). Logged + delivered to the agent at the next tool-call boundary as a user message. Requires an active turn; deposits without interrupting. |
 | `/stop` | Cancel current processing |
 | `/resume` | Re-enable after `/stop` |
 
