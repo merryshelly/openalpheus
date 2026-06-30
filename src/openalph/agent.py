@@ -266,7 +266,8 @@ class Agent:
                            callbacks: dict | None = None,
                            on_text_delta=None, on_thinking_delta=None,
                            on_cache_status=None, cache_ttl: str | None = None,
-                           append_user: bool = True) -> str:
+                           append_user: bool = True,
+                           drain_steering=None) -> str:
         """Process a user message and return the assistant's response.
 
         Appends the user message to room history, calls the LLM, appends the
@@ -320,6 +321,20 @@ class Agent:
 
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
+                    # Drain steering inbox at the top of every iteration (before API call).
+                    # Check both the direct kwarg and the callbacks dict (the latter allows
+                    # _process_message to pass the closure without breaking existing test mocks
+                    # that have explicit handle_input signatures without drain_steering).
+                    _effective_drain = drain_steering or (callbacks or {}).get('drain_steering')
+                    if _effective_drain:
+                        _steer_notes = await _effective_drain()
+                        for _note in _steer_notes:
+                            if _note.strip():
+                                history.append({
+                                    "role": "user",
+                                    "content": f"[Operator steering — mid-turn guidance]: {_note}",
+                                })
+
                     # Check for context overflow before calling the API (tool results may push over)
                     context_tokens = self._estimate_context_tokens(room_id)
                     available = self.config.model_max_tokens - self.config.max_tokens

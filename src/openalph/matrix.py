@@ -283,6 +283,8 @@ class MatrixBot:
         self._room_timesense = {}   # Room-scoped timesense toggle (prepend timestamp to user messages)
         self._background_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._steering_inbox: dict[str, list[str]] = {}
+        self._active_turns: set[str] = set()
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -1351,6 +1353,7 @@ class MatrixBot:
         """
         room_id = room.room_id
         self._current_room = room_id
+        _drain_steering_fn = None  # set after session lock acquired; used in outer finally
 
         try:
             # --- Mention gating ---
@@ -1559,6 +1562,47 @@ class MatrixBot:
                             detail=f"cache_read={cr} cache_creation={cc} miss_pct={miss_pct:.0f}",
                         )
 
+                # Build drain_steering closure and mark turn active.
+                # The closure pops the inbox atomically (list.pop is GIL-safe),
+                # logs each note to JSONL, emits a "delivered" notice, and
+                # returns the note strings so the agent loop can inject them.
+                # _active_turns is set here, BEFORE handle_input, so that a
+                # concurrent /steer command can detect the active turn.
+                if not hasattr(self, '_steering_inbox'):
+                    self._steering_inbox = {}
+                if not hasattr(self, '_active_turns'):
+                    self._active_turns = set()
+                self._active_turns.add(room_id)
+
+                async def _drain_steering() -> list:
+                    notes = self._steering_inbox.pop(room_id, [])
+                    for _n in notes:
+                        # Log to JSONL: role=user, source=steer, original text
+                        _sl2 = getattr(self, 'session_log', None)
+                        if _sl2:
+                            _sl2.append(
+                                role="user",
+                                sender=self.config.user_id,
+                                room=room_id,
+                                event_id=None,
+                                content=_n,
+                                source="steer",
+                            )
+                        # Emit "delivered" notice to operator
+                        try:
+                            await self.send_notice(room_id, "🧭 Steering note delivered")
+                        except Exception:
+                            pass
+                    return notes
+
+                _drain_steering_fn = _drain_steering
+
+                # Pass drain_steering via callbacks dict so that test mocks
+                # with explicit handle_input signatures (no drain_steering kwarg)
+                # are not broken. agent.handle_input extracts it from callbacks
+                # when drain_steering= kwarg is None.
+                callbacks['drain_steering'] = _drain_steering
+
                 response = await self.agent.handle_input(
                         body, room_id,
                         on_tool_call=_tool_notice,
@@ -1634,6 +1678,18 @@ class MatrixBot:
                 await self._set_typing(room_id, False)
 
         finally:
+            # Race rule: do a final drain pass to catch notes that arrived
+            # during the last iteration, THEN discard from _active_turns.
+            # This ensures a note deposited while the loop was on its last
+            # iteration is still logged this turn, not silently dropped.
+            if _drain_steering_fn is not None:
+                try:
+                    await _drain_steering_fn()
+                except Exception:
+                    pass
+            if hasattr(self, '_active_turns'):
+                self._active_turns.discard(room_id)
+
             # Release per-room session lock so queued messages can proceed.
             # The lock was acquired before the user-message JSONL write and
             # held through handle_input (which writes tool_intent / tool_notice
@@ -1819,6 +1875,9 @@ class MatrixBot:
         # --- Slash commands ---
         if body == "/stop":
             self._halted_rooms.add(room_id)
+            # Clear steering inbox so stale notes don't leak into the next turn
+            if hasattr(self, '_steering_inbox'):
+                self._steering_inbox.pop(room_id, None)
             await self._cancel_current()
             await self.send(room_id, "Stopped. Room halted \u2014 use `/resume` to re-enable.")
             return
@@ -2208,6 +2267,21 @@ class MatrixBot:
             else:
                 await self.send(room_id,
                     "Usage: `/umbral start <interval>` | `/umbral stop` | `/umbral status`")
+            return
+
+        if body.startswith("/steer"):
+            parts = body.split(None, 1)
+            note = parts[1].strip() if len(parts) > 1 else ""
+            if not note:
+                await self.send_notice(room_id, "Usage: /steer <message>")
+                return
+            if room_id not in getattr(self, '_active_turns', set()):
+                await self.send_notice(room_id, "🧭 No active turn to steer")
+                return
+            if not hasattr(self, '_steering_inbox'):
+                self._steering_inbox = {}
+            self._steering_inbox.setdefault(room_id, []).append(note)
+            await self.send_notice(room_id, "🧭 Steering note queued")
             return
 
         # If room is halted via /stop, drop regular messages but allow slash

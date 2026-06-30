@@ -270,9 +270,14 @@ class SessionLog:
                 continue
 
             if role == "user":
+                _user_content = entry.get("content", "")
+                # Steering notes: prepend framing prefix in context (JSONL stores original).
+                # Mirrors the timesense precedent: framing is context-only, not stored.
+                if entry.get("source") == "steer":
+                    _user_content = f"[Operator steering — mid-turn guidance]: {_user_content}"
                 context.append({
                     "role": "user",
-                    "content": entry.get("content", ""),
+                    "content": _user_content,
                 })
 
             elif role == "assistant":
