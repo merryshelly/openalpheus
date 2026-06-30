@@ -228,6 +228,35 @@ class SessionLog:
 
         return count, total_chars
 
+    def usage_totals(self, room_id: str) -> dict:
+        """Sum per-turn `usage` fields across assistant entries -> 5 per-room counters.
+        Returns zeros if no usage present. Maps:
+          usage.input_tokens        -> uncached_input_tokens
+          usage.output_tokens       -> total_output_tokens
+          usage.cache_read_tokens   -> cache_read_tokens
+          usage.cache_creation_tokens -> cache_creation_tokens
+          usage.tool_calls          -> total_tool_calls
+        Robust to entries with no `usage` key (skip)."""
+        totals = {
+            "uncached_input_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "total_output_tokens": 0,
+            "total_tool_calls": 0,
+        }
+        for entry in self.read(room_id):
+            if entry.get("role") != "assistant":
+                continue
+            u = entry.get("usage")
+            if not isinstance(u, dict):
+                continue
+            totals["uncached_input_tokens"] += u.get("input_tokens", 0)
+            totals["cache_read_tokens"] += u.get("cache_read_tokens", 0)
+            totals["cache_creation_tokens"] += u.get("cache_creation_tokens", 0)
+            totals["total_output_tokens"] += u.get("output_tokens", 0)
+            totals["total_tool_calls"] += u.get("tool_calls", 0)
+        return totals
+
     def build_context(self, room_id: str, *, skip_system: bool = True) -> list[dict]:
         """Build LLM conversation context from JSONL entries.
 

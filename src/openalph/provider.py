@@ -233,6 +233,39 @@ def _thinking_budget(level: str, base_max_tokens: int, model_max_tokens: int) ->
     return budget, max_tokens
 
 
+# (context_window, output_cap)  — output_cap None = no clamp (Fireworks/local tolerate)
+_MODEL_CAPABILITIES: list[tuple[str, int | None, int | None]] = [
+    # Anthropic
+    ("haiku-4-5",  200_000,   64_000),
+    ("sonnet-4-6", 200_000,  128_000),
+    ("opus-4-6",  1_048_576, 128_000),
+    ("opus-4-7",  1_048_576, 128_000),
+    ("opus-4-8",  1_048_576, 128_000),
+    ("fable",     1_048_576, 128_000),
+    # Fireworks / open
+    ("glm-5p2",   1_048_576, None),
+    ("kimi-k2p6",   262_144, None),
+    # Local
+    ("qwen3.5",     262_144, None),
+    ("qwen3p5",     262_144, None),
+    ("qwen3.6",     262_144, None),
+    ("qwen3p6",     262_144, None),
+    # Others (window only)
+    ("maverick",  1_048_576, None),
+    ("hermes",      131_072, None),
+    ("gemini",    1_048_576, None),
+]
+
+
+def model_context_window(api_model: str) -> int | None:
+    """Curated default context window for a model, or None if unknown."""
+    m = api_model.lower()
+    for frag, window, _cap in _MODEL_CAPABILITIES:
+        if frag in m:
+            return window
+    return None
+
+
 def _model_output_cap(api_model: str) -> int | None:
     """Maximum output tokens (max_tokens) a model's API will accept.
 
@@ -244,11 +277,9 @@ def _model_output_cap(api_model: str) -> int | None:
     Returns the cap in tokens, or None if unknown / no clamp required.
     """
     m = api_model.lower()
-    if "haiku-4-5" in m:
-        return 64000
-    if ("sonnet-4-6" in m or "opus-4-6" in m or "opus-4-7" in m
-            or "opus-4-8" in m or "fable" in m):
-        return 128000
+    for frag, _window, cap in _MODEL_CAPABILITIES:
+        if frag in m:
+            return cap
     return None
 
 

@@ -152,6 +152,9 @@ class Agent:
         self.cache_creation_tokens = 0
         self.total_output_tokens = 0
         self.total_tool_calls = 0
+        # Per-room usage tracking (Workstream C)
+        self._room_usage: dict[str, dict[str, int]] = {}
+        self._last_turn_usage: dict[str, dict[str, int]] = {}
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
         # Pre-compute tool definition cost for token estimation.
@@ -164,6 +167,7 @@ class Agent:
         self._current_task: asyncio.Task | None = None
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._room_models: dict[str, str] = {}  # room_id → model override
+        self._warned_models: set = set()  # warn-once for unknown model context windows
         self._truncation_retry = False
 
 
@@ -175,6 +179,57 @@ class Agent:
         """
         if room_id in self._rooms:
             self._rooms[room_id].clear()
+        self._room_usage.pop(room_id, None)
+        self._last_turn_usage.pop(room_id, None)
+
+    def _usage_for(self, room_id: str) -> dict[str, int]:
+        """Lazily init + return the per-room counter record (5 keys, all int)."""
+        if room_id not in self._room_usage:
+            self._room_usage[room_id] = {
+                "uncached_input_tokens": 0, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "total_output_tokens": 0,
+                "total_tool_calls": 0,
+            }
+        return self._room_usage[room_id]
+
+    def _record_turn_usage(self, room_id: str, usage) -> None:
+        """Called once per API call (text + tool turns + summary). Updates globals
+        AND per-room token counters, and stores the per-turn delta for the serializer.
+        `usage` is a provider Usage object (.input_tokens, .output_tokens,
+        .cache_read_tokens, .cache_creation_tokens; cache fields may be None)."""
+        cr = usage.cache_read_tokens or 0
+        cc = usage.cache_creation_tokens or 0
+        # globals (unchanged semantics)
+        self.uncached_input_tokens += usage.input_tokens
+        self.cache_read_tokens += cr
+        self.cache_creation_tokens += cc
+        self.total_output_tokens += usage.output_tokens
+        # per-room mirror
+        r = self._usage_for(room_id)
+        r["uncached_input_tokens"] += usage.input_tokens
+        r["cache_read_tokens"] += cr
+        r["cache_creation_tokens"] += cc
+        r["total_output_tokens"] += usage.output_tokens
+        # per-turn delta (serializer persists this; tool_calls added by serializer)
+        self._last_turn_usage[room_id] = {
+            "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
+            "cache_read_tokens": cr, "cache_creation_tokens": cc,
+        }
+
+    def _record_tool_calls(self, room_id: str, n: int) -> None:
+        self.total_tool_calls += n
+        self._usage_for(room_id)["total_tool_calls"] += n
+
+    def last_turn_usage(self, room_id: str) -> dict | None:
+        """Public accessor for the matrix serializer."""
+        return self._last_turn_usage.get(room_id)
+
+    def restore_usage(self, room_id: str, totals: dict) -> None:
+        """Set the per-room counters from JSONL-summed totals (rehydration)."""
+        r = self._usage_for(room_id)
+        for k in ("uncached_input_tokens", "cache_read_tokens", "cache_creation_tokens",
+                  "total_output_tokens", "total_tool_calls"):
+            r[k] = int(totals.get(k, 0))
 
     def history(self, room_id: str) -> list[dict]:
         """Get or create history for a room."""
@@ -185,6 +240,32 @@ class Agent:
     def get_model(self, room_id: str = "_default") -> str:
         """Return the active model for a room, falling back to config default."""
         return self._room_models.get(room_id, self.config.default_model)
+
+    def _resolve_model_limit_for(self, model_str: str) -> int:
+        """3-layer window resolution for an explicit model string (config override
+        -> curated default -> model_max_tokens fallback + warn-once)."""
+        if model_str in self.config.model_limits:
+            return self.config.model_limits[model_str]
+        from openalph.provider import model_context_window
+        w = model_context_window(model_str)
+        if w is not None:
+            return w
+        if model_str not in self._warned_models:
+            self._warned_models.add(model_str)
+            logger.warning("No curated context window for model %r; falling back to "
+                           "model_max_tokens=%d. Add a [model_limits] override if its "
+                           "window differs.", model_str, self.config.model_max_tokens)
+        return self.config.model_max_tokens
+
+    def _resolve_model_limit(self, room_id: str = "_default") -> int:
+        """True context window for the room's active model.
+
+        Layer 1: [model_limits] config override.
+        Layer 2: curated code default (model_context_window).
+        Layer 3: fallback to config.model_max_tokens (+ one-time WARN log).
+        Delegates to _resolve_model_limit_for with the room's active model.
+        """
+        return self._resolve_model_limit_for(self.get_model(room_id))
 
     def switch_model(self, model_str: str, room_id: str = "_default") -> str | None:
         """Switch active model. Returns error string on failure, None on success."""
@@ -207,8 +288,8 @@ class Agent:
             return f"Cannot switch to {model_str} — session contains images and model may not support vision."
 
         # Context window guard: check current context vs model limit
-        # Use model_limits from config if available, else config.model_max_tokens
-        model_limit = self.config.model_limits.get(model_str, self.config.model_max_tokens)
+        # Use 3-layer resolution (same as _resolve_model_limit) to get the target model's window
+        model_limit = self._resolve_model_limit_for(model_str)
         context_tokens = self._estimate_context_tokens(room_id)
         if context_tokens > model_limit - self.config.max_tokens:
             return f"Cannot switch to {model_str} — current context (~{context_tokens:,} tokens) exceeds model limit ({model_limit:,})."
@@ -301,9 +382,10 @@ class Agent:
                 context_tokens = self._estimate_context_tokens(room_id) + (
                     content_tokens if append_user else 0
                 )
-                available = self.config.model_max_tokens - self.config.max_tokens
+                limit = self._resolve_model_limit(room_id)
+                available = limit - self.config.max_tokens
                 if context_tokens > available:
-                    raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
+                    raise ContextOverflowError(context_tokens, limit)
 
                 if append_user:
                     history.append({"role": "user", "content": content})
@@ -337,9 +419,10 @@ class Agent:
 
                     # Check for context overflow before calling the API (tool results may push over)
                     context_tokens = self._estimate_context_tokens(room_id)
-                    available = self.config.model_max_tokens - self.config.max_tokens
+                    limit = self._resolve_model_limit(room_id)
+                    available = limit - self.config.max_tokens
                     if context_tokens > available:
-                        raise ContextOverflowError(context_tokens, self.config.model_max_tokens)
+                        raise ContextOverflowError(context_tokens, limit)
 
                     # Pass tools=None if no tools discovered (backward compatibility)
                     tools_arg = self.tools if self.tools else None
@@ -401,10 +484,7 @@ class Agent:
 
                     latency_ms = (time.monotonic() - start_time) * 1000
 
-                    self.uncached_input_tokens += response.usage.input_tokens
-                    self.cache_read_tokens += response.usage.cache_read_tokens or 0
-                    self.cache_creation_tokens += response.usage.cache_creation_tokens or 0
-                    self.total_output_tokens += response.usage.output_tokens
+                    self._record_turn_usage(room_id, response.usage)
                     usage = response.usage
 
                     # Check if response has tool calls
@@ -463,6 +543,7 @@ class Agent:
                                 {"thinking": tb.thinking, "signature": tb.signature}
                                 for tb in thinking_blocks
                             ]
+                        # INVARIANT (RC1): assistant_msg must be history[-1] when matrix persists this turn after return.
                         history.append(assistant_msg)
                         return final_text
 
@@ -483,6 +564,10 @@ class Agent:
                             {"thinking": tb.thinking, "signature": tb.signature}
                             for tb in thinking_blocks
                         ]
+                    # INVARIANT (RC1): tool_msg (carrying thinking) MUST remain history[-1]
+                    # when on_tool_intent fires — matrix._persist_assistant_turn reads
+                    # thinking from history[-1]. Do NOT insert any history mutation between
+                    # this append and the on_tool_intent call below.
                     history.append(tool_msg)
 
                     # Emit tool intent before execution (for session logging / observability)
@@ -516,7 +601,7 @@ class Agent:
                     results = await asyncio.gather(*tool_coros)
 
                     # Track total tool calls
-                    self.total_tool_calls += len(active_tool_calls)
+                    self._record_tool_calls(room_id, len(active_tool_calls))
 
                     # Build tool_calls log entry with is_error from results
                     logged_tool_calls = []
@@ -573,6 +658,11 @@ class Agent:
                     "Do NOT attempt further tool calls.]"
                 )
                 history.append({"role": "user", "content": limit_notice})
+                # FIX 2: clear stale last-turn usage BEFORE the summary try, so that if
+                # the summary fails or yields no done event, serializer sees no usage
+                # (preventing double-count of the prior tool turn on restart).
+                # On summary success, _record_turn_usage re-sets it correctly.
+                self._last_turn_usage.pop(room_id, None)
 
                 try:
                     summary_text = ""
@@ -600,10 +690,7 @@ class Agent:
                                 await on_text_delta("", done=True)
 
                     if summary_response:
-                        self.uncached_input_tokens += summary_response.usage.input_tokens
-                        self.cache_read_tokens += summary_response.usage.cache_read_tokens or 0
-                        self.cache_creation_tokens += summary_response.usage.cache_creation_tokens or 0
-                        self.total_output_tokens += summary_response.usage.output_tokens
+                        self._record_turn_usage(room_id, summary_response.usage)
                         if on_cache_status:
                             try:
                                 await on_cache_status(summary_response.usage, self.get_model(room_id))
@@ -753,8 +840,9 @@ class Agent:
         This ensures toolstrip-aware context sizes.
         """
         context_tokens = self._estimate_context_tokens(room_id, history=history)
-        model_max = self.config.model_max_tokens
+        model_max = self._resolve_model_limit(room_id)
         context_pct = round(context_tokens / model_max * 100) if model_max else 0
+        _u = self._usage_for(room_id)
         return {
             "name": self.config.name,
             "model": self.get_model(room_id),
@@ -762,9 +850,10 @@ class Agent:
             "context_tokens": context_tokens,
             "context_max": model_max,
             "context_pct": context_pct,
-            "uncached_input_tokens": self.uncached_input_tokens,
-            "cache_read_tokens": self.cache_read_tokens,
-            "cache_creation_tokens": self.cache_creation_tokens,
-            "total_output_tokens": self.total_output_tokens,
-            "total_tool_calls": self.total_tool_calls,
+            "context_remaining": max(0, model_max - context_tokens),
+            "uncached_input_tokens": _u["uncached_input_tokens"],
+            "cache_read_tokens": _u["cache_read_tokens"],
+            "cache_creation_tokens": _u["cache_creation_tokens"],
+            "total_output_tokens": _u["total_output_tokens"],
+            "total_tool_calls": _u["total_tool_calls"],
         }

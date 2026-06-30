@@ -637,6 +637,52 @@ class MatrixBot:
             await self.send(room, "Cancelled.")
             await self._set_typing(room, False)
 
+    def _persist_assistant_turn(self, room_id: str, *, content: str,
+                             tool_calls=None) -> None:
+        """Single serializer for assistant turns. Captures content + tool_calls +
+        thinking (from agent.history[-1]) + usage (from agent.last_turn_usage).
+        Used by BOTH the tool-use path (_tool_intent) and the final-text paths.
+
+        INVARIANT (RC1): This method reads thinking from agent.history(room_id)[-1].
+        It is correct ONLY because the caller (agent.handle_input) always appends the
+        assistant message to history immediately before this serializer runs. Any future
+        change that inserts a history mutation between that append and this call will
+        silently break thinking capture.
+        """
+        _sl = getattr(self, "session_log", None)
+        if not _sl:
+            return
+        # thinking: read from the current last assistant turn in history
+        thinking = None
+        try:
+            hist = self.agent.history(room_id)
+            if hist and hist[-1].get("role") == "assistant":
+                thinking = hist[-1].get("thinking")
+        except Exception:
+            logger.debug("_persist_assistant_turn: thinking capture failed", exc_info=True)
+            thinking = None
+        # usage: per-turn delta; isinstance guard so MagicMock agents (tests) -> {}
+        usage = {}
+        try:
+            lu = self.agent.last_turn_usage(room_id)
+            if isinstance(lu, dict):
+                usage = dict(lu)
+                usage["tool_calls"] = len(tool_calls or [])
+        except Exception:
+            logger.debug("_persist_assistant_turn: usage capture failed", exc_info=True)
+            usage = {}
+        kwargs = dict(role="assistant", sender=self.config.user_id,
+                      room=room_id, event_id=None, content=content or "")
+        if tool_calls is not None:
+            kwargs["tool_calls"] = [
+                {"call_id": tc.id, "name": tc.name, "input": tc.input} for tc in tool_calls
+            ]
+        if thinking:
+            kwargs["thinking"] = thinking
+        if usage:
+            kwargs["usage"] = usage
+        _sl.append(**kwargs)
+
     def _make_tool_callbacks(self, room_id: str):
         """Create tool-use callback closures bound to a specific room.
 
@@ -754,19 +800,7 @@ class MatrixBot:
                         await self._room_send_with_retry(room_id, dispatch_msg)
                     except Exception:
                         pass
-            _sl = getattr(self, 'session_log', None)
-            if _sl:
-                _sl.append(
-                    role="assistant",
-                    sender=self.config.user_id,
-                    room=room_id,
-                    event_id=None,
-                    content=content_text or "",
-                    tool_calls=[
-                        {"call_id": tc.id, "name": tc.name, "input": tc.input}
-                        for tc in tool_calls
-                    ],
-                )
+            self._persist_assistant_turn(room_id, content=content_text or "", tool_calls=tool_calls)
 
         return _tool_notice, _tool_intent
 
@@ -918,21 +952,7 @@ class MatrixBot:
                 callbacks=callbacks,
             )
             if response and response.strip():
-                if self.session_log:
-                    _thinking_data = None
-                    _agent_history = self.agent.history(room_id)
-                    if _agent_history and _agent_history[-1].get("role") == "assistant":
-                        _thinking_data = _agent_history[-1].get("thinking")
-                    _log_kwargs = dict(
-                        role="assistant",
-                        sender=self.config.user_id,
-                        room=room_id,
-                        event_id=None,
-                        content=response,
-                    )
-                    if _thinking_data:
-                        _log_kwargs["thinking"] = _thinking_data
-                    self.session_log.append(**_log_kwargs)
+                self._persist_assistant_turn(room_id, content=response)
                 await self.send(room_id, response)
             else:
                 # Model did tool work but returned empty text.  Retry once
@@ -951,21 +971,7 @@ class MatrixBot:
                     cache_ttl=_cache_ttl,
                 )
                 if retry and retry.strip():
-                    if self.session_log:
-                        _thinking_data = None
-                        _agent_history = self.agent.history(room_id)
-                        if _agent_history and _agent_history[-1].get("role") == "assistant":
-                            _thinking_data = _agent_history[-1].get("thinking")
-                        _log_kwargs = dict(
-                            role="assistant",
-                            sender=self.config.user_id,
-                            room=room_id,
-                            event_id=None,
-                            content=retry,
-                        )
-                        if _thinking_data:
-                            _log_kwargs["thinking"] = _thinking_data
-                        self.session_log.append(**_log_kwargs)
+                    self._persist_assistant_turn(room_id, content=retry)
                     await self.send(room_id, retry)
                 else:
                     logger.warning("Empty heartbeat response in %s after retry — giving up", room_id)
@@ -983,7 +989,8 @@ class MatrixBot:
         methods on self.agent, self.session_log, self.heartbeat, self.umbral.
         """
         from datetime import datetime, timezone
-        status_data = self.agent.status(rid)
+        _hist = self.session_log.build_context(rid) if getattr(self, 'session_log', None) else None
+        status_data = self.agent.status(rid, history=_hist)
 
         # Session age
         if getattr(self, 'session_log', None):
@@ -1223,6 +1230,7 @@ class MatrixBot:
                 history = self.agent.history(room_id)
                 history.clear()
                 history.extend(session_log.build_context(room_id))
+                self.agent.restore_usage(room_id, session_log.usage_totals(room_id))
 
                 # Restore per-room overrides (model, thinking) from session log.
                 # Scan all entries — last override wins (user may have switched multiple times).
@@ -1617,22 +1625,7 @@ class MatrixBot:
                     )
                 # Append assistant response to session log
                 if response and response.strip():
-                    if session_log:
-                        # Capture thinking blocks from agent's history for session persistence
-                        _thinking_data = None
-                        _agent_history = self.agent.history(room_id)
-                        if _agent_history and _agent_history[-1].get("role") == "assistant":
-                            _thinking_data = _agent_history[-1].get("thinking")
-                        _log_kwargs = dict(
-                            role="assistant",
-                            sender=self.config.user_id,
-                            room=room_id,
-                            event_id=None,
-                            content=response,
-                        )
-                        if _thinking_data:
-                            _log_kwargs["thinking"] = _thinking_data
-                        session_log.append(**_log_kwargs)
+                    self._persist_assistant_turn(room_id, content=response)
                     # Send if streaming didn't deliver, or if the response
                     # differs from what was streamed (e.g. tool-limit summary
                     # generated after the last streamed tool-call text).
@@ -1659,6 +1652,18 @@ class MatrixBot:
                             f"⚠️ Context at **{_pct}%** — "
                             f"~{_status['context_tokens']:,} / {_status['context_max']:,} tokens. "
                             f"Consider starting a new room soon.")
+                    # Output-headroom soft notice (Workstream B)
+                    try:
+                        _ctx = _status.get("context_tokens", 0)
+                        _resolved = _status.get("context_max", 0)
+                        _max_out = self.agent.config.max_tokens
+                        if _resolved and _ctx > _resolved - _max_out:
+                            await self.send_notice(room_id,
+                                f"ℹ️ Output headroom low — context (~{_ctx:,}) is within "
+                                f"the model's output reserve (~{_max_out:,} tokens) of the "
+                                f"{_resolved:,} window. Responses may be truncated soon.")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             except AgentOverflowError as e:
