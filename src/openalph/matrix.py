@@ -955,29 +955,38 @@ class MatrixBot:
                 self._persist_assistant_turn(room_id, content=response)
                 await self.send(room_id, response)
             else:
-                # Model did tool work but returned empty text.  Retry once
-                # with a nudge — the model sees its own tool results in
-                # history and should produce the report it failed to emit.
-                logger.warning("Empty heartbeat response in %s — retrying once", room_id)
-                retry = await self.agent.handle_input(
-                    "[SYSTEM: Your previous heartbeat response was empty. "
-                    "Summarize your findings now.]",
-                    room_id,
-                    on_tool_call=_tool_notice,
-                    on_tool_intent=_tool_intent,
-                    thinking=_thinking_override,
-                    on_thinking_delta=_thinking_delta,
-                    on_cache_status=_cache_status,
-                    cache_ttl=_cache_ttl,
-                )
-                if retry and retry.strip():
-                    self._persist_assistant_turn(room_id, content=retry)
-                    await self.send(room_id, retry)
-                else:
-                    logger.warning("Empty heartbeat response in %s after retry — giving up", room_id)
+                _stop = self.agent.last_stop_reason(room_id)
+                if _stop == "refusal":
+                    logger.warning("Model refusal during heartbeat in %s", room_id)
                     await self.send(room_id,
-                        "⚠️ **Empty heartbeat response** — the model returned no content "
-                        "after retry. This may indicate degeneration or a provider issue.")
+                        "⚠️ **Model refusal** — heartbeat turn refused by model "
+                        "(API returned `stop_reason: refusal`). Content policy "
+                        "restrictions were triggered. Consider switching models "
+                        "with `/model`.")
+                else:
+                    # Model did tool work but returned empty text.  Retry once
+                    # with a nudge — the model sees its own tool results in
+                    # history and should produce the report it failed to emit.
+                    logger.warning("Empty heartbeat response in %s — retrying once", room_id)
+                    retry = await self.agent.handle_input(
+                        "[SYSTEM: Your previous heartbeat response was empty. "
+                        "Summarize your findings now.]",
+                        room_id,
+                        on_tool_call=_tool_notice,
+                        on_tool_intent=_tool_intent,
+                        thinking=_thinking_override,
+                        on_thinking_delta=_thinking_delta,
+                        on_cache_status=_cache_status,
+                        cache_ttl=_cache_ttl,
+                    )
+                    if retry and retry.strip():
+                        self._persist_assistant_turn(room_id, content=retry)
+                        await self.send(room_id, retry)
+                    else:
+                        logger.warning("Empty heartbeat response in %s after retry — giving up", room_id)
+                        await self.send(room_id,
+                            "⚠️ **Empty heartbeat response** — the model returned no content "
+                            "after retry. This may indicate degeneration or a provider issue.")
         finally:
             await self._set_typing(room_id, False)
 
@@ -1635,11 +1644,20 @@ class MatrixBot:
                         logger.info("Response differs from streamed content — sending separately")
                         await self.send(room_id, response)
                 else:
-                    logger.warning("Empty response from agent in %s — not sending", room_id)
-                    await self.send(room_id,
-                        "⚠️ **Empty response** — the model returned no content. "
-                        "This may indicate degeneration or a provider issue. "
-                        "Try again or start a new room.")
+                    _stop = self.agent.last_stop_reason(room_id)
+                    if _stop == "refusal":
+                        logger.warning("Model refusal in %s — stop_reason=refusal", room_id)
+                        await self.send(room_id,
+                            "⚠️ **Model refusal** — the model refused to generate a response "
+                            "(API returned `stop_reason: refusal`). This usually means content "
+                            "policy restrictions were triggered. Try rephrasing, or switch "
+                            "models with `/model`.")
+                    else:
+                        logger.warning("Empty response from agent in %s — not sending", room_id)
+                        await self.send(room_id,
+                            "⚠️ **Empty response** — the model returned no content. "
+                            "This may indicate degeneration or a provider issue. "
+                            "Try again or start a new room.")
                 # Check context capacity after successful turn
                 try:
                     _sh = None

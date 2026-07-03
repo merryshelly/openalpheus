@@ -155,6 +155,7 @@ class Agent:
         # Per-room usage tracking (Workstream C)
         self._room_usage: dict[str, dict[str, int]] = {}
         self._last_turn_usage: dict[str, dict[str, int]] = {}
+        self._last_stop_reason: dict[str, str] = {}
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
         # Pre-compute tool definition cost for token estimation.
@@ -181,6 +182,7 @@ class Agent:
             self._rooms[room_id].clear()
         self._room_usage.pop(room_id, None)
         self._last_turn_usage.pop(room_id, None)
+        self._last_stop_reason.pop(room_id, None)
 
     def _usage_for(self, room_id: str) -> dict[str, int]:
         """Lazily init + return the per-room counter record (5 keys, all int)."""
@@ -223,6 +225,10 @@ class Agent:
     def last_turn_usage(self, room_id: str) -> dict | None:
         """Public accessor for the matrix serializer."""
         return self._last_turn_usage.get(room_id)
+
+    def last_stop_reason(self, room_id: str) -> str | None:
+        """Return the stop_reason from the last completed turn in this room."""
+        return self._last_stop_reason.get(room_id)
 
     def restore_usage(self, room_id: str, totals: dict) -> None:
         """Set the per-room counters from JSONL-summed totals (rehydration)."""
@@ -545,6 +551,7 @@ class Agent:
                             ]
                         # INVARIANT (RC1): assistant_msg must be history[-1] when matrix persists this turn after return.
                         history.append(assistant_msg)
+                        self._last_stop_reason[room_id] = response.stop_reason
                         return final_text
 
                     # Use tool_calls from stream or from response
@@ -709,6 +716,7 @@ class Agent:
                     )
 
                 history.append({"role": "assistant", "content": final_text})
+                self._last_stop_reason[room_id] = summary_response.stop_reason if summary_response else "max_iterations"
                 return final_text
             except asyncio.CancelledError:
                 # /stop or process shutdown cancelled us mid-tool-loop.
