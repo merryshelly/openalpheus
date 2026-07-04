@@ -1045,6 +1045,7 @@ class MatrixBot:
                     # with a nudge — the model sees its own tool results in
                     # history and should produce the report it failed to emit.
                     logger.warning("Empty heartbeat response in %s — retrying once", room_id)
+                    # R2-D-retry: pass same callbacks as primary call
                     retry = await self.agent.handle_input(
                         "[SYSTEM: Your previous heartbeat response was empty. "
                         "Summarize your findings now.]",
@@ -1055,6 +1056,7 @@ class MatrixBot:
                         on_thinking_delta=_thinking_delta,
                         on_cache_status=_cache_status,
                         cache_ttl=_cache_ttl,
+                        callbacks=callbacks,
                     )
                     if retry and retry.strip():
                         self._persist_assistant_turn(room_id, content=retry)
@@ -1327,6 +1329,33 @@ class MatrixBot:
                 # R1-4: Rehydrate per-room reminder engine fired-state from JSONL
                 # (e.g., a once-per-session trigger does not re-fire after restart)
                 self.agent.rehydrate_reminders(room_id, existing)
+
+                # R2-8: Rehydrate per-room tool counts from JSONL.
+                # Scan assistant entries with tool_calls for per-tool name counts.
+                # This ensures T3 suppression by prior memory_search survives restart.
+                _tool_counts: dict[str, int] = {}
+                _last_todo_write_args = None
+                for entry in existing:
+                    if entry.get("role") == "assistant" and entry.get("tool_calls"):
+                        for _tc in entry["tool_calls"]:
+                            _tc_name = _tc.get("name", "")
+                            if _tc_name:
+                                _tool_counts[_tc_name] = _tool_counts.get(_tc_name, 0) + 1
+                            # R2-todo-rehydrate: capture last todo_write args
+                            if _tc_name == "todo_write":
+                                _tc_input = _tc.get("input")
+                                if isinstance(_tc_input, dict) and "todos" in _tc_input:
+                                    _last_todo_write_args = _tc_input["todos"]
+                if _tool_counts:
+                    self.agent._room_tool_counts[room_id] = _tool_counts
+
+                # R2-todo-rehydrate: restore _TODO_STATE from last todo_write call
+                if _last_todo_write_args is not None:
+                    from openalph.tools import _TODO_STATE
+                    if isinstance(_last_todo_write_args, list):
+                        _TODO_STATE[room_id] = _last_todo_write_args
+                    else:
+                        _TODO_STATE[room_id] = []
 
                 # Restore per-room overrides (model, thinking) from session log.
                 # Scan all entries — last override wins (user may have switched multiple times).

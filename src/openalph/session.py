@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openalph.provider import ToolCall
+from openalph.tools import escape_system_reminder_tags
 
 logger = logging.getLogger(__name__)
 
@@ -300,10 +301,18 @@ class SessionLog:
 
             if role == "user":
                 _user_content = entry.get("content", "")
+                _source = entry.get("source")
                 # Steering notes: prepend framing prefix in context (JSONL stores original).
                 # Mirrors the timesense precedent: framing is context-only, not stored.
-                if entry.get("source") == "steer":
+                if _source == "steer":
                     _user_content = f"[Operator steering — mid-turn guidance]: {_user_content}"
+                elif _source not in ("reminder", "steer"):
+                    # R2-A: Escape user-origin <system-reminder> tags in context
+                    # to prevent spoofing.  Reminder entries (source="reminder")
+                    # are trusted harness content replayed verbatim.  JSONL stores
+                    # raw user text; escaping is context-only (audit fidelity).
+                    if isinstance(_user_content, str):
+                        _user_content = escape_system_reminder_tags(_user_content)
                 context.append({
                     "role": "user",
                     "content": _user_content,

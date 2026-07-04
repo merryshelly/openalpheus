@@ -17,7 +17,7 @@ from pathlib import Path
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
 from openalph.provider import complete, stream, StreamEvent, ThinkingBlock
-from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, BUILTIN_TOOLS, _TODO_STATE
+from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, BUILTIN_TOOLS, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
 
 logger = logging.getLogger(__name__)
@@ -418,7 +418,13 @@ class Agent:
                     raise ContextOverflowError(context_tokens, limit)
 
                 if append_user:
-                    history.append({"role": "user", "content": content})
+                    # R2-A: Escape user-origin <system-reminder> tags in context
+                    # to prevent spoofing.  JSONL stores raw text (audit fidelity);
+                    # escaping is context-only (mirrors /timesense, /steer).
+                    # Only genuine user content is escaped — harness-injected
+                    # reminder/steer strings are trusted and appended elsewhere.
+                    _escaped = escape_system_reminder_tags(content) if isinstance(content, str) else content
+                    history.append({"role": "user", "content": _escaped})
                 # else: caller already appended via JSONL → build_context → history.extend
 
                 # Per-turn tool call counter (reset each handle_input call)
@@ -478,9 +484,15 @@ class Agent:
                     _send_notice = (callbacks or {}).get("send_notice")
                     if _send_notice:
                         try:
+                            # R2-B: summary line + exact framed content (I2 compliance)
+                            import html as _html_mod
+                            _notice_body = (
+                                f"🔔 System reminder ({_rem.trigger})\n\n"
+                                f"{_html_mod.escape(_rem.content)}"
+                            )
                             await _send_notice(
                                 room_id,
-                                f"🔔 System reminder ({_rem.trigger})\n\n{_rem.text}",
+                                _notice_body,
                             )
                         except Exception:
                             logger.warning("send_notice callback failed for reminder")
@@ -553,9 +565,15 @@ class Agent:
                             _send_notice = (callbacks or {}).get("send_notice")
                             if _send_notice:
                                 try:
+                                    # R2-B: summary line + exact framed content (I2 compliance)
+                                    import html as _html_mod
+                                    _notice_body = (
+                                        f"🔔 System reminder ({_rem.trigger})\n\n"
+                                        f"{_html_mod.escape(_rem.content)}"
+                                    )
                                     await _send_notice(
                                         room_id,
-                                        f"🔔 System reminder ({_rem.trigger})\n\n{_rem.text}",
+                                        _notice_body,
                                     )
                                 except Exception:
                                     logger.warning("send_notice callback failed for reminder")

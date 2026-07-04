@@ -559,6 +559,27 @@ def tool_schemas(tools: list[ToolDef]) -> list[dict]:
     ]
 
 
+def escape_system_reminder_tags(text: str) -> str:
+    """Escape <system-reminder> tags in text to prevent spoofing (R2-A/R2-9).
+
+    Catches optional surrounding whitespace, attributes, newlines, and
+    mixed-case variants.  Normalizes to entity form: &lt;system-reminder&gt;
+    or &lt;/system-reminder&gt;.  Idempotent by construction — entity-escaped
+    tags (&lt;…&gt;) will not re-match the angle-bracket regex.
+
+    Used by wrap_tool_result (tool output security, §8) and by both
+    user-content escaping paths: agent.handle_input live-append and
+    session.build_context replay (R2-A).
+    """
+    import re as _re
+    return _re.sub(
+        r'<\s*(/?)\s*system-reminder\b[^>]*>',
+        lambda m: f'&lt;{m.group(1)}system-reminder&gt;',
+        text,
+        flags=_re.IGNORECASE,
+    )
+
+
 def wrap_tool_result(content: str, tool_name: str, tool_call_id: str) -> str:
     """Wrap tool result content in XML-style delimiter tags.
 
@@ -575,15 +596,8 @@ def wrap_tool_result(content: str, tool_name: str, tool_call_id: str) -> str:
     Returns:
         Content wrapped in ``<tool_result>`` tags with provenance attributes
     """
-    import re as _re
-    # Escape <system-reminder> and </system-reminder> tags (case-insensitive)
-    # Only these specific tags; no other angle-bracket content is touched.
-    content = _re.sub(
-        r'<(/?)system-reminder>',
-        lambda m: f'&lt;{m.group(1)}system-reminder&gt;',
-        content,
-        flags=_re.IGNORECASE,
-    )
+    # R2-9: Use shared helper for broadened regex (whitespace/attributes/case)
+    content = escape_system_reminder_tags(content)
     return (
         f'<tool_result tool="{tool_name}" id="{tool_call_id}">\n'
         f"{content}\n"
@@ -660,6 +674,28 @@ async def _execute_todo_write(input: dict, callbacks: dict | None) -> "ToolResul
         mutating state on validation failure.
     """
     todos = input.get("todos", [])
+
+    # R2-C: validate todos is a list of dicts before field access.
+    # Violations → is_error=True, state unchanged, no exception raised.
+    if not isinstance(todos, list):
+        return ToolResult(
+            content=(
+                "Validation error: todos must be a list (array) of todo items, "
+                f"got {type(todos).__name__}. Each item must be a dict with "
+                "'content' (str) and 'status' (str) fields."
+            ),
+            is_error=True,
+        )
+    for i, item in enumerate(todos):
+        if not isinstance(item, dict):
+            return ToolResult(
+                content=(
+                    f"Validation error: item {i} must be a dict, "
+                    f"got {type(item).__name__}. Each todo item must be a dict with "
+                    "'content' (str) and 'status' (str) fields."
+                ),
+                is_error=True,
+            )
 
     # Validate all items before touching state
     in_progress_count = 0
@@ -848,7 +884,7 @@ async def execute_tool(
         # --- Read-before-write guard ---
         _fw_path = input["path"]
         _guard_enabled = tool_config.get("require_read_before_write", True)
-        if _guard_enabled and _resolved_path is not None and _os_fw.path.exists(_fw_path):
+        if _guard_enabled and _resolved_path is not None and _os_fw.path.exists(_resolved_path):
             # File exists — apply guard
             _registry = (callbacks or {}).get("read_registry") if callbacks else None
             if _registry is None:
@@ -872,7 +908,7 @@ async def execute_tool(
                 )
             # File was read — check if mtime has changed since read
             try:
-                _current_mtime = _os_fw.stat(_fw_path).st_mtime
+                _current_mtime = _os_fw.stat(_resolved_path).st_mtime
                 _recorded_mtime = _registry[_resolved_path]
                 if _current_mtime > _recorded_mtime:
                     return ToolResult(
@@ -894,7 +930,7 @@ async def execute_tool(
             _registry = callbacks.get("read_registry")
             if _registry is not None:
                 try:
-                    _mtime = _os_fw.stat(_fw_path).st_mtime
+                    _mtime = _os_fw.stat(_resolved_path).st_mtime
                     _registry[_resolved_path] = _mtime
                 except Exception:
                     pass
