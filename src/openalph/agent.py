@@ -423,7 +423,19 @@ class Agent:
                     # escaping is context-only (mirrors /timesense, /steer).
                     # Only genuine user content is escaped — harness-injected
                     # reminder/steer strings are trusted and appended elsewhere.
-                    _escaped = escape_system_reminder_tags(content) if isinstance(content, str) else content
+                    if isinstance(content, str):
+                        _escaped = escape_system_reminder_tags(content)
+                    elif isinstance(content, list):
+                        # N1: vision/multimodal content — escape text blocks,
+                        # preserve image blocks (keeps live/rebuild symmetric).
+                        _escaped = [
+                            {**_blk, "text": escape_system_reminder_tags(_blk["text"])}
+                            if isinstance(_blk, dict) and _blk.get("type") == "text"
+                            and isinstance(_blk.get("text"), str) else _blk
+                            for _blk in content
+                        ]
+                    else:
+                        _escaped = content
                     history.append({"role": "user", "content": _escaped})
                 # else: caller already appended via JSONL → build_context → history.extend
 
