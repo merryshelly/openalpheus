@@ -107,8 +107,12 @@ def _make_bot(**overrides):
     })
     agent.last_turn_usage = MagicMock(return_value=None)
     agent.last_stop_reason = MagicMock(return_value="end_turn")
-    agent._reminder_engine = MagicMock()
-    agent._reminder_engine.rehydrate = MagicMock()
+    # R1-4 adaptation: per-room engines replaced shared _reminder_engine.
+    # Agent now exposes rehydrate_reminders(room_id, entries) instead.
+    agent._reminder_engines = {}
+    agent.rehydrate_reminders = MagicMock()
+    # R1-1: per-room read registries
+    agent._read_registries = {}
     agent.restore_usage = MagicMock()
     agent.reset_room = MagicMock()
     agent._room_models = {}
@@ -304,8 +308,11 @@ class TestGuidanceWiring:
 
         await bot._activate_room(ROOM)
 
-        bot.agent._reminder_engine.rehydrate.assert_called_once()
-        arg = bot.agent._reminder_engine.rehydrate.call_args[0][0]
+        # R1-4 adaptation: rehydrate is now via agent.rehydrate_reminders(room_id, entries)
+        bot.agent.rehydrate_reminders.assert_called_once()
+        call_args = bot.agent.rehydrate_reminders.call_args
+        assert call_args[0][0] == ROOM, "rehydrate must be called with the room_id"
+        arg = call_args[0][1]
         assert any(e.get("source") == "reminder" for e in arg), \
             "rehydrate must receive entries containing reminder records"
 

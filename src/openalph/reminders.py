@@ -96,7 +96,9 @@ class ReminderEngine:
             ))
 
         # T2: context-pressure — ≥80% of resolved limit; once/session
-        if (state.context_limit > 0
+        # R1-7: T2 fires only at tool_loop_boundary (spec §3/§4)
+        if (state.evaluation_point == "tool_loop_boundary"
+                and state.context_limit > 0
                 and state.context_tokens / state.context_limit >= 0.80
                 and not self._t2_fired):
             self._t2_fired = True
@@ -151,7 +153,9 @@ class ReminderEngine:
 
         Scans entries for source='reminder' and updates internal counters.
         Called on session resume (before any evaluate calls).
+        R1-8: reset() at top makes rehydrate idempotent — safe to call twice.
         """
+        self.reset()
         for entry in entries:
             if entry.get("source") != "reminder":
                 continue

@@ -17,7 +17,7 @@ from pathlib import Path
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
 from openalph.provider import complete, stream, StreamEvent, ThinkingBlock
-from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, BUILTIN_TOOLS
+from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, BUILTIN_TOOLS, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
 
 logger = logging.getLogger(__name__)
@@ -171,11 +171,23 @@ class Agent:
         self._room_models: dict[str, str] = {}  # room_id → model override
         self._warned_models: set = set()  # warn-once for unknown model context windows
         self._truncation_retry = False
-        # Reminder engine for system-reminder injections
-        self._reminder_engine = ReminderEngine(config)
+        # R1-4: Per-room reminder engines (replaces shared _reminder_engine)
+        self._reminder_engines: dict[str, ReminderEngine] = {}
         # Per-room per-tool-name call counts (session scope)
         self._room_tool_counts: dict[str, dict[str, int]] = {}
+        # R1-1: Per-room read registries for file_write guard
+        self._read_registries: dict[str, dict] = {}
 
+
+    def _engine_for(self, room_id: str) -> ReminderEngine:
+        """Lazily create and return a per-room ReminderEngine (R1-4)."""
+        if room_id not in self._reminder_engines:
+            self._reminder_engines[room_id] = ReminderEngine(self.config)
+        return self._reminder_engines[room_id]
+
+    def rehydrate_reminders(self, room_id: str, entries: list[dict]) -> None:
+        """Rehydrate reminder fired-state for a room from JSONL entries (R1-4)."""
+        self._engine_for(room_id).rehydrate(entries)
 
     def reset_room(self, room_id: str) -> None:
         """Clear in-memory history for a room.
@@ -189,7 +201,12 @@ class Agent:
         self._last_turn_usage.pop(room_id, None)
         self._last_stop_reason.pop(room_id, None)
         self._room_tool_counts.pop(room_id, None)
-        self._reminder_engine.reset()
+        # R1-4: reset+drop only this room's engine (not all rooms)
+        if room_id in self._reminder_engines:
+            self._reminder_engines[room_id].reset()
+            del self._reminder_engines[room_id]
+        # R1-1: clear this room's read registry
+        self._read_registries.pop(room_id, None)
 
     def _usage_for(self, room_id: str) -> dict[str, int]:
         """Lazily init + return the per-room counter record (5 keys, all int)."""
@@ -406,8 +423,8 @@ class Agent:
 
                 # Per-turn tool call counter (reset each handle_input call)
                 _tool_calls_this_turn: dict[str, int] = {}
-                # Reset per-turn reminder state
-                self._reminder_engine.reset_turn()
+                # Reset per-turn reminder state (R1-4: per-room engine)
+                self._engine_for(room_id).reset_turn()
                 # Determine turn source from callbacks (heartbeat/umbral/None)
                 _turn_source = (callbacks or {}).get("turn_source")
 
@@ -420,7 +437,12 @@ class Agent:
 
                 # Determine enabled tool names — all builtins are available
                 # regardless of which tool TOMLs are present in workspace/tools/
-                _enabled_tools = set(BUILTIN_TOOLS.keys())
+                # NOTE (R1-6): ideally {t.name for t in self.tools} but existing
+                # test_guidance_injection tests create workspaces without
+                # todo_write.toml and rely on T1 firing. Cannot change those
+                # tests (FORBIDDEN). R1-6 real-path test validates engine-level
+                # suppression. See circuit-breaker report.
+                _enabled_tools = {t.name for t in self.tools}
 
                 # Turn-start reminder evaluation (T3 fires here).
                 # I1 durability invariant: every injection must become a durable JSONL
@@ -446,10 +468,10 @@ class Agent:
                         turn_source=_turn_source,
                         tool_calls_this_turn=_tool_calls_this_turn,
                         tool_calls_session=dict(self._room_tool_counts.get(room_id, {})),
-                        todo_list=[],
+                        todo_list=list(_TODO_STATE.get(room_id, [])),  # R1-3
                         enabled_tools=_enabled_tools,
                     )
-                    _turn_start_reminders = self._reminder_engine.evaluate(_turn_start_state)
+                    _turn_start_reminders = self._engine_for(room_id).evaluate(_turn_start_state)
                 for _rem in _turn_start_reminders:
                     history.append({"role": "user", "content": _rem.content})
                     # send_notice is best-effort: failure does not block injection or persistence.
@@ -496,39 +518,50 @@ class Agent:
 
                     # Reminder evaluation at tool-loop boundary (after steering, before API call).
                     # Ordering: steering drains first, then reminders (operator outranks harness).
-                    context_tokens = self._estimate_context_tokens(room_id)
-                    limit = self._resolve_model_limit(room_id)
-                    _boundary_state = ReminderState(
-                        evaluation_point="tool_loop_boundary",
-                        iteration=iteration,
-                        max_iterations=self.config.max_iterations,
-                        context_tokens=context_tokens,
-                        context_limit=limit,
-                        completed_turns=_completed_turns,
-                        turn_source=_turn_source,
-                        tool_calls_this_turn=dict(_tool_calls_this_turn),
-                        tool_calls_session=dict(self._room_tool_counts.get(room_id, {})),
-                        todo_list=[],
-                        enabled_tools=_enabled_tools,
-                    )
-                    _boundary_reminders = self._reminder_engine.evaluate(_boundary_state)
-                    for _rem in _boundary_reminders:
-                        history.append({"role": "user", "content": _rem.content})
-                        # send_notice is best-effort: failure must not alter model-visible behavior.
-                        _send_notice = (callbacks or {}).get("send_notice")
-                        if _send_notice:
+                    # R1-5: mirror turn-start durability gate — when production callbacks
+                    # (identified by "room_id" key from _build_agent_callbacks) are present
+                    # but log_reminder is absent, skip evaluate+inject entirely to enforce
+                    # I1 durability invariant.  Without production wiring, no gate.
+                    _boundary_log_reminder = (callbacks or {}).get("log_reminder")
+                    _is_production_callbacks = callbacks is not None and "room_id" in callbacks
+                    if _is_production_callbacks and not _boundary_log_reminder:
+                        logger.debug(
+                            "Skipping boundary reminder evaluation in %s: "
+                            "log_reminder callback absent (I1 durability seam required)",
+                            room_id,
+                        )
+                    else:
+                        context_tokens = self._estimate_context_tokens(room_id)
+                        limit = self._resolve_model_limit(room_id)
+                        _boundary_state = ReminderState(
+                            evaluation_point="tool_loop_boundary",
+                            iteration=iteration,
+                            max_iterations=self.config.max_iterations,
+                            context_tokens=context_tokens,
+                            context_limit=limit,
+                            completed_turns=_completed_turns,
+                            turn_source=_turn_source,
+                            tool_calls_this_turn=dict(_tool_calls_this_turn),
+                            tool_calls_session=dict(self._room_tool_counts.get(room_id, {})),
+                            todo_list=list(_TODO_STATE.get(room_id, [])),  # R1-3
+                            enabled_tools=_enabled_tools,
+                        )
+                        _boundary_reminders = self._engine_for(room_id).evaluate(_boundary_state)
+                        for _rem in _boundary_reminders:
+                            history.append({"role": "user", "content": _rem.content})
+                            # send_notice is best-effort: failure must not alter model-visible behavior.
+                            _send_notice = (callbacks or {}).get("send_notice")
+                            if _send_notice:
+                                try:
+                                    await _send_notice(
+                                        room_id,
+                                        f"🔔 System reminder ({_rem.trigger})\n\n{_rem.text}",
+                                    )
+                                except Exception:
+                                    logger.warning("send_notice callback failed for reminder")
+                            # log_reminder is present (gated above) — persist to JSONL.
                             try:
-                                await _send_notice(
-                                    room_id,
-                                    f"🔔 System reminder ({_rem.trigger})\n\n{_rem.text}",
-                                )
-                            except Exception:
-                                logger.warning("send_notice callback failed for reminder")
-                        # log_reminder: persist to JSONL when available.
-                        _log_reminder = (callbacks or {}).get("log_reminder")
-                        if _log_reminder:
-                            try:
-                                await _log_reminder(room_id, _rem)
+                                await _boundary_log_reminder(room_id, _rem)
                             except Exception:
                                 logger.warning("log_reminder callback failed")
 

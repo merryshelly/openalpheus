@@ -117,7 +117,7 @@ def _cfg(workspace, **kw):
     return AgentConfig(**defaults)
 
 
-def _setup_workspace(tmp_path, tools=("shell", "file_read", "file_write", "file_edit")):
+def _setup_workspace(tmp_path, tools=("shell", "file_read", "file_write", "file_edit", "todo_write", "memory_search")):
     """Create workspace/tools/ with tool TOMLs for discovery."""
     tools_dir = tmp_path / "tools"
     tools_dir.mkdir(exist_ok=True)

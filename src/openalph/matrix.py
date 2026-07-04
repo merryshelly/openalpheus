@@ -825,6 +825,91 @@ class MatrixBot:
 
         return _tool_notice, _tool_intent
 
+    def _build_agent_callbacks(self, room_id: str, turn_source: str | None) -> dict:
+        """Build the reminder/registry/identity callbacks for handle_input (R1 refactor).
+
+        Used by BOTH _process_message and _run_heartbeat_turn so the wiring
+        is identical.  Returns a dict with at minimum: send_notice, log_reminder,
+        turn_source, read_registry, room_id, context_status, send_media,
+        on_redaction.
+        """
+
+        async def _reminder_send_notice(_room_id, body, **kw):
+            """Emit collapsed <details> m.notice for reminders."""
+            html = (
+                '<details>\n<summary>' + body.split('\n')[0] + '</summary>\n'
+                + mistune.html(body) +
+                '</details>'
+            )
+            content_msg = {
+                "msgtype": "m.notice",
+                "body": body,
+                "format": "org.matrix.custom.html",
+                "formatted_body": html,
+            }
+            await self._room_send_with_retry(_room_id, content_msg)
+
+        async def _log_reminder(_room_id, reminder):
+            """Log reminder to JSONL with source='reminder' + trigger."""
+            _sl = getattr(self, 'session_log', None)
+            if _sl:
+                _sl.append(
+                    role="user",
+                    sender=self.config.user_id,
+                    room=_room_id,
+                    event_id=None,
+                    content=reminder.content,
+                    source="reminder",
+                    trigger=reminder.trigger,
+                )
+
+        async def _context_status_callback(req_room_id=None):
+            return self._build_context_status(req_room_id or room_id)
+
+        async def _upload_callback(file_path, content_type, filename, caption=None):
+            await self.upload_and_send(room_id, file_path, content_type, filename, caption)
+
+        async def _redaction_notice(tool_name, events):
+            """Emit in-room notice when credentials are redacted from tool output."""
+            for event in events:
+                notice = f"🔒 Credential redacted in {tool_name} output: {event.pattern_name} ({event.char_count} chars)"
+                try:
+                    await self.send_notice(room_id, notice)
+                except Exception as exc:
+                    logger.error("Redaction notice failed in %s: %s", room_id, exc, exc_info=True)
+                _sl = getattr(self, 'session_log', None)
+                if _sl:
+                    _sl.append(
+                        role="system",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        event="credential_redaction",
+                        detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
+                    )
+
+        # R1-1: per-room read registry for file_write guard
+        # Use getattr for compatibility with mocked agents in test suites
+        _registries = getattr(self.agent, '_read_registries', None)
+        if _registries is None:
+            _registries = {}
+            try:
+                self.agent._read_registries = _registries
+            except AttributeError:
+                pass  # spec-mocked agent, read_registry will be empty dict
+        _read_registry = _registries.setdefault(room_id, {})
+
+        return {
+            "send_media": _upload_callback,
+            "on_redaction": _redaction_notice,
+            "context_status": _context_status_callback,
+            "send_notice": _reminder_send_notice,
+            "log_reminder": _log_reminder,
+            "turn_source": turn_source,
+            "read_registry": _read_registry,       # R1-1
+            "room_id": room_id,                    # R1-2
+        }
+
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
         """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
 
@@ -923,76 +1008,14 @@ class MatrixBot:
                         detail=f"cache_read={cr} cache_creation={cc} miss_pct={miss_pct:.0f}",
                     )
 
-            async def _redaction_notice(tool_name, events):
-                """Emit in-room notice when credentials are redacted from tool output."""
-                for event in events:
-                    notice = f"🔒 Credential redacted in {tool_name} output: {event.pattern_name} ({event.char_count} chars)"
-                    try:
-                        await self.send_notice(room_id, notice)
-                    except Exception as exc:
-                        logger.error("Redaction notice failed in %s: %s", room_id, exc, exc_info=True)
-                    _sl = getattr(self, 'session_log', None)
-                    if _sl:
-                        _sl.append(
-                            role="system",
-                            sender=self.config.user_id,
-                            room=room_id,
-                            event_id=None,
-                            event="credential_redaction",
-                            detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
-                        )
-
-            async def _context_status_callback(req_room_id=None):
-                return self._build_context_status(req_room_id or room_id)
-
-            # Upload callback for send_media tool (same as interactive path)
-            async def _upload_callback(file_path, content_type, filename, caption=None):
-                await self.upload_and_send(room_id, file_path, content_type, filename, caption)
-
             # Timesense: prepend timestamp to heartbeat content
             if getattr(self, '_room_timesense', {}).get(room_id):
                 from datetime import datetime, timezone
                 _ts = datetime.now(timezone.utc).astimezone().strftime("%A, %B %d, %Y — %H:%M %Z")
                 content = f"[{_ts}] {content}"
 
-            # --- Reminder wiring (heartbeat/umbral path) ---
-            async def _reminder_send_notice(_room_id, body, **kw):
-                """Emit collapsed <details> m.notice for reminders."""
-                html = (
-                    '<details>\n<summary>' + body.split('\n')[0] + '</summary>\n'
-                    + mistune.html(body) +
-                    '</details>'
-                )
-                content_msg = {
-                    "msgtype": "m.notice",
-                    "body": body,
-                    "format": "org.matrix.custom.html",
-                    "formatted_body": html,
-                }
-                await self._room_send_with_retry(_room_id, content_msg)
-
-            async def _log_reminder(_room_id, reminder):
-                """Log reminder to JSONL with source='reminder' + trigger."""
-                _sl = getattr(self, 'session_log', None)
-                if _sl:
-                    _sl.append(
-                        role="user",
-                        sender=self.config.user_id,
-                        room=_room_id,
-                        event_id=None,
-                        content=reminder.content,
-                        source="reminder",
-                        trigger=reminder.trigger,
-                    )
-
-            callbacks = {
-                "send_media": _upload_callback,
-                "on_redaction": _redaction_notice,
-                "context_status": _context_status_callback,
-                "send_notice": _reminder_send_notice,
-                "log_reminder": _log_reminder,
-                "turn_source": turn_source,
-            }
+            # R1 refactor: use shared _build_agent_callbacks for identical wiring
+            callbacks = self._build_agent_callbacks(room_id, turn_source)
 
             response = await self.agent.handle_input(
                 content,
@@ -1301,10 +1324,9 @@ class MatrixBot:
                 history.extend(session_log.build_context(room_id))
                 self.agent.restore_usage(room_id, session_log.usage_totals(room_id))
 
-                # Rehydrate reminder engine fired-state from JSONL entries
+                # R1-4: Rehydrate per-room reminder engine fired-state from JSONL
                 # (e.g., a once-per-session trigger does not re-fire after restart)
-                if hasattr(self.agent, '_reminder_engine'):
-                    self.agent._reminder_engine.rehydrate(existing)
+                self.agent.rehydrate_reminders(room_id, existing)
 
                 # Restore per-room overrides (model, thinking) from session log.
                 # Scan all entries — last override wins (user may have switched multiple times).
@@ -1522,73 +1544,13 @@ class MatrixBot:
             # Wire tool visibility for this turn
             _tool_notice, _tool_intent = self._make_tool_callbacks(room_id)
 
-            # Create upload callback for send_media tool
-            async def _upload_callback(file_path, content_type, filename, caption=None):
-                await self.upload_and_send(room.room_id, file_path, content_type, filename, caption)
-
             try:
                 # Resolve thinking level: room override > config
                 _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
                 _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
-                async def _redaction_notice(tool_name, events):
-                    """Emit in-room notice when credentials are redacted from tool output."""
-                    for event in events:
-                        notice = f"🔒 Credential redacted in {tool_name} output: {event.pattern_name} ({event.char_count} chars)"
-                        try:
-                            await self.send_notice(room_id, notice)
-                        except Exception as exc:
-                            logger.error("Redaction notice failed in %s: %s", room_id, exc, exc_info=True)
-                        if session_log:
-                            session_log.append(
-                                role="system",
-                                sender=self.config.user_id,
-                                room=room_id,
-                                event_id=None,
-                                event="credential_redaction",
-                                detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
-                            )
 
-                async def _context_status_callback(req_room_id=None):
-                    return self._build_context_status(req_room_id or room_id)
-
-                # --- Reminder wiring: send_notice + log_reminder closures ---
-                async def _reminder_send_notice(_room_id, body, **kw):
-                    """Emit an m.notice with collapsed <details> HTML for reminders."""
-                    html = (
-                        '<details>\n<summary>' + body.split('\n')[0] + '</summary>\n'
-                        + mistune.html(body) +
-                        '</details>'
-                    )
-                    content_msg = {
-                        "msgtype": "m.notice",
-                        "body": body,
-                        "format": "org.matrix.custom.html",
-                        "formatted_body": html,
-                    }
-                    await self._room_send_with_retry(_room_id, content_msg)
-
-                async def _log_reminder(_room_id, reminder):
-                    """Log a Reminder to JSONL with source='reminder' + trigger."""
-                    _sl = getattr(self, 'session_log', None)
-                    if _sl:
-                        _sl.append(
-                            role="user",
-                            sender=self.config.user_id,
-                            room=_room_id,
-                            event_id=None,
-                            content=reminder.content,
-                            source="reminder",
-                            trigger=reminder.trigger,
-                        )
-
-                callbacks = {
-                    "send_media": _upload_callback,
-                    "on_redaction": _redaction_notice,
-                    "context_status": _context_status_callback,
-                    "send_notice": _reminder_send_notice,
-                    "log_reminder": _log_reminder,
-                    "turn_source": None,
-                }
+                # R1 refactor: use shared _build_agent_callbacks for identical wiring
+                callbacks = self._build_agent_callbacks(room_id, None)
 
                 # Set up streaming delivery
                 streaming = StreamingDelivery(self, room_id)
