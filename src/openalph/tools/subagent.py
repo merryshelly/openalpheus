@@ -144,6 +144,9 @@ async def run_subagent(
     completed_iterations = 0
     peak_context_tokens = 0
 
+    # Per-sub-agent isolated read registry — prevents sub from using parent's read state
+    _sub_read_registry: dict[str, float] = {}
+
     try:
         for iteration in range(iteration_limit):
             iter_start = time.time()
@@ -237,6 +240,7 @@ async def run_subagent(
                     input=tc.input,
                     tool_config=tool_config,
                     agent_config=config,
+                    callbacks={"read_registry": _sub_read_registry},
                 ))
 
             results = await asyncio.gather(*tool_coros)

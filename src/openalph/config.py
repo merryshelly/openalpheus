@@ -72,6 +72,7 @@ class AgentConfig:
     thinking: str = "off"
     temperature: float | None = None
     top_p: float | None = None
+    reminders: bool = True
     model_limits: dict[str, int] = field(default_factory=dict)
     model_aliases: dict[str, str] = field(default_factory=dict)
 
@@ -253,6 +254,11 @@ def load_config(path: Path) -> AgentConfig:
     if not isinstance(truncation_limit, int) or truncation_limit <= 0:
         raise ConfigError("truncation_limit must be a positive integer")
 
+    # reminders defaults to True if not specified
+    reminders = agent_section.get("reminders", True)
+    if not isinstance(reminders, bool):
+        raise ConfigError("reminders must be a boolean")
+
     # vision defaults to False if not specified
     vision = agent_section.get("vision", False)
     if not isinstance(vision, bool):
@@ -426,6 +432,7 @@ def load_config(path: Path) -> AgentConfig:
         max_iterations=max_iterations,
         truncation_limit=truncation_limit,
         vision=vision,
+        reminders=reminders,
         thinking=thinking,
         temperature=temperature,
         top_p=top_p,

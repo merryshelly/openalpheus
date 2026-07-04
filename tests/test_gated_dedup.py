@@ -92,7 +92,7 @@ def make_event(sender, body, event_id="$evt1", mentions_user_ids=None):
     return event
 
 
-def make_bot_with_real_agent(tmp_path, rooms=None):
+def make_bot_with_real_agent(tmp_path, rooms=None, reminders=True):
     """
     Create a MatrixBot backed by a REAL Agent instance but with the
     provider's stream() function mocked so no network calls are made.
@@ -103,7 +103,7 @@ def make_bot_with_real_agent(tmp_path, rooms=None):
     to the LLM.
     """
     matrix_config = make_matrix_config(rooms=rooms)
-    agent_config = make_agent_config(workspace=tmp_path)
+    agent_config = make_agent_config(workspace=tmp_path, reminders=reminders)
 
     # Write a minimal SOUL.md so Agent.__init__ can assemble a system prompt
     (tmp_path / "SOUL.md").write_text("Test soul.")
@@ -171,7 +171,8 @@ class TestGatedDedup:
         exactly ONCE in the messages list passed to stream().  Before the
         fix, it appeared twice (hydration + handle_input append).
         """
-        agent, matrix_config, captured = make_bot_with_real_agent(tmp_path)
+        # reminders disabled: this test pins gated-dedup payload shape absent guidance injection (kdsn.186)
+        agent, matrix_config, captured = make_bot_with_real_agent(tmp_path, reminders=False)
         room_id = "!group:matrix.local"
         body = "Hey @watson please respond"
 
@@ -243,7 +244,8 @@ class TestGatedDedup:
         in the messages list passed to stream().
         """
         N_PAIRS = 5
-        agent, matrix_config, captured = make_bot_with_real_agent(tmp_path)
+        # reminders disabled: this test pins gated-dedup payload shape absent guidance injection (kdsn.186)
+        agent, matrix_config, captured = make_bot_with_real_agent(tmp_path, reminders=False)
         room_id = "!group2:matrix.local"
 
         session_log = SessionLog(tmp_path, matrix_config.user_id)

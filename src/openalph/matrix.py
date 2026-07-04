@@ -754,6 +754,27 @@ class MatrixBot:
                     await self._room_send_with_retry(room_id, content_msg)
                 except Exception:
                     pass
+            elif name == "todo_write" and not is_error:
+                # §9: todo_write → 📋 m.notice with summary + collapsed full list
+                result_str = str(result) if result else ""
+                # Extract summary line (first line of result)
+                summary_line = result_str.split('\n')[0] if result_str else "Todo list updated"
+                todo_body = f"📋 {summary_line}"
+                todo_html = (
+                    '<details>\n<summary>📋 ' + mistune.html(summary_line).strip().removeprefix('<p>').removesuffix('</p>') + '</summary>\n'
+                    + mistune.html(result_str) +
+                    '</details>'
+                )
+                todo_content = {
+                    "msgtype": "m.notice",
+                    "body": f"📋 {result_str}",
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": todo_html,
+                }
+                try:
+                    await self._room_send_with_retry(room_id, todo_content)
+                except Exception:
+                    pass
             else:
                 notice_body = f"🔧 {name}{detail} {status}"
                 try:
@@ -804,7 +825,7 @@ class MatrixBot:
 
         return _tool_notice, _tool_intent
 
-    async def _run_heartbeat_turn(self, room_id: str, content: str) -> None:
+    async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
         """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
 
         Extracted from _inject_heartbeat for reuse by _inject_umbral.
@@ -934,10 +955,43 @@ class MatrixBot:
                 _ts = datetime.now(timezone.utc).astimezone().strftime("%A, %B %d, %Y — %H:%M %Z")
                 content = f"[{_ts}] {content}"
 
+            # --- Reminder wiring (heartbeat/umbral path) ---
+            async def _reminder_send_notice(_room_id, body, **kw):
+                """Emit collapsed <details> m.notice for reminders."""
+                html = (
+                    '<details>\n<summary>' + body.split('\n')[0] + '</summary>\n'
+                    + mistune.html(body) +
+                    '</details>'
+                )
+                content_msg = {
+                    "msgtype": "m.notice",
+                    "body": body,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": html,
+                }
+                await self._room_send_with_retry(_room_id, content_msg)
+
+            async def _log_reminder(_room_id, reminder):
+                """Log reminder to JSONL with source='reminder' + trigger."""
+                _sl = getattr(self, 'session_log', None)
+                if _sl:
+                    _sl.append(
+                        role="user",
+                        sender=self.config.user_id,
+                        room=_room_id,
+                        event_id=None,
+                        content=reminder.content,
+                        source="reminder",
+                        trigger=reminder.trigger,
+                    )
+
             callbacks = {
                 "send_media": _upload_callback,
                 "on_redaction": _redaction_notice,
                 "context_status": _context_status_callback,
+                "send_notice": _reminder_send_notice,
+                "log_reminder": _log_reminder,
+                "turn_source": turn_source,
             }
 
             response = await self.agent.handle_input(
@@ -1079,7 +1133,7 @@ class MatrixBot:
             )
 
         try:
-            await self._run_heartbeat_turn(room_id, heartbeat_content)
+            await self._run_heartbeat_turn(room_id, heartbeat_content, turn_source="heartbeat")
         except AgentOverflowError:
             logger.warning("Context overflow in %s — auto-stopping heartbeat", room_id)
             await self.heartbeat.stop(room_id)
@@ -1113,7 +1167,7 @@ class MatrixBot:
             )
 
         try:
-            await self._run_heartbeat_turn(room_id, heartbeat_content)
+            await self._run_heartbeat_turn(room_id, heartbeat_content, turn_source="umbral")
         except AgentOverflowError:
             # Context was already too big — still archive+wipe (that's the point)
             logger.warning("Context overflow during umbral in %s — archiving anyway", room_id)
@@ -1138,6 +1192,12 @@ class MatrixBot:
                 detail=f"Context reset. Previous session archived to sessions/{archive_name}",
             )
             self.agent.reset_room(room_id)
+            # Clear todo state for this room (session-scoped; umbral = new session)
+            try:
+                from openalph.tools import _TODO_STATE
+                _TODO_STATE.pop(room_id, None)
+            except Exception:
+                pass
             self._active_rooms.discard(room_id)
             await self.send_notice(
                 room_id,
@@ -1240,6 +1300,11 @@ class MatrixBot:
                 history.clear()
                 history.extend(session_log.build_context(room_id))
                 self.agent.restore_usage(room_id, session_log.usage_totals(room_id))
+
+                # Rehydrate reminder engine fired-state from JSONL entries
+                # (e.g., a once-per-session trigger does not re-fire after restart)
+                if hasattr(self.agent, '_reminder_engine'):
+                    self.agent._reminder_engine.rehydrate(existing)
 
                 # Restore per-room overrides (model, thinking) from session log.
                 # Scan all entries — last override wins (user may have switched multiple times).
@@ -1486,10 +1551,43 @@ class MatrixBot:
                 async def _context_status_callback(req_room_id=None):
                     return self._build_context_status(req_room_id or room_id)
 
+                # --- Reminder wiring: send_notice + log_reminder closures ---
+                async def _reminder_send_notice(_room_id, body, **kw):
+                    """Emit an m.notice with collapsed <details> HTML for reminders."""
+                    html = (
+                        '<details>\n<summary>' + body.split('\n')[0] + '</summary>\n'
+                        + mistune.html(body) +
+                        '</details>'
+                    )
+                    content_msg = {
+                        "msgtype": "m.notice",
+                        "body": body,
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": html,
+                    }
+                    await self._room_send_with_retry(_room_id, content_msg)
+
+                async def _log_reminder(_room_id, reminder):
+                    """Log a Reminder to JSONL with source='reminder' + trigger."""
+                    _sl = getattr(self, 'session_log', None)
+                    if _sl:
+                        _sl.append(
+                            role="user",
+                            sender=self.config.user_id,
+                            room=_room_id,
+                            event_id=None,
+                            content=reminder.content,
+                            source="reminder",
+                            trigger=reminder.trigger,
+                        )
+
                 callbacks = {
                     "send_media": _upload_callback,
                     "on_redaction": _redaction_notice,
                     "context_status": _context_status_callback,
+                    "send_notice": _reminder_send_notice,
+                    "log_reminder": _log_reminder,
+                    "turn_source": None,
                 }
 
                 # Set up streaming delivery

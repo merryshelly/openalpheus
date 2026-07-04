@@ -131,10 +131,24 @@ async def edit_file(path: str, old_text: str, new_text: str) -> ToolResult:
         count = content.count(old_text)
         
         if count == 0:
-            return ToolResult(content=f"Error: old_text not found in file", is_error=True)
+            return ToolResult(
+                content=(
+                    f"Error: old_text not found in {path}. "
+                    "Read the file first — its content may differ from what you expect. "
+                    "Check spacing, indentation, and line endings exactly."
+                ),
+                is_error=True,
+            )
         
         if count > 1:
-            return ToolResult(content=f"Error: old_text appears {count} times in file (ambiguous)", is_error=True)
+            return ToolResult(
+                content=(
+                    f"Error: old_text appears {count} times in {path} (ambiguous). "
+                    "Add more surrounding context lines to old_text to disambiguate "
+                    "and uniquely identify the target occurrence."
+                ),
+                is_error=True,
+            )
         
         # Exactly one match - perform replacement
         new_content = content.replace(old_text, new_text, 1)

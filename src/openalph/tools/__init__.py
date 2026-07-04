@@ -139,25 +139,34 @@ class ToolError(Exception):
 
 BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
     "shell": {
-        "description": "Execute a shell command. Runs command via subprocess and returns stdout on success, stderr on failure. Timeout kills the process. Output may be truncated.",
+        "description": (
+            "Run a shell command and return stdout (success) or stderr (failure). "
+            "IMPORTANT: prefer bounded commands — pipe through head/tail/grep rather than "
+            "dumping unlimited output; large output is truncated. "
+            "NEVER run interactive commands (ssh, vim, python REPL, anything requiring stdin input) "
+            "— they will hang until timeout. "
+            "NEVER use for file reads/edits when file_read/file_edit are available; "
+            "those tools are safer and register reads in the session. "
+            "Timeout kills the process; set timeout explicitly for long-running tasks."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The shell command to execute. Pipe through head/tail/grep to bound output."
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the command (optional)"
+                    "description": "Working directory for the command (optional; defaults to workspace root)"
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (optional, uses default if not specified)"
+                    "description": "Timeout in seconds (optional; uses default if not specified — set explicitly for slow commands)"
                 },
                 "env": {
                     "type": "object",
-                    "description": "Environment variables to set (optional)",
+                    "description": "Extra environment variables to set for this command (optional)",
                     "additionalProperties": {"type": "string"}
                 }
             },
@@ -169,7 +178,12 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         }
     },
     "file_read": {
-        "description": "Read file contents. Returns file content as text. Supports offset and limit for reading portions of large files. Binary files return an error.",
+        "description": (
+            "Read a file and return its text content. "
+            "IMPORTANT: reading a file registers it in the session — required before file_write can overwrite it. "
+            "For large files use offset+limit to read in sections rather than loading the whole file at once. "
+            "Binary files return an error; use shell for binary inspection."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -179,11 +193,11 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Line number to start reading from (1-indexed, optional)"
+                    "description": "1-indexed line number to start reading from (optional; for large files, read in sections with offset+limit)"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of lines to read (optional)"
+                    "description": "Maximum number of lines to read (optional; combine with offset to page through large files)"
                 }
             },
             "required": ["path"]
@@ -191,7 +205,14 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         "config": {}
     },
     "file_write": {
-        "description": "Write content to a file. Creates parent directories if they don't exist. Overwrites the file if it already exists.",
+        "description": (
+            "Write content to a file, creating parent directories as needed. "
+            "NEVER write to an existing file you have not read this session — "
+            "the guard will refuse it and the file will be unchanged. "
+            "Read the file first (any offset/limit counts), then write. "
+            "Prefer file_edit for targeted changes to existing files; "
+            "file_write is for new files or complete replacements after reading."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -206,10 +227,19 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             },
             "required": ["path", "content"]
         },
-        "config": {}
+        "config": {
+            "require_read_before_write": True
+        }
     },
     "file_edit": {
-        "description": "Replace exact text in a file. Finds and replaces a single exact occurrence of old_text with new_text. Returns an error if no match is found or if multiple matches exist.",
+        "description": (
+            "Replace one exact occurrence of old_text with new_text in a file. "
+            "ALWAYS read the file first — exact-match fails against content you imagine rather than what is on disk. "
+            "IMPORTANT: preserve indentation and whitespace exactly in old_text; even a single space difference causes no-match. "
+            "Fails if old_text appears zero times (read the file first) or more than once "
+            "(add surrounding context lines to old_text to make it unique). "
+            "Prefer this over file_write for targeted changes to existing files."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -231,7 +261,13 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         "config": {}
     },
     "web_search": {
-        "description": "Search the web. Returns formatted results with title, URL, and snippet for each result.",
+        "description": (
+            "Search the web via Brave Search and return ranked results with title, URL, and snippet. "
+            "IMPORTANT: prefer many small targeted searches over one broad query — "
+            "narrow queries return more precise results. "
+            "Use web_fetch to retrieve full content from a result URL. "
+            "NOT for workspace/memory lookups — use memory_search for prior session knowledge."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -252,7 +288,12 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         }
     },
     "web_fetch": {
-        "description": "Fetch and extract readable content from a URL. Converts HTML to text and returns the readable content. Respects max_chars limit.",
+        "description": (
+            "Fetch a URL and return its readable text content (HTML converted to plain text). "
+            "Use max_chars to limit response size for large pages; if content is truncated, "
+            "increase max_chars or fetch a more specific anchor URL. "
+            "NOT for local files — use file_read instead."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -262,7 +303,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum characters to return (optional)"
+                    "description": "Maximum characters to return (optional; reduce for large pages, increase if content is cut off)"
                 }
             },
             "required": ["url"]
@@ -270,29 +311,38 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         "config": {}
     },
     "subagent": {
-        "description": "Run a focused sub-agent task. Multi-turn LLM call with tool access for isolated work. Sub-agent inherits parent's tools (except subagent) and iterates up to max_iterations (default 200). Uses parent's config for API key and provider.",
+        "description": (
+            "Delegate a focused, bounded task to an isolated sub-agent. "
+            "The sub-agent runs a full multi-turn tool loop and inherit the parent's enabled tools "
+            "(minus subagent itself, preventing recursion). "
+            "IMPORTANT: use for parallelisable or self-contained work that would consume "
+            "many of the parent's iterations; do not delegate for simple single-tool calls. "
+            "NEVER assume the sub-agent shares parent state — it starts with a clean context. "
+            "Specify model to route to a cheaper or more capable model for the sub-task; "
+            "set max_iterations conservatively to prevent runaway loops."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "Task description for the sub-agent"
+                    "description": "Complete self-contained task description for the sub-agent (include all context it needs)"
                 },
                 "system_prompt": {
                     "type": "string",
-                    "description": "Custom system prompt (optional, defaults to helpful assistant)"
+                    "description": "Custom system prompt for the sub-agent (optional; defaults to helpful assistant)"
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model to use (optional, defaults to parent's model)"
+                    "description": "Model identifier to use (optional; defaults to parent model — override to use a cheaper or stronger model)"
                 },
                 "max_tokens": {
                     "type": "integer",
-                    "description": "Maximum tokens for response (optional)"
+                    "description": "Maximum tokens per response turn (optional)"
                 },
                 "max_iterations": {
                     "type": "integer",
-                    "description": "Maximum tool-call iterations (optional, default 200)"
+                    "description": "Maximum tool-call iterations before the sub-agent stops (optional; default 100 — set lower for bounded tasks)"
                 }
             },
             "required": ["task"]
@@ -302,7 +352,14 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         }
     },
     "memory_search": {
-        "description": "Search workspace memory files using hybrid semantic + keyword search. Returns ranked snippets with file paths and line numbers. Use file_read to expand context around results.",
+        "description": (
+            "Search workspace memory files using hybrid semantic + keyword search. "
+            "Returns ranked snippets with file paths and line numbers. "
+            "IMPORTANT: search BEFORE asserting anything about prior work, decisions, dates, "
+            "people, preferences, or todos — do not rely on recall alone. "
+            "Run multiple targeted queries rather than one broad search. "
+            "Use file_read to expand context around a returned snippet."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -333,12 +390,53 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "extra_paths": []
         }
     },
+    "todo_write": {
+        "description": (
+            "Maintain a session-scoped task list for multi-step work. "
+            "Use for tasks with more than 3 steps; track exactly one in_progress item at a time. "
+            "Mark items completed ONLY when fully done — if blocked, keep in_progress and add a new item. "
+            "WHEN NOT TO USE: single-step tasks, trivial commands, or conversational replies. "
+            "IMPORTANT: This list dies with the session — promote anything durable "
+            "(blocked, deferred, or newly-discovered work) to your issue tracker before session end. "
+            "Replaces the entire list on every call (full-array replacement); empty array clears."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "Complete replacement list of todo items (empty array clears all)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Task description (required, must be non-empty)"
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Task status: pending, in_progress, or completed"
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Optional form or context identifier for the active task"
+                            }
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        },
+        "config": {}
+    },
     "context_status": {
         "description": (
-            "Get agent self-monitoring data: context window usage, session age, "
-            "model info, token stats, and heartbeat state. Use to make decisions "
-            "about delegation, context management, and turn planning. No parameters "
-            "required — returns current status as JSON."
+            "Return current agent self-monitoring data as JSON: context window usage, "
+            "session age, model info, token stats, and heartbeat state. "
+            "Use before delegating or when approaching context limits to inform handoff decisions. "
+            "No parameters required — room_id is injected by the framework."
         ),
         "parameters": {
             "type": "object",
@@ -354,9 +452,10 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
     },
     "send_media": {
         "description": (
-            "Send a file to the current Matrix room. Supports audio, images, "
-            "video, and generic files. The file must exist in your workspace. "
-            "Use after generating files (e.g., TTS audio) to deliver them."
+            "Upload and send a file to the current Matrix room. "
+            "Supports audio, images, video, and generic files. "
+            "IMPORTANT: the file must already exist in your workspace before calling this. "
+            "NOT for text replies — send text as normal message content, not as a file."
         ),
         "parameters": {
             "type": "object",
@@ -464,7 +563,9 @@ def wrap_tool_result(content: str, tool_name: str, tool_call_id: str) -> str:
     """Wrap tool result content in XML-style delimiter tags.
 
     Gives the LLM a structural signal that the content is tool output
-    (data), not instructions.  Content is never escaped or modified.
+    (data), not instructions.  Literal <system-reminder> and </system-reminder>
+    tags (case-insensitive) are escaped to entity form before wrapping to prevent
+    injection via tool output.  No other content is modified.
 
     Args:
         content: Raw tool result text (already truncated if needed)
@@ -474,6 +575,15 @@ def wrap_tool_result(content: str, tool_name: str, tool_call_id: str) -> str:
     Returns:
         Content wrapped in ``<tool_result>`` tags with provenance attributes
     """
+    import re as _re
+    # Escape <system-reminder> and </system-reminder> tags (case-insensitive)
+    # Only these specific tags; no other angle-bracket content is touched.
+    content = _re.sub(
+        r'<(/?)system-reminder>',
+        lambda m: f'&lt;{m.group(1)}system-reminder&gt;',
+        content,
+        flags=_re.IGNORECASE,
+    )
     return (
         f'<tool_result tool="{tool_name}" id="{tool_call_id}">\n'
         f"{content}\n"
@@ -501,9 +611,8 @@ def truncate_result(text: str, max_chars: int) -> str:
     removed_count = len(text) - max_chars
     
     # Budget for head and tail (leave room for marker)
-    # Marker format: "[truncated: N chars removed]"
-    # We need to account for marker length in the budget
-    marker = f"[truncated: {removed_count} chars removed]"
+    # Marker includes continuation steering so the agent knows how to recover.
+    marker = f"[truncated: {removed_count} chars removed — re-run with offset/limit or a narrower command to retrieve more]"
     marker_len = len(marker)
     
     # Available space for content after accounting for marker
@@ -522,6 +631,123 @@ def truncate_result(text: str, max_chars: int) -> str:
     tail = text[-tail_len:] if tail_len > 0 else ""
     
     return head + marker + tail
+
+
+# ---------------------------------------------------------------------------
+# todo_write: per-room/per-instance in-memory state
+# ---------------------------------------------------------------------------
+# State is kept in a dict keyed by room_id (from callbacks["room_id"]).
+# When callbacks has no room_id (e.g. sub-agent with empty callbacks dict),
+# the key is the id() of the callbacks dict, giving each caller-instance its
+# own isolated state — consistent with context_status/send_media precedents.
+_TODO_STATE: dict[Any, list[dict]] = {}
+
+_VALID_STATUSES = {"pending", "in_progress", "completed"}
+
+
+async def _execute_todo_write(input: dict, callbacks: dict | None) -> "ToolResult":
+    """Execute the todo_write tool.
+
+    Full-array replacement semantics: every call replaces the entire list.
+    Empty array clears. Validates before mutating state.
+
+    Args:
+        input: Tool input dict (must contain 'todos' key).
+        callbacks: Callbacks dict used for state isolation (room_id or obj identity).
+
+    Returns:
+        ToolResult with formatted list + counts on success, or error without
+        mutating state on validation failure.
+    """
+    todos = input.get("todos", [])
+
+    # Validate all items before touching state
+    in_progress_count = 0
+    for i, item in enumerate(todos):
+        content = item.get("content", "")
+        status = item.get("status", "")
+
+        if not isinstance(content, str) or not content.strip():
+            return ToolResult(
+                content=(
+                    f"Validation error: item {i} has empty or missing content. "
+                    "Each todo item must have a non-empty content string."
+                ),
+                is_error=True,
+            )
+
+        if status not in _VALID_STATUSES:
+            return ToolResult(
+                content=(
+                    f"Validation error: item {i} has invalid status {status!r}. "
+                    f"Valid status values are: {', '.join(sorted(_VALID_STATUSES))}."
+                ),
+                is_error=True,
+            )
+
+        if status == "in_progress":
+            in_progress_count += 1
+
+    if in_progress_count > 1:
+        return ToolResult(
+            content=(
+                f"Validation error: {in_progress_count} items have status in_progress. "
+                "At most 1 item may be in_progress at a time."
+            ),
+            is_error=True,
+        )
+
+    # Determine state key: room_id from callbacks, else id(callbacks) for isolation
+    if callbacks and "room_id" in callbacks:
+        state_key = callbacks["room_id"]
+    elif callbacks is not None:
+        state_key = id(callbacks)
+    else:
+        # No callbacks at all (e.g. bare execute_tool call in tests without room scoping)
+        state_key = None
+
+    # Full replacement: store validated list (defensive copy, strip unknown fields)
+    clean_todos = []
+    for item in todos:
+        clean_item: dict = {
+            "content": item["content"],
+            "status": item["status"],
+        }
+        if "activeForm" in item:
+            clean_item["activeForm"] = item["activeForm"]
+        clean_todos.append(clean_item)
+
+    _TODO_STATE[state_key] = clean_todos
+
+    # Build result echo: formatted list + counts
+    counts: dict[str, int] = {"pending": 0, "in_progress": 0, "completed": 0}
+    lines = []
+    status_symbols = {"pending": "○", "in_progress": "●", "completed": "✓"}
+    for item in clean_todos:
+        st = item["status"]
+        counts[st] = counts.get(st, 0) + 1
+        sym = status_symbols.get(st, "?")
+        lines.append(f"  {sym} [{st}] {item['content']}")
+
+    if not clean_todos:
+        list_text = "  (empty)"
+    else:
+        list_text = "\n".join(lines)
+
+    summary_parts = []
+    if counts["in_progress"]:
+        summary_parts.append(f"{counts['in_progress']} in progress")
+    if counts["pending"]:
+        summary_parts.append(f"{counts['pending']} pending")
+    if counts["completed"]:
+        summary_parts.append(f"{counts['completed']} completed")
+    if not summary_parts:
+        summary_parts = ["0 items"]
+
+    summary = " · ".join(summary_parts)
+    result_text = f"Todo list updated ({summary}):\n{list_text}"
+
+    return ToolResult(content=result_text, is_error=False)
 
 
 async def execute_tool(
@@ -576,6 +802,14 @@ async def execute_tool(
         if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
             input["path"] = str(agent_config.workspace / file_path)
 
+    # Normalize path to resolved form for registry keys (symlinks, .., relative spellings)
+    # so that read via relative and write via absolute always hit the same registry entry.
+    _resolved_path: str | None = None
+    if name in ("file_read", "file_write", "file_edit") and "path" in input:
+        try:
+            _resolved_path = str(Path(input["path"]).resolve())
+        except Exception:
+            _resolved_path = input["path"]
 
     if name == "shell":
         from .shell import run_shell
@@ -597,12 +831,73 @@ async def execute_tool(
             offset=input.get("offset"),
             limit=input.get("limit"),
         )
+        # On successful read, record path+mtime in read_registry
+        if not result.is_error and _resolved_path is not None and callbacks is not None:
+            _registry = callbacks.get("read_registry")
+            if _registry is not None:
+                try:
+                    import os as _os
+                    _mtime = _os.stat(_resolved_path).st_mtime
+                    _registry[_resolved_path] = _mtime
+                except Exception:
+                    pass  # best effort; guard will conservatively deny if stat fails
     elif name == "file_write":
         from .file import write_file
+        import os as _os_fw
+
+        # --- Read-before-write guard ---
+        _fw_path = input["path"]
+        _guard_enabled = tool_config.get("require_read_before_write", True)
+        if _guard_enabled and _resolved_path is not None and _os_fw.path.exists(_fw_path):
+            # File exists — apply guard
+            _registry = (callbacks or {}).get("read_registry") if callbacks else None
+            if _registry is None:
+                # No registry provided (guard cannot be satisfied) — block to be safe
+                # unless guard is explicitly disabled via config
+                return ToolResult(
+                    content=(
+                        f"File exists and was not read this session: {_fw_path}. "
+                        "Read it first, or use file_edit for targeted changes."
+                    ),
+                    is_error=True,
+                )
+            if _resolved_path not in _registry:
+                # File exists but was not read — refuse
+                return ToolResult(
+                    content=(
+                        f"File exists and was not read this session: {_fw_path}. "
+                        "Read it first, or use file_edit for targeted changes."
+                    ),
+                    is_error=True,
+                )
+            # File was read — check if mtime has changed since read
+            try:
+                _current_mtime = _os_fw.stat(_fw_path).st_mtime
+                _recorded_mtime = _registry[_resolved_path]
+                if _current_mtime > _recorded_mtime:
+                    return ToolResult(
+                        content=(
+                            f"File changed on disk since you last read it: {_fw_path}. "
+                            "Re-read before overwriting."
+                        ),
+                        is_error=True,
+                    )
+            except Exception:
+                pass  # stat failed; proceed (new file or disappeared — let write handle it)
+
         result = await write_file(
             path=input["path"],
             content=input["content"],
         )
+        # On successful write, update read_registry with new mtime
+        if not result.is_error and _resolved_path is not None and callbacks is not None:
+            _registry = callbacks.get("read_registry")
+            if _registry is not None:
+                try:
+                    _mtime = _os_fw.stat(_fw_path).st_mtime
+                    _registry[_resolved_path] = _mtime
+                except Exception:
+                    pass
     elif name == "file_edit":
         from .file import edit_file
         result = await edit_file(
@@ -610,6 +905,16 @@ async def execute_tool(
             old_text=input["old_text"],
             new_text=input["new_text"],
         )
+        # On successful edit, update read_registry with new mtime (keeps registry fresh)
+        if not result.is_error and _resolved_path is not None and callbacks is not None:
+            _registry = callbacks.get("read_registry")
+            if _registry is not None:
+                try:
+                    import os as _os_fe
+                    _mtime = _os_fe.stat(_resolved_path).st_mtime
+                    _registry[_resolved_path] = _mtime
+                except Exception:
+                    pass
     elif name == "web_search":
         from .web import web_search
         # Resolve api_key: direct value, or via api_key_cmd with TTL caching.
@@ -676,6 +981,8 @@ async def execute_tool(
             max_upload_bytes=tool_config.get("max_upload_bytes", 20_971_520),
             upload_callback=callbacks.get("send_media") if callbacks else None,
         )
+    elif name == "todo_write":
+        result = await _execute_todo_write(input, callbacks)
     else:
         return ToolResult(
             content=f"Unknown tool: {name}",
