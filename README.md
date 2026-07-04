@@ -18,7 +18,7 @@ All agent frameworks make tradeoffs. We optimized for:
 
 - **Control.** Full control of the system prompt. Your agent doesn't read a single character you didn't put there. Behavior is configured by editing markdown files — no code required.
 - **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
-- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Ten tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
+- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Eleven tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
 - **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
 - **Maintainability.** ~9,000 LOC. Full test coverage. Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
 - **Resilience.** Each agent runs as an isolated Unix process with its own filesystem. One agent can crash out, trash its workspace, and the others are unaffected.
@@ -85,9 +85,18 @@ Skills are listed by name in the prompt; the agent reads their content on demand
 
 Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
 
-Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `web_search`\*, `web_fetch`, `subagent`, `memory_search`, `send_media`, `context_status`.
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `web_search`\*, `web_fetch`, `subagent`, `memory_search`, `send_media`, `context_status`, `todo_write`.
 
 \*`web_search` requires a [Brave Search API key](https://brave.com/search/api/) configured in `workspace/tools/web_search.toml`. Without it, the tool is available but returns an error. `web_fetch` (direct URL fetching) works without any API key.
+
+### Guidance injection
+
+Optional, config-aware in-stream guidance that helps agents stay on track during long turns — without touching the system prompt, and fully visible.
+
+- **System reminders.** A per-room engine evaluates deterministic triggers against harness-observable state (iteration count, context %, memory-search history, todo state) and injects `<system-reminder>` messages at tool-call boundaries. No NLP, no model calls. Every injected byte is durable in the session JSONL and surfaces as a collapsed Matrix notice. Disable per agent with `reminders = false` in `[agent]`.
+- **`todo_write` tool.** A session-scoped working-memory task list. The harness stays tracker-agnostic — promoting todos to a durable tracker is an operator convention, not a dependency.
+- **Read-before-write guard.** `file_write` refuses to overwrite an existing file not read this session (or changed on disk since) — blind overwrites are structurally prevented, not just discouraged. Opt out with `require_read_before_write = false` in `workspace/tools/file_write.toml`.
+- **Rich tool descriptions.** All built-in tools carry prompt-engineered descriptions (purpose, constraints, when-not) plus steering in error/truncation returns — passed via the API `tools` parameter, never injected into the system prompt.
 
 ### Providers
 
@@ -101,7 +110,7 @@ Hybrid semantic + keyword search over workspace files. Nomic-embed-text embeddin
 
 ### Security
 
-Credential redaction (10 pattern types) applied to all tool output before it enters agent context. Tool results wrapped with injection defense. Unix user isolation is kernel-enforced. Homeserver registration locked after bootstrap.
+Credential redaction (10 pattern types) applied to all tool output before it enters agent context. Tool results wrapped with injection defense. Literal `<system-reminder>` markup in untrusted tool and user content is escaped so it cannot forge harness guidance. Unix user isolation is kernel-enforced. Homeserver registration locked after bootstrap.
 
 ## Source Tree
 
