@@ -13,6 +13,7 @@ import hashlib
 import logging
 import tempfile
 import time
+from html import escape as html_escape
 from pathlib import Path
 
 import mistune
@@ -777,10 +778,33 @@ class MatrixBot:
                     pass
             else:
                 notice_body = f"🔧 {name}{detail} {status}"
-                try:
-                    await self.send_notice(room_id, notice_body)
-                except Exception:
-                    pass
+                if is_error:
+                    result_str = str(result) if result else ""
+                    if len(result_str) > 2000:
+                        detail_text = result_str[:2000] + "\n[error detail truncated]"
+                    else:
+                        detail_text = result_str
+                    error_html = (
+                        html_escape(notice_body)
+                        + '\n<details>\n<summary>⚠️ Error detail</summary>\n'
+                        + html_escape(detail_text)
+                        + '</details>'
+                    )
+                    content_msg = {
+                        "msgtype": "m.notice",
+                        "body": notice_body,
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": error_html,
+                    }
+                    try:
+                        await self._room_send_with_retry(room_id, content_msg)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await self.send_notice(room_id, notice_body)
+                    except Exception:
+                        pass
             # Append tool result to session log
             _sl = getattr(self, 'session_log', None)
             if _sl:

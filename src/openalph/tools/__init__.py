@@ -147,6 +147,8 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "— they will hang until timeout. "
             "NEVER use for file reads/edits when file_read/file_edit are available; "
             "those tools are safer and register reads in the session. "
+            "For content or filename search across files, prefer the grep/glob tools "
+            "(bounded, structured output) over shell grep/find pipelines. "
             "Timeout kills the process; set timeout explicitly for long-running tasks."
         ),
         "parameters": {
@@ -182,7 +184,8 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "Read a file and return its text content. "
             "IMPORTANT: reading a file registers it in the session — required before file_write can overwrite it. "
             "For large files use offset+limit to read in sections rather than loading the whole file at once. "
-            "Binary files return an error; use shell for binary inspection."
+            "Binary files return an error; use shell for binary inspection. "
+            "To locate files or content first, use glob/grep."
         ),
         "parameters": {
             "type": "object",
@@ -210,6 +213,9 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "NEVER write to an existing file you have not read this session — "
             "the guard will refuse it and the file will be unchanged. "
             "Read the file first (any offset/limit counts), then write. "
+            "Written files are syntax-validated for known code types "
+            "(a clean file that would become broken is rejected, unchanged; "
+            "new files must be born clean). "
             "Prefer file_edit for targeted changes to existing files; "
             "file_write is for new files or complete replacements after reading."
         ),
@@ -237,7 +243,13 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "ALWAYS read the file first — exact-match fails against content you imagine rather than what is on disk. "
             "IMPORTANT: preserve indentation and whitespace exactly in old_text; even a single space difference causes no-match. "
             "Fails if old_text appears zero times (read the file first) or more than once "
-            "(add surrounding context lines to old_text to make it unique). "
+            "(add surrounding context lines to old_text to make it unique) — unless replace_all is set. "
+            "Set replace_all=true to replace every occurrence in one call (e.g. renaming a symbol "
+            "or string across the whole file) instead of disambiguating a single match. "
+            "For multiple distinct edits to the same file in one call, prefer file_patch "
+            "(multi-hunk, atomic). "
+            "The resulting file is syntax-validated for known code types; an edit that would "
+            "turn a clean file broken is rejected, unchanged. "
             "Prefer this over file_write for targeted changes to existing files."
         ),
         "parameters": {
@@ -254,11 +266,138 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 "new_text": {
                     "type": "string",
                     "description": "Text to replace the old_text with"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every occurrence instead of requiring exactly one (optional; default false) — use for renaming a symbol/string across the file"
                 }
             },
             "required": ["path", "old_text", "new_text"]
         },
         "config": {}
+    },
+    "file_patch": {
+        "description": (
+            "Apply one or more SEARCH/REPLACE hunks to an existing file in a single, atomic call. "
+            "Fence syntax (each hunk):\n"
+            "<<<<<<< SEARCH\n"
+            "exact existing lines\n"
+            "=======\n"
+            "replacement lines\n"
+            ">>>>>>> REPLACE\n"
+            "Worked example — change 'foo = 1' to 'foo = 2':\n"
+            "<<<<<<< SEARCH\n"
+            "foo = 1\n"
+            "=======\n"
+            "foo = 2\n"
+            ">>>>>>> REPLACE\n"
+            "IMPORTANT: read the file first — each hunk's SEARCH must match the current file "
+            "content EXACTLY (whitespace and indentation included) exactly once. "
+            "Prefer ONE file_patch call with multiple hunks over many separate file_edit calls "
+            "on the same file. Hunks apply in order against the file as edited by earlier hunks "
+            "in the same call; ALL-OR-NOTHING — if any hunk fails to match, no hunk is written "
+            "and the file is left byte-identical. "
+            "The resulting file is syntax-validated for known code types; a patch that would "
+            "turn a clean file broken is rejected, unchanged. "
+            "When NOT to use: creating a new file (use file_write); a single trivial replacement "
+            "in a file (use file_edit)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to patch (relative paths resolve from workspace root — use skills/foo.md, not workspace/skills/foo.md); file must already exist"
+                },
+                "patch": {
+                    "type": "string",
+                    "description": "One or more SEARCH/REPLACE fenced hunks (text outside blocks is ignored)"
+                }
+            },
+            "required": ["path", "patch"]
+        },
+        "config": {}
+    },
+    "grep": {
+        "description": (
+            "Search file contents for a pattern across the workspace (or a "
+            "narrower path/glob) using Python re syntax, matched per line. "
+            "IMPORTANT: prefer many small targeted searches (narrow path/glob, "
+            "specific pattern) over one broad search across the whole tree. "
+            "Default output_mode='files_with_matches' returns matching filenames "
+            "only; use output_mode='content' to see the actual matching lines, "
+            "or output_mode='count' for per-file/total match counts. "
+            "NOT for memory or prior-session lookups — use memory_search for "
+            "recalling past work, decisions, or preferences; grep only sees "
+            "files that exist on disk right now."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Python re regular expression, matched against each line individually"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search (optional; default: workspace root)"
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Filename filter, fnmatch syntax (e.g. \"*.py\") narrowing which files are searched (optional)"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "description": "\"files_with_matches\" (default, filenames only) | \"content\" (matching lines as 'path:lineno: line') | \"count\" (per-file + total match counts)"
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "description": "Cap on returned entries (optional; default 50 for files_with_matches/count, 100 for content)"
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Match case-insensitively (optional; default false)"
+                }
+            },
+            "required": ["pattern"]
+        },
+        "config": {
+            "max_scan_files": 10000,
+            "max_file_bytes": 5242880
+        }
+    },
+    "glob": {
+        "description": (
+            "Find files and directories by name pattern (pathlib glob syntax, "
+            "including \"**\" for recursion) under the workspace or a given path. "
+            "pattern=\"*\" lists a directory's entries — this is the directory-"
+            "listing tool; results are sorted newest-first (by mtime) and "
+            "directories are rendered with a trailing \"/\". "
+            "NOT for searching file contents — use grep for matching lines "
+            "within files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern (pathlib syntax, e.g. \"*.py\", \"**/*.md\", \"*\" for a directory listing)"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory root to search (optional; default: workspace root)"
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "description": "Cap on returned entries (optional; default 100)"
+                }
+            },
+            "required": ["pattern"]
+        },
+        "config": {
+            "max_scan_files": 10000,
+            "max_file_bytes": 5242880
+        }
     },
     "web_search": {
         "description": (
@@ -786,6 +925,34 @@ async def _execute_todo_write(input: dict, callbacks: dict | None) -> "ToolResul
     return ToolResult(content=result_text, is_error=False)
 
 
+def _update_read_registry(resolved_path: str | None, callbacks: dict | None) -> None:
+    """Refresh the read-registry mtime entry for a resolved path after a mutation.
+
+    Shared by file_read/file_write/file_edit/file_patch (all four call sites use
+    this exact same best-effort pattern) so that a file freshly written/edited/
+    patched/read is considered "read this session" for the write-before-read
+    guard (V6). Best effort: any failure (missing registry, stat failure, no
+    callbacks) is silently ignored — the guard falls back to conservative
+    denial rather than raising through a successful tool call.
+
+    Args:
+        resolved_path: Absolute, resolved path whose registry entry should be
+            refreshed, or None if no path was resolved for this call.
+        callbacks: The callbacks dict passed to execute_tool (may be None, or
+            may lack a "read_registry" key).
+    """
+    if resolved_path is None or callbacks is None:
+        return
+    _registry = callbacks.get("read_registry")
+    if _registry is None:
+        return
+    try:
+        _mtime = os.stat(resolved_path).st_mtime
+        _registry[resolved_path] = _mtime
+    except Exception:
+        pass  # best effort; guard will conservatively deny if stat fails
+
+
 async def execute_tool(
     name: str,
     input: dict,
@@ -794,10 +961,10 @@ async def execute_tool(
     tools: list[ToolDef] | None = None,
     callbacks: dict | None = None,
 ) -> ToolResult:
-    """Dispatch to the named tool executor.
-    
-    Routes input + config to the appropriate tool implementation.
-    
+    """Validate name/params against BUILTIN_TOOLS, dispatch to the tool's
+    executor module, then redact credentials from the result before
+    returning (truncate + wrap happen later, at the call site).
+
     Args:
         name: Tool name to execute
         input: Tool input parameters
@@ -806,10 +973,6 @@ async def execute_tool(
         
     Returns:
         ToolResult with content and error status
-        
-    Note:
-        This is a stub that dispatches to tool-specific modules.
-        Full implementation will be in Phase 2.
     """
     # Validate tool name exists
     if name not in BUILTIN_TOOLS:
@@ -833,7 +996,10 @@ async def execute_tool(
     input = dict(input)
 
     # Resolve relative paths for file tools against workspace
-    if name in ("file_read", "file_write", "file_edit", "send_media") and "path" in input:
+    # grep/glob join this tuple ONLY (not the _resolved_path registry tuple
+    # below) — a match is not a file read for write-guard purposes (anchors §7.2).
+    if name in ("file_read", "file_write", "file_edit", "file_patch", "send_media",
+                "grep", "glob") and "path" in input:
         file_path = input["path"]
         if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
             input["path"] = str(agent_config.workspace / file_path)
@@ -841,7 +1007,7 @@ async def execute_tool(
     # Normalize path to resolved form for registry keys (symlinks, .., relative spellings)
     # so that read via relative and write via absolute always hit the same registry entry.
     _resolved_path: str | None = None
-    if name in ("file_read", "file_write", "file_edit") and "path" in input:
+    if name in ("file_read", "file_write", "file_edit", "file_patch") and "path" in input:
         try:
             _resolved_path = str(Path(input["path"]).resolve())
         except Exception:
@@ -868,15 +1034,8 @@ async def execute_tool(
             limit=input.get("limit"),
         )
         # On successful read, record path+mtime in read_registry
-        if not result.is_error and _resolved_path is not None and callbacks is not None:
-            _registry = callbacks.get("read_registry")
-            if _registry is not None:
-                try:
-                    import os as _os
-                    _mtime = _os.stat(_resolved_path).st_mtime
-                    _registry[_resolved_path] = _mtime
-                except Exception:
-                    pass  # best effort; guard will conservatively deny if stat fails
+        if not result.is_error:
+            _update_read_registry(_resolved_path, callbacks)
     elif name == "file_write":
         from .file import write_file
         import os as _os_fw
@@ -924,33 +1083,58 @@ async def execute_tool(
         result = await write_file(
             path=input["path"],
             content=input["content"],
+            tool_config=tool_config,
         )
         # On successful write, update read_registry with new mtime
-        if not result.is_error and _resolved_path is not None and callbacks is not None:
-            _registry = callbacks.get("read_registry")
-            if _registry is not None:
-                try:
-                    _mtime = _os_fw.stat(_resolved_path).st_mtime
-                    _registry[_resolved_path] = _mtime
-                except Exception:
-                    pass
+        if not result.is_error:
+            _update_read_registry(_resolved_path, callbacks)
     elif name == "file_edit":
         from .file import edit_file
         result = await edit_file(
             path=input["path"],
             old_text=input["old_text"],
             new_text=input["new_text"],
+            replace_all=input.get("replace_all", False),
+            tool_config=tool_config,
         )
         # On successful edit, update read_registry with new mtime (keeps registry fresh)
-        if not result.is_error and _resolved_path is not None and callbacks is not None:
-            _registry = callbacks.get("read_registry")
-            if _registry is not None:
-                try:
-                    import os as _os_fe
-                    _mtime = _os_fe.stat(_resolved_path).st_mtime
-                    _registry[_resolved_path] = _mtime
-                except Exception:
-                    pass
+        if not result.is_error:
+            _update_read_registry(_resolved_path, callbacks)
+    elif name == "file_patch":
+        from .file import patch_file
+        result = await patch_file(
+            path=input["path"],
+            patch=input["patch"],
+            tool_config=tool_config,
+        )
+        # On successful patch, update read_registry with new mtime (keeps registry fresh)
+        if not result.is_error:
+            _update_read_registry(_resolved_path, callbacks)
+    elif name == "grep":
+        from .search import run_grep
+        result = await run_grep(
+            pattern=input["pattern"],
+            path=input.get("path"),
+            glob=input.get("glob"),
+            output_mode=input.get("output_mode", "files_with_matches"),
+            head_limit=input.get("head_limit"),
+            case_insensitive=input.get("case_insensitive", False),
+            config=tool_config,
+            workspace=agent_config.workspace if hasattr(agent_config, "workspace") else Path("."),
+        )
+        # grep is read-only over file CONTENT for search purposes, not a
+        # file_read — it does NOT touch the read-registry (anchors §7.2).
+    elif name == "glob":
+        from .search import run_glob
+        result = await run_glob(
+            pattern=input["pattern"],
+            path=input.get("path"),
+            head_limit=input.get("head_limit"),
+            config=tool_config,
+            workspace=agent_config.workspace if hasattr(agent_config, "workspace") else Path("."),
+        )
+        # glob is a directory/name listing, not a file_read — it does NOT
+        # touch the read-registry (anchors §7.2).
     elif name == "web_search":
         from .web import web_search
         # Resolve api_key: direct value, or via api_key_cmd with TTL caching.
