@@ -827,6 +827,65 @@ def _build_openai_kwargs(
     return api_kwargs
 
 
+KEEPALIVE_MAX_OUTPUT_TOKENS = 1  # ping output is discarded; we only want the cache read
+
+
+async def ping_cache(
+    config: AgentConfig,
+    *,
+    system: str,
+    messages: list[dict],
+    tools: list | None,
+    cache_ttl: str | None,
+    model: str | None = None,
+) -> Usage | None:
+    """Refresh an Anthropic prompt-cache prefix by replaying the last request.
+
+    Issues a SINGLE non-streaming Anthropic call with the same cached prefix
+    (model + system + tools + messages + cache_ttl) as the parent's in-flight
+    request, capped at KEEPALIVE_MAX_OUTPUT_TOKENS with thinking forced off
+    (a 1-token cap mis-clamps a thinking budget; thinking is a request param,
+    not part of the cached content prefix, so disabling it preserves the key).
+    The throwaway output is discarded; the returned Usage lets the caller verify
+    the ping was a cache READ (hit) rather than a WRITE (prefix drift/expiry).
+
+    Returns None for non-Anthropic providers (OpenAI-compat auto-caches; no TTL
+    knob, no write premium) — nothing to refresh.
+    """
+    model_str = model or config.default_model
+    provider_cfg, api_model = resolve_model(
+        model_str, config.providers, aliases=config.model_aliases,
+    )
+    if provider_cfg.type != "anthropic":
+        return None
+
+    provider_messages = _convert_messages_for_provider(messages, provider_cfg.type)
+    provider_tools = _convert_tools_for_provider(tools, provider_cfg.type)
+    client = _get_client(provider_cfg)
+
+    api_kwargs = _build_anthropic_kwargs(
+        api_model=api_model,
+        system=system,
+        provider_messages=provider_messages,
+        provider_tools=provider_tools,
+        max_tokens=KEEPALIVE_MAX_OUTPUT_TOKENS,
+        thinking_level="off",
+        model_max_tokens=getattr(config, "model_max_tokens", 200000),
+        temperature=None,
+        top_p=None,
+        cache_ttl=cache_ttl,
+    )
+
+    response = await client.messages.create(**api_kwargs)
+    u = response.usage
+    return Usage(
+        input_tokens=u.input_tokens,
+        output_tokens=u.output_tokens,
+        cache_read_tokens=u.cache_read_input_tokens,
+        cache_creation_tokens=u.cache_creation_input_tokens,
+    )
+
+
 async def stream(
     config: AgentConfig,
     system: str,

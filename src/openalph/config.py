@@ -53,6 +53,7 @@ class ProviderConfig:
     quirks: list[str] = field(default_factory=list)
     timeout: float = 600.0  # HTTP read timeout in seconds (default matches SDK defaults)
     cache_bust_notices: bool = False  # Emit in-room notice on full prompt cache miss
+    subagent_cache_keepalive: bool = False  # Refresh parent prompt cache during long subagent runs (Anthropic only)
     routing: dict | None = None  # OpenRouter provider routing preferences
 
 
@@ -346,6 +347,10 @@ def load_config(path: Path) -> AgentConfig:
         cache_bust_notices = section_data.get("cache_bust_notices", False)
         if not isinstance(cache_bust_notices, bool):
             raise ConfigError(f"cache_bust_notices must be a boolean")
+
+        subagent_cache_keepalive = section_data.get("subagent_cache_keepalive", False)
+        if not isinstance(subagent_cache_keepalive, bool):
+            raise ConfigError(f"subagent_cache_keepalive must be a boolean")
         
         routing = section_data.get("routing")
         if routing is not None and not isinstance(routing, dict):
@@ -359,6 +364,7 @@ def load_config(path: Path) -> AgentConfig:
             quirks=quirks,
             timeout=timeout,
             cache_bust_notices=cache_bust_notices,
+            subagent_cache_keepalive=subagent_cache_keepalive,
             routing=routing,
         )
 

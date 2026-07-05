@@ -6,6 +6,7 @@ so the operator can check usage without external tooling.
 """
 
 import asyncio
+import contextlib
 import base64
 import json
 import logging
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
-from openalph.provider import complete, stream, StreamEvent, ThinkingBlock
+from openalph.provider import complete, stream, ping_cache, StreamEvent, ThinkingBlock
 from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, BUILTIN_TOOLS, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
 
@@ -133,6 +134,33 @@ class ContextOverflowError(Exception):
             f"Context overflow: ~{current_tokens:,} tokens exceeds model capacity "
             f"({max_tokens:,}). Start a new room."
         )
+
+
+# --- Subagent cache keepalive (workspace-kdsn.190) -------------------------
+KEEPALIVE_REFRESH_FRACTION = 0.8   # refresh at 80% of the TTL window
+KEEPALIVE_MIN_INTERVAL_S = 60      # floor (protects a 5m-TTL room)
+KEEPALIVE_MIN_CACHE_READ = 1000    # a real prefix hit reads at least this many tokens
+_KEEPALIVE_TTL_SECONDS = {"5m": 300, "1h": 3600}
+KEEPALIVE_MAX_CONSECUTIVE_ERRORS = 3   # abort keepalive after this many back-to-back ping errors
+KEEPALIVE_ERROR_BACKOFF_S = 5          # quick retry after a transient ping error (capped by interval)
+
+
+def _keepalive_ttl_seconds(cache_ttl: str | None) -> int:
+    """Resolve a cache_ttl label to seconds; unknown/None -> 1h (platform default)."""
+    return _KEEPALIVE_TTL_SECONDS.get(cache_ttl or "1h", 3600)
+
+
+def _keepalive_interval(cache_ttl: str | None) -> float:
+    """Refresh interval: a fraction of the TTL, floored at KEEPALIVE_MIN_INTERVAL_S."""
+    return max(_keepalive_ttl_seconds(cache_ttl) * KEEPALIVE_REFRESH_FRACTION,
+               KEEPALIVE_MIN_INTERVAL_S)
+
+
+def _keepalive_is_hit(read: int | None, write: int | None) -> bool:
+    """A ping is a cache HIT when the read dominates the write and clears the floor."""
+    read = read or 0
+    write = write or 0
+    return read > write and read >= KEEPALIVE_MIN_CACHE_READ
 
 
 class Agent:
@@ -371,6 +399,114 @@ class Agent:
                 f.write(json.dumps(entry) + "\n")
         except Exception as e:
             logger.warning(f"Failed to write JSONL log: {e}")
+
+    def _maybe_arm_cache_keepalive(self, *, room_id, active_tool_calls,
+                                   request_messages, tools_arg, cache_ttl, callbacks,
+                                   stream_start=None):
+        """Arm a background cache-keepalive task iff a subagent is in the batch AND
+        the active model is an Anthropic provider with subagent_cache_keepalive on.
+        Returns (task, stop_event) or (None, None). Zero overhead in the default path.
+        One task covers the parent's single cache prefix even for N parallel subagents.
+        """
+        if not any(getattr(tc, "name", None) == "subagent" for tc in active_tool_calls):
+            return None, None
+        try:
+            from openalph.config import resolve_model
+            provider_cfg, _ = resolve_model(
+                self.get_model(room_id), self.config.providers,
+                aliases=self.config.model_aliases,
+            )
+        except Exception:
+            return None, None
+        if provider_cfg.type != "anthropic" or not getattr(
+            provider_cfg, "subagent_cache_keepalive", False
+        ):
+            return None, None
+        stop = asyncio.Event()
+        on_miss = (callbacks or {}).get("on_keepalive_miss")
+        elapsed = (time.monotonic() - stream_start) if stream_start is not None else 0.0
+        logger.info(
+            "cache keepalive armed in %s (interval=%.0fs, stream_elapsed=%.1fs)",
+            room_id, _keepalive_interval(cache_ttl), elapsed,
+        )
+        task = asyncio.create_task(self._cache_keepalive(
+            system=self.system_prompt,
+            messages=request_messages,
+            tools=tools_arg,
+            cache_ttl=cache_ttl,
+            model=self.get_model(room_id),
+            room_id=room_id,
+            on_miss=on_miss,
+            stop=stop,
+            stream_elapsed=elapsed,
+        ))
+        return task, stop
+
+    async def _cache_keepalive(self, *, system, messages, tools, cache_ttl, model,
+                               room_id, on_miss, stop, stream_elapsed=0.0):
+        """Periodically refresh the parent's Anthropic prompt cache while a subagent
+        runs. Fires a cheap max_tokens=1 ping just inside the TTL; verifies each ping
+        was a cache READ and aborts (with an operator notice) on a WRITE signature so
+        a drifted/expired prefix cannot turn insurance into a cost bomb.
+
+        The cache TTL starts at the *request* (stream start), not at arm time, so the
+        first fire is shortened by the stream duration already elapsed. Transient ping
+        errors get quick retries; KEEPALIVE_MAX_CONSECUTIVE_ERRORS in a row aborts with
+        an operator notice instead of retrying blindly for the whole subagent run.
+        """
+        interval = _keepalive_interval(cache_ttl)
+        # First fire accounts for time already consumed by the (possibly slow) stream.
+        next_wait = max(interval - max(stream_elapsed, 0.0), 0.0)
+        errors = 0
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=next_wait)
+                return  # stop set (gather completed / cancelled) -> clean exit
+            except asyncio.TimeoutError:
+                pass  # time to refresh
+            next_wait = interval  # subsequent fires use the full interval unless shortened below
+            try:
+                usage = await ping_cache(
+                    self.config, system=system, messages=messages,
+                    tools=tools, cache_ttl=cache_ttl, model=model,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # A ping failure must NEVER crash the parent turn.
+                errors += 1
+                logger.warning("cache keepalive ping error #%d in %s: %s", errors, room_id, e)
+                if errors >= KEEPALIVE_MAX_CONSECUTIVE_ERRORS:
+                    logger.warning(
+                        "cache keepalive aborting after %d consecutive errors in %s",
+                        errors, room_id,
+                    )
+                    await self._keepalive_notify_miss(on_miss, room_id)
+                    return
+                next_wait = min(KEEPALIVE_ERROR_BACKOFF_S, interval)  # quick retry, not a full TTL window
+                continue
+            errors = 0  # a completed ping (hit or miss) clears the error streak
+            if usage is None:
+                return  # non-Anthropic (gated upstream) -> nothing to do
+            read = usage.cache_read_tokens or 0
+            write = usage.cache_creation_tokens or 0
+            if _keepalive_is_hit(read, write):
+                logger.info("cache keepalive hit in %s (read=%d write=%d)", room_id, read, write)
+                continue
+            logger.warning(
+                "cache keepalive MISS in %s (read=%d write=%d) -- disabling for this turn",
+                room_id, read, write,
+            )
+            await self._keepalive_notify_miss(on_miss, room_id)
+            return  # never ping into a miss
+
+    async def _keepalive_notify_miss(self, on_miss, room_id):
+        """Fire the operator miss-notice callback, isolated from its own failures."""
+        if on_miss is not None:
+            try:
+                await on_miss(room_id)
+            except Exception:
+                logger.error("cache keepalive miss notice failed in %s", room_id, exc_info=True)
 
     async def handle_input(self, text: str, room_id: str = "_default", *,
                            on_tool_call=None, on_tool_intent=None, thinking: str | None = None,
@@ -617,10 +753,21 @@ class Agent:
                     tool_calls = []
                     usage = None
 
+                    # Cache-keepalive (spec §1.3): snapshot the EXACT request suffix
+                    # sent this iteration -- it ends on a valid user/tool_result
+                    # boundary. The post-response history ends on the assistant
+                    # tool_use turn, which is not a replayable prefix.
+                    # INVARIANT: history dicts (and tools_arg) are APPEND-ONLY /
+                    # stable between this shallow snapshot and the keepalive's last
+                    # ping. In-place mutation of an existing entry would drift the
+                    # cache key. The hit-check catches drift (one bounded write) but
+                    # preventing it is cheaper -- keep such mutations append-only.
+                    _ka_request_messages = list(history)
+
                     async for event in stream(
                         config=self.config,
                         system=self.system_prompt,
-                        messages=list(history),
+                        messages=_ka_request_messages,
                         tools=tools_arg,
                         model=self.get_model(room_id),
                         thinking=effective_thinking,
@@ -777,7 +924,24 @@ class Agent:
                             callbacks=tc_callbacks,
                         ))
 
-                    results = await asyncio.gather(*tool_coros)
+                    _ka_task, _ka_stop = self._maybe_arm_cache_keepalive(
+                        room_id=room_id,
+                        active_tool_calls=active_tool_calls,
+                        request_messages=_ka_request_messages,
+                        tools_arg=tools_arg,
+                        cache_ttl=cache_ttl,
+                        callbacks=callbacks,
+                        stream_start=start_time,
+                    )
+                    try:
+                        results = await asyncio.gather(*tool_coros)
+                    finally:
+                        if _ka_task is not None:
+                            _ka_stop.set()
+                            _ka_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await _ka_task
+                            logger.info("cache keepalive disarmed in %s", room_id)
 
                     # Track total tool calls (aggregate + per-tool-name + per-turn)
                     self._record_tool_calls(room_id, len(active_tool_calls))

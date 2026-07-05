@@ -888,6 +888,26 @@ class MatrixBot:
                         detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
                     )
 
+        async def _keepalive_miss_notice(_room_id=None):
+            """Emit notice + system log when cache keepalive detects a write (miss)."""
+            rid = _room_id or room_id
+            notice = ("⚠️ cache keepalive missed (wrote instead of read) -- "
+                      "disabling for this turn; next resume may bust cache")
+            try:
+                await self.send_notice(rid, notice)
+            except Exception as exc:
+                logger.error("cache keepalive miss notice failed in %s: %s", rid, exc, exc_info=True)
+            _sl = getattr(self, 'session_log', None)
+            if _sl:
+                _sl.append(
+                    role="system",
+                    sender=self.config.user_id,
+                    room=rid,
+                    event_id=None,
+                    event="cache_keepalive_miss",
+                    detail="ping wrote instead of read",
+                )
+
         # R1-1: per-room read registry for file_write guard
         # Use getattr for compatibility with mocked agents in test suites
         _registries = getattr(self.agent, '_read_registries', None)
@@ -902,6 +922,7 @@ class MatrixBot:
         return {
             "send_media": _upload_callback,
             "on_redaction": _redaction_notice,
+            "on_keepalive_miss": _keepalive_miss_notice,
             "context_status": _context_status_callback,
             "send_notice": _reminder_send_notice,
             "log_reminder": _log_reminder,
