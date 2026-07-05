@@ -197,16 +197,47 @@ class StreamEvent:
 def _supports_adaptive_thinking(model_id: str) -> bool:
     """Returns True for models that support adaptive thinking (type=adaptive + effort).
 
-    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, sonnet-4-6, mythos, fable.
+    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, sonnet-4-6, sonnet-5, mythos, fable.
+
+    Case-insensitive (matches model_context_window / _model_output_cap).
     """
+    model_id = model_id.lower()
     return (
         "opus-4-5" in model_id
         or "opus-4-6" in model_id
         or "sonnet-4-6" in model_id
+        or "sonnet-5" in model_id
         or "opus-4-7" in model_id
         or "opus-4-8" in model_id
         or "mythos" in model_id
         or "fable" in model_id
+    )
+
+
+def _supports_sampling_params(model_id: str) -> bool:
+    """Returns True for Anthropic models that accept temperature/top_p/top_k.
+
+    Modern Anthropic models removed sampling params: Opus 4.7, Opus 4.8, Sonnet 5,
+    Fable, and Mythos 400 (or silently ignore) when temperature/top_p/top_k are
+    sent. Only older releases still accept them.
+
+    Fail-closed ALLOWLIST: the 4.x families are enumerated PER-MINOR, so a future
+    in-family minor that drops sampling (as Opus did at 4.6 -> 4.7) is NOT
+    auto-accepted; only the frozen legacy claude-3.x family is matched broadly.
+    Unknown/future models default to False, so we never send a param that 400s (a
+    dropped param on a model that would have accepted it is merely ignored, never
+    an error). Case-insensitive, matching model_context_window/_model_output_cap.
+
+    Verified empirically 2026-07-04 (live API, oa-babson key): claude-sonnet-5
+    rejects the legacy sampling params. Folds in the Opus 4.7 guard (kdsn.134).
+    """
+    model_id = model_id.lower()
+    return (
+        "claude-3" in model_id       # frozen legacy family (3.x sonnet/opus/haiku)
+        or "opus-4-5" in model_id
+        or "opus-4-6" in model_id
+        or "sonnet-4-6" in model_id
+        or "haiku-4-5" in model_id
     )
 
 
@@ -238,6 +269,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None]] = [
     # Anthropic
     ("haiku-4-5",  200_000,   64_000),
     ("sonnet-4-6", 200_000,  128_000),
+    ("sonnet-5",  1_048_576, 128_000),
     ("opus-4-6",  1_048_576, 128_000),
     ("opus-4-7",  1_048_576, 128_000),
     ("opus-4-8",  1_048_576, 128_000),
@@ -716,8 +748,12 @@ def _build_anthropic_kwargs(
             elif isinstance(msg_content, list) and msg_content:
                 msg_content[-1]["cache_control"] = _cc
     
-    # Add sampling parameters (only when thinking is off — Anthropic disallows with thinking)
-    if thinking_level == "off":
+    # Add sampling parameters. Two gates:
+    #   1. Anthropic disallows sampling params together with extended thinking.
+    #   2. Modern Anthropic models (Opus 4.7+, Sonnet 5, Fable, Mythos) REMOVED
+    #      temperature/top_p/top_k; sending them 400s. _supports_sampling_params()
+    #      allowlists the older families (unknown/future models default to off).
+    if thinking_level == "off" and _supports_sampling_params(api_model):
         if temperature is not None:
             api_kwargs["temperature"] = temperature
         if top_p is not None:
