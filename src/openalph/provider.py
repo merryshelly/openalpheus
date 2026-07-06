@@ -873,17 +873,24 @@ async def ping_cache(
     messages: list[dict],
     tools: list | None,
     cache_ttl: str | None,
+    thinking_level: str,
     model: str | None = None,
 ) -> Usage | None:
     """Refresh an Anthropic prompt-cache prefix by replaying the last request.
 
-    Issues a SINGLE non-streaming Anthropic call with the same cached prefix
-    (model + system + tools + messages + cache_ttl) as the parent's in-flight
-    request, capped at KEEPALIVE_MAX_OUTPUT_TOKENS with thinking forced off
-    (a 1-token cap mis-clamps a thinking budget; thinking is a request param,
-    not part of the cached content prefix, so disabling it preserves the key).
-    The throwaway output is discarded; the returned Usage lets the caller verify
-    the ping was a cache READ (hit) rather than a WRITE (prefix drift/expiry).
+    Issues a SINGLE non-streaming Anthropic call replaying the parent's in-flight
+    cached prefix (model + system + tools + messages + cache_ttl) AND its exact
+    thinking config: thinking_level rebuilds the same adaptive+effort (or budget)
+    block the parent used, capped at KEEPALIVE_MAX_OUTPUT_TOKENS. The parent's
+    thinking mode is LOAD-BEARING -- Anthropic incorporates the extended-thinking
+    mode AND effort into the prompt-cache key, so a thinking-OFF (or wrong-effort)
+    replay against a thinking-ON prefix is a GUARANTEED total miss + full rewrite
+    (verified live 2026-07-05; specs/subagent-cache-keepalive-prod-failure-2026-07-05.md).
+    max_tokens=1 is fine even with adaptive thinking on: Anthropic accepts it and
+    the response just truncates (stop_reason=max_tokens) AFTER the billed cache
+    read, which is all the ping needs. The throwaway output is discarded; the
+    returned Usage lets the caller verify the ping was a cache READ (hit) rather
+    than a WRITE (prefix drift/expiry).
 
     Returns None for non-Anthropic providers (OpenAI-compat auto-caches; no TTL
     knob, no write premium) — nothing to refresh.
@@ -905,7 +912,7 @@ async def ping_cache(
         provider_messages=provider_messages,
         provider_tools=provider_tools,
         max_tokens=KEEPALIVE_MAX_OUTPUT_TOKENS,
-        thinking_level="off",
+        thinking_level=thinking_level,
         model_max_tokens=getattr(config, "model_max_tokens", 200000),
         temperature=None,
         top_p=None,

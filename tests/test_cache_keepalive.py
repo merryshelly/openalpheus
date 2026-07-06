@@ -14,7 +14,7 @@ Bead: workspace-kdsn.190
 Interface locked by this suite (re-anchored against post-.186 source):
 
   provider.py
-    ping_cache(config, *, system, messages, tools, cache_ttl, model=None)
+    ping_cache(config, *, system, messages, tools, cache_ttl, thinking_level, model=None)
         -> Usage | None    # None (no-op) for non-Anthropic providers
     KEEPALIVE_MAX_OUTPUT_TOKENS == 1
 
@@ -26,7 +26,7 @@ Interface locked by this suite (re-anchored against post-.186 source):
     _keepalive_interval(cache_ttl)    -> float     # max(ttl*FRACTION, MIN_INTERVAL)
     _keepalive_is_hit(read, write)    -> bool      # read > write and read >= MIN_CACHE_READ
     ping_cache                                     # imported into agent namespace
-    Agent._cache_keepalive(*, system, messages, tools, cache_ttl, model,
+    Agent._cache_keepalive(*, system, messages, tools, cache_ttl, model, thinking,
                            room_id, on_miss, stop)  # background coroutine
 
   config.py
@@ -38,6 +38,7 @@ Interface locked by this suite (re-anchored against post-.186 source):
 
 import asyncio
 import logging
+import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -90,6 +91,7 @@ pytestmark = pytest.mark.skipif(
 
 ROOM = "!room-a:matrix.local"
 MODEL_ANTHROPIC = "anthropic/claude-sonnet-4-20250514"
+MODEL_OPUS = "anthropic/claude-opus-4-8"  # adaptive-thinking model (merry's real config)
 MODEL_OPENAI = "openai/gpt-x"
 
 # A cache-hit Usage: huge read, ~zero write (prefix was warm).
@@ -315,19 +317,53 @@ class TestHelpers:
 @pytest.mark.asyncio
 class TestPingCache:
 
-    async def test_uses_max_tokens_1_and_thinking_off(self, tmp_path):
+    async def test_ping_replays_parent_thinking_adaptive(self, tmp_path):
+        # workspace-kdsn.199: the ping MUST replay the parent's EXACT thinking mode.
+        # Anthropic keys the prompt cache on the extended-thinking mode AND effort, so
+        # a thinking-off (or wrong-effort) ping is a guaranteed total miss + rewrite.
+        # Verified live 2026-07-05: adaptive + max_tokens=1 is accepted and HITS.
         cfg = _make_agent_config(tmp_path, keepalive=True)
         client = _mock_client()
         with patch.object(provider_mod, "_get_client", return_value=client):
             await provider_mod.ping_cache(
                 cfg, system="SYS", messages=[{"role": "user", "content": "hi"}],
-                tools=None, cache_ttl="1h",
+                tools=None, cache_ttl="1h", model=MODEL_OPUS, thinking_level="max",
             )
         client.messages.create.assert_awaited_once()
         kw = client.messages.create.call_args.kwargs
+        assert kw["max_tokens"] == 1                       # stays cheap even with thinking on
+        assert kw["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kw["output_config"]["effort"] == "max"      # effort matches parent (part of cache key)
+
+    async def test_ping_thinking_off_stays_off(self, tmp_path):
+        # A non-thinking parent -> the ping omits thinking too (matches the off prefix).
+        cfg = _make_agent_config(tmp_path, keepalive=True)
+        client = _mock_client()
+        with patch.object(provider_mod, "_get_client", return_value=client):
+            await provider_mod.ping_cache(
+                cfg, system="SYS", messages=[{"role": "user", "content": "hi"}],
+                tools=None, cache_ttl="1h", model=MODEL_OPUS, thinking_level="off",
+            )
+        kw = client.messages.create.call_args.kwargs
         assert kw["max_tokens"] == 1
-        assert "thinking" not in kw           # thinking forced off for the ping
-        assert "output_config" not in kw      # no adaptive-thinking effort block
+        assert "thinking" not in kw
+        assert "output_config" not in kw
+
+    async def test_ping_cache_key_fields_match_parent_stream(self, tmp_path):
+        # Guard for the .199 bug CLASS: the ping's cache-key inputs (system, tools,
+        # messages, thinking, output_config) must be IDENTICAL to the parent stream's
+        # for the same thinking_level -- only max_tokens may differ. Any divergence
+        # silently busts the cache; this is the mock-free unit proxy for that.
+        from openalph.provider import _build_anthropic_kwargs
+        common = dict(api_model="claude-opus-4-8", system="SYS",
+                      provider_messages=[{"role": "user", "content": "hi"}],
+                      provider_tools=None, thinking_level="max", model_max_tokens=200000,
+                      temperature=None, top_p=None, cache_ttl="1h")
+        parent = _build_anthropic_kwargs(max_tokens=2048, **common)
+        ping = _build_anthropic_kwargs(max_tokens=1, **common)
+        for field in ("system", "tools", "messages", "thinking", "output_config"):
+            assert parent.get(field) == ping.get(field), f"cache-key field {field!r} diverged parent vs ping"
+        assert ping["max_tokens"] == 1 and parent["max_tokens"] == 2048
 
     async def test_returns_usage_with_cache_counters(self, tmp_path):
         cfg = _make_agent_config(tmp_path, keepalive=True)
@@ -335,7 +371,7 @@ class TestPingCache:
         with patch.object(provider_mod, "_get_client", return_value=client):
             usage = await provider_mod.ping_cache(
                 cfg, system="SYS", messages=[{"role": "user", "content": "hi"}],
-                tools=None, cache_ttl="1h",
+                tools=None, cache_ttl="1h", thinking_level="off",
             )
         assert usage.cache_read_tokens == 123_456
         assert usage.cache_creation_tokens == 7
@@ -347,7 +383,7 @@ class TestPingCache:
         msgs = [{"role": "user", "content": "long history here"}]
         with patch.object(provider_mod, "_get_client", return_value=client):
             await provider_mod.ping_cache(
-                cfg, system=sys, messages=msgs, tools=None, cache_ttl="1h",
+                cfg, system=sys, messages=msgs, tools=None, cache_ttl="1h", thinking_level="off",
             )
         kw = client.messages.create.call_args.kwargs
         # system is wrapped in a cache_control text block by _build_anthropic_kwargs
@@ -361,7 +397,7 @@ class TestPingCache:
         with patch.object(provider_mod, "_get_client") as gc:
             usage = await provider_mod.ping_cache(
                 cfg, system="SYS", messages=[{"role": "user", "content": "hi"}],
-                tools=None, cache_ttl="1h", model=MODEL_OPENAI,
+                tools=None, cache_ttl="1h", model=MODEL_OPENAI, thinking_level="off",
             )
         assert usage is None
         gc.assert_not_called()
@@ -745,3 +781,80 @@ class TestMissNoticeWiring:
         bot.session_log.append.assert_called()
         kw = bot.session_log.append.call_args.kwargs
         assert kw.get("role") == "system"
+
+
+
+# ===========================================================================
+# M. Real-path wiring (workspace-kdsn.199) — the ARM SITE must thread the
+#    parent's effective thinking level into the ping. Drives a REAL Agent
+#    through handle_input (only stream + ping_cache mocked), per the
+#    tool-management "one lesson": a mocked-seam test can't catch a wiring gap.
+# ===========================================================================
+@pytest.mark.asyncio
+class TestKeepaliveThreadsParentThinking:
+
+    async def _run_and_capture(self, cfg):
+        agent = Agent(cfg)
+        release = asyncio.Event()
+        with patch.object(agent_mod, "stream", side_effect=_subagent_stream()), \
+             patch.object(agent_mod, "execute_tool", side_effect=_blocking_exec(release)), \
+             patch.object(agent_mod, "ping_cache", new=AsyncMock(return_value=_usage(**HIT))) as ping, \
+             patch.object(agent_mod, "_keepalive_interval", return_value=0.01):
+            task = asyncio.create_task(agent.handle_input("go", room_id=ROOM, callbacks={}))
+            await _wait_for(lambda: ping.call_count > 0, timeout=1.0)
+            release.set()
+            await task
+        return ping
+
+    async def test_ping_receives_parent_effective_thinking(self, tmp_path):
+        cfg = _make_agent_config(tmp_path, keepalive=True, thinking="high")
+        ping = await self._run_and_capture(cfg)
+        assert ping.call_count >= 1
+        assert ping.call_args.kwargs.get("thinking_level") == "high", \
+            "arm site must thread the parent's effective thinking level into ping_cache"
+
+    async def test_ping_thinking_off_when_parent_off(self, tmp_path):
+        # Default config.thinking == "off" -> ping must also be off (matches the prefix).
+        cfg = _make_agent_config(tmp_path, keepalive=True)
+        ping = await self._run_and_capture(cfg)
+        assert ping.call_args.kwargs.get("thinking_level") == "off"
+
+
+# ===========================================================================
+# N. Live-API cache-hit smoke (workspace-kdsn.199 acceptance criterion).
+#    Mocks cannot exercise Anthropic's cache-key semantics, so this asserts a
+#    real parent-mode ping HITS a thinking-ON prefix. Opt-in: set
+#    OPENALPH_LIVE_ANTHROPIC_KEY to run; skipped otherwise (keeps CI green).
+# ===========================================================================
+_LIVE_KEY = os.environ.get("OPENALPH_LIVE_ANTHROPIC_KEY")
+
+
+@pytest.mark.skipif(not _LIVE_KEY, reason="set OPENALPH_LIVE_ANTHROPIC_KEY to run the live cache-hit smoke test")
+@pytest.mark.asyncio
+class TestLiveCacheHit:
+
+    async def test_parent_mode_ping_hits_thinking_on_prefix(self):
+        import time as _t
+        import anthropic
+        from openalph.provider import _build_anthropic_kwargs
+        api_model = "claude-opus-4-8"
+        marker = f"kdsn199-{int(_t.time())}"
+        system = ("Cache smoke harness. Answer in one word. "
+                  + ("The quick brown fox jumps over the lazy dog. " * 500)
+                  + f" marker:{marker}")
+        user = [{"role": "user", "content": "Reply with exactly: OK"}]
+        client = anthropic.AsyncAnthropic(api_key=_LIVE_KEY)
+
+        def _kw(level, mt):
+            return _build_anthropic_kwargs(
+                api_model=api_model, system=system,
+                provider_messages=[dict(m) for m in user], provider_tools=None,
+                max_tokens=mt, thinking_level=level, model_max_tokens=200000,
+                temperature=None, top_p=None, cache_ttl="1h")
+
+        w = await client.messages.create(**_kw("max", 2048))   # WRITE the thinking-ON prefix
+        assert w.usage.cache_creation_input_tokens > 0
+        await asyncio.sleep(2)
+        p = await client.messages.create(**_kw("max", 1))       # PING in parent mode, mt=1
+        assert p.usage.cache_read_input_tokens > 0, "parent-mode ping must HIT the thinking-ON prefix"
+        assert p.usage.cache_creation_input_tokens == 0, "parent-mode ping must not rewrite the prefix"

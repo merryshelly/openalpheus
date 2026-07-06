@@ -402,7 +402,7 @@ class Agent:
 
     def _maybe_arm_cache_keepalive(self, *, room_id, active_tool_calls,
                                    request_messages, tools_arg, cache_ttl, callbacks,
-                                   stream_start=None):
+                                   thinking, stream_start=None):
         """Arm a background cache-keepalive task iff a subagent is in the batch AND
         the active model is an Anthropic provider with subagent_cache_keepalive on.
         Returns (task, stop_event) or (None, None). Zero overhead in the default path.
@@ -435,6 +435,7 @@ class Agent:
             tools=tools_arg,
             cache_ttl=cache_ttl,
             model=self.get_model(room_id),
+            thinking=thinking,
             room_id=room_id,
             on_miss=on_miss,
             stop=stop,
@@ -443,7 +444,7 @@ class Agent:
         return task, stop
 
     async def _cache_keepalive(self, *, system, messages, tools, cache_ttl, model,
-                               room_id, on_miss, stop, stream_elapsed=0.0):
+                               thinking, room_id, on_miss, stop, stream_elapsed=0.0):
         """Periodically refresh the parent's Anthropic prompt cache while a subagent
         runs. Fires a cheap max_tokens=1 ping just inside the TTL; verifies each ping
         was a cache READ and aborts (with an operator notice) on a WRITE signature so
@@ -469,6 +470,7 @@ class Agent:
                 usage = await ping_cache(
                     self.config, system=system, messages=messages,
                     tools=tools, cache_ttl=cache_ttl, model=model,
+                    thinking_level=thinking,
                 )
             except asyncio.CancelledError:
                 raise
@@ -931,6 +933,7 @@ class Agent:
                         tools_arg=tools_arg,
                         cache_ttl=cache_ttl,
                         callbacks=callbacks,
+                        thinking=effective_thinking,
                         stream_start=start_time,
                     )
                     try:
