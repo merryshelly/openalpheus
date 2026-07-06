@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import tomllib
@@ -124,17 +125,43 @@ def _cap(text: str) -> str:
     return text[:_CHECKER_OUTPUT_CAP] + " \u2026[checker output truncated]"
 
 
+def _scrub_tmp_path(detail: str, tmp_path: str, real_path: str) -> str:
+    """Rewrite the NamedTemporaryFile path a subprocess checker printed into
+    its output with the REAL target path, before that detail is relayed to
+    the model (R14). A checker like `bash -n` names the file it checked
+    (the ephemeral tempfile) in its error text; left as-is, the rejection
+    detail would reference a meaningless /tmp basename instead of the file
+    the model actually asked to write. Replaces the full tmp path first,
+    then falls back to a basename-only replace in case only the basename
+    survived some other transformation upstream."""
+    if not detail:
+        return detail
+    scrubbed = detail.replace(tmp_path, real_path)
+    tmp_base = os.path.basename(tmp_path)
+    real_base = os.path.basename(real_path)
+    if tmp_base and tmp_base != real_base:
+        scrubbed = scrubbed.replace(tmp_base, real_base)
+    return scrubbed
+
+
 def _run_subprocess_checker(
-    binary: str, args: tuple[str, ...], content: str, suffix: str,
+    binary: str, args: tuple[str, ...], content: str, suffix: str, real_path: str,
 ) -> tuple[str, str]:
     """Run one subprocess syntax check against candidate `content`.
 
     Returns (status, detail):
         "ok"          - checker ran, exit 0
-        "fail"        - checker ran, nonzero exit; detail = checker output
+        "fail"        - checker ran, nonzero exit; detail = checker output,
+                        with any ephemeral tempfile path rewritten to
+                        `real_path` (R14) before being relayed to the model
         "unavailable" - the checker invocation itself failed (timeout or
                         crash) — an infrastructure failure, not a verdict
                         (fail-open, V2/V4); detail explains why
+
+    Args:
+        real_path: the REAL target path (not yet on disk, or the file being
+            overwritten) — used only to scrub the tempfile path out of a
+            "fail" detail before it is relayed.
 
     The tempfile is always removed in `finally`, regardless of outcome —
     no orphan tempfiles survive a call, success or failure.
@@ -160,6 +187,7 @@ def _run_subprocess_checker(
         detail = (proc.stderr or proc.stdout or "").strip()
         if not detail:
             detail = f"{binary} exited with code {proc.returncode}"
+        detail = _scrub_tmp_path(detail, tmp_path, real_path)
         return "fail", detail
     except subprocess.TimeoutExpired:
         logger.warning(
@@ -213,13 +241,65 @@ def _run_checker(plan, content: str, path: str) -> tuple[str, str]:
         return ("ok" if ok else "fail"), detail
     _, binary, args = plan
     suffix = Path(path).suffix
-    return _run_subprocess_checker(binary, args, content, suffix=suffix)
+    return _run_subprocess_checker(binary, args, content, suffix=suffix, real_path=path)
 
 
 def _write_now(path: str, content: str) -> None:
-    """The ONE place a validated write reaches disk (single point of truth)."""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    """The ONE place a validated write reaches disk (single point of truth).
+
+    Writes ATOMICALLY (R6): content lands in a ``tempfile.NamedTemporaryFile``
+    created in the TARGET'S PARENT DIRECTORY (same filesystem as the target,
+    so the final ``os.replace`` is an atomic rename, never a cross-device
+    copy), then flushed and ``os.fsync``'d. When overwriting an EXISTING
+    file, the tmp is ``os.chmod``'d to that file's PRIOR mode before the
+    replace — a fresh ``NamedTemporaryFile`` defaults to 0o600, which would
+    otherwise silently reset an existing file's permissions on every write
+    that goes through this seam. The tmp is unlinked on ANY failure path
+    (tempfile creation, write, fsync, chmod, or the replace itself), so a
+    failed write never leaves an orphan tmp file, and the real path — if it
+    already existed — is left byte-identical (V1: the swap either happens
+    in full or not at all).
+
+    ``os.replace`` is called as a plain module-level attribute access (this
+    module does ``import os`` at the top, never ``from os import replace``)
+    so that tests which monkeypatch ``openalph.tools.validate.os.replace``
+    observe the substitution.
+
+    R10: parent-directory creation happens HERE — immediately before the
+    write actually lands — rather than upfront in the calling tool. A
+    rejected write (validation reject) never reaches this function, so it
+    leaves no orphan parent directories for a brand-new nested path.
+    """
+    parent = os.path.dirname(os.path.abspath(path)) or os.sep
+    os.makedirs(parent, exist_ok=True)
+
+    prior_mode: int | None = None
+    if os.path.exists(path):
+        prior_mode = stat.S_IMODE(os.stat(path).st_mode)
+
+    suffix = Path(path).suffix or None
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=parent, prefix=".tmp-", suffix=suffix,
+            delete=False, encoding="utf-8",
+        ) as tf:
+            tmp_path = tf.name
+            tf.write(content)
+            tf.flush()
+            os.fsync(tf.fileno())
+
+        if prior_mode is not None:
+            os.chmod(tmp_path, prior_mode)
+
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 async def _validated_write(
@@ -269,14 +349,27 @@ async def _validated_write(
         try:
             with open(path, "r", encoding="utf-8") as f:
                 original = f.read()
+        except FileNotFoundError:
+            # R13 TOCTOU: the file existed at the os.path.exists() check
+            # above but is gone by the time we actually open it (e.g. a
+            # concurrent delete). Treat this exactly like a new file —
+            # pre_ok stays vacuously True (no checker invocation on
+            # content we can no longer read) — and fall through to the
+            # normal post_ok gate below. This is deliberately NOT the
+            # generic fail-open path just below: that path skips
+            # validation ENTIRELY (writes unconditionally), which would
+            # let a broken candidate land with no check at all merely
+            # because of an unlucky race.
+            pass
         except Exception:
-            # Can't even read the original to validate it (e.g. a binary
-            # file — write_file has no _is_binary guard for existing
-            # files). Validation cannot proceed meaningfully; skip it
-            # entirely rather than guess at a verdict.
+            # Can't even read the original to validate it for some OTHER
+            # reason (e.g. a binary file — write_file has no _is_binary
+            # guard for existing files). Validation cannot proceed
+            # meaningfully; skip it entirely rather than guess at a verdict.
             _write_now(path, new_content)
             return ToolResult(content="", is_error=False)
-        pre_status, _pre_detail = _run_checker(plan, original, path)
+        else:
+            pre_status, _pre_detail = _run_checker(plan, original, path)
 
     if pre_status == "unavailable":
         # Infra failure on the pre-check: never learned pre_ok, so we can't

@@ -2,7 +2,6 @@
 
 import os
 import re
-from pathlib import Path
 
 from openalph.tools import ToolResult
 
@@ -97,11 +96,10 @@ async def write_file(path: str, content: str, tool_config: dict | None = None) -
         ToolResult with confirmation or error
     """
     try:
-        # Create parent directories
-        parent = Path(path).parent
-        if parent:
-            parent.mkdir(parents=True, exist_ok=True)
-
+        # R10: parent-directory creation moves to AFTER the validation
+        # verdict (inside _validated_write, immediately before the atomic
+        # write) so a rejected write leaves no filesystem trace — no orphan
+        # parent directories for a brand-new nested path.
         from .validate import _validated_write
         vresult = await _validated_write(path, content, tool_config)
         if vresult.is_error:
@@ -154,6 +152,20 @@ async def edit_file(
         if _is_binary(path):
             return ToolResult(content=f"Error: Binary file cannot be edited: {path}", is_error=True)
         
+        if old_text == "":
+            # R12: empty old_text must be rejected in BOTH modes. Without
+            # this guard, str.count("") == len(content) + 1 (falls into the
+            # ambiguous->count>1 branch in single mode, wrong steering text)
+            # and str.replace(old_text, new_text) with replace_all=True
+            # inserts new_text between every character (content shredded).
+            return ToolResult(
+                content=(
+                    f"Error: old_text must not be empty in {path}. "
+                    "Provide the exact existing text to find and replace."
+                ),
+                is_error=True,
+            )
+
         with open(path, 'r', encoding='utf-8') as f:
             content = f.read()
         
@@ -258,10 +270,22 @@ def _parse_patch_hunks(patch: str) -> tuple[list[tuple[str, str]] | None, str | 
     Returns:
         (hunks, None) on success, where hunks is a non-empty list of
         (search_text, replace_text) tuples in patch order; or
-        (None, error_message) if no complete hunk was found, or a hunk's
-        SEARCH section is empty.
+        (None, error_message) if no complete hunk was found, a hunk's
+        SEARCH section is empty, a block was left open (nested SEARCH or
+        unclosed at EOF — R3), or a hunk's body contains a fence-shaped
+        line this format cannot express unambiguously (R2).
+
+    Splitting uses ``patch.split('\\n')`` — NEVER ``str.splitlines()``.
+    ``splitlines()`` also breaks on \\x0b, \\x0c, \\x1c-\\x1e, \\x85, \\u2028,
+    \\u2029 etc., which ``open()`` in text mode does NOT treat as line
+    separators (only \\n / \\r\\n / \\r are normalized); using splitlines()
+    here would silently reshape hunk content relative to what is actually
+    on disk (spurious SEARCH not-found, mangled REPLACE). A single trailing
+    '\\r' is stripped per line post-split to mirror universal-newline
+    reads of a '\\r\\n'-terminated patch string.
     """
-    lines = patch.splitlines()
+    raw_lines = patch.split('\n')
+    lines = [ln[:-1] if ln.endswith('\r') else ln for ln in raw_lines]
     hunks: list[tuple[str, str]] = []
     state = "outside"  # outside -> search -> replace -> outside
     search_lines: list[str] = []
@@ -274,13 +298,36 @@ def _parse_patch_hunks(patch: str) -> tuple[list[tuple[str, str]] | None, str | 
                 search_lines = []
             # else: prose outside a block — ignored (weak-model tolerance)
         elif state == "search":
-            if _DIVIDER_FENCE_RE.match(line):
+            if _SEARCH_FENCE_RE.match(line):
+                # R3: a new block start while this one is still open — the
+                # previous block never got its divider. Hard error naming
+                # the hunk; no silent absorption into a later block's body.
+                hunk_index = len(hunks) + 1
+                return None, (
+                    f"Error: hunk {hunk_index}: a new '<<<<<<< SEARCH' was "
+                    "encountered while still inside an open block — the "
+                    "previous block is missing its '=======' divider. Every "
+                    "SEARCH/REPLACE block must be fully closed before "
+                    "starting another.\n\n" + _PATCH_FORMAT_EXAMPLE
+                )
+            elif _DIVIDER_FENCE_RE.match(line):
                 state = "replace"
                 replace_lines = []
             else:
                 search_lines.append(line)
         elif state == "replace":
-            if _REPLACE_FENCE_RE.match(line):
+            if _SEARCH_FENCE_RE.match(line):
+                # R3: same class of error — nested block start, this time
+                # while the previous block's REPLACE side is still open.
+                hunk_index = len(hunks) + 1
+                return None, (
+                    f"Error: hunk {hunk_index}: a new '<<<<<<< SEARCH' was "
+                    "encountered while still inside an open block — the "
+                    "previous block is missing its '>>>>>>> REPLACE' close. "
+                    "Every SEARCH/REPLACE block must be fully closed before "
+                    "starting another.\n\n" + _PATCH_FORMAT_EXAMPLE
+                )
+            elif _REPLACE_FENCE_RE.match(line):
                 search_text = "\n".join(search_lines)
                 replace_text = "\n".join(replace_lines)
                 if search_text == "":
@@ -293,14 +340,40 @@ def _parse_patch_hunks(patch: str) -> tuple[list[tuple[str, str]] | None, str | 
                 state = "outside"
             else:
                 replace_lines.append(line)
-        # (a block left open at end-of-input — never reaching its closing
-        # fence — is simply dropped; it contributes to a "zero blocks"
-        # outcome only if no other hunk in the patch parsed successfully)
+
+    if state != "outside":
+        # R3: a block left open at end-of-input must never be silently
+        # dropped (nor cause a partial apply of earlier hunks) — hard
+        # error naming the hunk index and which fence is missing.
+        hunk_index = len(hunks) + 1
+        missing = "=======" if state == "search" else ">>>>>>> REPLACE"
+        return None, (
+            f"Error: hunk {hunk_index}: block left open at end of patch — "
+            f"missing its '{missing}' fence. Every SEARCH/REPLACE block must "
+            "be fully closed.\n\n" + _PATCH_FORMAT_EXAMPLE
+        )
 
     if not hunks:
         return None, (
             "Error: no valid SEARCH/REPLACE blocks found in patch.\n\n" + _PATCH_FORMAT_EXAMPLE
         )
+
+    # R2: post-parse hazard check — reject any hunk whose SEARCH or REPLACE
+    # body contains a fence-shaped line (git-conflict markers, a Setext
+    # heading's bare '======='/'-------' look-alike, etc.). Such content
+    # cannot be expressed unambiguously in this format; silently accepting
+    # it risks a boundary-shifted wrong write instead of a clean reject.
+    for i, (search_text, replace_text) in enumerate(hunks, start=1):
+        body_lines = search_text.split("\n") + replace_text.split("\n")
+        for body_line in body_lines:
+            if (_SEARCH_FENCE_RE.match(body_line)
+                    or _DIVIDER_FENCE_RE.match(body_line)
+                    or _REPLACE_FENCE_RE.match(body_line)):
+                return None, (
+                    f"Error: hunk {i}: content contains fence-like lines (e.g. "
+                    "'=======') that this patch format cannot express "
+                    "unambiguously — use file_edit for this change."
+                )
 
     return hunks, None
 
