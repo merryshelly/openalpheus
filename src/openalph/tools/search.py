@@ -24,6 +24,7 @@ apply to it.
 
 import contextlib
 import fnmatch
+import logging
 import os
 import re
 import signal
@@ -34,6 +35,8 @@ from pathlib import Path
 from openalph.tools import ToolResult
 
 from .file import _is_binary
+
+logger = logging.getLogger(__name__)
 
 # Directory names pruned from the walk entirely (design §6, shared by
 # grep + glob). Never descended into; never returned as a match.
@@ -112,9 +115,39 @@ def _time_budget_guard(deadline: float):
     asyncio.to_thread for this one call).
 
     If signals are unavailable (no SIGALRM on this platform, or we are not
-    on the main thread for some reason), this degrades gracefully to a
-    no-op: the caller's between-units monotonic checks remain as the
-    fallback bound (coarser, but still eventually terminates).
+    on the main thread for some reason), this degrades to a no-op: the
+    caller's between-units monotonic checks remain as the fallback bound
+    (coarser, but still eventually terminates). N1: unlike before, this
+    degradation is now LOUD rather than silent -- when SIGALRM is expected
+    to be available (``can_signal`` True) but arming fails at the syscall
+    (``ValueError``/``OSError``, the observed signature of "not the main
+    thread"), a ``logger.warning`` fires once for this scan entry stating
+    that the scan is running WITHOUT the primary ReDoS bound and is relying
+    on between-unit checks only. Grep/glob currently dispatch on the
+    asyncio main thread in production (verified: no ``Thread`` /
+    ``to_thread`` / worker-loop wraps the tool-execution path), so this
+    should never fire today; it exists so a future refactor that moves the
+    scan off-thread (e.g. ``asyncio.to_thread``, a ``ThreadPoolExecutor``)
+    is caught by an operator instead of silently losing the CRITICAL bound.
+    The dispatch-level ``asyncio.wait_for`` "belt" in tools/__init__.py does
+    NOT provide backup here or in general -- it can only cancel at an
+    ``await`` point, and the scan body below is entirely synchronous, so it
+    is inert against a single hung/backtracking match regardless of thread.
+
+    CORRECTNESS PRECONDITION (N5): the code inside the ``with`` block MUST
+    remain entirely ``await``-free and this guard must not be entered
+    re-entrantly (nested) or concurrently on the same thread. The signal
+    handler and itimer deadline are PROCESS-GLOBAL state that this context
+    manager saves on ``__enter__`` and restores on ``__exit__``; if the
+    guarded region ever yields control (an ``await``) while armed, or if two
+    guards are active at once on one thread, the second ``__enter__``
+    clobbers the first's itimer deadline and the second's ``__exit__``
+    restores the WRONG saved handler (the first guard's ``_alarm_handler``,
+    not the original), corrupting the save-restore chain. This is currently
+    safe only because run_grep/run_glob's scan bodies contain zero awaits
+    and ``asyncio.gather`` never actually interleaves two synchronous,
+    await-free coroutines on one thread -- both must remain true for this
+    guard to stay correct.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -130,6 +163,20 @@ def _time_budget_guard(deadline: float):
             armed = True
         except (ValueError, OSError):
             armed = False  # e.g. not main thread -- fall back to no-op
+            # N1: loud degradation -- SIGALRM was available but could not be
+            # armed (the ValueError/OSError signature of "not running on the
+            # main thread of the main interpreter"). This scan proceeds with
+            # NO primary ReDoS bound; only the coarser between-unit
+            # time.monotonic() checks remain. Logged once per scan entry
+            # (this function is entered exactly once per run_grep/run_glob
+            # call), never per scanned unit.
+            logger.warning(
+                "grep/glob time-budget guard could not arm SIGALRM (not "
+                "running on the main thread of the main interpreter) -- "
+                "this scan is running WITHOUT the primary ReDoS time bound "
+                "and is relying on between-unit checks only, which cannot "
+                "interrupt a single in-flight catastrophic regex match."
+            )
 
     try:
         yield
@@ -367,6 +414,23 @@ async def run_grep(
         budget = float((config or {}).get("time_budget_seconds", DEFAULT_TIME_BUDGET_SECONDS))
 
         root = _resolve_root(path, workspace)
+        # N2: refuse a symlink AS THE SEARCH ROOT itself (narrow fix -- the
+        # walker (R7) already skips symlinks discovered INSIDE a scan, but
+        # never checked the root the caller named). os.path.islink() lstats
+        # (never follows), so this also catches a broken symlink before
+        # root.exists()/is_file() would otherwise silently follow it. No
+        # general workspace-containment/realpath-escape check is added here
+        # (filed separately) -- this refuses the literal symlink-root case
+        # only, matching the no-follow policy the rest of the walker enforces.
+        if os.path.islink(root):
+            return ToolResult(
+                content=(
+                    f"Error: path is a symlink: {root} — search tools do "
+                    "not follow symlinks; pass the resolved target "
+                    "explicitly if intended."
+                ),
+                is_error=True,
+            )
         if not root.exists():
             return ToolResult(
                 content=f"Error: path does not exist: {root}",
@@ -686,6 +750,18 @@ async def run_glob(
         budget = float((config or {}).get("time_budget_seconds", DEFAULT_TIME_BUDGET_SECONDS))
 
         root = _resolve_root(path, workspace)
+        # N2: refuse a symlink AS THE SEARCH ROOT itself (see run_grep's
+        # identical check above for the full rationale — narrow fix only,
+        # no general workspace-containment/realpath-escape check).
+        if os.path.islink(root):
+            return ToolResult(
+                content=(
+                    f"Error: path is a symlink: {root} — search tools do "
+                    "not follow symlinks; pass the resolved target "
+                    "explicitly if intended."
+                ),
+                is_error=True,
+            )
         if not root.exists():
             return ToolResult(
                 content=f"Error: path does not exist: {root}",

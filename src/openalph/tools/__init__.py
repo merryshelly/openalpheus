@@ -1177,11 +1177,29 @@ async def _execute_tool_inner(
                 ),
                 is_error=True,
             )
-        # R1 dispatch belt: outer wall-clock bound on top of search.py's own
-        # in-scan SIGALRM+deadline enforcement (defense in depth — see
-        # tmp/f1/REPORT.md note for F3: asyncio.wait_for is compatible here;
-        # asyncio.to_thread is FORBIDDEN, it would defeat the SIGALRM guard
-        # by pinning the scan on a worker thread that never sees the signal).
+        # N1 (honesty correction): this asyncio.wait_for is NOT a scan bound
+        # and must never be relied on as one. wait_for can only cancel
+        # run_grep at an `await` point, but run_grep's scan body (walk /
+        # stat / open / read / rx.search) is entirely SYNCHRONOUS -- zero
+        # awaits between entry and return. A synchronous coroutine that
+        # hangs holds the event loop, so wait_for's timeout callback cannot
+        # be delivered until the coroutine yields the loop, which a hung
+        # scan never does (verified: wrapping a busy sync loop in
+        # asyncio.wait_for lets it run to full completion regardless of
+        # timeout). This wrapper is kept only because it is a harmless
+        # no-op belt for the ordinary case (run_grep returns/raises before
+        # ever needing to be cancelled); it is NOT "defense in depth" against
+        # a stuck scan.
+        #
+        # The REAL and ONLY bound on scan wall-clock time is search.py's
+        # in-scan SIGALRM+deadline enforcement (_time_budget_guard), which
+        # requires running on the main thread of the main interpreter
+        # (signal.signal/setitimer raise ValueError off-main-thread). That
+        # guard now logs a warning (once per scan entry) if it is ever
+        # unable to arm -- e.g. because a future refactor dispatches grep/
+        # glob via asyncio.to_thread or a worker-thread event loop -- so an
+        # operator can see the ReDoS bound was silently lost; this
+        # wait_for wrapper will NOT catch that condition either way.
         budget = float(tool_config.get("time_budget_seconds", 10))
         try:
             result = await asyncio.wait_for(
@@ -1221,8 +1239,12 @@ async def _execute_tool_inner(
                 ),
                 is_error=True,
             )
-        # R1 dispatch belt: see grep branch above (same rationale — outer
-        # asyncio.wait_for is compatible; asyncio.to_thread is FORBIDDEN).
+        # N1 (honesty correction): see the grep branch above -- this
+        # asyncio.wait_for is NOT a scan bound (run_glob's scan body is also
+        # entirely await-free, so wait_for cannot cancel a hung scan). The
+        # real and only bound is search.py's in-scan SIGALRM+deadline
+        # enforcement, which is main-thread-only and now logs a warning if
+        # it fails to arm.
         budget = float(tool_config.get("time_budget_seconds", 10))
         try:
             result = await asyncio.wait_for(

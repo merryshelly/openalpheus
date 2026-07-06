@@ -886,14 +886,31 @@ async def ping_cache(
     mode AND effort into the prompt-cache key, so a thinking-OFF (or wrong-effort)
     replay against a thinking-ON prefix is a GUARANTEED total miss + full rewrite
     (verified live 2026-07-05; specs/subagent-cache-keepalive-prod-failure-2026-07-05.md).
-    max_tokens=1 is fine even with adaptive thinking on: Anthropic accepts it and
+    max_tokens=1 is fine even with ADAPTIVE thinking on: Anthropic accepts it and
     the response just truncates (stop_reason=max_tokens) AFTER the billed cache
     read, which is all the ping needs. The throwaway output is discarded; the
     returned Usage lets the caller verify the ping was a cache READ (hit) rather
     than a WRITE (prefix drift/expiry).
 
+    N4: this max_tokens=1 cheapness guarantee holds ONLY for models on the
+    adaptive-thinking path (``_supports_adaptive_thinking``). For BUDGET-based
+    thinking models (thinking enabled, model not on that allowlist),
+    ``_build_anthropic_kwargs`` unconditionally OVERRIDES max_tokens to
+    base+budget_tokens (up to ~16384 for thinking_level="high") -- reusing
+    that SAME decision (not a duplicated model-name list) below, this
+    function refuses to ping at all in that case rather than silently
+    authorize a real (and expensive) thinking generation every keepalive
+    interval. The ADAPTIVE path is completely unreached by this new check
+    and is byte-for-byte unchanged from before.
+
     Returns None for non-Anthropic providers (OpenAI-compat auto-caches; no TTL
-    knob, no write premium) — nothing to refresh.
+    knob, no write premium) — nothing to refresh. For a budget-thinking model
+    (see N4 above), returns a deliberately miss-shaped ``Usage`` (cache_read
+    <= cache_creation, so ``_keepalive_is_hit`` reads it as a MISS) instead of
+    attempting any API call -- this reuses the caller's EXISTING miss-handling
+    branch (log + operator on_miss notice + abort the keepalive loop) as the
+    closest available "abort keepalive" signal, without requiring any change
+    to the caller's retry/error-counting logic.
     """
     model_str = model or config.default_model
     provider_cfg, api_model = resolve_model(
@@ -901,6 +918,29 @@ async def ping_cache(
     )
     if provider_cfg.type != "anthropic":
         return None
+
+    # N4: a keepalive ping must NEVER authorize a real thinking budget. This
+    # is the EXACT condition _build_anthropic_kwargs uses to pick its
+    # "budget-based thinking for older models" branch (thinking enabled AND
+    # the model is not on the adaptive-thinking allowlist) -- reusing
+    # _supports_adaptive_thinking directly rather than re-deriving/duplicating
+    # its model-name list. That branch overrides max_tokens to base+budget,
+    # discarding the KEEPALIVE_MAX_OUTPUT_TOKENS=1 cap this ping is built
+    # around, so a ping against such a model is never actually cheap. Refuse
+    # to ping at all rather than let that happen silently.
+    if thinking_level != "off" and not _supports_adaptive_thinking(api_model):
+        logger.warning(
+            "cache keepalive ping skipped for model %r: thinking_level=%r "
+            "requires budget-based thinking on this model, which would "
+            "override max_tokens to base+budget instead of the cheap "
+            "max_tokens=%d the ping is designed around -- a cache-key-"
+            "matching ping cannot be cheap for budget-thinking models.",
+            api_model, thinking_level, KEEPALIVE_MAX_OUTPUT_TOKENS,
+        )
+        return Usage(
+            input_tokens=0, output_tokens=0,
+            cache_read_tokens=0, cache_creation_tokens=0,
+        )
 
     provider_messages = _convert_messages_for_provider(messages, provider_cfg.type)
     provider_tools = _convert_tools_for_provider(tools, provider_cfg.type)

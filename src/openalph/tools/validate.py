@@ -257,8 +257,52 @@ def _write_now(path: str, content: str) -> None:
     that goes through this seam. The tmp is unlinked on ANY failure path
     (tempfile creation, write, fsync, chmod, or the replace itself), so a
     failed write never leaves an orphan tmp file, and the real path — if it
-    already existed — is left byte-identical (V1: the swap either happens
-    in full or not at all).
+    already existed — is left byte-identical.
+
+    N6 (atomicity claim, scoped): the guarantee above is about
+    READER-VISIBILITY only — no reader of ``path`` can ever observe a torn
+    or partially-written file, because the swap is a single ``os.replace``
+    rename that either lands in full or not at all. This is NOT a claim
+    about cross-crash durability of the rename itself: ``os.replace`` is not
+    followed by an ``fsync`` on the parent directory's fd here, so on a
+    hard crash/power-loss in the narrow window right after this function
+    returns, a journaling filesystem could in principle revert the
+    directory entry to the prior inode on reboot even though the tempfile's
+    *data* was fsync'd. That cross-crash durability gap is deliberately out
+    of scope for this function (it would need a parent-dir fsync to close);
+    what V1 actually promises, and what this function delivers, is that a
+    reader never sees a torn/partial file, not that the rename itself
+    durably survives a power-loss immediately after the call.
+
+    N3 (symlink targets): if ``path`` is a symlink, the OLD pre-R6 code
+    (``open(path, 'w')``) wrote THROUGH the link (mutating the link's
+    target in place); naively ``os.replace``-ing onto ``path`` itself would
+    instead replace the symlink's own directory entry with a regular file —
+    silently detaching the link (the target file would keep its original,
+    now-stale content, and the agent's edit would appear to succeed while
+    never reaching the real file). To preserve the pre-existing write-
+    through-symlink semantics while keeping R6's atomicity, this function
+    resolves ``path`` via ``os.path.realpath()`` ONCE when ``path`` is a
+    symlink, and performs the ENTIRE tempfile+chmod+replace sequence against
+    that REAL target instead: the tempfile is created in the real target's
+    parent directory, the prior mode is read from the real target, and
+    ``os.replace`` lands on the real target's path. ``path`` itself (the
+    symlink) is never touched, so it survives pointing at the same (now
+    updated) real file. Non-symlink ``path`` values are completely unaffected
+    (``target_path`` degenerates to ``path`` and every step below is
+    byte-for-byte the same as before this fix).
+
+    Hardlink divergence (documented, no code change — see N3 finding): if
+    ``path`` has hardlink siblings (``os.stat(path).st_nlink > 1``),
+    ``os.replace`` still gives ``path`` a NEW inode, so sibling hardlinks
+    keep the OLD content and now point at a different inode than ``path``.
+    An in-place fallback (truncate + write) would avoid that divergence but
+    would reopen R6's original atomicity hole (a reader could observe a
+    torn/partial file mid-write, and a mid-write crash could leave a
+    corrupted file instead of the original) — that tradeoff is deliberately
+    rejected here. Hardlinked targets are therefore expected to diverge from
+    their siblings on write, same as a plain ``os.replace``-based editor
+    would behave; there is no special-case handling for this in the code.
 
     ``os.replace`` is called as a plain module-level attribute access (this
     module does ``import os`` at the top, never ``from os import replace``)
@@ -270,14 +314,20 @@ def _write_now(path: str, content: str) -> None:
     rejected write (validation reject) never reaches this function, so it
     leaves no orphan parent directories for a brand-new nested path.
     """
-    parent = os.path.dirname(os.path.abspath(path)) or os.sep
+    # N3: resolve a symlinked path ONCE to its real target and perform the
+    # whole tempfile/chmod/replace sequence there, so `path` (the symlink)
+    # is never itself replaced and keeps pointing at the (now-updated) real
+    # file. Non-symlink paths are unaffected: target_path == path.
+    target_path = os.path.realpath(path) if os.path.islink(path) else path
+
+    parent = os.path.dirname(os.path.abspath(target_path)) or os.sep
     os.makedirs(parent, exist_ok=True)
 
     prior_mode: int | None = None
-    if os.path.exists(path):
-        prior_mode = stat.S_IMODE(os.stat(path).st_mode)
+    if os.path.exists(target_path):
+        prior_mode = stat.S_IMODE(os.stat(target_path).st_mode)
 
-    suffix = Path(path).suffix or None
+    suffix = Path(target_path).suffix or None
     tmp_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -292,7 +342,7 @@ def _write_now(path: str, content: str) -> None:
         if prior_mode is not None:
             os.chmod(tmp_path, prior_mode)
 
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, target_path)
     except Exception:
         if tmp_path is not None:
             try:
