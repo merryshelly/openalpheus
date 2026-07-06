@@ -22,9 +22,12 @@ reading a candidate file's lines — glob never reads file content at all
 apply to it.
 """
 
+import contextlib
 import fnmatch
 import os
 import re
+import signal
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +45,17 @@ SKIP_DIRS = frozenset({
 # Config defaults (overridable per-call via tool_config / TOML [config]).
 DEFAULT_MAX_SCAN_FILES = 10000
 DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB = 5242880
+DEFAULT_TIME_BUDGET_SECONDS = 10.0
+
+# Regex input is capped per line so a single re call is bounded in principle;
+# this is a secondary defense, NOT the primary ReDoS bound (see
+# _time_budget_guard below) -- catastrophic backtracking is superlinear in
+# input length, but even a short capped line can still blow the wall-clock
+# budget, which is why every match is also wrapped by the deadline guard.
+_MAX_REGEX_INPUT_CHARS = 10_000
+
+# R11: valid grep output modes (schema + validation share this one set).
+_VALID_OUTPUT_MODES = ("files_with_matches", "content", "count")
 
 # Exact overflow steering text (design §6/§7, V3). The em-dash is literal —
 # do not "fix" it to a hyphen; tests pin these exact bytes.
@@ -56,6 +70,81 @@ _SCAN_BOUND_NOTE = (
     "completed — results may be incomplete; narrow your path/glob to "
     "scan fewer files)"
 )
+
+# Footer note for skipped symlink files (R7), parallel in shape to
+# _SCAN_BOUND_NOTE / the binary-skip footer text.
+_SYMLINK_SKIP_NOTE = "({n} symlink(s) skipped: not followed)"
+
+
+class _TimeBudgetExceeded(Exception):
+    """Raised internally when a scan exceeds its wall-clock time budget.
+
+    Never escapes run_grep/run_glob directly -- always caught and turned
+    into an is_error ToolResult naming the budget.
+    """
+
+
+def _alarm_handler(signum, frame):
+    raise _TimeBudgetExceeded()
+
+
+@contextlib.contextmanager
+def _time_budget_guard(deadline: float):
+    """Bound the wall-clock time of the code inside the ``with`` block.
+
+    R1 (CRITICAL): a single catastrophic ``re`` match holds the GIL for its
+    entire duration -- on slow/throttled hardware a single pathological
+    line (e.g. ``(a+)+$`` on ~28 'a's) can take tens of seconds, which is
+    LONGER than any reasonable per-file/per-line "check the clock between
+    units" granularity could bound (the match itself is the unit that
+    overruns). A between-units monotonic check (also present in the scan
+    loops below, as a fast path and a defense for the no-SIGALRM case)
+    therefore cannot be the only enforcement -- it only helps for future
+    units, not the one currently backtracking.
+
+    The one stdlib mechanism that CAN interrupt a single in-flight ``re``
+    match is a signal: CPython's regex engine periodically checks for
+    pending signals during backtracking and raises the handler's exception
+    from inside the match call. This requires running on the main thread of
+    the main interpreter (``signal.signal``/``setitimer`` raise ValueError
+    off-main-thread) -- which holds here because run_grep/run_glob's sync
+    scan core runs inline (see module docstring below on why NOT
+    asyncio.to_thread for this one call).
+
+    If signals are unavailable (no SIGALRM on this platform, or we are not
+    on the main thread for some reason), this degrades gracefully to a
+    no-op: the caller's between-units monotonic checks remain as the
+    fallback bound (coarser, but still eventually terminates).
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _TimeBudgetExceeded()
+
+    can_signal = hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
+    armed = False
+    old_handler = None
+    if can_signal:
+        try:
+            old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            armed = True
+        except (ValueError, OSError):
+            armed = False  # e.g. not main thread -- fall back to no-op
+
+    try:
+        yield
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            if old_handler is not None:
+                signal.signal(signal.SIGALRM, old_handler)
+
+
+def _format_time_budget_error(budget: float) -> str:
+    return (
+        f"Search exceeded time budget ({budget:g}s) — narrow with "
+        "path/glob or simplify the pattern."
+    )
 
 
 @dataclass
@@ -87,24 +176,65 @@ def _resolve_root(path: str | None, workspace: Path) -> Path:
 
 
 def _display_path(p: Path, workspace: Path) -> str:
-    """Render a path workspace-relative when possible, else absolute (V7)."""
+    """Render a path workspace-relative when possible, else absolute (V7).
+
+    R15: computed LEXICALLY via ``os.path.relpath`` -- never ``.resolve()``
+    (which follows symlinks). A symlink INSIDE the workspace pointing at a
+    file OUTSIDE it must still display at its in-workspace name (e.g.
+    "link.txt"), never the resolved external absolute target: resolving
+    would leak the external path and would make grep/glob spell the same
+    in-workspace entry differently depending on incidental symlink targets.
+    A purely lexical relpath naturally keeps grep and glob spelling the same
+    file identically too (R15 forward-guard), since it never depends on
+    what (if anything) a path component points at.
+    """
     try:
-        return p.resolve().relative_to(Path(workspace).resolve()).as_posix()
+        rel = os.path.relpath(str(p), str(workspace))
     except Exception:
         return str(p)
+    rel_path = Path(rel)
+    if rel == os.curdir or rel_path.parts[:1] == (os.pardir,):
+        # Escapes upward out of the workspace (or IS the workspace root) --
+        # not really "within" it for display purposes; fall back to
+        # absolute rather than leak a ".."-relative escape (V7). Checked by
+        # PARTS, not a string prefix, so a real dirname like "..hidden"
+        # (which merely starts with the two characters ".." but is not the
+        # parent-dir token) is not misclassified as an escape.
+        return str(p)
+    return rel_path.as_posix()
 
 
-def _walk(root: Path, max_scan_files: int) -> tuple[list[_Entry], bool]:
+def _walk(
+    root: Path, max_scan_files: int, deadline: float | None = None
+) -> tuple[list[_Entry], bool, int]:
     """Walk ``root`` (no symlink following), pruning SKIP_DIRS, collecting
     up to ``max_scan_files`` total entries (files and directories combined).
 
-    Returns ``(entries, bound_hit)`` where ``bound_hit`` is True if the walk
-    was stopped early because the bound was reached (V3 footer steering).
-    Per-directory names are processed in sorted order so an early stop
-    always drops the same trailing entries call-to-call (determinism).
+    Returns ``(entries, bound_hit, symlinks_skipped)`` where ``bound_hit`` is
+    True if the walk was stopped early because the bound was reached (V3
+    footer steering), and ``symlinks_skipped`` is the count of symlinked
+    FILE entries excluded from ``entries`` (R7). Per-directory names are
+    processed in sorted order so an early stop always drops the same
+    trailing entries call-to-call (determinism).
+
+    R7: symlinked FILE entries are never followed -- checked via
+    ``os.path.islink`` BEFORE the ``stat()``/read that would otherwise
+    silently resolve through the link to outside-workspace content. Counted
+    so the caller can report "N symlink(s) skipped" (an honest footer, not a
+    silent omission). Symlinked DIRECTORIES are already excluded from
+    descent by ``os.walk(..., followlinks=False)`` above (pre-existing,
+    unchanged) -- this walker never recurses into one, so no file living
+    only behind a symlinked directory can ever reach ``entries`` regardless.
+
+    R1: if ``deadline`` is given, a ``time.monotonic()`` check runs between
+    each directory entry processed (the "per glob directory entry" between-
+    unit bound) -- this is the degraded-mode bound only; the primary
+    interruption for a single pathological op is the caller's SIGALRM guard.
+    Raises ``_TimeBudgetExceeded`` if the deadline has passed.
     """
     entries: list[_Entry] = []
     bound_hit = False
+    symlinks_skipped = 0
 
     for dirpath, dirnames, filenames in os.walk(str(root), topdown=True, followlinks=False):
         # Prune in place: removes skip-list dirs from further traversal AND
@@ -113,6 +243,8 @@ def _walk(root: Path, max_scan_files: int) -> tuple[list[_Entry], bool]:
         dirpath_p = Path(dirpath)
 
         for d in dirnames:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _TimeBudgetExceeded()
             if len(entries) >= max_scan_files:
                 bound_hit = True
                 break
@@ -126,10 +258,17 @@ def _walk(root: Path, max_scan_files: int) -> tuple[list[_Entry], bool]:
             break
 
         for f in sorted(filenames):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _TimeBudgetExceeded()
             if len(entries) >= max_scan_files:
                 bound_hit = True
                 break
             p = dirpath_p / f
+            # R7: check BEFORE stat()/read -- a symlinked file must never be
+            # followed (no-follow policy matches the directory case above).
+            if os.path.islink(p):
+                symlinks_skipped += 1
+                continue
             try:
                 st = p.stat()
             except OSError:
@@ -138,7 +277,32 @@ def _walk(root: Path, max_scan_files: int) -> tuple[list[_Entry], bool]:
         if bound_hit:
             break
 
-    return entries, bound_hit
+    return entries, bound_hit, symlinks_skipped
+
+
+def _skip_bound_footer_parts(
+    skipped: int, symlinks_skipped: int, bound_hit: bool, max_scan_files: int
+) -> list[str]:
+    """Build the shared skip/bound footer fragments (R5/R7), shared by both
+    grep's zero-match and non-zero-match paths, and by glob's.
+
+    R5: this MUST be computed and consulted before any zero-match early
+    return decides its wording -- a zero-match result must not claim
+    definitive absence ("No matches for pattern ...") when some candidates
+    were never scanned (skipped as binary/oversize/symlink, or the walk
+    itself was bounded before completion): the needle could be sitting
+    unread in one of those. Returning a non-empty list here is the signal
+    the caller uses to swap the confident zero-match wording for the
+    honest "incomplete" one.
+    """
+    parts: list[str] = []
+    if skipped > 0:
+        parts.append(f"({skipped} file(s) skipped: binary or exceeds size limit)")
+    if symlinks_skipped > 0:
+        parts.append(_SYMLINK_SKIP_NOTE.format(n=symlinks_skipped))
+    if bound_hit:
+        parts.append(_SCAN_BOUND_NOTE.format(max_scan_files=max_scan_files))
+    return parts
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +338,33 @@ async def run_grep(
         ToolResult. Zero matches is a hint, not an error. Invalid regex is
         an error naming the ``re.error`` message plus Python-re steering.
     """
+    budget = DEFAULT_TIME_BUDGET_SECONDS
     try:
+        # R11: validate params before doing any I/O -- an unknown output_mode
+        # must not silently fall through to files_with_matches, and a
+        # head_limit < 1 must not silently negative-slice or produce an
+        # empty body (mirrors read_file's offset/limit posture).
+        if output_mode not in _VALID_OUTPUT_MODES:
+            return ToolResult(
+                content=(
+                    f"Error: invalid output_mode {output_mode!r}. "
+                    f"Must be one of: {', '.join(_VALID_OUTPUT_MODES)}."
+                ),
+                is_error=True,
+            )
+        if head_limit is not None and head_limit < 1:
+            return ToolResult(
+                content=(
+                    f"Error: head_limit must be >= 1 (got {head_limit}). "
+                    "Omit head_limit to use the mode's default cap."
+                ),
+                is_error=True,
+            )
+
         workspace = Path(workspace)
         max_scan_files = config.get("max_scan_files", DEFAULT_MAX_SCAN_FILES)
         max_file_bytes = config.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
+        budget = float((config or {}).get("time_budget_seconds", DEFAULT_TIME_BUDGET_SECONDS))
 
         root = _resolve_root(path, workspace)
         if not root.exists():
@@ -200,51 +387,96 @@ async def run_grep(
                 is_error=True,
             )
 
-        # Candidate file set. grep's `path` may name a single file directly
-        # (design §6 schema: "file or directory root") — bypass the walker
-        # in that case rather than treating it as a (non-existent) subtree.
+        # R1: deadline captured at scan entry; the SIGALRM guard below is the
+        # primary interruption for a single catastrophic re.search call (a
+        # match holds the GIL for its whole duration -- no between-unit check
+        # can interrupt the unit currently backtracking). Between-unit
+        # time.monotonic() checks (per file below, per entry inside _walk)
+        # remain as the degraded-mode bound (no SIGALRM / non-main-thread)
+        # and as a cheap early-out once the budget is already spent.
+        deadline = time.monotonic() + budget
         bound_hit = False
-        if root.is_file():
-            candidates = [root]
-        else:
-            entries, bound_hit = _walk(root, max_scan_files)
-            candidates = [e.path for e in entries if not e.is_dir]
-            if glob:
-                candidates = [p for p in candidates if fnmatch.fnmatch(p.name, glob)]
-
         skipped = 0
+        symlinks_skipped = 0
         # (path, mtime, [(lineno, line_text), ...]) per file with >=1 match.
         file_matches: list[tuple[Path, float, list[tuple[int, str]]]] = []
 
-        for p in candidates:
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            if st.st_size > max_file_bytes:
-                skipped += 1
-                continue
-            if _is_binary(str(p)):
-                skipped += 1
-                continue
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    text = f.read()
-            except (UnicodeDecodeError, OSError):
-                skipped += 1
-                continue
+        with _time_budget_guard(deadline):
+            # Candidate file set. grep's `path` may name a single file
+            # directly (design §6 schema: "file or directory root") --
+            # bypass the walker in that case rather than treating it as a
+            # (non-existent) subtree.
+            if root.is_file():
+                candidates = [root]
+            else:
+                entries, bound_hit, symlinks_skipped = _walk(
+                    root, max_scan_files, deadline=deadline)
+                candidates = [e.path for e in entries if not e.is_dir]
+                if glob:
+                    candidates = [p for p in candidates if fnmatch.fnmatch(p.name, glob)]
 
-            hits: list[tuple[int, str]] = []
-            for lineno, line in enumerate(text.splitlines(), start=1):
-                if rx.search(line) is not None:
-                    hits.append((lineno, line))
-            if hits:
-                file_matches.append((p, st.st_mtime, hits))
+            for p in candidates:
+                if time.monotonic() >= deadline:
+                    raise _TimeBudgetExceeded()
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_size > max_file_bytes:
+                    skipped += 1
+                    continue
+                if _is_binary(str(p)):
+                    skipped += 1
+                    continue
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        text = f.read()
+                except (UnicodeDecodeError, OSError):
+                    skipped += 1
+                    continue
+
+                hits: list[tuple[int, str]] = []
+                for lineno, line in enumerate(text.splitlines(), start=1):
+                    # Between-unit (per-line-batch) deadline check -- the
+                    # degraded-mode bound; granularity of 1 line is cheap
+                    # (a single time.monotonic() call) and matches the R1
+                    # fixtures' per-line cost distribution.
+                    if time.monotonic() >= deadline:
+                        raise _TimeBudgetExceeded()
+                    if rx.search(line[:_MAX_REGEX_INPUT_CHARS]) is not None:
+                        hits.append((lineno, line))
+                if hits:
+                    file_matches.append((p, st.st_mtime, hits))
 
         # Deterministic order: mtime desc, path asc tiebreak (V3).
         file_matches.sort(key=lambda t: (-t[1], _display_path(t[0], workspace)))
 
+        # R5: the skip/bound footer is computed BEFORE the zero-match early
+        # return decides its wording -- a zero-match result must not claim
+        # definitive absence when some candidates were never scanned (the
+        # needle could be sitting unread in a skipped/unreached file).
+        footer_parts = _skip_bound_footer_parts(
+            skipped, symlinks_skipped, bound_hit, max_scan_files)
+
         if not file_matches:
+            if footer_parts:
+                # Skips/bound-hit exist: do NOT claim definitive absence.
+                # NOTE: the pattern is deliberately NOT echoed here — when a
+                # zero-match is caused by skipped entries (e.g. symlinks,
+                # R7), echoing the needle back would reproduce the very
+                # string the no-follow policy refused to read (pinned by
+                # TestR7Symlinks::test_symlinked_file_content_not_returned).
+                content = (
+                    "No matches in scanned files. Try broadening the "
+                    "search, check the path/glob filters, or verify the "
+                    "regex is correct (Python re syntax).\n\n"
+                    + "\n".join(footer_parts)
+                )
+                return ToolResult(content=content, is_error=False)
+            # PRESERVATION CONSTRAINT: zero skips and no bound hit -- keep
+            # the exact original text (test_search_tools.py pins this
+            # substring in test_zero_match_is_hint_not_error and
+            # test_case_insensitive_flag).
             return ToolResult(
                 content=(
                     f"No matches for pattern {pattern!r}. Try broadening "
@@ -253,8 +485,6 @@ async def run_grep(
                 ),
                 is_error=False,
             )
-
-        footer_parts: list[str] = []
 
         if output_mode == "content":
             limit = head_limit if head_limit is not None else 100
@@ -287,12 +517,9 @@ async def run_grep(
             if total > limit:
                 footer_parts.append(_OVERFLOW.format(n=limit, m=total))
 
-        if skipped > 0:
-            footer_parts.append(
-                f"({skipped} file(s) skipped: binary or exceeds size limit)"
-            )
-        if bound_hit:
-            footer_parts.append(_SCAN_BOUND_NOTE.format(max_scan_files=max_scan_files))
+        # skip/symlink/bound-hit fragments were already appended to
+        # footer_parts above (R5, before the zero-match decision) -- only
+        # the mode-specific OVERFLOW fragment (if any) was added since.
 
         content = body
         if footer_parts:
@@ -300,6 +527,8 @@ async def run_grep(
 
         return ToolResult(content=content, is_error=False)
 
+    except _TimeBudgetExceeded:
+        return ToolResult(content=_format_time_budget_error(budget), is_error=True)
     except Exception as e:
         return ToolResult(content=f"Error running grep: {e}", is_error=True)
 
@@ -439,9 +668,22 @@ async def run_glob(
         trailing "/", sorted newest-first (mtime desc, path asc tiebreak).
         Zero matches is a hint, not an error. A nonexistent root is an error.
     """
+    budget = DEFAULT_TIME_BUDGET_SECONDS
     try:
+        # R11: glob shares grep's head_limit posture -- < 1 must error, not
+        # silently negative-slice or produce an empty body.
+        if head_limit is not None and head_limit < 1:
+            return ToolResult(
+                content=(
+                    f"Error: head_limit must be >= 1 (got {head_limit}). "
+                    "Omit head_limit to use the default cap (100)."
+                ),
+                is_error=True,
+            )
+
         workspace = Path(workspace)
         max_scan_files = config.get("max_scan_files", DEFAULT_MAX_SCAN_FILES)
+        budget = float((config or {}).get("time_budget_seconds", DEFAULT_TIME_BUDGET_SECONDS))
 
         root = _resolve_root(path, workspace)
         if not root.exists():
@@ -463,18 +705,51 @@ async def run_glob(
                 is_error=True,
             )
 
-        entries, bound_hit = _walk(root, max_scan_files)
+        # R1: same deadline + SIGALRM design as run_grep -- a single
+        # backtracking rx.match(rel) call below holds the GIL for its whole
+        # duration, so the SIGALRM guard is the primary interruption; the
+        # per-entry time.monotonic() check is the degraded-mode bound.
+        deadline = time.monotonic() + budget
 
-        matched: list[_Entry] = []
-        for e in entries:
-            rel = e.path.relative_to(root).as_posix()
-            if rx.match(rel) is not None:
-                matched.append(e)
+        with _time_budget_guard(deadline):
+            entries, bound_hit, symlinks_skipped = _walk(
+                root, max_scan_files, deadline=deadline)
+
+            matched: list[_Entry] = []
+            for e in entries:
+                if time.monotonic() >= deadline:
+                    raise _TimeBudgetExceeded()
+                rel = e.path.relative_to(root).as_posix()
+                if rx.match(rel) is not None:
+                    matched.append(e)
 
         # Deterministic order: mtime desc, path asc tiebreak (V3).
         matched.sort(key=lambda e: (-e.mtime, _display_path(e.path, workspace)))
 
+        # R5: the skip/bound footer is computed BEFORE the zero-match early
+        # return decides its wording (mirrors run_grep) -- a zero-match
+        # result must not claim definitive absence when the walk was cut
+        # short or symlink entries were skipped (the target could be one of
+        # them). glob has no binary/oversize skip class, hence skipped=0.
+        zero_footer_parts = _skip_bound_footer_parts(
+            0, symlinks_skipped, bound_hit, max_scan_files)
+
         if not matched:
+            if zero_footer_parts:
+                # Skips/bound-hit exist: do NOT claim definitive absence.
+                # Pattern deliberately not echoed (mirrors run_grep's
+                # honest path; see R7 no-follow note there).
+                return ToolResult(
+                    content=(
+                        f"No matches in scanned files under {root}. The "
+                        "scan was incomplete -- try a broader pattern or "
+                        "a different path root.\n\n"
+                        + "\n".join(zero_footer_parts)
+                    ),
+                    is_error=False,
+                )
+            # PRESERVATION: zero skips and no bound hit -- keep the original
+            # confident wording.
             return ToolResult(
                 content=(
                     f"No matches for pattern {pattern!r} under {root}. "
@@ -495,6 +770,8 @@ async def run_glob(
         footer_parts: list[str] = []
         if total > limit:
             footer_parts.append(_OVERFLOW.format(n=limit, m=total))
+        if symlinks_skipped > 0:
+            footer_parts.append(_SYMLINK_SKIP_NOTE.format(n=symlinks_skipped))
         if bound_hit:
             footer_parts.append(_SCAN_BOUND_NOTE.format(max_scan_files=max_scan_files))
 
@@ -504,5 +781,7 @@ async def run_glob(
 
         return ToolResult(content=content, is_error=False)
 
+    except _TimeBudgetExceeded:
+        return ToolResult(content=_format_time_budget_error(budget), is_error=True)
     except Exception as e:
         return ToolResult(content=f"Error running glob: {e}", is_error=True)
