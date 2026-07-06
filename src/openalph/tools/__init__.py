@@ -3,6 +3,7 @@
 Tool registry, discovery, schema generation, and result truncation.
 """
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -965,6 +966,13 @@ async def execute_tool(
     executor module, then redact credentials from the result before
     returning (truncate + wrap happen later, at the call site).
 
+    R9: this outer function is a thin wrapper — ALL dispatch logic (including
+    the early unknown-tool / missing-param / guard-refusal returns) lives in
+    ``_execute_tool_inner``, so every return path (early or late) flows
+    through the SAME credential-redaction tail below before reaching the
+    caller. Message formats are unchanged from before the refactor; only the
+    control flow was moved.
+
     Args:
         name: Tool name to execute
         input: Tool input parameters
@@ -973,6 +981,52 @@ async def execute_tool(
         
     Returns:
         ToolResult with content and error status
+    """
+    result = await _execute_tool_inner(
+        name=name,
+        input=input,
+        tool_config=tool_config,
+        agent_config=agent_config,
+        tools=tools,
+        callbacks=callbacks,
+    )
+
+    # Redact credentials from tool output — applies to EVERY return path
+    # above (unknown tool, missing param, guard refusal, and normal
+    # dispatch results alike), not just the successful-dispatch tail.
+    from .security import redact_credentials as _redact_credentials
+    redacted_content, redaction_events = _redact_credentials(result.content)
+    if redaction_events:
+        result = ToolResult(content=redacted_content, is_error=result.is_error)
+        for event in redaction_events:
+            logger.warning(
+                "Credential redacted in %s output: %s (%d chars)",
+                name, event.pattern_name, event.char_count,
+            )
+        if callbacks and "on_redaction" in callbacks:
+            try:
+                await callbacks["on_redaction"](name, redaction_events)
+            except Exception as e:
+                logger.warning("on_redaction callback failed: %s", e)
+
+    return result
+
+
+async def _execute_tool_inner(
+    name: str,
+    input: dict,
+    tool_config: dict,
+    agent_config: Any,
+    tools: list[ToolDef] | None = None,
+    callbacks: dict | None = None,
+) -> ToolResult:
+    """Dispatch body moved out of execute_tool (R9). Every return here —
+    early (unknown tool / missing param / guard refusal) or from a tool's
+    executor module — is just a ToolResult; execute_tool applies the
+    redaction tail uniformly to whatever this function returns.
+
+    MESSAGE FORMATS UNCHANGED from the pre-refactor execute_tool: this is a
+    pure code-motion, not a rewording.
     """
     # Validate tool name exists
     if name not in BUILTIN_TOOLS:
@@ -1112,27 +1166,84 @@ async def execute_tool(
             _update_read_registry(_resolved_path, callbacks)
     elif name == "grep":
         from .search import run_grep
-        result = await run_grep(
-            pattern=input["pattern"],
-            path=input.get("path"),
-            glob=input.get("glob"),
-            output_mode=input.get("output_mode", "files_with_matches"),
-            head_limit=input.get("head_limit"),
-            case_insensitive=input.get("case_insensitive", False),
-            config=tool_config,
-            workspace=agent_config.workspace if hasattr(agent_config, "workspace") else Path("."),
-        )
+        # R16: search tools require an explicit workspace — never silently
+        # fall back to scanning the process CWD.
+        if not hasattr(agent_config, "workspace"):
+            return ToolResult(
+                content=(
+                    "grep requires workspace configuration: agent_config has "
+                    "no 'workspace' attribute. Refusing to fall back to the "
+                    "process working directory."
+                ),
+                is_error=True,
+            )
+        # R1 dispatch belt: outer wall-clock bound on top of search.py's own
+        # in-scan SIGALRM+deadline enforcement (defense in depth — see
+        # tmp/f1/REPORT.md note for F3: asyncio.wait_for is compatible here;
+        # asyncio.to_thread is FORBIDDEN, it would defeat the SIGALRM guard
+        # by pinning the scan on a worker thread that never sees the signal).
+        budget = float(tool_config.get("time_budget_seconds", 10))
+        try:
+            result = await asyncio.wait_for(
+                run_grep(
+                    pattern=input["pattern"],
+                    path=input.get("path"),
+                    glob=input.get("glob"),
+                    output_mode=input.get("output_mode", "files_with_matches"),
+                    head_limit=input.get("head_limit"),
+                    case_insensitive=input.get("case_insensitive", False),
+                    config=tool_config,
+                    workspace=agent_config.workspace,
+                ),
+                timeout=budget + 5.0,
+            )
+        except asyncio.TimeoutError:
+            result = ToolResult(
+                content=(
+                    f"grep exceeded its time budget ({budget:g}s) at the "
+                    "dispatch level — narrow with path/glob or simplify the "
+                    "pattern."
+                ),
+                is_error=True,
+            )
         # grep is read-only over file CONTENT for search purposes, not a
         # file_read — it does NOT touch the read-registry (anchors §7.2).
     elif name == "glob":
         from .search import run_glob
-        result = await run_glob(
-            pattern=input["pattern"],
-            path=input.get("path"),
-            head_limit=input.get("head_limit"),
-            config=tool_config,
-            workspace=agent_config.workspace if hasattr(agent_config, "workspace") else Path("."),
-        )
+        # R16: search tools require an explicit workspace — never silently
+        # fall back to scanning the process CWD.
+        if not hasattr(agent_config, "workspace"):
+            return ToolResult(
+                content=(
+                    "glob requires workspace configuration: agent_config has "
+                    "no 'workspace' attribute. Refusing to fall back to the "
+                    "process working directory."
+                ),
+                is_error=True,
+            )
+        # R1 dispatch belt: see grep branch above (same rationale — outer
+        # asyncio.wait_for is compatible; asyncio.to_thread is FORBIDDEN).
+        budget = float(tool_config.get("time_budget_seconds", 10))
+        try:
+            result = await asyncio.wait_for(
+                run_glob(
+                    pattern=input["pattern"],
+                    path=input.get("path"),
+                    head_limit=input.get("head_limit"),
+                    config=tool_config,
+                    workspace=agent_config.workspace,
+                ),
+                timeout=budget + 5.0,
+            )
+        except asyncio.TimeoutError:
+            result = ToolResult(
+                content=(
+                    f"glob exceeded its time budget ({budget:g}s) at the "
+                    "dispatch level — narrow with path/glob or simplify the "
+                    "pattern."
+                ),
+                is_error=True,
+            )
         # glob is a directory/name listing, not a file_read — it does NOT
         # touch the read-registry (anchors §7.2).
     elif name == "web_search":
@@ -1209,20 +1320,6 @@ async def execute_tool(
             is_error=True,
         )
 
-    # Redact credentials from tool output
-    from .security import redact_credentials as _redact_credentials
-    redacted_content, redaction_events = _redact_credentials(result.content)
-    if redaction_events:
-        result = ToolResult(content=redacted_content, is_error=result.is_error)
-        for event in redaction_events:
-            logger.warning(
-                "Credential redacted in %s output: %s (%d chars)",
-                name, event.pattern_name, event.char_count,
-            )
-        if callbacks and "on_redaction" in callbacks:
-            try:
-                await callbacks["on_redaction"](name, redaction_events)
-            except Exception as e:
-                logger.warning("on_redaction callback failed: %s", e)
-
+    # R9: redaction now applied uniformly by the outer execute_tool wrapper
+    # (covers this return AND the early returns above) — nothing to do here.
     return result

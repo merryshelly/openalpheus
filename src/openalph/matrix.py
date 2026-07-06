@@ -722,6 +722,10 @@ class MatrixBot:
                 task_preview = input_data.get("task", "")
                 model_info = input_data.get("model", "default")
                 result_preview = str(result) if result else ""
+                # R8: cap an ERROR result preview before it enters the notice —
+                # parity with the generic error branch's detail-text cap below.
+                if is_error and len(result_preview) > 2000:
+                    result_preview = result_preview[:2000] + "\n[truncated]"
                 # Calculate elapsed time if we have a start timestamp
                 elapsed_str = ""
                 start_ts = _subagent_start_times.pop(call_id, None)
@@ -734,15 +738,19 @@ class MatrixBot:
                         elapsed_str = f" — {elapsed:.1f}s"
                 summary_line = f"🤖 subagent ({model_info}) {status}{elapsed_str}"
                 html = f'<b>{summary_line}</b>'
+                # R8: html.escape (not raw mistune.html) — task/result previews
+                # are tool-influenced text and must never pass raw HTML to the
+                # client. Cosmetic markdown loss here is an accepted tradeoff
+                # (audit decision).
                 if task_preview:
                     html += (
                         f'\n<details><summary>📋 Task brief</summary>\n'
-                        f'{mistune.html(task_preview)}</details>'
+                        f'{html_escape(task_preview)}</details>'
                     )
                 if result_preview:
                     html += (
                         f'\n<details><summary>📨 Result</summary>\n'
-                        f'{mistune.html(result_preview)}</details>'
+                        f'{html_escape(result_preview)}</details>'
                     )
                 body_text = f"{summary_line}\n\nTask: {task_preview[:200]}"
                 content_msg = {
@@ -829,10 +837,12 @@ class MatrixBot:
                     iters = tc.input.get("max_iterations", 200)
                     summary = f"⚙️ Spawning sub-agent ({model_info}, max {iters} iters)"
                     html = f'<b>{summary}</b>'
+                    # R8: html.escape (not raw mistune.html) — the dispatch task
+                    # brief is tool-influenced text; never pass raw HTML through.
                     if task_preview:
                         html += (
                             f'\n<details><summary>📋 Task brief</summary>\n'
-                            f'{mistune.html(task_preview)}</details>'
+                            f'{html_escape(task_preview)}</details>'
                         )
                     body_text = f"{summary}: {task_preview[:200]}"
                     dispatch_msg = {
