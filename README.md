@@ -18,9 +18,9 @@ All agent frameworks make tradeoffs. We optimized for:
 
 - **Control.** Full control of the system prompt. Your agent doesn't read a single character you didn't put there. Behavior is configured by editing markdown files — no code required.
 - **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
-- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Eleven tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
+- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Fourteen tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
 - **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
-- **Maintainability.** ~9,000 LOC. Full test coverage. Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
+- **Maintainability.** ~13,000 LOC. Full test coverage. Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
 - **Resilience.** Each agent runs as an isolated Unix process with its own filesystem. One agent can crash out, trash its workspace, and the others are unaffected.
 - **Focus.** Matrix is a mature protocol with an array of clients for mobile, desktop, web. No bespoke UI, no custom views to maintain.
 - **Transparency.** Session state is append-only text in JSONL, not a database. `grep` works. `cat` works. No migrations, no schema, no query language needed.
@@ -85,7 +85,7 @@ Skills are listed by name in the prompt; the agent reads their content on demand
 
 Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
 
-Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `web_search`\*, `web_fetch`, `subagent`, `memory_search`, `send_media`, `context_status`, `todo_write`.
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `grep`, `glob`, `subagent`, `memory_search`, `send_media`, `context_status`, `todo_write`.
 
 \*`web_search` requires a [Brave Search API key](https://brave.com/search/api/) configured in `workspace/tools/web_search.toml`. Without it, the tool is available but returns an error. `web_fetch` (direct URL fetching) works without any API key.
 
@@ -97,6 +97,8 @@ Optional, config-aware in-stream guidance that helps agents stay on track during
 - **`todo_write` tool.** A session-scoped working-memory task list. The harness stays tracker-agnostic — promoting todos to a durable tracker is an operator convention, not a dependency.
 - **Read-before-write guard.** `file_write` refuses to overwrite an existing file not read this session (or changed on disk since) — blind overwrites are structurally prevented, not just discouraged. Opt out with `require_read_before_write = false` in `workspace/tools/file_write.toml`.
 - **Rich tool descriptions.** All built-in tools carry prompt-engineered descriptions (purpose, constraints, when-not) plus steering in error/truncation returns — passed via the API `tools` parameter, never injected into the system prompt.
+- **Multi-hunk patching + validated edits.** `file_patch` applies several SEARCH/REPLACE hunks to a file in one atomic, all-or-nothing call. `file_edit`, `file_write`, and `file_patch` run a zero-dependency syntax check (Python / JSON / TOML) before writing and reject an edit that would turn a clean file broken; writes commit atomically (temp file + rename).
+- **Bounded search.** `grep` (regex over file contents) and `glob` (filename patterns) are pure-Python and workspace-scoped, with file-count and byte caps, a per-scan time budget that defends against catastrophic-backtracking (ReDoS) patterns, and no-follow handling of symlinks.
 
 ### Providers
 

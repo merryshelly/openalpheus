@@ -260,7 +260,7 @@ sudo -u oa-<name> nano /home/oa-<name>/workspace/skills/my-skill.md
 ```
 
 ### Tools
-Enabled by `.toml` files in `workspace/tools/`. Empty file = enabled with defaults. All 9 built-in tools enabled by default:
+Enabled by `.toml` files in `workspace/tools/`. Empty file = enabled with defaults. All 14 built-in tools enabled by default:
 
 | Tool | Purpose |
 |------|---------|
@@ -268,11 +268,16 @@ Enabled by `.toml` files in `workspace/tools/`. Empty file = enabled with defaul
 | `file_read` | Read files |
 | `file_write` | Write/create files |
 | `file_edit` | Find-and-replace in files |
+| `file_patch` | Apply multiple SEARCH/REPLACE hunks to a file atomically |
 | `web_search` | Web search (requires Brave Search API key in TOML) |
 | `web_fetch` | Fetch + extract text from URLs |
+| `grep` | Search file contents by regex (bounded, workspace-scoped) |
+| `glob` | Find files by name pattern (bounded, workspace-scoped) |
 | `subagent` | Spawn sub-agents for complex tasks |
 | `memory_search` | Semantic + keyword search over workspace |
 | `send_media` | Send files to Matrix room |
+| `context_status` | Agent self-monitoring (context %, tokens, session age) |
+| `todo_write` | Session-scoped working-memory task list |
 
 Disable a tool by removing its TOML: `rm workspace/tools/shell.toml` then restart.
 

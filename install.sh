@@ -2053,7 +2053,7 @@ print(pathlib.Path(openalph.templates.__file__).parent)
     mkdir -p "${TOOLS_DIR}"
 
     local tool
-    for tool in shell file_read file_write file_edit web_search web_fetch subagent memory_search send_media; do
+    for tool in shell file_read file_write file_edit web_search web_fetch subagent memory_search send_media context_status todo_write file_patch grep glob; do
         touch "${TOOLS_DIR}/${tool}.toml"
     done
 
