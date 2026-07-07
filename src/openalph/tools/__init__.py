@@ -450,6 +450,69 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         },
         "config": {}
     },
+    "web_fetch_js": {
+        "description": (
+            "Fetch a JavaScript-rendered web page via Tabstack's cloud browser and return clean "
+            "content. Use when web_fetch returns an empty shell, a \"please enable JavaScript\" "
+            "notice, or obviously incomplete text from a JS-heavy site (SPAs, dashboards, "
+            "infinite-scroll, dynamically-loaded data). "
+            "IMPORTANT: try web_fetch FIRST — it's faster and free. Reach for web_fetch_js only "
+            "when web_fetch's result is clearly unrendered; this runs a real browser (slower, up "
+            "to ~60s at effort=max). "
+            "IMPORTANT: provide a schema (JSON Schema) to get structured JSON back instead of "
+            "markdown — ideal when you need specific fields (prices, listings, table rows). "
+            "Omit it for clean readable markdown. "
+            "NEVER send credentials, cookies, or authenticated URLs through this tool — Tabstack "
+            "fetches the page from its own cloud and cannot use your session. For logged-in "
+            "flows, use local Playwright (see browser-automation skill). "
+            "When NOT to use: static/simple pages web_fetch already handles; multi-step "
+            "interaction (clicking, form flows) or multi-page research — those stay in the "
+            "browser-automation skill via the tabstack CLI (/automate, /research)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The publicly accessible URL to fetch and render."
+                },
+                "schema": {
+                    "type": "object",
+                    "description": (
+                        "Optional JSON Schema. If provided, returns structured JSON extraction "
+                        "matching the schema instead of markdown. Use for specific fields "
+                        "(prices, listings, table rows)."
+                    )
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": ["min", "standard", "max"],
+                    "description": (
+                        "Browser rendering effort. Default max (full render). Drop to "
+                        "standard/min for speed on lighter pages."
+                    )
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": (
+                        "Truncate returned markdown to this many chars (head+tail), like "
+                        "web_fetch. Ignored in schema mode."
+                    )
+                },
+                "nocache": {
+                    "type": "boolean",
+                    "description": "Bypass Tabstack's cache for real-time data. Default false."
+                }
+            },
+            "required": ["url"]
+        },
+        "config": {
+            "api_key": "",
+            "base_url": "https://api.tabstack.ai/v1",
+            "default_effort": "max",
+            "timeout": 90
+        }
+    },
     "subagent": {
         "description": (
             "Delegate a focused, bounded task to an isolated sub-agent. "
@@ -1330,6 +1393,34 @@ async def _execute_tool_inner(
         result = await web_fetch(
             url=input["url"],
             max_chars=input.get("max_chars"),
+            tool_config=tool_config,
+        )
+    elif name == "web_fetch_js":
+        from .web import web_fetch_js
+        # Reuse the TTL-cached resolver — same rate-limit safety invariant as
+        # web_search (§6, load-bearing): a per-call `op read` under burst load
+        # (e.g. an agent scraping a paginated JS site) exhausts the 1Password
+        # service-account rate limit; the TTL cache is what prevents that.
+        api_key = tool_config.get("api_key", "")
+        if not api_key and "api_key_cmd" in tool_config:
+            api_key = _resolve_cached_api_key(
+                tool_config["api_key_cmd"],
+                tool_config.get("api_key_cache_ttl"),
+            )
+        result = await web_fetch_js(
+            url=input.get("url", ""),
+            schema=input.get("schema"),
+            effort=input.get("effort") or tool_config.get("default_effort", "max"),
+            max_chars=input.get("max_chars"),
+            # L3: pass the raw value through -- do NOT force bool() here.
+            # bool("false") is True, so a force-bool() at the dispatch seam
+            # would turn a stringly-typed "false" into True before the
+            # handler ever sees it. web_fetch_js itself validates
+            # isinstance(nocache, bool) and coerces any non-bool to False.
+            nocache=input.get("nocache", False),
+            api_key=api_key,
+            base_url=tool_config.get("base_url", "https://api.tabstack.ai/v1"),
+            timeout=tool_config.get("timeout", 90),
         )
     elif name == "subagent":
         from .subagent import run_subagent
