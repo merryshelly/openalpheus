@@ -737,7 +737,25 @@ def _build_anthropic_kwargs(
     # Add prompt caching to last user message.
     # Deep copy the target message to avoid mutating the caller's history
     # dicts (shared references from agent.py's shallow list copy).
-    if api_kwargs["messages"]:
+    #
+    # Caller-placed breakpoint (advisor amendment, design §14 #1b): if a
+    # caller has ALREADY placed a block-level cache_control anywhere in
+    # provider_messages (e.g. the advisor handler puts one on its rendered-
+    # transcript block so a later, cheap-to-vary block can follow it), honor
+    # that breakpoint and SKIP the automatic last-block application below --
+    # otherwise the auto-apply would move (or add a second) breakpoint onto
+    # the trailing block, busting the cache prefix the caller deliberately
+    # pinned earlier in the message. When no caller breakpoint is present,
+    # behavior is UNCHANGED: the last block of the last user message is
+    # still cached automatically (backward-compatible; every pre-existing
+    # caller relies on this and places no cache_control of its own).
+    _caller_has_breakpoint = any(
+        isinstance(block, dict) and "cache_control" in block
+        for msg in api_kwargs["messages"]
+        if isinstance(msg.get("content"), list)
+        for block in msg["content"]
+    )
+    if not _caller_has_breakpoint and api_kwargs["messages"]:
         last_msg = api_kwargs["messages"][-1]
         if last_msg.get("role") == "user":
             last_msg = copy.deepcopy(last_msg)
@@ -1234,12 +1252,16 @@ async def complete(
     max_tokens: int | None = None,
     model: str | None = None,
     thinking: str | None = None,
+    cache_ttl: str | None = None,
 ) -> Response:
     """
     Route to Anthropic or OpenAI SDK based on config.providers.
     If max_tokens is None, use config.max_tokens.
     If model is None, use config.default_model.
     If thinking is None, use config.thinking (defaults to "off").
+    cache_ttl is forwarded to stream() unchanged (advisor amendment, design
+    §14 #1a); omitting it (None) preserves prior behavior exactly, since
+    stream() already treats a None cache_ttl as "use the default".
     
     Errors propagate directly - no wrapping, no retry.
     """
@@ -1252,6 +1274,7 @@ async def complete(
         max_tokens=max_tokens,
         model=model,
         thinking=thinking,
+        cache_ttl=cache_ttl,
     ):
         if event.type == "done":
             response = event.response

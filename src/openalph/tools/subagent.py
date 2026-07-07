@@ -146,6 +146,9 @@ async def run_subagent(
 
     # Per-sub-agent isolated read registry — prevents sub from using parent's read state
     _sub_read_registry: dict[str, float] = {}
+    # Per-sub-agent isolated advisor consult counter — local to this dispatch,
+    # not the parent room's (a parent near-cap must not gate the sub).
+    _sub_advisor_uses: dict = {}
 
     try:
         for iteration in range(iteration_limit):
@@ -240,7 +243,13 @@ async def run_subagent(
                     input=tc.input,
                     tool_config=tool_config,
                     agent_config=config,
-                    callbacks={"read_registry": _sub_read_registry},
+                    callbacks={
+                        "read_registry": _sub_read_registry,
+                        "get_transcript": lambda: (system, list(messages)),
+                        "advisor_uses": _sub_advisor_uses,
+                        "room_id": "__sub__",
+                        "call_id": call_id,
+                    },
                 ))
 
             results = await asyncio.gather(*tool_coros)

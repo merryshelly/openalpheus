@@ -286,6 +286,7 @@ class MatrixBot:
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._steering_inbox: dict[str, list[str]] = {}
         self._active_turns: set[str] = set()
+        self._advisor_results: dict[tuple, dict] = {}  # R5: keyed (room_id, call_id)
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -784,6 +785,42 @@ class MatrixBot:
                     await self._room_send_with_retry(room_id, todo_content)
                 except Exception:
                     pass
+            elif name == "advisor":
+                # R5 (audit remediation): room-scoped key — the bot-wide
+                # _advisor_results dict keyed by call_id alone would collide
+                # across concurrent rooms; room_id is in this closure's
+                # scope (_make_tool_callbacks(self, room_id)).
+                info = self._advisor_results.pop((room_id, call_id), {})
+                advice = info.get("advice") or (str(result) if result else "")
+                elapsed = info.get("elapsed_s", 0.0)
+                itok = info.get("input_tokens", 0)
+                otok = info.get("output_tokens", 0)
+                crd = info.get("cache_read_tokens", 0)
+                mdl = info.get("model", "?")
+                if is_error:
+                    summary_line = f"🔮 Advisor failed: {str(result)[:200]}"
+                    adv_html = html_escape(summary_line)
+                else:
+                    summary_line = f"🔮 Advisor returned ({elapsed:.1f}s · {itok}/{otok} tokens · cache read {crd})"
+                    adv_html = f'<b>{html_escape(summary_line)}</b>'
+                    if advice:
+                        adv_html += f'\n<details><summary>🔮 advice</summary>\n{html_escape(advice)}</details>'
+                try:
+                    await self._room_send_with_retry(room_id, {
+                        "msgtype": "m.notice", "body": summary_line,
+                        "format": "org.matrix.custom.html", "formatted_body": adv_html,
+                    })
+                except Exception:
+                    pass
+                if not is_error:
+                    _sl_adv = getattr(self, 'session_log', None)
+                    if _sl_adv:
+                        _sl_adv.append(
+                            role="system", sender=self.config.user_id, room=room_id,
+                            event_id=None, event="advisor_consult", model=mdl,
+                            input_tokens=itok, output_tokens=otok,
+                            cache_read_tokens=crd, elapsed_s=elapsed,
+                        )
             else:
                 notice_body = f"🔧 {name}{detail} {status}"
                 if is_error:
@@ -853,6 +890,25 @@ class MatrixBot:
                     }
                     try:
                         await self._room_send_with_retry(room_id, dispatch_msg)
+                    except Exception:
+                        pass
+                elif tc.name == "advisor" and isinstance(tc.input, dict):
+                    mdl = tc.input.get("model", "advisor")
+                    # N1 (audit remediation): `focus` is executor-authored and
+                    # is about to be echoed into the room's spawn notice --
+                    # redact it before display, same as the egress-side fix
+                    # in tools/advisor.py's run_advisor.
+                    from openalph.tools.security import redact_credentials
+                    focus = redact_credentials(str(tc.input.get("focus", "")))[0]
+                    summary = f"🔮 Advisor consult → {mdl}"
+                    if focus:
+                        summary += f" — focus: {str(focus)[:120]}"
+                    try:
+                        await self._room_send_with_retry(room_id, {
+                            "msgtype": "m.notice", "body": summary,
+                            "format": "org.matrix.custom.html",
+                            "formatted_body": f'<b>{html_escape(summary)}</b>',
+                        })
                     except Exception:
                         pass
             self._persist_assistant_turn(room_id, content=content_text or "", tool_calls=tool_calls)
@@ -953,6 +1009,18 @@ class MatrixBot:
                 pass  # spec-mocked agent, read_registry will be empty dict
         _read_registry = _registries.setdefault(room_id, {})
 
+        # advisor: per-room consult counter (getattr for mocked-agent compatibility)
+        _advisor_uses = getattr(self.agent, '_advisor_uses', None)
+        if _advisor_uses is None:
+            _advisor_uses = {}
+            try:
+                self.agent._advisor_uses = _advisor_uses
+            except AttributeError:
+                pass
+        # Lazy-init for tests that construct MatrixBot via __new__
+        if not hasattr(self, '_advisor_results'):
+            self._advisor_results = {}
+
         return {
             "send_media": _upload_callback,
             "on_redaction": _redaction_notice,
@@ -963,6 +1031,9 @@ class MatrixBot:
             "turn_source": turn_source,
             "read_registry": _read_registry,       # R1-1
             "room_id": room_id,                    # R1-2
+            "get_transcript": lambda: (self.agent.system_prompt, list(self.agent.history(room_id))),
+            "advisor_uses": _advisor_uses,
+            "advisor_results": self._advisor_results,
         }
 
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
@@ -1390,12 +1461,15 @@ class MatrixBot:
                 # This ensures T3 suppression by prior memory_search survives restart.
                 _tool_counts: dict[str, int] = {}
                 _last_todo_write_args = None
+                advisor_count = 0
                 for entry in existing:
                     if entry.get("role") == "assistant" and entry.get("tool_calls"):
                         for _tc in entry["tool_calls"]:
                             _tc_name = _tc.get("name", "")
                             if _tc_name:
                                 _tool_counts[_tc_name] = _tool_counts.get(_tc_name, 0) + 1
+                            if _tc_name == "advisor":
+                                advisor_count += 1
                             # R2-todo-rehydrate: capture last todo_write args
                             if _tc_name == "todo_write":
                                 _tc_input = _tc.get("input")
@@ -1403,6 +1477,11 @@ class MatrixBot:
                                     _last_todo_write_args = _tc_input["todos"]
                 if _tool_counts:
                     self.agent._room_tool_counts[room_id] = _tool_counts
+                # advisor: rehydrate per-room consult counter (survives restart)
+                try:
+                    self.agent._advisor_uses[room_id] = advisor_count
+                except (AttributeError, TypeError):
+                    pass
 
                 # R2-todo-rehydrate: restore _TODO_STATE from last todo_write call
                 if _last_todo_write_args is not None:

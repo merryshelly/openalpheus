@@ -491,6 +491,45 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "default_max_iterations": 100
         }
     },
+    "advisor": {
+        "description": (
+            "Consult a second, typically stronger model for strategic guidance mid-task. "
+            "The advisor sees your full transcript (system prompt, conversation, and tool "
+            "activity so far) and returns advice as text. "
+            "IMPORTANT: consult before committing to an approach on a non-obvious design "
+            "decision, before your first substantive write on a multi-step task, and before "
+            "declaring complex work done. "
+            "The advisor has no tools and cannot act — its advice is guidance to weigh "
+            "against your own context; you remain responsible for the outcome. "
+            "Use focus to ask a specific question. "
+            "NOT for: trivial or single-step tasks, factual lookups (use web_search), or "
+            "delegating work (use subagent)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "Specific question or area to direct the advisor's attention (optional)"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Override the configured advisor model (alias or provider/model; optional)"
+                }
+            },
+            "required": []
+        },
+        "config": {
+            "model": "",
+            "max_uses": 10,
+            "max_tokens": 8192,
+            "thinking": "medium",
+            "include_system_prompt": True,
+            "transcript_max_chars": 0,
+            "cache_ttl": "5m",
+            "timeout": 300
+        }
+    },
     "memory_search": {
         "description": (
             "Search workspace memory files using hybrid semantic + keyword search. "
@@ -1303,6 +1342,15 @@ async def _execute_tool_inner(
             max_tokens=input.get("max_tokens"),
             max_iterations=input.get("max_iterations"),
             call_id=callbacks.get("call_id") if callbacks else None,
+        )
+    elif name == "advisor":
+        from .advisor import run_advisor
+        result = await run_advisor(
+            focus=input.get("focus"),
+            model=input.get("model"),
+            config=agent_config,
+            tool_config=tool_config,
+            callbacks=callbacks,
         )
     elif name == "memory_search":
         from .memory_search import run_memory_search

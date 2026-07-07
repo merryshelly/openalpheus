@@ -205,6 +205,8 @@ class Agent:
         self._room_tool_counts: dict[str, dict[str, int]] = {}
         # R1-1: Per-room read registries for file_write guard
         self._read_registries: dict[str, dict] = {}
+        # Per-room advisor consult counters (session cap tracking)
+        self._advisor_uses: dict[str, int] = {}
 
 
     def _engine_for(self, room_id: str) -> ReminderEngine:
@@ -235,6 +237,7 @@ class Agent:
             del self._reminder_engines[room_id]
         # R1-1: clear this room's read registry
         self._read_registries.pop(room_id, None)
+        self._advisor_uses.pop(room_id, None)
 
     def _usage_for(self, room_id: str) -> dict[str, int]:
         """Lazily init + return the per-room counter record (5 keys, all int)."""
