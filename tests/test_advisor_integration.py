@@ -630,6 +630,110 @@ class TestNotices:
         assert "<b>caution</b>" not in fb, \
             "Advice HTML must be escaped (not rendered) — no raw <b> from the advice"
 
+    @pytest.mark.asyncio
+    async def test_return_notice_preserves_advice_line_breaks(self, tmp_path):
+        """FIX kdsn.198.9 #3: multi-line advice keeps its line breaks — the fold
+        converts real newlines to <br> (HTML would otherwise fold them to spaces).
+        Still html.escape'd; NOT markdown-rendered (a pattern-copier must not
+        reintroduce mistune)."""
+        assert run_advisor is not None, NOT_IMPL
+        advice = "Line one.\nLine two.\n\nFinal paragraph."
+        sent = await self._run_with_notices(tmp_path, advice_text=advice)
+        details = [m for m in sent
+                   if "<details>" in str(m.get("formatted_body", ""))
+                   and "advice" in str(m.get("formatted_body", ""))]
+        assert details, "Return notice must render the advice in a <details> fold"
+        fb = str(details[-1]["formatted_body"])
+        assert "Line one.<br>Line two." in fb, \
+            "Adjacent advice lines must be separated by <br>, not folded to a run-on"
+        assert "<br><br>" in fb, "A blank line in advice must survive as <br><br>"
+        assert "Line one.\nLine two." not in fb, \
+            "The literal-newline run-on (folded to a space by clients) must be gone"
+        # No markdown rendering: a literal <tag> in advice is escaped, not rendered.
+        adv2 = "First.\n<b>not bold</b>"
+        sent2 = await self._run_with_notices(tmp_path, advice_text=adv2)
+        fb2 = str([m for m in sent2 if "<details>" in str(m.get("formatted_body", ""))
+                   and "advice" in str(m.get("formatted_body", ""))][-1]["formatted_body"])
+        assert "First.<br>" in fb2 and "&lt;b&gt;not bold&lt;/b&gt;" in fb2, \
+            "Advice must be html.escape'd with breaks preserved (no raw <b>)"
+
+    @pytest.mark.asyncio
+    async def test_notices_show_resolved_model_not_literal_advisor(self, tmp_path):
+        """FIX kdsn.198.9 #2: both spawn and return notices name the RESOLVED
+        advisor model (alias 'adv' expanded to 'anthropic/claude-opus-4-8'),
+        never the literal fallback word 'advisor'. The call carries no per-call
+        model, so it relies on the configured default — exactly SB's '→ advisor'
+        scenario."""
+        assert run_advisor is not None, NOT_IMPL
+        sent = await self._run_with_notices(tmp_path)
+        spawn = [str(m.get("body", "")) + str(m.get("formatted_body", ""))
+                 for m in sent if "consult" in str(m.get("body", "")).lower()]
+        ret = [str(m.get("body", "")) + str(m.get("formatted_body", ""))
+               for m in sent if "returned" in str(m.get("body", "")).lower()]
+        assert spawn, "spawn notice must fire"
+        assert ret, "return notice must fire"
+        assert any("anthropic/claude-opus-4-8" in b for b in spawn), \
+            "spawn notice must show the resolved/expanded model (alias 'adv' expanded)"
+        assert any("anthropic/claude-opus-4-8" in b for b in ret), \
+            "return notice must show the resolved/expanded model"
+        assert not any("→ advisor" in b for b in spawn), \
+            "spawn notice must not show the literal 'advisor' fallback as the model"
+
+    @pytest.mark.asyncio
+    async def test_spawn_notice_full_focus_in_details_fold(self, tmp_path):
+        """FIX kdsn.198.9 #1: the complete focus/ask is visible under a collapsed
+        <details> fold (subagent-brief pattern); the summary line carries only a
+        short preview. A long, multi-line focus must not be truncated away."""
+        assert run_advisor is not None, NOT_IMPL
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        sent = []
+        bot._room_send_with_retry = AsyncMock(side_effect=lambda rid, msg, **kw: sent.append(msg))
+        bot.send_notice = AsyncMock(side_effect=lambda rid, text, **kw: sent.append(
+            {"msgtype": "m.notice", "body": text}))
+        bot._set_typing = AsyncMock()
+        _tool_notice, _tool_intent = bot._make_tool_callbacks(ROOM_A)
+        cb = bot._build_agent_callbacks(ROOM_A, None)
+        long_focus = (
+            "Should we migrate the validator set to the new client before the fork,\n"
+            "or wait until after? Consider client diversity, slashing risk, and the\n"
+            "attestation-effectiveness dip we saw last time. This sentence pushes the "
+            "focus well beyond the 120-character summary-line preview cap for certain.")
+        idx = [0]
+
+        async def _stream(*, messages=None, tools=None, model="m", **kw):
+            idx[0] += 1
+            if idx[0] == 1:
+                tc = ToolCall(id="adv_1", name="advisor", input={"focus": long_focus})
+                yield StreamEvent(type="done", model=model, stop_reason="tool_use",
+                                  response=Response(content="", tool_calls=[tc], model=model,
+                                                    usage=Usage(input_tokens=10, output_tokens=5),
+                                                    stop_reason="tool_use"))
+            else:
+                yield StreamEvent(type="done", model=model, stop_reason="end_turn",
+                                  response=Response(content="fin", model=model,
+                                                    usage=Usage(input_tokens=10, output_tokens=5),
+                                                    stop_reason="end_turn"))
+
+        with patch("openalph.agent.stream", side_effect=_stream), \
+             patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=_advice_response()):
+            await agent.handle_input("work", room_id=ROOM_A, callbacks=cb,
+                                     on_tool_call=_tool_notice, on_tool_intent=_tool_intent)
+
+        spawn = [m for m in sent if "consult" in str(m.get("body", "")).lower()]
+        assert spawn, "spawn notice must fire"
+        body = str(spawn[0].get("body", ""))
+        fb = str(spawn[0].get("formatted_body", ""))
+        # Summary line is a short preview — the tail of a long focus is NOT on it.
+        assert "attestation-effectiveness dip" not in body, \
+            "summary line must be a short preview, not the full focus"
+        # Full focus lives in a collapsed <details> fold, incl. the truncated tail.
+        assert "<details>" in fb and "full focus" in fb, \
+            "the full focus must be under a collapsed <details> fold"
+        assert "attestation-effectiveness dip" in fb and "for certain." in fb, \
+            "the tail of a long focus must survive verbatim in the fold"
+        assert "<br>" in fb, "multi-line focus must keep its line breaks in the fold"
+
 
 # ========================================================================
 # Counter rehydration from JSONL on _activate_room (§6)

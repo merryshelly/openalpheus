@@ -101,6 +101,18 @@ def _event_id_hash(event_id: str) -> str:
     """
     return hashlib.sha256(event_id.encode()).hexdigest()[:16]
 
+
+def _escape_preserve_breaks(text: str) -> str:
+    """html-escape tool/model-origin text for a Matrix notice while preserving
+    line breaks. HTML whitespace-folds literal newlines to spaces, so escape
+    first (the deliberate injection-defense choice for model-origin text — NOT
+    mistune/markdown) then convert real newlines to <br>. Mirrors the
+    '<br>'.join idiom already used by the todo-notice fold."""
+    esc = html_escape(str(text))
+    esc = esc.replace("\r\n", "\n").replace("\r", "\n")
+    return esc.replace("\n", "<br>")
+
+
 def format_model_list(aliases: dict[str, str], current_model: str) -> str:
     """Format model alias table for /model list output."""
     lines = [f"**Current model:** `{current_model}`\n"]
@@ -685,6 +697,15 @@ class MatrixBot:
             kwargs["usage"] = usage
         _sl.append(**kwargs)
 
+    def _advisor_display_model(self, mdl) -> str:
+        """Expand a model alias to its full provider/model for display in the
+        advisor notice (idempotent for already-full strings and non-aliases).
+        Aliases live on the AGENT's config, not the MatrixConfig — mirrors
+        resolve_model's expansion so the notice names the model that ran."""
+        aliases = getattr(getattr(self.agent, "config", None), "model_aliases", None) or {}
+        key = str(mdl)
+        return aliases.get(key, key)
+
     def _make_tool_callbacks(self, room_id: str):
         """Create tool-use callback closures bound to a specific room.
 
@@ -827,15 +848,18 @@ class MatrixBot:
                 itok = info.get("input_tokens", 0)
                 otok = info.get("output_tokens", 0)
                 crd = info.get("cache_read_tokens", 0)
-                mdl = info.get("model", "?")
+                mdl = self._advisor_display_model(info.get("model", "?"))
                 if is_error:
                     summary_line = f"🔮 Advisor failed: {str(result)[:200]}"
                     adv_html = html_escape(summary_line)
                 else:
-                    summary_line = f"🔮 Advisor returned ({elapsed:.1f}s · {itok}/{otok} tokens · cache read {crd})"
+                    summary_line = f"🔮 Advisor returned · {mdl} ({elapsed:.1f}s · {itok}/{otok} tokens · cache read {crd})"
                     adv_html = f'<b>{html_escape(summary_line)}</b>'
                     if advice:
-                        adv_html += f'\n<details><summary>🔮 advice</summary>\n{html_escape(advice)}</details>'
+                        # FIX 3 (kdsn.198.9): preserve advice line breaks — HTML folds
+                        # literal newlines to spaces. Keep html_escape (injection defense
+                        # for model-origin advice); NOT mistune markdown rendering.
+                        adv_html += f'\n<details><summary>🔮 advice</summary>\n{_escape_preserve_breaks(advice)}</details>'
                 try:
                     await self._room_send_with_retry(room_id, {
                         "msgtype": "m.notice", "body": summary_line,
@@ -924,7 +948,16 @@ class MatrixBot:
                     except Exception:
                         pass
                 elif tc.name == "advisor" and isinstance(tc.input, dict):
-                    mdl = tc.input.get("model", "advisor")
+                    # FIX 2 (kdsn.198.9): show the RESOLVED advisor model, not the
+                    # literal word "advisor". The tool hasn't run yet at spawn, so
+                    # mirror run_advisor's resolution (call-param > tool_config) and
+                    # expand any alias — byte-identical to the model the return
+                    # notice will show.
+                    _adv_cfg = next(
+                        (t.config for t in (getattr(self.agent, "tools", None) or [])
+                         if getattr(t, "name", None) == "advisor"), {})
+                    mdl = self._advisor_display_model(
+                        str(tc.input.get("model") or (_adv_cfg or {}).get("model") or "advisor"))
                     # N1 (audit remediation): `focus` is executor-authored and
                     # is about to be echoed into the room's spawn notice --
                     # redact it before display, same as the egress-side fix
@@ -933,12 +966,20 @@ class MatrixBot:
                     focus = redact_credentials(str(tc.input.get("focus", "")))[0]
                     summary = f"🔮 Advisor consult → {mdl}"
                     if focus:
-                        summary += f" — focus: {str(focus)[:120]}"
+                        # FIX 1 (kdsn.198.9): short one-line preview on the summary
+                        # line; full focus under a collapsed <details> fold (same
+                        # pattern as the subagent task-brief notice).
+                        preview = focus.replace("\n", " ").replace("\r", " ")[:120]
+                        summary += f" — focus: {preview}"
+                    formatted = f'<b>{html_escape(summary)}</b>'
+                    if focus:
+                        formatted += (f'\n<details><summary>🔮 full focus</summary>\n'
+                                      f'{_escape_preserve_breaks(focus)}</details>')
                     try:
                         await self._room_send_with_retry(room_id, {
                             "msgtype": "m.notice", "body": summary,
                             "format": "org.matrix.custom.html",
-                            "formatted_body": f'<b>{html_escape(summary)}</b>',
+                            "formatted_body": formatted,
                         })
                     except Exception:
                         pass
