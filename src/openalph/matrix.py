@@ -766,18 +766,49 @@ class MatrixBot:
                     pass
             elif name == "todo_write" and not is_error:
                 # §9: todo_write → 📋 m.notice with summary + collapsed full list
-                result_str = str(result) if result else ""
-                # Extract summary line (first line of result)
-                summary_line = result_str.split('\n')[0] if result_str else "Todo list updated"
-                todo_body = f"📋 {summary_line}"
+                # Render from STRUCTURED input_data, NOT the `result` string:
+                # in production `result` is the wrapped
+                # `<tool_result tool="todo_write" id="...">...</tool_result>`
+                # envelope built by agent.py's wrap_tool_result, so deriving
+                # the notice from it leaked the envelope + call id and
+                # markdown collapsed the single-\n-separated todo lines onto
+                # one line. input_data is {"todos": [{"content","status",
+                # "activeForm"?}, ...]} — build the notice from that instead.
+                todos = input_data.get("todos", []) if isinstance(input_data, dict) else []
+                if not isinstance(todos, list):
+                    todos = []
+                status_markers = {"in_progress": "●", "pending": "○", "completed": "✓"}
+                n_in_progress = sum(1 for t in todos if isinstance(t, dict)
+                                     and t.get("status") == "in_progress")
+                n_pending = sum(1 for t in todos if isinstance(t, dict)
+                                 and t.get("status") == "pending")
+                n_completed = sum(1 for t in todos if isinstance(t, dict)
+                                   and t.get("status") == "completed")
+                summary_line = (
+                    f"{n_in_progress} in progress · {n_pending} pending"
+                    f" · {n_completed} completed"
+                )
+                active = ""
+                for t in todos:
+                    if isinstance(t, dict) and t.get("status") == "in_progress":
+                        active = str(t.get("content", ""))
+                        break
+                if active:
+                    summary_line += f" — {active}"
+                todo_body = f"📋 Todos: {summary_line}"
+                todo_lines = [
+                    f"{status_markers.get(t.get('status'), '?')} "
+                    f"{html_escape(str(t.get('content', '')))}"
+                    for t in todos if isinstance(t, dict)
+                ]
                 todo_html = (
-                    '<details>\n<summary>📋 ' + mistune.html(summary_line).strip().removeprefix('<p>').removesuffix('</p>') + '</summary>\n'
-                    + mistune.html(result_str) +
+                    '<details>\n<summary>📋 Todos: ' + html_escape(summary_line) + '</summary>\n'
+                    + '<br>'.join(todo_lines) +
                     '</details>'
                 )
                 todo_content = {
                     "msgtype": "m.notice",
-                    "body": f"📋 {result_str}",
+                    "body": todo_body,
                     "format": "org.matrix.custom.html",
                     "formatted_body": todo_html,
                 }
@@ -925,10 +956,16 @@ class MatrixBot:
         """
 
         async def _reminder_send_notice(_room_id, body, **kw):
-            """Emit collapsed <details> m.notice for reminders."""
+            """Emit collapsed <details> m.notice for reminders.
+
+            Summary holds the header line (lines[0]); the details body
+            renders only the remainder, so the header isn't re-rendered
+            inside the expanded body (mirrors the thinking-block pattern).
+            """
+            lines = body.split('\n')
             html = (
-                '<details>\n<summary>' + body.split('\n')[0] + '</summary>\n'
-                + mistune.html(body) +
+                '<details>\n<summary>' + lines[0] + '</summary>\n'
+                + mistune.html('\n'.join(lines[1:]).strip()) +
                 '</details>'
             )
             content_msg = {

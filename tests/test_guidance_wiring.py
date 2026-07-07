@@ -232,6 +232,13 @@ class TestGuidanceWiring:
         assert '<details>' in fb, "Must use collapsed <details> HTML"
         assert 'todo-nudge' in fb or 'todo-nudge' in content.get('body', ''), \
             "Trigger ID must appear in notice"
+        # Bug fix (workspace-kdsn.186.17, issue 1): the header line
+        # (already in <summary>) must NOT be re-rendered inside the
+        # expanded <details> body too. Against the pre-fix code, mistune
+        # re-rendered the WHOLE body (header included), so the header
+        # string appeared twice; against the fix it appears exactly once.
+        assert fb.count("System reminder (todo-nudge)") == 1, \
+            "Reminder header must appear exactly once (not duplicated in body)"
 
     @pytest.mark.asyncio
     async def test_display_only_invariant(self):
@@ -291,6 +298,43 @@ class TestGuidanceWiring:
                 found = True
                 break
         assert found, "todo_write must emit 📋 m.notice with collapsed list"
+
+        # Bug fix (workspace-kdsn.186.17, issue 2): notice must be built from
+        # the STRUCTURED input_data, not the `result` string. In production
+        # `result` is the wrapped `<tool_result tool="..." id="...">...
+        # </tool_result>` envelope (agent.py's wrap_tool_result) — deriving
+        # the notice from that string leaks the envelope + tool-call id and
+        # collapses the todos onto one line. Pin: envelope/id must NOT leak,
+        # and each todo must render as its own marker (one per todo).
+        bot.client.room_send.reset_mock()
+        await _tool_notice(
+            "call_1", "todo_write",
+            {"todos": [
+                {"content": "Task A", "status": "in_progress"},
+                {"content": "Task B", "status": "pending"},
+            ]},
+            '<tool_result tool="todo_write" id="toolu_ABC">\n'
+            'Todo list updated (1 in progress · 1 pending):\n'
+            '  ● [in_progress] Task A\n'
+            '  ○ [pending] Task B\n'
+            '</tool_result>',
+            False,
+        )
+
+        fb2 = None
+        for call in bot.client.room_send.call_args_list:
+            content = call[0][2] if len(call[0]) > 2 else {}
+            if isinstance(content, dict) and '📋' in content.get('body', ''):
+                fb2 = content.get('formatted_body', '')
+                break
+        assert fb2 is not None, "todo_write must emit a 📋 m.notice"
+        assert 'id=' not in fb2, \
+            "tool-call id from the <tool_result> envelope must not leak into the notice"
+        assert '<tool_result' not in fb2, \
+            "the <tool_result> wrapper envelope must not leak into the notice"
+        marker_count = fb2.count('●') + fb2.count('○') + fb2.count('✓')
+        assert marker_count == 2, \
+            f"expected one status marker per todo (2 todos), got {marker_count}"
 
     @pytest.mark.asyncio
     async def test_rehydration_on_activate(self):
