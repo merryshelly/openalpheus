@@ -66,6 +66,7 @@ async def run_subagent(
     max_tokens: int | None = None,
     max_iterations: int | None = None,
     call_id: str | None = None,
+    parent_room_id: str | None = None,
 ) -> ToolResult:
     """Execute a multi-turn LLM call as a sub-agent.
 
@@ -77,6 +78,16 @@ async def run_subagent(
     is always prepended to the system prompt. Custom system prompts are
     appended after the preamble.
 
+    Two independent, append-only JSONL logs are written as the run
+    progresses (workspace-kdsn.192):
+      - workspace/logs/subagents/<ts>-<call_id>.jsonl — METRICS (iteration
+        token counts, tool NAMES, summary). Pre-existing; untouched here.
+      - workspace/sessions/subs/<date>-<call_id>.jsonl — FLIGHT RECORDER,
+        a full-content transcript (assistant turns, post-redaction tool
+        results, final response). New in this change. Both are pure,
+        out-of-band I/O: neither can mutate `messages` or the returned
+        ToolResult, and nothing either writes ever re-enters model context.
+
     Args:
         task: The task description for the sub-agent
         config: Parent agent's configuration (API key, provider, model)
@@ -86,6 +97,9 @@ async def run_subagent(
         max_tokens: Max tokens override (default: use parent's max_tokens)
         max_iterations: Max tool-call iterations (default: MAX_ITERATIONS)
         call_id: Optional identifier for cross-referencing logs (default: generated from timestamp)
+        parent_room_id: Optional parent Matrix room id, recorded in the flight
+            recorder transcript header for cross-referencing only — never
+            used for execution/dispatch decisions.
 
     Returns:
         ToolResult with the LLM's response content, or error description on failure
@@ -122,6 +136,48 @@ async def run_subagent(
                 f.write(json.dumps(entry) + "\n")
         except Exception as log_exc:
             logger.warning("Failed to write subagent log: %s", log_exc)
+
+    # --- Flight recorder: full-content, append-only transcript (workspace-kdsn.192) ---
+    #
+    # SEPARATE from the metrics log above (_append_log / logs/subagents) — that log
+    # records iteration token counts, tool NAMES, and a summary (metrics, not content).
+    # This transcript captures the actual CONTENT of the run: full assistant turns,
+    # the post-redaction/post-truncation tool_result bytes, and a final entry. It is
+    # PURE OUT-OF-BAND I/O — it must never mutate `messages` or the returned
+    # ToolResult, and nothing it writes may ever enter a model context. Every write
+    # (including directory creation) is wrapped in try/except and logs-and-continues
+    # on failure: a recorder failure must NEVER break the sub run.
+    transcript_date = time.strftime("%Y-%m-%d", time.localtime(run_start))
+    transcript_filename = f"{transcript_date}-{safe_call_id}.jsonl"
+    transcript_dir = Path(config.workspace) / "sessions" / "subs"
+    transcript_path = transcript_dir / transcript_filename
+
+    def _append_transcript(entry: dict) -> None:
+        try:
+            os.makedirs(transcript_dir, exist_ok=True)
+            with open(transcript_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as transcript_exc:
+            logger.warning("Failed to write subagent flight recorder transcript: %s", transcript_exc)
+
+    def _usage_snapshot() -> dict:
+        """Point-in-time token usage snapshot for the flight recorder's final entry."""
+        return {
+            "uncached_input_tokens": uncached_input_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "total_output_tokens": total_output_tokens,
+            "peak_context_tokens": peak_context_tokens,
+        }
+
+    _append_transcript({
+        "event": "meta",
+        "model": config.default_model,
+        "parent_room_id": parent_room_id,
+        "parent_call_id": call_id,
+        "task": task,
+        "ts_start": int(run_start),
+    })
 
     def _estimate_context_tokens(msgs: list[dict]) -> int:
         """Estimate token count from messages list (1 token ≈ 4 chars)."""
@@ -167,6 +223,18 @@ async def run_subagent(
                 cache_read_tokens += response.usage.cache_read_tokens or 0
                 cache_creation_tokens += response.usage.cache_creation_tokens or 0
                 total_output_tokens += response.usage.output_tokens or 0
+
+            # Flight recorder: record this iteration's assistant turn verbatim
+            # (content + tool call name/id/input) — out-of-band, does not touch messages.
+            _append_transcript({
+                "event": "assistant",
+                "iteration": iteration,
+                "content": response.content,
+                "tool_calls": [
+                    {"name": tc.name, "id": tc.id, "input": tc.input}
+                    for tc in (response.tool_calls or [])
+                ],
+            })
 
             # Text response — check for truncation before accepting
             if not response.tool_calls:
@@ -219,6 +287,14 @@ async def run_subagent(
                     "model": config.default_model,
                     "task": task,
                 })
+                _append_transcript({
+                    "event": "final",
+                    "status": "completed",
+                    "response": response.content,
+                    "iterations": completed_iterations,
+                    "usage": _usage_snapshot(),
+                    "elapsed_s": round(elapsed, 3),
+                })
                 return ToolResult(content=response.content, is_error=False)
 
             # Tool calls — execute and loop
@@ -260,6 +336,18 @@ async def run_subagent(
                     error_count += 1
                 truncated = truncate_result(result.content, config.truncation_limit)
                 wrapped = wrap_tool_result(truncated, tc.name, tc.id)
+                # Flight recorder: record the SAME post-redaction, post-truncation
+                # `wrapped` bytes that are about to be appended to `messages` below —
+                # i.e. exactly what the sub-agent itself saw, never the raw pre-redaction
+                # tool output. Out-of-band: this call cannot affect `messages`.
+                _append_transcript({
+                    "event": "tool_result",
+                    "iteration": iteration,
+                    "call_id": tc.id,
+                    "name": tc.name,
+                    "content": wrapped,
+                    "is_error": result.is_error,
+                })
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -322,16 +410,38 @@ async def run_subagent(
                 tools=None,  # no tools — force text response
                 max_tokens=max_tokens,
             )
+            final_content = (
+                f"⚠️ Sub-agent hit tool call limit ({iteration_limit} iterations). "
+                f"Summary:\n\n{summary.content}"
+            )
+            _append_transcript({
+                "event": "final",
+                "status": "circuit_breaker",
+                "response": final_content,
+                "iterations": completed_iterations,
+                "usage": _usage_snapshot(),
+                "elapsed_s": round(elapsed, 3),
+            })
             return ToolResult(
-                content=f"⚠️ Sub-agent hit tool call limit ({iteration_limit} iterations). "
-                        f"Summary:\n\n{summary.content}",
+                content=final_content,
                 is_error=True,
             )
         except Exception as e:
             logger.warning("Sub-agent summary generation failed: %s", e)
+            final_content = (
+                f"⚠️ Sub-agent hit tool call limit ({iteration_limit} iterations). "
+                "Summary generation also failed."
+            )
+            _append_transcript({
+                "event": "final",
+                "status": "circuit_breaker",
+                "response": final_content,
+                "iterations": completed_iterations,
+                "usage": _usage_snapshot(),
+                "elapsed_s": round(elapsed, 3),
+            })
             return ToolResult(
-                content=f"⚠️ Sub-agent hit tool call limit ({iteration_limit} iterations). "
-                        "Summary generation also failed.",
+                content=final_content,
                 is_error=True,
             )
 
@@ -352,4 +462,13 @@ async def run_subagent(
             "task": task,
             "error": str(e),
         })
-        return ToolResult(content=f"Sub-agent error: {e}", is_error=True)
+        final_content = f"Sub-agent error: {e}"
+        _append_transcript({
+            "event": "final",
+            "status": "error",
+            "response": final_content,
+            "iterations": completed_iterations,
+            "usage": _usage_snapshot(),
+            "elapsed_s": round(elapsed, 3),
+        })
+        return ToolResult(content=final_content, is_error=True)

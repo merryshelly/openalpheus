@@ -1433,6 +1433,13 @@ async def _execute_tool_inner(
             max_tokens=input.get("max_tokens"),
             max_iterations=input.get("max_iterations"),
             call_id=callbacks.get("call_id") if callbacks else None,
+            # Flight recorder (workspace-kdsn.192): the PARENT room, so the
+            # sub's transcript header can cross-reference where it was
+            # dispatched from. callbacks["room_id"] here is the main-loop's
+            # own room_id (set by MatrixBot._build_agent_callbacks), i.e.
+            # the parent — never the sub's own dispatch-time "__sub__" id
+            # used internally inside run_subagent's tool-call callbacks.
+            parent_room_id=callbacks.get("room_id") if callbacks else None,
         )
     elif name == "advisor":
         from .advisor import run_advisor
