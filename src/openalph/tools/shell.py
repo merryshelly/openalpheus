@@ -9,6 +9,7 @@ import signal
 from typing import Any
 
 from . import ToolResult, truncate_result
+from .security import op_egress_block_reason
 
 
 async def run_shell(
@@ -31,6 +32,16 @@ async def run_shell(
         ToolResult with stdout on success, stderr+exit_code on failure.
         Timeout returns error with "timeout" in content.
     """
+    # L2 op-egress guard: block+redirect commands that would print a
+    # 1Password secret to stdout (op read / opread / op document get /
+    # op item get --fields|--format|--reveal), BEFORE any subprocess is
+    # spawned and before any state (process_env, etc.) is built. Pure
+    # predicate — no I/O, no mutation. Covers sub-agents too, since they
+    # route shell calls through this same run_shell.
+    block_reason = op_egress_block_reason(command)
+    if block_reason:
+        return ToolResult(content=block_reason, is_error=True)
+
     # Build environment: merge provided env with existing
     process_env = os.environ.copy()
     if env is not None:

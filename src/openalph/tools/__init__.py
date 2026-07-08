@@ -1056,6 +1056,52 @@ def _update_read_registry(resolved_path: str | None, callbacks: dict | None) -> 
         pass  # best effort; guard will conservatively deny if stat fails
 
 
+def _collect_known_secrets(agent_config: Any) -> set[str]:
+    """Assemble the set of currently-known secret VALUES for L1 value-based
+    redaction (``redact_known_secrets`` in ``security.py``).
+
+    Unions two populations:
+      - ``agent_config.providers[*].api_key`` — the harness's own LLM
+        provider keys, resolved once at config-load time (config.py).
+      - ``_api_key_cache`` values (``v[0]``) — per-tool keys resolved via a
+        tool's ``api_key_cmd`` (e.g. an ``op read`` command), cached with a
+        TTL above.
+
+    Defensive: tolerates a missing/non-dict ``.providers`` attribute on
+    ``agent_config`` (explicit ``isinstance`` guard — treated as empty
+    rather than raising), and skips None/empty-string values from either
+    source. No length filter here — the length/entropy threshold lives
+    entirely in ``redact_known_secrets`` (its ``min_length`` parameter),
+    keeping this collector a pure "what values currently exist" assembly
+    step.
+
+    Args:
+        agent_config: The agent's config object (or anything config-shaped;
+            only ``.providers`` is read, defensively).
+
+    Returns:
+        A deduplicated ``set[str]`` of known secret values. Empty when there
+        are no providers and the api-key cache is empty (the "works without
+        1Password" no-op case).
+    """
+    known: set[str] = set()
+
+    providers = getattr(agent_config, "providers", None)
+    if not isinstance(providers, dict):
+        providers = {}
+    for provider in providers.values():
+        api_key = getattr(provider, "api_key", None)
+        if api_key:
+            known.add(api_key)
+
+    for cached in _api_key_cache.values():
+        value = cached[0] if cached else None
+        if value:
+            known.add(value)
+
+    return known
+
+
 async def execute_tool(
     name: str,
     input: dict,
@@ -1096,8 +1142,28 @@ async def execute_tool(
     # Redact credentials from tool output — applies to EVERY return path
     # above (unknown tool, missing param, guard refusal, and normal
     # dispatch results alike), not just the successful-dispatch tail.
+    #
+    # L1 value-based pass FIRST (redact known secrets in full, before the
+    # pattern pass could fragment one that embeds a pattern-shaped
+    # substring) — remediation round 1 §B: value-first makes the L1
+    # backstop guarantee actually hold ("the value IS the value —
+    # redacted in full"). Cost is cosmetic: a KNOWN shaped key (e.g. a
+    # live sk-ant-... provider key) now gets [REDACTED:known_secret]
+    # instead of [REDACTED:api_key]. An UNKNOWN shaped secret (not in the
+    # known-set) still gets [REDACTED:api_key] from the pattern pass below.
+    known_secrets = _collect_known_secrets(agent_config)
+    if known_secrets:
+        from .security import redact_known_secrets as _redact_known_secrets
+        content_after_value, value_events = _redact_known_secrets(result.content, known_secrets)
+    else:
+        content_after_value, value_events = result.content, []
+
+    # Pattern pass SECOND (catches shaped UNKNOWN secrets not in the
+    # known-set — proves value-first did not weaken pattern coverage).
     from .security import redact_credentials as _redact_credentials
-    redacted_content, redaction_events = _redact_credentials(result.content)
+    redacted_content, pattern_events = _redact_credentials(content_after_value)
+    redaction_events = value_events + pattern_events
+
     if redaction_events:
         result = ToolResult(content=redacted_content, is_error=result.is_error)
         for event in redaction_events:
