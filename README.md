@@ -179,9 +179,9 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | `/status` | Model, context usage, token counts |
 | `/model <provider/model>` | Switch model for this room |
 | `/thinking <off\|low\|medium\|high\|xhigh\|max>` | Set extended thinking level (`xhigh` and `max` require supported models) |
-| `/heartbeat start <interval>` | Start recurring timer (e.g., `5m`, `1h`) |
+| `/heartbeat start <interval> [directive]` | Start recurring timer (e.g., `5m`, `1h`); optional trailing directive becomes the turn content on each fire (else a WAKE pointer) |
 | `/heartbeat stop` | Stop heartbeat |
-| `/umbral start <interval>` | Start recurring context rotation (min 30m) |
+| `/umbral start <interval> [directive]` | Start recurring context rotation (min 30m); optional trailing directive is re-injected as the turn content each cycle |
 | `/umbral stop` | Stop context rotation |
 | `/cache <1h\|5m\|off>` | Anthropic prompt cache TTL (default `1h`) |
 | `/cache toolstrip` | Reclaim context by replacing old tool outputs with placeholders |
