@@ -21,6 +21,7 @@ class UmbralEntry:
     room_id: str
     interval_seconds: int
     seconds_until_next: int
+    directive: str | None = None
 
 
 class UmbralManager:
@@ -31,8 +32,9 @@ class UmbralManager:
         self._intervals: dict[str, float] = {}
         self._last_fired: dict[str, float] = {}
         self._processing: dict[str, bool] = {}
+        self._directives: dict[str, str | None] = {}
 
-    async def start(self, room_id: str, interval_seconds: int | float, *, _initial_delay: float | None = None) -> None:
+    async def start(self, room_id: str, interval_seconds: int | float, directive: str | None = None, *, _initial_delay: float | None = None) -> None:
         if interval_seconds <= 0:
             raise ValueError(f"interval_seconds must be positive, got {interval_seconds}")
         if room_id in self._tasks:
@@ -42,6 +44,14 @@ class UmbralManager:
             except asyncio.CancelledError:
                 pass
         self._intervals[room_id] = float(interval_seconds)
+        # Robustness (audit M1): a non-str directive (corrupt/hand-edited JSON, or a
+        # future self-control caller) would crash escape_system_reminder_tags at inject
+        # time — and in umbral that call precedes archive+wipe, so context would never
+        # rotate.  Coerce to None (→ WAKE fallback) at this single seam.
+        if directive is not None and not isinstance(directive, str):
+            logger.warning("Ignoring non-str directive for %s (%s)", room_id, type(directive).__name__)
+            directive = None
+        self._directives[room_id] = directive
         # Only set last_fired to now on fresh start (not resume)
         if _initial_delay is None:
             self._last_fired[room_id] = time.time()
@@ -65,6 +75,7 @@ class UmbralManager:
         del self._intervals[room_id]
         self._last_fired.pop(room_id, None)
         self._processing.pop(room_id, None)
+        self._directives.pop(room_id, None)
         await self._persist()
         return True
 
@@ -82,6 +93,7 @@ class UmbralManager:
                 room_id=room_id,
                 interval_seconds=int(interval),
                 seconds_until_next=seconds_until_next,
+                directive=self._directives.get(room_id),
             ))
         return entries
 
@@ -103,6 +115,7 @@ class UmbralManager:
             room_id = entry.get("room_id")
             interval = entry.get("interval_seconds")
             last_fired = entry.get("last_fired_at")
+            directive = entry.get("directive")
             if room_id and interval is not None:
                 initial_delay = None
                 if last_fired is not None:
@@ -116,7 +129,7 @@ class UmbralManager:
                         initial_delay = min(remaining, float(interval))
                     # Preserve the persisted last_fired value
                     self._last_fired[room_id] = last_fired
-                await self.start(room_id, interval, _initial_delay=initial_delay)
+                await self.start(room_id, interval, directive, _initial_delay=initial_delay)
 
     async def shutdown(self) -> None:
         tasks = list(self._tasks.values())
@@ -128,6 +141,7 @@ class UmbralManager:
         self._intervals.clear()
         self._last_fired.clear()
         self._processing.clear()
+        self._directives.clear()
 
     async def _umbral_loop(self, room_id: str, interval_seconds: float, initial_delay: float | None = None) -> None:
         try:
@@ -167,9 +181,13 @@ class UmbralManager:
                 "room_id": room_id,
                 "interval_seconds": self._intervals[room_id],
                 "last_fired_at": self._last_fired.get(room_id),
+                "directive": self._directives.get(room_id),
             }
             for room_id in self._tasks
         ]
         tmp_path = self.config_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(data))
         os.replace(tmp_path, self.config_path)
+
+    def directive_for(self, room_id: str) -> str | None:
+        return self._directives.get(room_id)

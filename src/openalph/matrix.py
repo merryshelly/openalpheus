@@ -43,6 +43,7 @@ from openalph.session import SessionLog
 from openalph.mention import mentions_me, is_gated, strip_mention, MentionCheckResult
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
+from openalph.tools import escape_system_reminder_tags
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,11 @@ def format_model_list(aliases: dict[str, str], current_model: str) -> str:
     else:
         lines.append("No model aliases configured.")
     return "\n".join(lines)
+
+
+def _trunc_directive(d: str, width: int = 120) -> str:
+    one_line = " ".join(d.split())
+    return one_line if len(one_line) <= width else one_line[:width - 1] + "…"
 
 
 class StreamingDelivery:
@@ -1345,7 +1351,11 @@ class MatrixBot:
 
     async def _inject_heartbeat(self, room_id: str) -> None:
         """Process a heartbeat as if the agent received a wake message."""
-        heartbeat_content = "[Automated heartbeat — operator may not be present. Execute your WAKE instructions.]"
+        _d = self.heartbeat.directive_for(room_id) if self.heartbeat else None
+        if _d:
+            heartbeat_content = f"[Automated heartbeat turn — operator may not be present. Your standing directive for this room:]\n\n{escape_system_reminder_tags(_d)}"
+        else:
+            heartbeat_content = "[Automated heartbeat — operator may not be present. Execute your WAKE instructions.]"
 
         # Post to Matrix so the operator can see heartbeat triggers
         await self.send_notice(room_id, "💓 Heartbeat")
@@ -1381,7 +1391,11 @@ class MatrixBot:
 
     async def _inject_umbral(self, room_id: str) -> None:
         """Execute an umbral turn: heartbeat + context rotation."""
-        heartbeat_content = "[Automated heartbeat — operator may not be present. Execute your WAKE instructions.]"
+        _d = self.umbral.directive_for(room_id) if self.umbral else None
+        if _d:
+            heartbeat_content = f"[Automated umbral turn — operator may not be present. Your standing directive for this room:]\n\n{escape_system_reminder_tags(_d)}"
+        else:
+            heartbeat_content = "[Automated heartbeat — operator may not be present. Execute your WAKE instructions.]"
 
         await self.send_notice(room_id, "🌑 Umbral turn beginning")
 
@@ -2514,7 +2528,7 @@ class MatrixBot:
             return
 
         if body.startswith("/heartbeat"):
-            parts = body.split()
+            parts = body.split(None, 3)
             if len(parts) >= 3 and parts[1] == "start":
                 interval = parse_interval(parts[2])
                 if interval is None:
@@ -2526,7 +2540,8 @@ class MatrixBot:
                         "Stop the umbral timer first (`/umbral stop`) — "
                         "umbral and heartbeat cannot run in the same room.")
                 else:
-                    await self.heartbeat.start(room_id, interval)
+                    directive = parts[3] if len(parts) >= 4 else None
+                    await self.heartbeat.start(room_id, interval, directive)
                     human = format_interval(interval)
                     await self.send(room_id, f"Heartbeat started: every {human} in this room.")
             elif len(parts) >= 2 and parts[1] == "stop":
@@ -2545,14 +2560,17 @@ class MatrixBot:
                         # Resolve room name from nio client
                         nio_room = self.client.rooms.get(e.room_id)
                         name = (getattr(nio_room, 'name', '') or getattr(nio_room, 'display_name', '') or e.room_id) if nio_room else e.room_id
-                        lines.append(f"- **{name}** — every {format_interval(e.interval_seconds)}, next in {format_interval(e.seconds_until_next)}")
+                        line = f"- **{name}** — every {format_interval(e.interval_seconds)}, next in {format_interval(e.seconds_until_next)}"
+                        if e.directive:
+                            line += f" · directive: {_trunc_directive(e.directive)}"
+                        lines.append(line)
                     await self.send(room_id, "\n".join(lines))
             else:
                 await self.send(room_id, "Usage: `/heartbeat start <interval>` | `/heartbeat stop` | `/heartbeat status`")
             return
 
         if body.startswith("/umbral"):
-            parts = body.split()
+            parts = body.split(None, 3)
             if len(parts) >= 3 and parts[1] == "start":
                 interval = parse_interval(parts[2])
                 if interval is None:
@@ -2564,7 +2582,8 @@ class MatrixBot:
                         "Stop the heartbeat first (`/heartbeat stop`) — "
                         "umbral and heartbeat cannot run in the same room.")
                 else:
-                    await self.umbral.start(room_id, interval)
+                    directive = parts[3] if len(parts) >= 4 else None
+                    await self.umbral.start(room_id, interval, directive)
                     human = format_interval(interval)
                     await self.send(room_id, f"🌑 Umbral started: every {human} in this room.")
             elif len(parts) >= 2 and parts[1] == "stop":
@@ -2584,9 +2603,12 @@ class MatrixBot:
                         name = (getattr(nio_room, 'name', '') or
                                 getattr(nio_room, 'display_name', '') or
                                 e.room_id) if nio_room else e.room_id
-                        lines.append(
+                        line = (
                             f"- **{name}** — every {format_interval(e.interval_seconds)}, "
                             f"next in {format_interval(e.seconds_until_next)}")
+                        if e.directive:
+                            line += f" · directive: {_trunc_directive(e.directive)}"
+                        lines.append(line)
                     await self.send(room_id, "\n".join(lines))
             else:
                 await self.send(room_id,

@@ -140,8 +140,10 @@ def _make_bot(**overrides):
     bot.session_log.usage_totals = MagicMock(return_value={})
     bot.heartbeat = MagicMock()
     bot.heartbeat.is_active = MagicMock(return_value=False)
+    bot.heartbeat.directive_for = MagicMock(return_value=None)
     bot.umbral = MagicMock()
     bot.umbral.is_active = MagicMock(return_value=False)
+    bot.umbral.directive_for = MagicMock(return_value=None)
     bot._steering_inbox = {}
     bot._active_turns = set()
 
