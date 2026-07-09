@@ -371,7 +371,7 @@ async def run_advisor(
                     messages=call_messages,
                     model=model_str,
                     max_tokens=tool_config.get("max_tokens", 8192),
-                    thinking=tool_config.get("thinking", "medium"),
+                    thinking=tool_config.get("thinking", "high"),
                     cache_ttl=cache_ttl,
                 ),
                 timeout=tool_config.get("timeout", 300),

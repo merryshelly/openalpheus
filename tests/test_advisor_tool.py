@@ -654,6 +654,24 @@ class TestRequestShape:
         assert kw["thinking"] == "medium", "Configured thinking effort must be forwarded"
 
     @pytest.mark.asyncio
+    async def test_default_thinking_is_high(self, tmp_path):
+        """kdsn.198.13: the advisor's fleet-wide CODE default thinking level is
+        'high' (not 'medium') when a workspace advisor.toml does not set it.
+        Reasoning depth is a property of the TOOL — 'advisors need to give sage
+        advice.' Per-workspace TOML can still override up or down."""
+        assert run_advisor is not None, NOT_IMPL
+        cfg = _cfg(tmp_path)
+        cb = _callbacks()
+        tc = _tc_cfg()
+        tc.pop("thinking", None)  # exercise the code default, not an explicit value
+        with patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=_resp()) as mock_complete:
+            await run_advisor(focus=None, model=None, config=cfg,
+                              tool_config=tc, callbacks=cb)
+        assert mock_complete.call_args.kwargs["thinking"] == "high", \
+            "Advisor default thinking level must be 'high' (kdsn.198.13)"
+
+    @pytest.mark.asyncio
     async def test_cache_ttl_forwarded_to_complete(self, tmp_path):
         """The configured cache_ttl is forwarded to complete() (relies on §14 #1a passthrough)."""
         assert run_advisor is not None, NOT_IMPL
