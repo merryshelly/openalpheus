@@ -14,7 +14,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from openalph.provider import complete
+from openalph.provider import complete, compute_cost
 from openalph.tools import ToolDef, ToolResult, tool_schemas, truncate_result, wrap_tool_result
 from openalph.config import AgentConfig
 
@@ -67,6 +67,7 @@ async def run_subagent(
     max_iterations: int | None = None,
     call_id: str | None = None,
     parent_room_id: str | None = None,
+    callbacks: dict | None = None,
 ) -> ToolResult:
     """Execute a multi-turn LLM call as a sub-agent.
 
@@ -199,12 +200,64 @@ async def run_subagent(
     total_tool_calls = 0
     completed_iterations = 0
     peak_context_tokens = 0
+    # Cost tracking (workspace-kdsn.218): single fixed model per sub-run
+    # (config.default_model never changes mid-run -- no per-call switch
+    # mechanism exists for subs), so cache_ttl_fallback="1h" is a safe
+    # constant (subs have no room-level cache_ttl concept).
+    sub_cost = 0.0
+    sub_unpriced = 0
+    # F2 (kdsn.218 remediation): provider-type gate for pricing. Resolved once
+    # (single fixed model per run). Fail-soft: unknown -> not-Anthropic -> the
+    # run's tokens are tallied unpriced rather than mispriced or crashing.
+    _sub_api_model = config.default_model  # fallback if a response omits .model
+    try:
+        from openalph.config import resolve_model
+        _sub_pcfg, _sub_api_model = resolve_model(config.default_model, config.providers,
+                                                  aliases=config.model_aliases)
+        _sub_is_anthropic = getattr(_sub_pcfg, "type", None) == "anthropic"
+    except Exception:
+        _sub_is_anthropic = False
+
+    def _write_subagent_bridge() -> None:
+        """Fail-soft: write frozen sub-run cost to the callbacks bridge for
+        the parent's tool-result JSONL entry. Must never raise (mirrors
+        advisor.py's bridge at tools/advisor.py:~415-431)."""
+        try:
+            if callbacks and "subagent_results" in callbacks:
+                _key = (parent_room_id, call_id)
+                callbacks["subagent_results"][_key] = {
+                    "cost_usd": sub_cost,
+                    "unpriced_tokens": sub_unpriced,
+                    "model": config.default_model,
+                }
+        except Exception:
+            pass
+
+    def _accrue_cost(model_s, usage_obj) -> None:
+        """Fail-soft cost accrual (F3, kdsn.218 re-audit): a compute_cost failure
+        must never convert a successful sub-run into an error — log and treat as
+        $0, mirroring the main path's guard in agent._record_turn_usage."""
+        nonlocal sub_cost, sub_unpriced
+        try:
+            # re-audit LOW-1: fall back to the resolved API model if a response
+            # omits .model, mirroring the advisor path's `_api_model` fallback.
+            _cr = compute_cost(model_s or _sub_api_model, usage_obj,
+                               cache_ttl_fallback="1h", is_anthropic=_sub_is_anthropic)
+            sub_cost += _cr.cost_usd
+            sub_unpriced += _cr.unpriced_tokens
+        except Exception:
+            logger.warning("subagent cost: compute_cost failed for model %r; recording $0", model_s)
 
     # Per-sub-agent isolated read registry — prevents sub from using parent's read state
     _sub_read_registry: dict[str, float] = {}
     # Per-sub-agent isolated advisor consult counter — local to this dispatch,
     # not the parent room's (a parent near-cap must not gate the sub).
     _sub_advisor_uses: dict = {}
+    # F6 (kdsn.218 remediation): local advisor-cost bridge. A sub keeps the
+    # advisor tool; without a bridge here a sub->advisor consult would be costed
+    # by neither sub nor parent. run_advisor writes frozen cost keyed by the
+    # inner call's tc.id; we drain it after each tool batch into sub_cost.
+    _sub_advisor_results: dict = {}
 
     try:
         for iteration in range(iteration_limit):
@@ -223,6 +276,7 @@ async def run_subagent(
                 cache_read_tokens += response.usage.cache_read_tokens or 0
                 cache_creation_tokens += response.usage.cache_creation_tokens or 0
                 total_output_tokens += response.usage.output_tokens or 0
+                _accrue_cost(response.model, response.usage)
 
             # Flight recorder: record this iteration's assistant turn verbatim
             # (content + tool call name/id/input) — out-of-band, does not touch messages.
@@ -295,6 +349,7 @@ async def run_subagent(
                     "usage": _usage_snapshot(),
                     "elapsed_s": round(elapsed, 3),
                 })
+                _write_subagent_bridge()
                 return ToolResult(content=response.content, is_error=False)
 
             # Tool calls — execute and loop
@@ -323,12 +378,25 @@ async def run_subagent(
                         "read_registry": _sub_read_registry,
                         "get_transcript": lambda: (system, list(messages)),
                         "advisor_uses": _sub_advisor_uses,
+                        "advisor_results": _sub_advisor_results,
                         "room_id": "__sub__",
-                        "call_id": call_id,
+                        # Unique per inner call so concurrent advisor consults
+                        # in one batch don't collide on the bridge key (F6).
+                        "call_id": tc.id,
                     },
                 ))
 
             results = await asyncio.gather(*tool_coros)
+
+            # F6: fold any nested advisor-consult cost into this sub-run's cost.
+            if _sub_advisor_results:
+                for _adv in _sub_advisor_results.values():
+                    try:
+                        sub_cost += float(_adv.get("cost_usd", 0.0) or 0.0)
+                        sub_unpriced += int(_adv.get("unpriced_tokens", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                _sub_advisor_results.clear()
 
             error_count = 0
             for tc, result in zip(response.tool_calls, results):
@@ -410,6 +478,8 @@ async def run_subagent(
                 tools=None,  # no tools — force text response
                 max_tokens=max_tokens,
             )
+            if summary.usage:
+                _accrue_cost(summary.model, summary.usage)
             final_content = (
                 f"⚠️ Sub-agent hit tool call limit ({iteration_limit} iterations). "
                 f"Summary:\n\n{summary.content}"
@@ -422,6 +492,7 @@ async def run_subagent(
                 "usage": _usage_snapshot(),
                 "elapsed_s": round(elapsed, 3),
             })
+            _write_subagent_bridge()
             return ToolResult(
                 content=final_content,
                 is_error=True,
@@ -440,6 +511,7 @@ async def run_subagent(
                 "usage": _usage_snapshot(),
                 "elapsed_s": round(elapsed, 3),
             })
+            _write_subagent_bridge()
             return ToolResult(
                 content=final_content,
                 is_error=True,
@@ -471,4 +543,5 @@ async def run_subagent(
             "usage": _usage_snapshot(),
             "elapsed_s": round(elapsed, 3),
         })
+        _write_subagent_bridge()
         return ToolResult(content=final_content, is_error=True)

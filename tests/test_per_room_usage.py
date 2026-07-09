@@ -253,6 +253,11 @@ class TestUsageTotals:
             "cache_creation_tokens": 0,
             "total_output_tokens": 0,
             "total_tool_calls": 0,
+            # Cost-tracking counters (workspace-kdsn.218): zero on an empty log.
+            "main_cost_usd": 0.0,
+            "subagent_cost_usd": 0.0,
+            "advisor_cost_usd": 0.0,
+            "unpriced_tokens": 0,
         }
 
 

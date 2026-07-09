@@ -29,7 +29,7 @@ import json
 import logging
 
 from openalph.config import AgentConfig, resolve_model
-from openalph.provider import complete, ProviderError
+from openalph.provider import complete, ProviderError, compute_cost
 from openalph.tools import ToolResult
 from openalph.tools.security import redact_credentials
 
@@ -417,6 +417,18 @@ async def run_advisor(
         try:
             if callbacks and "advisor_results" in callbacks and callbacks.get("call_id"):
                 _u = getattr(response, "usage", None)
+                _cost_usd = 0.0
+                _unpriced_tokens = 0
+                if _u is not None:
+                    # F1/F2 (kdsn.218 remediation): price from the SDK-served /
+                    # resolved model (not the bare-alias `model_str`), gated by
+                    # the resolved provider's type — mirrors the main path.
+                    _priced_model = getattr(response, "model", None) or _api_model
+                    _cr = compute_cost(
+                        _priced_model, _u, cache_ttl_fallback=cache_ttl,
+                        is_anthropic=(getattr(provider_cfg, "type", None) == "anthropic"))
+                    _cost_usd = _cr.cost_usd
+                    _unpriced_tokens = _cr.unpriced_tokens
                 # R5 (audit remediation): key by (room_id, call_id) -- the
                 # bot-wide _advisor_results dict is shared across rooms, and
                 # call_id alone can collide across concurrent rooms.
@@ -426,6 +438,9 @@ async def run_advisor(
                     "input_tokens": getattr(_u, "input_tokens", 0),
                     "output_tokens": getattr(_u, "output_tokens", 0),
                     "cache_read_tokens": getattr(_u, "cache_read_tokens", 0),
+                    "cache_creation_tokens": getattr(_u, "cache_creation_tokens", 0),
+                    "cost_usd": _cost_usd,
+                    "unpriced_tokens": _unpriced_tokens,
                     "elapsed_s": _elapsed,
                     "advice": advice,
                 }

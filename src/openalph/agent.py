@@ -17,7 +17,7 @@ from pathlib import Path
 
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
-from openalph.provider import complete, stream, ping_cache, StreamEvent, ThinkingBlock
+from openalph.provider import complete, stream, ping_cache, StreamEvent, ThinkingBlock, compute_cost
 from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, BUILTIN_TOOLS, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
 
@@ -240,20 +240,40 @@ class Agent:
         self._advisor_uses.pop(room_id, None)
 
     def _usage_for(self, room_id: str) -> dict[str, int]:
-        """Lazily init + return the per-room counter record (5 keys, all int)."""
+        """Lazily init + return the per-room counter record."""
         if room_id not in self._room_usage:
             self._room_usage[room_id] = {
                 "uncached_input_tokens": 0, "cache_read_tokens": 0,
                 "cache_creation_tokens": 0, "total_output_tokens": 0,
                 "total_tool_calls": 0,
+                "main_cost_usd": 0.0, "subagent_cost_usd": 0.0,
+                "advisor_cost_usd": 0.0, "unpriced_tokens": 0,
             }
         return self._room_usage[room_id]
 
-    def _record_turn_usage(self, room_id: str, usage) -> None:
+    def _provider_is_anthropic(self, model_str: str) -> bool:
+        """Resolve whether `model_str` routes to an Anthropic-typed provider —
+        the authoritative gate for USD cost pricing (F2, kdsn.218). Fail-soft:
+        an unknown model or resolution error returns False (the call is tallied
+        as unpriced, never mispriced at Anthropic rates, never a crash)."""
+        try:
+            from openalph.config import resolve_model
+            pcfg, _ = resolve_model(model_str, self.config.providers,
+                                    aliases=self.config.model_aliases)
+            return getattr(pcfg, "type", None) == "anthropic"
+        except Exception:
+            return False
+
+    def _record_turn_usage(self, room_id: str, usage, model: str, cache_ttl: str | None,
+                           is_anthropic: bool | None = None) -> None:
         """Called once per API call (text + tool turns + summary). Updates globals
         AND per-room token counters, and stores the per-turn delta for the serializer.
         `usage` is a provider Usage object (.input_tokens, .output_tokens,
-        .cache_read_tokens, .cache_creation_tokens; cache fields may be None)."""
+        .cache_read_tokens, .cache_creation_tokens; cache fields may be None).
+        `model` is the resolved/authoritative model string for this call (used to
+        freeze cost); `cache_ttl` is the room's cache TTL label, used only as the
+        aggregate-cache-write fallback multiplier inside compute_cost.
+        `is_anthropic` gates pricing by provider type (F2)."""
         cr = usage.cache_read_tokens or 0
         cc = usage.cache_creation_tokens or 0
         # globals (unchanged semantics)
@@ -267,10 +287,28 @@ class Agent:
         r["cache_read_tokens"] += cr
         r["cache_creation_tokens"] += cc
         r["total_output_tokens"] += usage.output_tokens
+        # frozen cost for THIS call. F3 (kdsn.218): fail-soft — a bad model
+        # string or usage shape must never raise through the hot turn loop;
+        # on failure record $0 and move on.
+        try:
+            cr_result = compute_cost(model, usage, cache_ttl_fallback=cache_ttl or "1h",
+                                     is_anthropic=is_anthropic)
+            _cost_usd = cr_result.cost_usd
+            _unpriced = cr_result.unpriced_tokens
+        except Exception:
+            logger.warning("cost: compute_cost failed for model %r; recording $0", model)
+            _cost_usd = 0.0
+            _unpriced = 0
+        r["main_cost_usd"] += _cost_usd
+        r["unpriced_tokens"] += _unpriced
         # per-turn delta (serializer persists this; tool_calls added by serializer)
         self._last_turn_usage[room_id] = {
             "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
             "cache_read_tokens": cr, "cache_creation_tokens": cc,
+            "cost_usd": _cost_usd, "model": model,
+            "cache_creation_5m": usage.cache_creation_5m_tokens or 0,
+            "cache_creation_1h": usage.cache_creation_1h_tokens or 0,
+            "unpriced_tokens": _unpriced,
         }
 
     def _record_tool_calls(self, room_id: str, n: int) -> None:
@@ -286,11 +324,30 @@ class Agent:
         return self._last_stop_reason.get(room_id)
 
     def restore_usage(self, room_id: str, totals: dict) -> None:
-        """Set the per-room counters from JSONL-summed totals (rehydration)."""
+        """Set the per-room counters from JSONL-summed totals (rehydration).
+
+        Float-safe: cost counters are dollars-and-cents floats, NOT int-cast
+        (a blanket int() cast would truncate them to whole dollars).
+        Fail-soft (F3, kdsn.218): a malformed persisted value coerces to 0
+        per-key rather than raising through _activate_room and bricking the
+        room's wake."""
+        def _int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
+        def _float(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
         r = self._usage_for(room_id)
         for k in ("uncached_input_tokens", "cache_read_tokens", "cache_creation_tokens",
                   "total_output_tokens", "total_tool_calls"):
-            r[k] = int(totals.get(k, 0))
+            r[k] = _int(totals.get(k, 0))
+        for k in ("main_cost_usd", "subagent_cost_usd", "advisor_cost_usd"):
+            r[k] = _float(totals.get(k, 0.0))
+        r["unpriced_tokens"] = _int(totals.get("unpriced_tokens", 0))
 
     def history(self, room_id: str) -> list[dict]:
         """Get or create history for a room."""
@@ -814,7 +871,9 @@ class Agent:
 
                     latency_ms = (time.monotonic() - start_time) * 1000
 
-                    self._record_turn_usage(room_id, response.usage)
+                    self._record_turn_usage(
+                        room_id, response.usage, response.model, cache_ttl,
+                        is_anthropic=self._provider_is_anthropic(self.get_model(room_id)))
                     usage = response.usage
 
                     # Check if response has tool calls
@@ -1048,7 +1107,9 @@ class Agent:
                                 await on_text_delta("", done=True)
 
                     if summary_response:
-                        self._record_turn_usage(room_id, summary_response.usage)
+                        self._record_turn_usage(
+                            room_id, summary_response.usage, summary_response.model, cache_ttl,
+                            is_anthropic=self._provider_is_anthropic(self.get_model(room_id)))
                         if on_cache_status:
                             try:
                                 await on_cache_status(summary_response.usage, self.get_model(room_id))
@@ -1215,4 +1276,9 @@ class Agent:
             "cache_creation_tokens": _u["cache_creation_tokens"],
             "total_output_tokens": _u["total_output_tokens"],
             "total_tool_calls": _u["total_tool_calls"],
+            "main_cost_usd": _u["main_cost_usd"],
+            "subagent_cost_usd": _u["subagent_cost_usd"],
+            "advisor_cost_usd": _u["advisor_cost_usd"],
+            "unpriced_tokens": _u["unpriced_tokens"],
+            "total_cost_usd": _u["main_cost_usd"] + _u["subagent_cost_usd"] + _u["advisor_cost_usd"],
         }

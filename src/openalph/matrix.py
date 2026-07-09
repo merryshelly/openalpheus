@@ -305,6 +305,7 @@ class MatrixBot:
         self._steering_inbox: dict[str, list[str]] = {}
         self._active_turns: set[str] = set()
         self._advisor_results: dict[tuple, dict] = {}  # R5: keyed (room_id, call_id)
+        self._subagent_results: dict[tuple, dict] = {}  # keyed (room_id, call_id)
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -854,6 +855,9 @@ class MatrixBot:
                 itok = info.get("input_tokens", 0)
                 otok = info.get("output_tokens", 0)
                 crd = info.get("cache_read_tokens", 0)
+                cct = info.get("cache_creation_tokens", 0)
+                cost_usd = info.get("cost_usd", 0.0)
+                adv_unpriced = info.get("unpriced_tokens", 0)
                 mdl = self._advisor_display_model(info.get("model", "?"))
                 if is_error:
                     summary_line = f"🔮 Advisor failed: {str(result)[:200]}"
@@ -881,7 +885,22 @@ class MatrixBot:
                             event_id=None, event="advisor_consult", model=mdl,
                             input_tokens=itok, output_tokens=otok,
                             cache_read_tokens=crd, elapsed_s=elapsed,
+                            cache_creation_tokens=cct, cost_usd=cost_usd,
+                            unpriced_tokens=adv_unpriced,
                         )
+                        # F4 (kdsn.218): accumulate advisor cost LIVE so /status
+                        # is accurate before restart. Disjoint from the restart
+                        # re-sum (restore_usage assigns once at _activate_room,
+                        # before any live turn). Kept INSIDE the `if _sl_adv:`
+                        # persistence guard (re-audit LOW-2) so live and
+                        # post-restart totals stay identical: no session log =>
+                        # neither persisted nor live-counted.
+                        try:
+                            _uu = self.agent._usage_for(room_id)
+                            _uu["advisor_cost_usd"] += cost_usd or 0.0
+                            _uu["unpriced_tokens"] += adv_unpriced or 0
+                        except Exception:
+                            pass
             else:
                 notice_body = f"🔧 {name}{detail} {status}"
                 if is_error:
@@ -914,7 +933,7 @@ class MatrixBot:
             # Append tool result to session log
             _sl = getattr(self, 'session_log', None)
             if _sl:
-                _sl.append(
+                _tool_kwargs = dict(
                     role="tool",
                     sender=self.config.user_id,
                     room=room_id,
@@ -924,6 +943,20 @@ class MatrixBot:
                     output=result,
                     is_error=is_error,
                 )
+                if name == "subagent":
+                    _sub_info = getattr(self, "_subagent_results", {}).pop((room_id, call_id), {})
+                    _tool_kwargs["cost_usd"] = _sub_info.get("cost_usd", 0.0)
+                    _tool_kwargs["unpriced_tokens"] = _sub_info.get("unpriced_tokens", 0)
+                    # F4 (kdsn.218): accumulate subagent cost LIVE (same pop —
+                    # one read of the bridge dict feeds both the JSONL kwargs and
+                    # the live counter). Disjoint from the restart re-sum.
+                    try:
+                        _uu = self.agent._usage_for(room_id)
+                        _uu["subagent_cost_usd"] += _sub_info.get("cost_usd", 0.0) or 0.0
+                        _uu["unpriced_tokens"] += _sub_info.get("unpriced_tokens", 0) or 0
+                    except Exception:
+                        pass
+                _sl.append(**_tool_kwargs)
 
         async def _tool_intent(tool_calls, content_text):
             # Emit Matrix notice for subagent dispatch
@@ -1104,6 +1137,8 @@ class MatrixBot:
         # Lazy-init for tests that construct MatrixBot via __new__
         if not hasattr(self, '_advisor_results'):
             self._advisor_results = {}
+        if not hasattr(self, '_subagent_results'):
+            self._subagent_results = {}
 
         return {
             "send_media": _upload_callback,
@@ -1118,6 +1153,7 @@ class MatrixBot:
             "get_transcript": lambda: (self.agent.system_prompt, list(self.agent.history(room_id))),
             "advisor_uses": _advisor_uses,
             "advisor_results": self._advisor_results,
+            "subagent_results": self._subagent_results,
         }
 
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
@@ -2325,6 +2361,19 @@ class MatrixBot:
                 f"| **Session in (cache write)** | {status['cache_creation_tokens']:,} tokens |",
                 f"| **Session out** | {status['total_output_tokens']:,} tokens |",
                 f"| **Tool calls** | {status['total_tool_calls']} |",
+            ]
+            if status.get('total_cost_usd', 0.0) > 0:
+                lines.append(f"| **Session cost (main)** | ${status.get('main_cost_usd', 0.0):.2f} |")
+                if status.get('subagent_cost_usd', 0.0) > 0:
+                    lines.append(f"| **Session cost (subagent)** | ${status.get('subagent_cost_usd', 0.0):.2f} |")
+                if status.get('advisor_cost_usd', 0.0) > 0:
+                    lines.append(f"| **Session cost (advisor)** | ${status.get('advisor_cost_usd', 0.0):.2f} |")
+                lines.append(f"| **Session cost (total)** | ${status.get('total_cost_usd', 0.0):.2f} |")
+            if status.get('unpriced_tokens', 0) > 0:
+                lines.append(
+                    f"| **Unpriced** | {status.get('unpriced_tokens', 0):,} tokens (non-Anthropic or unlisted model) |"
+                )
+            lines += [
                 f"| **Thinking** | {_thinking} |",
                 f"| **Cache TTL** | {_cache_ttl} |",
                 f"| **Timesense** | {'on' if getattr(self, '_room_timesense', {}).get(room_id) else 'off'} |",

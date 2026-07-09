@@ -8,6 +8,7 @@ The adapter handles the differences in API shapes and response formats between p
 import copy
 import logging
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from typing import AsyncGenerator
 import json
 import re
@@ -140,6 +141,11 @@ class Usage:
     output_tokens: int
     cache_read_tokens: int | None = None
     cache_creation_tokens: int | None = None
+    # TTL-split cache-write breakdown (Anthropic only; None when the response
+    # carries no cache_creation object or the provider doesn't surface a split).
+    # Invariant when both present: 5m + 1h == cache_creation_tokens.
+    cache_creation_5m_tokens: int | None = None
+    cache_creation_1h_tokens: int | None = None
 
 
 @dataclass
@@ -313,6 +319,174 @@ def _model_output_cap(api_model: str) -> int | None:
         if frag in m:
             return cap
     return None
+
+
+def _cc_split(usage, attr: str) -> int | None:
+    """Read a TTL-split cache-creation field off an Anthropic SDK usage object.
+
+    Returns None when the response carries no `cache_creation` breakdown
+    (older/edge responses, or providers that don't surface the split).
+    """
+    cc = getattr(usage, "cache_creation", None)
+    if cc is None:
+        return None
+    return getattr(cc, attr, None)
+
+
+# ---- Session USD cost pricing (Anthropic only) --------------------------
+# Verified 2026-07-09 against platform.claude.com/docs/en/about-claude/pricing
+# (official Anthropic docs). Base rates in USD per MTok. Cache costs derive
+# from these uniform multipliers (confirmed uniform across every model row):
+CACHE_READ_MULT = 0.1        # cache hit / refresh  = 0.1x base input
+CACHE_WRITE_5M_MULT = 1.25   # 5-minute cache write = 1.25x base input
+CACHE_WRITE_1H_MULT = 2.0    # 1-hour cache write   = 2.0x base input
+
+# No >200K long-context premium tier exists for any current model — dropped
+# per SB (2026-07-09); the historical surcharge was a Sonnet 4.5 1M-beta
+# artifact, retired. Rates are flat across all context sizes.
+#
+# Keyed by BARE resolved model string. compute_cost() normalizes off a
+# provider prefix ("anthropic/...") and a trailing -YYYYMMDD date suffix
+# before lookup. Sonnet 5 carries an effective-date schedule (intro rates
+# through 2026-08-31, standard from 2026-09-01).
+_MODEL_PRICING: dict[str, dict] = {
+    "claude-opus-4-8":   {"input": 5.0,  "output": 25.0},
+    "claude-opus-4-7":   {"input": 5.0,  "output": 25.0},
+    "claude-opus-4-6":   {"input": 5.0,  "output": 25.0},
+    "claude-opus-4-5":   {"input": 5.0,  "output": 25.0},
+    "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0},
+    "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0},
+    "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0},
+    "claude-fable-5":    {"input": 10.0, "output": 50.0},
+    "claude-mythos-5":   {"input": 10.0, "output": 50.0},
+    "claude-sonnet-5": {
+        # (effective_date, rates) — pick the latest date <= call date.
+        "effective": [
+            (date(1970, 1, 1),  {"input": 2.0, "output": 10.0}),   # introductory
+            (date(2026, 9, 1),  {"input": 3.0, "output": 15.0}),   # standard
+        ],
+    },
+}
+
+
+@dataclass
+class CostResult:
+    """Result of a single-call cost computation.
+
+    priced=False means the model wasn't in the Anthropic pricing table: the
+    call is never dollar-costed (cost_usd=0.0) and its whole token count is
+    reported in `unpriced_tokens` instead (never a silent $0, never a crash).
+    """
+    cost_usd: float
+    unpriced_tokens: int
+    priced: bool
+
+
+def _resolve_rates(entry: dict, now: date) -> dict:
+    """Select base input/output rates, honoring an effective-date schedule."""
+    if "effective" in entry:
+        chosen = entry["effective"][0][1]
+        for eff_date, rates in entry["effective"]:
+            if now >= eff_date:
+                chosen = rates
+        return chosen
+    return entry
+
+
+_warned_unpriced_anthropic: set[str] = set()
+
+
+def compute_cost(model: str, usage: Usage, *, cache_ttl_fallback: str = "1h",
+                 now: date | datetime | None = None,
+                 is_anthropic: bool | None = None) -> CostResult:
+    """Frozen USD cost of one Anthropic API call. Pure (except a warn-once log).
+
+    Cache-write tokens are costed per their TTL bucket using the SDK's 5m/1h
+    split (Usage.cache_creation_5m_tokens / _1h_tokens). If only an aggregate
+    is available (older/edge responses), it is costed at `cache_ttl_fallback`
+    (default "1h", the platform default and the conservative choice).
+
+    `is_anthropic` is the authoritative provider-type gate (kdsn.218 remediation
+    F2): pass `False` to force unpriced when the serving provider is NOT
+    Anthropic-typed — so a non-Anthropic provider returning a claude-shaped
+    model id (e.g. an OpenAI-compatible router) is never dollar-costed at
+    Anthropic rates. `None` (default) keeps pure string-shape classification for
+    unit tests / legacy callers; production call sites always pass an explicit
+    bool resolved from the provider config.
+
+    Non-Anthropic or unlisted-Anthropic models are never dollar-costed: their
+    whole token count goes to `unpriced_tokens`. `now` selects the effective
+    rate for date-scheduled models (Sonnet 5); default is today's UTC date.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc).date()
+    elif isinstance(now, datetime):
+        now = now.date()
+
+    in_tok = usage.input_tokens or 0
+    out_tok = usage.output_tokens or 0
+    cache_read = usage.cache_read_tokens or 0
+    cc_total = usage.cache_creation_tokens or 0
+    cc_5m = usage.cache_creation_5m_tokens
+    cc_1h = usage.cache_creation_1h_tokens
+
+    # Provider-type gate (F2): a caller that knows the serving provider is not
+    # Anthropic-typed forces unpriced regardless of the model string's shape.
+    if is_anthropic is False:
+        unpriced = in_tok + out_tok + cache_read + cc_total
+        logger.debug("cost: unpriced (non-Anthropic provider) model %r", model)
+        return CostResult(cost_usd=0.0, unpriced_tokens=unpriced, priced=False)
+
+    # Normalize: strip provider prefix (last path component), then date suffix.
+    base = model.rsplit("/", 1)[-1] if "/" in model else model
+    entry = _MODEL_PRICING.get(base)
+    if entry is None:
+        stripped = re.sub(r"-\d{8}$", "", base)
+        entry = _MODEL_PRICING.get(stripped)
+        if entry is not None:
+            base = stripped
+
+    if entry is None:
+        unpriced = in_tok + out_tok + cache_read + cc_total
+        if base.startswith("claude"):
+            if base not in _warned_unpriced_anthropic:
+                _warned_unpriced_anthropic.add(base)
+                logger.warning(
+                    "cost: unlisted Anthropic model %r — add it to _MODEL_PRICING",
+                    model)
+        else:
+            logger.debug("cost: unpriced (non-Anthropic) model %r", model)
+        return CostResult(cost_usd=0.0, unpriced_tokens=unpriced, priced=False)
+
+    rates = _resolve_rates(entry, now)
+    in_rate = rates["input"]
+    out_rate = rates["output"]
+
+    cost = in_tok * in_rate + out_tok * out_rate
+    cost += cache_read * in_rate * CACHE_READ_MULT
+    # Cache-write cost by TTL bucket. F8 (kdsn.218 remediation): treat a
+    # present-but-zero split the same as an absent split, and cost any residual
+    # (split sum < aggregate) at the fallback multiplier — so an SDK-inconsistent
+    # cache_creation object can never silently under-cost the write.
+    split_5m = cc_5m or 0
+    split_1h = cc_1h or 0
+    split_sum = split_5m + split_1h
+    _fallback_mult = CACHE_WRITE_5M_MULT if cache_ttl_fallback == "5m" else CACHE_WRITE_1H_MULT
+    if split_sum == 0 and cc_total > 0:
+        cost += cc_total * in_rate * _fallback_mult
+        logger.debug("cost: cache_creation split absent/zero; costed %d tokens at "
+                     "%s fallback multiplier", cc_total, cache_ttl_fallback)
+    else:
+        cost += split_5m * in_rate * CACHE_WRITE_5M_MULT
+        cost += split_1h * in_rate * CACHE_WRITE_1H_MULT
+        residual = cc_total - split_sum
+        if residual > 0:
+            cost += residual * in_rate * _fallback_mult
+            logger.debug("cost: cache_creation split (%d) < aggregate (%d); costed "
+                         "residual %d at %s fallback", split_sum, cc_total, residual,
+                         cache_ttl_fallback)
+    cost /= 1_000_000.0
+    return CostResult(cost_usd=cost, unpriced_tokens=0, priced=True)
 
 
 def _convert_tools_for_provider(tools: list | None, provider_type: str) -> list[dict] | None:
@@ -665,6 +839,8 @@ def _parse_anthropic_response(response) -> Response:
             output_tokens=response.usage.output_tokens,
             cache_read_tokens=response.usage.cache_read_input_tokens,
             cache_creation_tokens=response.usage.cache_creation_input_tokens,
+            cache_creation_5m_tokens=_cc_split(response.usage, "ephemeral_5m_input_tokens"),
+            cache_creation_1h_tokens=_cc_split(response.usage, "ephemeral_1h_input_tokens"),
         ),
         stop_reason=response.stop_reason,
         generation_id=getattr(response, "id", "") or "",

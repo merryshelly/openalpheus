@@ -1506,6 +1506,7 @@ async def _execute_tool_inner(
             # the parent — never the sub's own dispatch-time "__sub__" id
             # used internally inside run_subagent's tool-call callbacks.
             parent_room_id=callbacks.get("room_id") if callbacks else None,
+            callbacks=callbacks,
         )
     elif name == "advisor":
         from .advisor import run_advisor

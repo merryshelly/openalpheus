@@ -230,32 +230,69 @@ class SessionLog:
         return count, total_chars
 
     def usage_totals(self, room_id: str) -> dict:
-        """Sum per-turn `usage` fields across assistant entries -> 5 per-room counters.
+        """Sum per-turn `usage` fields across assistant entries -> per-room counters.
         Returns zeros if no usage present. Maps:
           usage.input_tokens        -> uncached_input_tokens
           usage.output_tokens       -> total_output_tokens
           usage.cache_read_tokens   -> cache_read_tokens
           usage.cache_creation_tokens -> cache_creation_tokens
           usage.tool_calls          -> total_tool_calls
-        Robust to entries with no `usage` key (skip)."""
+          usage.cost_usd            -> main_cost_usd
+          usage.unpriced_tokens     -> unpriced_tokens
+        Also re-sums frozen cost from subagent tool-result entries
+        (role="tool", entry.cost_usd -> subagent_cost_usd) and advisor
+        consult system entries (role="system", event="advisor_consult",
+        entry.cost_usd -> advisor_cost_usd). Robust to entries with no
+        `usage`/`cost_usd` key (skip).
+
+        F3 (kdsn.218 remediation): every summed field is numeric-coerced
+        fail-soft — a malformed persisted value (string/None/list) coerces to
+        0 rather than raising through rehydration and bricking room wake."""
+        def _num(v):
+            if isinstance(v, bool):
+                return 0
+            return v if isinstance(v, (int, float)) else 0
         totals = {
             "uncached_input_tokens": 0,
             "cache_read_tokens": 0,
             "cache_creation_tokens": 0,
             "total_output_tokens": 0,
             "total_tool_calls": 0,
+            "main_cost_usd": 0.0,
+            "subagent_cost_usd": 0.0,
+            "advisor_cost_usd": 0.0,
+            "unpriced_tokens": 0,
         }
-        for entry in self.read(room_id):
+        entries = self.read(room_id)
+        for entry in entries:
             if entry.get("role") != "assistant":
                 continue
             u = entry.get("usage")
             if not isinstance(u, dict):
                 continue
-            totals["uncached_input_tokens"] += u.get("input_tokens", 0)
-            totals["cache_read_tokens"] += u.get("cache_read_tokens", 0)
-            totals["cache_creation_tokens"] += u.get("cache_creation_tokens", 0)
-            totals["total_output_tokens"] += u.get("output_tokens", 0)
-            totals["total_tool_calls"] += u.get("tool_calls", 0)
+            totals["uncached_input_tokens"] += _num(u.get("input_tokens", 0))
+            totals["cache_read_tokens"] += _num(u.get("cache_read_tokens", 0))
+            totals["cache_creation_tokens"] += _num(u.get("cache_creation_tokens", 0))
+            totals["total_output_tokens"] += _num(u.get("output_tokens", 0))
+            totals["total_tool_calls"] += _num(u.get("tool_calls", 0))
+            totals["main_cost_usd"] += _num(u.get("cost_usd", 0.0))
+            totals["unpriced_tokens"] += _num(u.get("unpriced_tokens", 0))
+
+        for entry in entries:
+            # F7 (kdsn.218): only subagent tool entries carry cost_usd; guard on
+            # the tool name so a future cost-bearing tool can't be mis-attributed
+            # to subagent spend.
+            if entry.get("role") != "tool" or entry.get("name") != "subagent":
+                continue
+            totals["subagent_cost_usd"] += _num(entry.get("cost_usd", 0.0))
+            totals["unpriced_tokens"] += _num(entry.get("unpriced_tokens", 0))
+
+        for entry in entries:
+            if entry.get("role") != "system" or entry.get("event") != "advisor_consult":
+                continue
+            totals["advisor_cost_usd"] += _num(entry.get("cost_usd", 0.0))
+            totals["unpriced_tokens"] += _num(entry.get("unpriced_tokens", 0))
+
         return totals
 
     def build_context(self, room_id: str, *, skip_system: bool = True) -> list[dict]:
