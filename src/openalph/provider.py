@@ -110,6 +110,19 @@ def _sanitize_error(message: str) -> str:
 # Keyed by (provider, api_key, base_url) so different configs get different clients.
 _client_cache: dict[tuple, object] = {}
 
+# SDK-level automatic retry budget for transient failures (408/409/429/5xx incl
+# Anthropic 529 overload), applied at request AND stream-establishment time. The
+# SDK default is 2 -- every 529 was already retried twice invisibly. Bump to 20
+# (kdsn.220) to ride out transient overload blips. SDK backoff is 0.5->1->2->4->8s
+# then capped 8s/attempt (honors Retry-After up to 60s), so 20 retries is ~2.25min
+# worst case; a blip outlasting that is a sustained outage, not a blip -> fail the
+# turn and let the next message/heartbeat pick it up. The turn holds its per-room
+# asyncio lock for the whole retry window, which is why this is capped at 20 and
+# not higher. /stop stays responsive: CancelledError propagates through the
+# backoff sleep. Mid-stream failures cannot be resumed (accepted); history is
+# unchanged since the assistant turn is appended only after the stream completes.
+_MAX_SDK_RETRIES = 20
+
 
 def _get_client(provider: ProviderConfig):
     """Get or create a cached provider client."""
@@ -120,6 +133,7 @@ def _get_client(provider: ProviderConfig):
             _client_cache[key] = anthropic.AsyncAnthropic(
                 api_key=provider.api_key,
                 timeout=httpx.Timeout(timeout, connect=10.0),
+                max_retries=_MAX_SDK_RETRIES,
             )
         return _client_cache[key]
     elif provider.type == "openai":
@@ -129,6 +143,7 @@ def _get_client(provider: ProviderConfig):
                 api_key=provider.api_key,
                 base_url=provider.base_url,
                 timeout=httpx.Timeout(timeout, connect=10.0),
+                max_retries=_MAX_SDK_RETRIES,
             )
         return _client_cache[key]
     else:

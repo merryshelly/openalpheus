@@ -247,16 +247,6 @@ def render_transcript(
 # Component D -- counter/cap (design Section 6)
 # ---------------------------------------------------------------------------
 
-def _strip_cache_control(blocks: list[dict]) -> list[dict]:
-    """Return copies of `blocks` with any `cache_control` key removed.
-
-    Used for openai-type advisor providers, which don't support Anthropic's
-    cache_control breakpoints -- sending the key there would be at best
-    ignored and at worst rejected, so it is stripped rather than sent.
-    """
-    return [{k: v for k, v in block.items() if k != "cache_control"} for block in blocks]
-
-
 async def run_advisor(
     *,
     focus: str | None,
@@ -354,12 +344,19 @@ async def run_advisor(
             closing_text = f"{_CLOSING_INSTRUCTION}\n\nFocus: {focus}"
         focus_block = {"type": "text", "text": closing_text}
 
-        user_content = [transcript_block, focus_block]
-        if provider_cfg.type != "anthropic":
-            # cache_control is an Anthropic-specific breakpoint; strip it
-            # for other advisor provider types (test_cache_control_absent_
-            # for_openai_advisor).
-            user_content = _strip_cache_control(user_content)
+        if provider_cfg.type == "anthropic":
+            user_content = [transcript_block, focus_block]
+        else:
+            # kdsn.198.11: openai-type advisor providers reject Anthropic-style
+            # content BLOCKS (a list) for a user message's text field
+            # ("Invalid type for ...content[0].text: expected a string, but got
+            # an array"). cache_control is an Anthropic-only breakpoint, so
+            # there is nothing to preserve by keeping the block list here --
+            # flatten to a single string, the shape every OpenAI-compatible
+            # endpoint accepts. Built from the SAME already-redacted pieces the
+            # block path uses (one source of truth; both were redacted above
+            # before egress).
+            user_content = f"{rendered_transcript}\n\n{closing_text}"
 
         call_messages = [{"role": "user", "content": user_content}]
         call_config = dataclasses.replace(config, default_model=model_str)
@@ -403,6 +400,26 @@ async def run_advisor(
         # (Downstream execute_tool redaction becomes a harmless idempotent
         # no-op on already-redacted text.)
         advice = redact_credentials(advice)[0]
+        # kdsn.198.10: a provider content-policy refusal carries empty content,
+        # so without this it would be swallowed by the generic empty-advice
+        # message below -- indistinguishable from a degenerate empty response,
+        # and (for sub consults, which emit no Matrix notice) invisible. Surface
+        # it as a distinct, actionable failure. Kept GENERAL (operator scope
+        # note): no model-specific routing here, just name the model that
+        # refused and steer to retry with a stronger one. "refusal" is
+        # Anthropic's stop_reason; "content_filter" is the OpenAI-family
+        # finish_reason equivalent -- match both, since openai-type advisors
+        # are supported (kdsn.198.11).
+        stop_reason = getattr(response, "stop_reason", "") or ""
+        if stop_reason in ("refusal", "content_filter"):
+            return ToolResult(
+                content=(
+                    f"Advisor ({model_str}) refused on content-policy grounds. "
+                    "Retry the consult with a different, stronger model via the "
+                    "`model` parameter."
+                ),
+                is_error=True,
+            )
         if not advice:
             return ToolResult(
                 content=(

@@ -375,6 +375,108 @@ class TestFailSoft:
 
 
 # ========================================================================
+# Refusal handling (kdsn.198.10) — a provider content-policy refusal must
+# surface as a DISTINCT, actionable message, not the generic empty-advice
+# steering (which would be indistinguishable from a degenerate empty response,
+# and invisible for sub consults that emit no Matrix notice).
+# ========================================================================
+
+class TestRefusalHandling:
+
+    @pytest.mark.asyncio
+    async def test_anthropic_refusal_surfaced_distinctly(self, tmp_path):
+        """stop_reason='refusal' (Anthropic) → is_error message naming the refusal,
+        NOT the generic 'no advice' empty-response message."""
+        assert run_advisor is not None, NOT_IMPL
+        cfg = _cfg(tmp_path)
+        cb = _callbacks()
+        refusal = Response(
+            content="", model="claude-fable-5",
+            usage=Usage(input_tokens=10, output_tokens=2),
+            stop_reason="refusal",
+        )
+        with patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=refusal):
+            result = await run_advisor(
+                focus=None, model="anthropic/claude-fable-5", config=cfg,
+                tool_config=_tc_cfg(model="anthropic/claude-fable-5"), callbacks=cb,
+            )
+        assert result.is_error, "A refusal must be an is_error ToolResult"
+        low = result.content.lower()
+        assert "refus" in low, f"Refusal must be named as such: {result.content!r}"
+        assert "no advice" not in low, \
+            "A refusal must NOT collapse into the generic empty-advice message"
+
+    @pytest.mark.asyncio
+    async def test_openai_content_filter_surfaced_distinctly(self, tmp_path):
+        """stop_reason='content_filter' (the OpenAI-family finish_reason) is
+        treated the same as an Anthropic refusal — kdsn.198.11 enables
+        openai-type advisors, so their refusal vocabulary must be covered too."""
+        assert run_advisor is not None, NOT_IMPL
+        cfg = _cfg(tmp_path, providers={"oai": _provider(key="oai", type="openai")})
+        cb = _callbacks()
+        filtered = Response(
+            content="", model="gpt-strong",
+            usage=Usage(input_tokens=10, output_tokens=0),
+            stop_reason="content_filter",
+        )
+        with patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=filtered):
+            result = await run_advisor(
+                focus=None, model="oai/gpt-strong", config=cfg,
+                tool_config=_tc_cfg(model="oai/gpt-strong"), callbacks=cb,
+            )
+        assert result.is_error
+        assert "refus" in result.content.lower(), \
+            f"content_filter must surface as a refusal-class message: {result.content!r}"
+
+    @pytest.mark.asyncio
+    async def test_refusal_message_is_general_not_model_specific(self, tmp_path):
+        """Operator scope note (kdsn.198.10): keep it GENERAL. The message names
+        the refusing model and steers to the generic `model` parameter — it must
+        NOT hardcode a specific model to switch to (no baked-in 'opus')."""
+        assert run_advisor is not None, NOT_IMPL
+        cfg = _cfg(tmp_path)
+        cb = _callbacks()
+        refusal = Response(
+            content="", model="claude-fable-5",
+            usage=Usage(input_tokens=10, output_tokens=2),
+            stop_reason="refusal",
+        )
+        with patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=refusal):
+            result = await run_advisor(
+                focus=None, model="anthropic/claude-fable-5", config=cfg,
+                tool_config=_tc_cfg(model="anthropic/claude-fable-5"), callbacks=cb,
+            )
+        low = result.content.lower()
+        assert "opus" not in low, \
+            "Refusal steering must stay general — no hardcoded model name"
+        assert "model" in low, \
+            "Refusal steering should point at the `model` parameter"
+
+    @pytest.mark.asyncio
+    async def test_non_refusal_empty_still_generic(self, tmp_path):
+        """A plain empty response (stop_reason='end_turn') is NOT a refusal —
+        it must keep the generic empty-advice message, not the refusal one."""
+        assert run_advisor is not None, NOT_IMPL
+        cfg = _cfg(tmp_path)
+        cb = _callbacks()
+        with patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=_resp(content="")):
+            result = await run_advisor(
+                focus=None, model=None, config=cfg,
+                tool_config=_tc_cfg(), callbacks=cb,
+            )
+        assert result.is_error
+        low = result.content.lower()
+        assert "no advice" in low or "proceed" in low, \
+            f"Non-refusal empty must keep the generic message: {result.content!r}"
+        assert "refus" not in low, \
+            "A non-refusal empty response must not claim a content-policy refusal"
+
+
+# ========================================================================
 # Thinking dropped (§4, §5)
 # ========================================================================
 
@@ -493,6 +595,48 @@ class TestRequestShape:
         messages = mock_complete.call_args.kwargs["messages"]
         assert not _has_any_cache_control(messages), \
             "openai-type advisor must have cache_control stripped (unsupported there)"
+
+    @pytest.mark.asyncio
+    async def test_openai_advisor_content_is_flat_string(self, tmp_path):
+        """kdsn.198.11: for an openai-type advisor provider the user message
+        content must be a FLAT STRING, not a list of Anthropic-style text blocks
+        (the openai wire format rejects the block-array for that field). The
+        transcript + focus text must both still be present."""
+        assert run_advisor is not None, NOT_IMPL
+        cfg = _cfg(tmp_path, providers={"oai": _provider(key="oai", type="openai")})
+        cb = _callbacks()
+        with patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=_resp()) as mock_complete:
+            await run_advisor(focus="FOCUS_MARKER_Q", model="oai/gpt-strong",
+                              config=cfg, tool_config=_tc_cfg(model="oai/gpt-strong"),
+                              callbacks=cb)
+        messages = mock_complete.call_args.kwargs["messages"]
+        assert len(messages) == 1 and messages[0]["role"] == "user"
+        content = messages[0]["content"]
+        assert isinstance(content, str), \
+            f"openai-type advisor content must be a flat string, got {type(content).__name__}"
+        assert "TRANSCRIPT_USER_MARKER" in content, "Transcript text must be present"
+        assert "FOCUS_MARKER_Q" in content, "Focus text must be present"
+
+    @pytest.mark.asyncio
+    async def test_anthropic_advisor_content_stays_block_list(self, tmp_path):
+        """Regression guard for kdsn.198.11: the anthropic path is UNCHANGED —
+        still a list of content blocks carrying the cache_control breakpoint."""
+        assert run_advisor is not None, NOT_IMPL
+        cfg = _cfg(tmp_path, providers={"anthropic": _provider()})
+        cb = _callbacks()
+        with patch("openalph.tools.advisor.complete", new_callable=AsyncMock,
+                   return_value=_resp()) as mock_complete:
+            await run_advisor(focus="q", model="anthropic/claude-opus-4-8",
+                              config=cfg,
+                              tool_config=_tc_cfg(model="anthropic/claude-opus-4-8"),
+                              callbacks=cb)
+        messages = mock_complete.call_args.kwargs["messages"]
+        content = messages[0]["content"]
+        assert isinstance(content, list), \
+            "anthropic advisor content must stay a block list"
+        assert _has_any_cache_control(messages), \
+            "anthropic advisor must keep its cache_control breakpoint"
 
     @pytest.mark.asyncio
     async def test_max_tokens_and_thinking_forwarded(self, tmp_path):
