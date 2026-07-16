@@ -354,11 +354,11 @@ class TestThinkingPersisted:
         agent.history = MagicMock(return_value=history_list)
         agent.last_turn_usage = MagicMock(return_value=None)
 
-        # Make a ToolCall-like object
-        tc = MagicMock()
-        tc.id = "call_abc"
-        tc.name = "shell"
-        tc.input = {"command": "ls"}
+        # Real ToolCall (not a bare MagicMock): production code now reads
+        # tc.extra_content too (bead workspace-kdsn.186.18), which a bare
+        # MagicMock would auto-vivify into a non-JSON-serializable child
+        # mock instead of the real dataclass default of None.
+        tc = ToolCall(id="call_abc", name="shell", input={"command": "ls"})
 
         # Call the serializer directly
         bot._persist_assistant_turn(room, content="Using tool", tool_calls=[tc])

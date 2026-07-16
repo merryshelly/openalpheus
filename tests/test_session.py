@@ -562,11 +562,13 @@ class TestMatrixBotIntegration:
         # Simulate agent emitting tool intent then returning
         async def fake_handle_input(body, room_id, *, on_tool_call=None, on_tool_intent=None, on_text_delta=None, on_thinking_delta=None, thinking=None, callbacks=None, on_cache_status=None, cache_ttl=None, append_user=True):
             if on_tool_intent:
-                # Simulate ToolCall objects
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.name = "shell"
-                tc.input = {"command": "uptime"}
+                # Real ToolCall (not a bare MagicMock): production code now
+                # reads tc.extra_content too (bead workspace-kdsn.186.18),
+                # which a bare MagicMock would auto-vivify into a
+                # non-JSON-serializable child mock instead of the real
+                # dataclass default of None.
+                from openalph.provider import ToolCall
+                tc = ToolCall(id="call_1", name="shell", input={"command": "uptime"})
                 await on_tool_intent([tc], "Let me check...")
             if on_tool_call:
                 await on_tool_call("call_1", "shell", {"command": "uptime"}, "up 3 days", False)

@@ -695,9 +695,18 @@ class MatrixBot:
         kwargs = dict(role="assistant", sender=self.config.user_id,
                       room=room_id, event_id=None, content=content or "")
         if tool_calls is not None:
-            kwargs["tool_calls"] = [
-                {"call_id": tc.id, "name": tc.name, "input": tc.input} for tc in tool_calls
-            ]
+            logged = []
+            for tc in tool_calls:
+                entry = {"call_id": tc.id, "name": tc.name, "input": tc.input}
+                # Persist opaque provider metadata (e.g. Google's
+                # extra_content.google.thought_signature) so it survives
+                # rehydration and can be echoed back on a later turn — see
+                # ToolCall.extra_content docstring / bead workspace-kdsn.186.18.
+                extra_content = getattr(tc, "extra_content", None)
+                if extra_content:
+                    entry["extra_content"] = extra_content
+                logged.append(entry)
+            kwargs["tool_calls"] = logged
         if thinking:
             kwargs["thinking"] = thinking
         if usage:

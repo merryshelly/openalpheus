@@ -168,6 +168,14 @@ class ToolCall:
     id: str
     name: str
     input: dict
+    # Opaque provider-specific metadata that must be echoed back verbatim on
+    # the next turn for multi-turn tool use to work correctly (e.g. Google
+    # Gemini 3.x's `extra_content.google.thought_signature` — see
+    # https://ai.google.dev/gemini-api/docs/thought-signatures and bead
+    # workspace-kdsn.186.18). None for every other provider today. Anthropic
+    # has its own, separate signature mechanism via ThinkingBlock.signature;
+    # this field is not used for Anthropic.
+    extra_content: dict | None = None
 
     def __post_init__(self):
         # Models occasionally emit tool names with leading/trailing whitespace
@@ -776,14 +784,24 @@ def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
                 # Convert ToolCall objects to OpenAI format
                 openai_tool_calls = []
                 for tc in tool_calls:
-                    openai_tool_calls.append({
+                    oai_tc = {
                         "id": tc.id,
                         "type": "function",
                         "function": {
                             "name": tc.name,
                             "arguments": json.dumps(tc.input),
                         },
-                    })
+                    }
+                    # Echo back opaque provider metadata verbatim if present
+                    # (e.g. Google's extra_content.google.thought_signature —
+                    # required on the next turn for Gemini 3.x tool use, see
+                    # ToolCall.extra_content docstring / bead
+                    # workspace-kdsn.186.18). No-op (key omitted) for every
+                    # provider that never populated it.
+                    extra_content = getattr(tc, "extra_content", None)
+                    if extra_content:
+                        oai_tc["extra_content"] = extra_content
+                    openai_tool_calls.append(oai_tc)
                 result.append({
                     "role": "assistant",
                     "content": content or None,
@@ -875,11 +893,21 @@ def _parse_openai_response(response) -> Response:
                 arguments = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 arguments = {}
-            
+
+            # Capture opaque provider metadata that must be echoed back next
+            # turn (currently: Google's extra_content.google.thought_signature
+            # on Gemini 3.x — see ToolCall.extra_content docstring / bead
+            # workspace-kdsn.186.18). Verified live (2026-07-16) that Gemini's
+            # OpenAI-compat tool_call objects surface this as a plain
+            # attribute (pydantic extra="allow"); harmless None on providers
+            # that don't send it.
+            extra_content = getattr(tc, "extra_content", None)
+
             tool_calls.append(ToolCall(
                 id=tc.id,
                 name=tc.function.name,
                 input=arguments,
+                extra_content=extra_content,
             ))
     
     # Extract reasoning (OpenRouter extension) into thinking blocks
@@ -1353,12 +1381,28 @@ async def stream(
                     # Handle tool calls
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
+                            # Google's Gemini OpenAI-compat streaming never
+                            # populates tool_calls[].index (verified live
+                            # 2026-07-16 — always None). Falling back to the
+                            # call's own id keeps concurrent tool calls from
+                            # colliding into the same accumulator slot (they
+                            # would otherwise all land on the same `None` key,
+                            # corrupting/losing all but one call in a
+                            # multi-tool-call turn). Real index-bearing
+                            # providers are unaffected — idx stays their int.
                             idx = tc_delta.index
+                            if idx is None:
+                                idx = tc_delta.id or f"__unindexed_{len(tool_call_accumulators)}"
                             if idx not in tool_call_accumulators:
                                 tool_call_accumulators[idx] = {
                                     "id": tc_delta.id or "",
                                     "name": tc_delta.function.name or "",
                                     "arguments": "",
+                                    # Opaque metadata (e.g. Google's
+                                    # extra_content.google.thought_signature)
+                                    # that must be echoed back next turn —
+                                    # see ToolCall.extra_content docstring.
+                                    "extra_content": getattr(tc_delta, "extra_content", None),
                                 }
                             if tc_delta.function.arguments:
                                 tool_call_accumulators[idx]["arguments"] += tc_delta.function.arguments
@@ -1382,6 +1426,7 @@ async def stream(
                         id=tc_data["id"],
                         name=tc_data["name"],
                         input=input_dict,
+                        extra_content=tc_data.get("extra_content"),
                     ),
                 )
             
@@ -1397,6 +1442,7 @@ async def stream(
                     id=tc_data["id"],
                     name=tc_data["name"],
                     input=input_dict,
+                    extra_content=tc_data.get("extra_content"),
                 ))
             
             # Build and yield final done event

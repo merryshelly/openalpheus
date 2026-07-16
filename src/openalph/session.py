@@ -380,6 +380,7 @@ class SessionLog:
                                 id=tc.get("call_id") or tc.get("id", ""),
                                 name=tc.get("name", ""),
                                 input=stripped_input,
+                                extra_content=tc.get("extra_content"),
                             ))
                     else:
                         tool_calls = [
@@ -387,6 +388,7 @@ class SessionLog:
                                 id=tc.get("call_id") or tc.get("id", ""),
                                 name=tc.get("name", ""),
                                 input=tc.get("input", {}),
+                                extra_content=tc.get("extra_content"),
                             )
                             for tc in entry["tool_calls"]
                         ]
