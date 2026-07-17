@@ -10,7 +10,7 @@ Tiny, self-contained, disproportionately effective.
 
 OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix provides the transport layer. Local JSONL files hold session state. systemd manages the lifecycle. Four direct Python dependencies. No cloud except the ones you explicitly choose.
 
-**Status: v0.1.2 — early release.** Core is stable and tested (1,435+ tests). The interface may evolve.
+**Status: v0.1.2 — early release.** Core is stable and tested (2,420+ tests). The interface may evolve.
 
 ## Why
 
@@ -18,9 +18,9 @@ All agent frameworks make tradeoffs. We optimized for:
 
 - **Control.** Full control of the system prompt. Your agent doesn't read a single character you didn't put there. Behavior is configured by editing markdown files — no code required.
 - **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
-- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Fourteen tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
+- **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Sixteen tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
 - **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
-- **Maintainability.** ~13,000 LOC. Full test coverage. Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
+- **Maintainability.** ~15,700 LOC source. Full test coverage (2,420+ tests). Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
 - **Resilience.** Each agent runs as an isolated Unix process with its own filesystem. One agent can crash out, trash its workspace, and the others are unaffected.
 - **Focus.** Matrix is a mature protocol with an array of clients for mobile, desktop, web. No bespoke UI, no custom views to maintain.
 - **Transparency.** Session state is append-only text in JSONL, not a database. `grep` works. `cat` works. No migrations, no schema, no query language needed.
@@ -85,9 +85,11 @@ Skills are listed by name in the prompt; the agent reads their content on demand
 
 Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
 
-Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `grep`, `glob`, `subagent`, `memory_search`, `send_media`, `context_status`, `todo_write`.
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `web_fetch_js`\*\*, `grep`, `glob`, `subagent`, `advisor`, `memory_search`, `send_media`, `context_status`, `todo_write`.
 
 \*`web_search` requires a [Brave Search API key](https://brave.com/search/api/) configured in `workspace/tools/web_search.toml`. Without it, the tool is available but returns an error. `web_fetch` (direct URL fetching) works without any API key.
+
+\*\*`web_fetch_js` renders JavaScript-heavy pages (SPAs, dashboards, infinite-scroll) via [Tabstack](https://tabstack.ai)'s cloud browser — opt-in via `api_key` in `workspace/tools/web_fetch_js.toml` (unconfigured = tool unavailable). Unlike `web_fetch`, the target URL and page content transit a third-party cloud, so treat it as a deliberate exception to "no cloud except the ones you explicitly choose." `web_fetch` nudges toward it at the point of need when a fetch looks unrendered.
 
 ### Guidance injection
 
@@ -99,6 +101,7 @@ Optional, config-aware in-stream guidance that helps agents stay on track during
 - **Rich tool descriptions.** All built-in tools carry prompt-engineered descriptions (purpose, constraints, when-not) plus steering in error/truncation returns — passed via the API `tools` parameter, never injected into the system prompt.
 - **Multi-hunk patching + validated edits.** `file_patch` applies several SEARCH/REPLACE hunks to a file in one atomic, all-or-nothing call. `file_edit`, `file_write`, and `file_patch` run a zero-dependency syntax check (Python / JSON / TOML) before writing and reject an edit that would turn a clean file broken; writes commit atomically (temp file + rename).
 - **Bounded search.** `grep` (regex over file contents) and `glob` (filename patterns) are pure-Python and workspace-scoped, with file-count and byte caps, a per-scan time budget that defends against catastrophic-backtracking (ReDoS) patterns, and no-follow handling of symlinks.
+- **`advisor` tool.** A built-in second opinion: the calling agent can hand its own transcript to a separate (often stronger) model mid-task and get judgment back — no tools of its own, capped uses per room, useful before a non-obvious design decision, a first substantive write, or declaring complex work done. Advice is guidance, not a directive; the calling agent stays responsible for the outcome.
 
 ### Providers
 
@@ -127,25 +130,30 @@ src/openalph/
 ├── mention.py         Mention detection + room gating
 ├── prompt.py          System prompt assembly from workspace files
 ├── provider.py        Anthropic + OpenAI routing, streaming, error handling
+├── reminders.py       Deterministic system-reminder engine (state-triggered guidance)
 ├── session.py         Append-only JSONL, context rebuild, overflow
 ├── umbral.py          Recurring context rotation (archive + wipe + reset)
 ├── memory/
 │   ├── chunker.py     Document chunking
 │   ├── embeddings.py  Embedding generation
 │   ├── indexer.py     Index construction
+│   ├── schema.py      SQLite schema + sqlite-vec loading
 │   └── search.py      Hybrid semantic + keyword search
 └── tools/
     ├── __init__.py    Registry, discovery, dispatch, truncation
-    ├── file.py        file_read, file_write, file_edit
+    ├── advisor.py     Second-model consult (client-side, no tools of its own)
+    ├── file.py        file_read, file_write, file_edit, file_patch
     ├── media.py       Send files to Matrix rooms
     ├── memory_search.py  Hybrid search tool
+    ├── search.py      grep + glob (bounded, pure-stdlib file search)
     ├── security.py    Credential redaction (10 patterns)
     ├── shell.py       Subprocess execution
     ├── subagent.py    Multi-turn sub-agent with tool access
-    └── web.py         Web search (Brave) + fetch (HTML→text)
+    ├── validate.py    Syntax check on file_edit/file_write/file_patch (fails open)
+    └── web.py         web_search (Brave) + web_fetch (HTML→text) + web_fetch_js (Tabstack)
 ```
 
-~9,000 LOC source. 1,435+ tests. 4 direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
+~15,700 LOC source. 2,420+ tests. 4 direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
 
 ## Prerequisites
 
@@ -177,16 +185,19 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | Command | Effect |
 |---------|--------|
 | `/status` | Model, context usage, token counts |
-| `/model <provider/model>` | Switch model for this room |
-| `/thinking <off\|low\|medium\|high\|xhigh\|max>` | Set extended thinking level (`xhigh` and `max` require supported models) |
+| `/model <provider/model\|list>` | Switch model for this room, or list configured aliases |
+| `/thinking <off\|low\|medium\|high\|xhigh\|max>` | Set extended thinking level for this room (`xhigh`/`max` require supported models; no argument shows the current level) |
 | `/heartbeat start <interval> [directive]` | Start recurring timer (e.g., `5m`, `1h`); optional trailing directive becomes the turn content on each fire (else a WAKE pointer) |
 | `/heartbeat stop` | Stop heartbeat |
+| `/heartbeat status` | List active heartbeats across rooms |
 | `/umbral start <interval> [directive]` | Start recurring context rotation (min 30m); optional trailing directive is re-injected as the turn content each cycle |
 | `/umbral stop` | Stop context rotation |
-| `/cache <1h\|5m\|off>` | Anthropic prompt cache TTL (default `1h`) |
+| `/umbral status` | List active umbral timers across rooms |
+| `/cache <1h\|5m\|off>` | Anthropic prompt cache TTL (default `1h`; no argument shows current TTL + toolstrip state) |
 | `/cache toolstrip` | Reclaim context by replacing old tool outputs with placeholders |
-| `/timesense <on\|off>` | Prepend timestamp to every user message in LLM context (off by default) |
+| `/timesense <on\|off>` | Prepend timestamp to every user message in LLM context (off by default; no argument shows current state) |
 | `/steer <message>` | Inject a mid-turn steering note into the **active** turn (real-time steering). Logged + delivered to the agent at the next tool-call boundary as a user message. Requires an active turn; deposits without interrupting. |
+| `/showprompt` | Display the assembled system prompt + tool list, delivered as a Markdown file attachment |
 | `/stop` | Cancel current processing |
 | `/resume` | Re-enable after `/stop` |
 
@@ -201,12 +212,18 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 ## CLI
 
 ```
-openalph new-agent <name>    Create agent (user, workspace, config, systemd)
-openalph run <name>          Run agent in foreground (debug)
-openalph restart <name>      Restart agent
-openalph status <name>       Show agent status
-openalph logs <name>         Follow agent logs
-openalph showprompt <name>   Display assembled system prompt
+openalph new-agent <name>         Create agent (user, workspace, config, systemd)
+openalph start <name|all>         Start agent(s)
+openalph stop <name|all>          Stop agent(s)
+openalph restart <name|all>       Restart agent(s)
+openalph status [name]            Show systemd status (all agents if omitted)
+openalph list                     List configured agent names
+openalph logs <name> [-f]         Follow agent logs (journalctl)
+openalph run <name>               Run agent in foreground (debug)
+openalph monitor <name>           Live-tail an agent's JSONL session log, formatted
+openalph chat <name> [--room ID]  Local interactive session, no Matrix — in-memory
+                                   only, history lost on exit; quick debugging
+openalph showprompt <name>        Display the assembled system prompt + tool list
 ```
 
 ## Security
