@@ -55,7 +55,7 @@ class TestDetectAndTruncateDegeneration:
 
     def test_entirely_degenerate_output(self):
         """When the entire output is degenerate, return just the warning."""
-        text = "!" * 500
+        text = "!" * (_DEGEN_CHAR_THRESHOLD + 100)
         result, degenerate = _detect_and_truncate_degeneration(text)
         assert degenerate is True
         assert "repetition collapse" in result.lower()

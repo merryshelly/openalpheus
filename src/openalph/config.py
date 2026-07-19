@@ -73,6 +73,7 @@ class AgentConfig:
     thinking: str = "off"
     temperature: float | None = None
     top_p: float | None = None
+    degen_detector: str = "warn"  # streaming degeneration monitor mode: off|warn|abort
     reminders: bool = True
     model_limits: dict[str, int] = field(default_factory=dict)
     model_aliases: dict[str, str] = field(default_factory=dict)
@@ -285,6 +286,14 @@ def load_config(path: Path) -> AgentConfig:
             raise ConfigError("top_p must be a number between 0 and 1")
         top_p = float(top_p)
 
+    # degen_detector: streaming degeneration monitor mode (kdsn.241.4).
+    # off = disabled; warn = log trips, never modify output (default, initial
+    # rollout); abort = tear down the stream mid-generation on a trip.
+    degen_detector = agent_section.get("degen_detector", "warn")
+    valid_degen = ("off", "warn", "abort")
+    if degen_detector not in valid_degen:
+        raise ConfigError(f"degen_detector must be one of {valid_degen}, got: {degen_detector!r}")
+
     # Validate workspace path
     try:
         workspace_path_str = workspace_section["path"]
@@ -442,6 +451,7 @@ def load_config(path: Path) -> AgentConfig:
         thinking=thinking,
         temperature=temperature,
         top_p=top_p,
+        degen_detector=degen_detector,
         model_limits=model_limits,
         model_aliases=model_aliases,
     )

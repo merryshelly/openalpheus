@@ -16,6 +16,7 @@ import anthropic
 import httpx
 import openai
 from openalph.config import AgentConfig, ProviderConfig, resolve_model
+from openalph.degen import DegenerationMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +37,18 @@ _API_KEY_PATTERN = re.compile(r'\b(sk-[a-zA-Z0-9_-]{10,})\b')
 # ---------------------------------------------------------------------------
 # Degeneration detection
 # ---------------------------------------------------------------------------
-# Minimum consecutive identical characters to trigger truncation.
-_DEGEN_CHAR_THRESHOLD = 50
+# Minimum consecutive identical characters to trigger post-hoc truncation.
+# Raised 50 -> 4500 (kdsn.241.4): 50 false-fired on legitimate bounded runs
+# (pytest dot output, separator lines). True single-token spam runs to the
+# token cap (tens of thousands); 4500 clears the largest legitimate run while
+# still catching pathological spam. Word/phrase and compression-based loops are
+# now caught mid-stream by the DegenerationMonitor (openalph.degen), for which
+# this remains an aligned post-hoc backstop on the final accumulated text.
+_DEGEN_CHAR_THRESHOLD = 4500
 _DEGEN_WARNING = (
     "\n\n⚠️ *Output truncated — repetition collapse detected. "
     "Session context may be degraded; consider starting a new session (`/new`).*"
 )
-
-# Default frequency_penalty for OpenAI-compatible providers.
-# Discourages token repetition at the sampling level.  Moderate value
-# that shouldn't affect normal output but raises the cost of degenerate loops.
-_DEFAULT_FREQUENCY_PENALTY = 0.3
 
 
 def _detect_and_truncate_degeneration(text: str) -> tuple[str, bool]:
@@ -344,6 +346,48 @@ def _model_output_cap(api_model: str) -> int | None:
     return None
 
 
+@dataclass(frozen=True)
+class SamplingProfile:
+    """Per-model sampling params for OpenAI-compatible providers.
+
+    A field set to ``None`` means "do not send this param" (omit); a numeric
+    value means "send exactly this". Penalties only for now — temperature/top_p
+    remain config-driven (and the vendor defaults for GLM-5.2/Kimi K2.6 are
+    already correct: temp=1.0, top_p=0.95 via generation_config.json, so no
+    override is needed). Extend with temperature/top_p fields here if a model
+    ever needs a pinned value that differs from its provider default.
+    """
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+
+
+# Default: OMIT penalties. This replaces the old unconditional
+# frequency_penalty=0.3, which the LZ-Penalty paper + every vendor's own
+# defaults show is harmful to long-reasoning models and unnecessary elsewhere
+# (kdsn.241.3 / penalty-and-harness-practice.md).
+_DEFAULT_SAMPLING_PROFILE = SamplingProfile()
+
+# Per-model overrides, fragment-keyed (substring match on api_model.lower(),
+# first match wins — same convention as _MODEL_CAPABILITIES). GLM-5.2 and
+# Kimi K2.6 are PINNED to zero penalties per vendor requirement (Moonshot
+# hard-errors on nonzero for Kimi; Z.AI omits the param). They currently equal
+# the default, but are enumerated explicitly so a future change to the default
+# can never silently start sending these models a penalty they must not get.
+_SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
+    ("glm-5p2",   SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    ("kimi-k2p6", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+]
+
+
+def _sampling_profile(api_model: str) -> SamplingProfile:
+    """Resolve the sampling profile for a model, or the default if unmatched."""
+    m = api_model.lower()
+    for frag, profile in _SAMPLING_PROFILES:
+        if frag in m:
+            return profile
+    return _DEFAULT_SAMPLING_PROFILE
+
+
 def _cc_split(usage, attr: str) -> int | None:
     """Read a TTL-split cache-creation field off an Anthropic SDK usage object.
 
@@ -575,7 +619,11 @@ def _dedup_trailing_user(messages: list[dict]) -> list[dict]:
     return messages
 
 
-def _convert_messages_for_provider(messages: list[dict], provider_type: str) -> list[dict]:
+def _convert_messages_for_provider(
+    messages: list[dict],
+    provider_type: str,
+    quirks: list[str] | None = None,
+) -> list[dict]:
     """Convert normalized message history to provider-native format.
     
     Normalized format:
@@ -594,7 +642,8 @@ def _convert_messages_for_provider(messages: list[dict], provider_type: str) -> 
     if provider_type == "anthropic":
         return _convert_messages_for_anthropic(messages)
     elif provider_type == "openai":
-        return _convert_messages_for_openai(messages)
+        reasoning_replay = "reasoning_replay" in (quirks or [])
+        return _convert_messages_for_openai(messages, reasoning_replay=reasoning_replay)
     return messages
 
 
@@ -730,21 +779,45 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
     return merged
 
 
-def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
-    """Convert normalized messages to OpenAI format."""
+def _convert_messages_for_openai(
+    messages: list[dict], reasoning_replay: bool = False,
+) -> list[dict]:
+    """Convert normalized messages to OpenAI format.
+
+    reasoning_replay: when True, stored thinking blocks on assistant turns are
+    re-emitted as a flat ``reasoning_content`` string (the OpenAI-compat wire
+    field) instead of being dropped. Vendor thinking models (Kimi K2.6,
+    GLM-5.2) require the reasoning to be sent back within a multi-step
+    tool-calling loop or they degenerate/loop (kdsn.241.2; vendor-guidance.md).
+    Opt-in per-provider via the ``reasoning_replay`` quirk, because some strict
+    OpenAI-compatible endpoints reject the unknown field; Fireworks accepts it.
+    When False (default), the historical strip behavior is preserved.
+    """
     # Belt-and-suspenders: drop duplicate trailing user message if present.
     # The gated-room path should prevent this via append_user=False, but we
     # guard here as a defence-in-depth measure against future regressions.
     messages = _dedup_trailing_user(messages)
 
-    # Strip thinking from all assistant messages — provider-specific field
-    # that most OpenAI-compatible APIs reject.  Same rationale as Anthropic:
-    # thinking already influenced the response; replaying wastes context.
-    messages = [
-        {k: v for k, v in msg.items() if k != "thinking"}
-        if msg.get("role") == "assistant" else msg
-        for msg in messages
-    ]
+    # Normalize the provider-specific `thinking` field on assistant messages.
+    # Default: strip it (most OpenAI-compatible APIs reject the unknown field).
+    # reasoning_replay: convert it to a verbatim `reasoning_content` string so
+    # the model keeps its reasoning state across tool-call steps.
+    def _normalize_assistant_thinking(msg: dict) -> dict:
+        if msg.get("role") != "assistant":
+            return msg
+        out = {k: v for k, v in msg.items() if k != "thinking"}
+        if reasoning_replay:
+            texts = [
+                tb.get("thinking", "")
+                for tb in (msg.get("thinking") or [])
+                if tb.get("thinking")
+            ]
+            joined = "\n".join(texts)
+            if joined:
+                out["reasoning_content"] = joined
+        return out
+
+    messages = [_normalize_assistant_thinking(msg) for msg in messages]
 
     result = []
     for msg in messages:
@@ -802,11 +875,19 @@ def _convert_messages_for_openai(messages: list[dict]) -> list[dict]:
                     if extra_content:
                         oai_tc["extra_content"] = extra_content
                     openai_tool_calls.append(oai_tc)
-                result.append({
+                built = {
                     "role": "assistant",
                     "content": content or None,
                     "tool_calls": openai_tool_calls,
-                })
+                }
+                # Carry reasoning_content into the rebuilt tool-call turn.
+                # _normalize_assistant_thinking set it on `msg`, but this branch
+                # constructs a fresh dict, so it must be forwarded explicitly —
+                # this is exactly the in-tool-loop turn the vendors require it on
+                # (kdsn.241.2). No-op when reasoning_replay is off / absent.
+                if msg.get("reasoning_content"):
+                    built["reasoning_content"] = msg["reasoning_content"]
+                result.append(built)
             else:
                 # No tool calls - simple text message
                 result.append(msg)
@@ -1042,7 +1123,7 @@ def _build_openai_kwargs(
     """Build kwargs for OpenAI chat completions API."""
     # Provider capability flags — OpenRouter proxies handle unknown params gracefully,
     # but direct APIs (OpenAI, Google) reject params they don't support.
-    _supports_frequency_penalty = provider_key not in ("google",)
+    _supports_penalties = provider_key not in ("google",)
     _supports_reasoning_extra = provider_key in ("openrouter", "macstudio")
     # OpenAI deprecated max_tokens in favor of max_completion_tokens (o1+, GPT-5+).
     # Google and OpenRouter still use max_tokens.
@@ -1070,8 +1151,16 @@ def _build_openai_kwargs(
         "messages": messages_with_system,
         _token_key: max_tokens,
     }
-    if _supports_frequency_penalty:
-        api_kwargs["frequency_penalty"] = _DEFAULT_FREQUENCY_PENALTY
+    # Sampling penalties: roster-driven per-model profile (kdsn.241.3).
+    # Default profile omits them; GLM/Kimi pinned to omit. A profile value of
+    # None means "don't send"; a number means "send exactly this". Gated by
+    # provider support (Google rejects penalty params).
+    if _supports_penalties:
+        _profile = _sampling_profile(api_model)
+        if _profile.frequency_penalty is not None:
+            api_kwargs["frequency_penalty"] = _profile.frequency_penalty
+        if _profile.presence_penalty is not None:
+            api_kwargs["presence_penalty"] = _profile.presence_penalty
     if provider_tools:
         api_kwargs["tools"] = provider_tools
     
@@ -1229,7 +1318,9 @@ async def stream(
     )
     
     # Convert messages to provider-native format
-    provider_messages = _convert_messages_for_provider(messages, provider_cfg.type)
+    provider_messages = _convert_messages_for_provider(
+        messages, provider_cfg.type, quirks=provider_cfg.quirks,
+    )
     
     # Convert tools to provider-native format
     provider_tools = _convert_tools_for_provider(tools, provider_cfg.type)
@@ -1239,7 +1330,7 @@ async def stream(
     
     # Resolve thinking level: param > config > "off"
     thinking_level = thinking if thinking is not None else getattr(config, "thinking", "off")
-    
+
     if provider_cfg.type == "anthropic":
         client = _get_client(provider_cfg)
         
@@ -1320,7 +1411,14 @@ async def stream(
     
     elif provider_cfg.type == "openai":
         client = _get_client(provider_cfg)
-        
+
+        # Streaming degeneration monitor (kdsn.241.4) — OpenAI-compatible path only,
+        # where the open-weight (GLM/Kimi) repetition collapse this targets occurs.
+        # Warn-only by default: logs trips, never modifies output. "abort" mode is
+        # config-gated and dormant (its mid-stream teardown + truncation precision
+        # are validated in Phase 2 before it is armed in production).
+        degen_monitor = DegenerationMonitor(mode=getattr(config, "degen_detector", "warn"))
+
         api_kwargs = _build_openai_kwargs(
             api_model=api_model,
             system=system,
@@ -1347,6 +1445,7 @@ async def stream(
             usage = None
             stop_reason = None
             generation_id = ""
+            degen_aborted = False
             # Accumulate tool call data: index -> {"id": str, "name": str, "arguments": str}
             tool_call_accumulators: dict[int, dict] = {}
             
@@ -1371,6 +1470,15 @@ async def stream(
                     if delta.content is not None:
                         yield StreamEvent(type="text", content=delta.content)
                         accumulated_text += delta.content
+                        if degen_monitor.feed(delta.content):
+                            logger.warning(
+                                "degeneration detected on stream: layer=%s pos=%s model=%s gen=%s mode=%s",
+                                degen_monitor.trigger_layer, degen_monitor.trigger_pos,
+                                api_model, generation_id, degen_monitor.mode,
+                            )
+                            if degen_monitor.mode == "abort":
+                                degen_aborted = True
+                                break
                     
                     # Handle reasoning (OpenRouter extension)
                     reasoning_text = getattr(delta, 'reasoning', None) or getattr(delta, 'reasoning_content', None)
@@ -1410,6 +1518,28 @@ async def stream(
                     # Track finish reason
                     if choice.finish_reason:
                         stop_reason = choice.finish_reason
+            
+            # Mid-stream degeneration abort (kdsn.241.4). We broke out of the
+            # consume loop; tear down the HTTP stream so we stop reading (and,
+            # for providers that honor it, stop being billed for) the garbage
+            # tail, then truncate the emitted text at the detection point and
+            # append the standard warning. NOTE: real-network teardown semantics
+            # are validated in Phase 2 before "abort" is armed in production;
+            # the shipped default is "warn" (this branch is dormant).
+            if degen_aborted:
+                try:
+                    await response.close()
+                except Exception:
+                    logger.debug("degen-abort: stream close raised (ignored)", exc_info=True)
+                cut = degen_monitor.trigger_pos
+                if cut is not None and 0 <= cut <= len(accumulated_text):
+                    accumulated_text = accumulated_text[:cut].rstrip()
+                accumulated_text = (accumulated_text + _DEGEN_WARNING) if accumulated_text else _DEGEN_WARNING.lstrip()
+                stop_reason = stop_reason or "degenerate"
+                # Drop any partially-accumulated tool calls: a mid-stream abort
+                # means their JSON args are incomplete/garbage — never emit or
+                # execute them.
+                tool_call_accumulators.clear()
             
             # Yield tool_done events for accumulated tool calls
             for idx in sorted(tool_call_accumulators.keys()):
@@ -1460,6 +1590,7 @@ async def stream(
                 generation_id=generation_id,
             )
             response_obj.content, response_obj.degenerate = _detect_and_truncate_degeneration(response_obj.content)
+            response_obj.degenerate = response_obj.degenerate or degen_monitor.tripped
             
             yield StreamEvent(
                 type="done",

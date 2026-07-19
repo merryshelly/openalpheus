@@ -821,10 +821,12 @@ class TestBuildOpenaiKwargs:
         kw = _build_openai_kwargs(**self._base_args(provider_key="google"))
         assert "frequency_penalty" not in kw
 
-    def test_openai_includes_frequency_penalty(self):
-        """Direct OpenAI provider sends frequency_penalty."""
+    def test_openai_omits_frequency_penalty_by_default(self):
+        """Default sampling profile no longer sends frequency_penalty (kdsn.241.3).
+        The old unconditional 0.3 was harmful to long-reasoning models; the
+        default profile now omits penalties. See test_sampling_profiles.py."""
         kw = _build_openai_kwargs(**self._base_args(provider_key="openai"))
-        assert "frequency_penalty" in kw
+        assert "frequency_penalty" not in kw
 
     # --- reasoning extra_body ---
 

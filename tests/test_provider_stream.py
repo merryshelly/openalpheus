@@ -937,7 +937,7 @@ class TestOpenAIStream:
 
     @pytest.mark.asyncio
     async def test_kwargs_system_prepended(self):
-        """System message prepended, frequency_penalty set, stream=True."""
+        """System message prepended, no frequency_penalty by default, stream=True."""
         config = make_openai_config(max_tokens=2048)
         chunks = [
             _openai_text_chunk("ok", finish_reason="stop"),
@@ -960,7 +960,8 @@ class TestOpenAIStream:
         assert kw["stream"] is True
         assert kw["messages"][0] == {"role": "system", "content": "Be helpful."}
         assert kw["max_tokens"] == 2048
-        assert kw["frequency_penalty"] == pytest.approx(0.3)
+        # kdsn.241.3: default sampling profile omits frequency_penalty (was 0.3).
+        assert "frequency_penalty" not in kw
 
     @pytest.mark.asyncio
     async def test_stream_options_include_usage(self):
@@ -1350,7 +1351,7 @@ class TestExistingBehavior:
 
     @pytest.mark.asyncio
     async def test_openai_frequency_penalty(self):
-        """OpenAI path includes frequency_penalty."""
+        """OpenAI path omits frequency_penalty by default (kdsn.241.3)."""
         config = make_openai_config()
         chunks = [
             _openai_text_chunk("ok", finish_reason="stop"),
@@ -1370,4 +1371,4 @@ class TestExistingBehavior:
             )
 
         kw = client.chat.completions.create.call_args.kwargs
-        assert kw["frequency_penalty"] == pytest.approx(0.3)
+        assert "frequency_penalty" not in kw
