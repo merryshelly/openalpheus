@@ -73,7 +73,7 @@ class AgentConfig:
     thinking: str = "off"
     temperature: float | None = None
     top_p: float | None = None
-    degen_detector: str = "warn"  # streaming degeneration monitor mode: off|warn|abort
+    degen_detector: str = "off"  # streaming degeneration monitor mode: off|warn|abort (default off per Phase 1 code-audit -- H1/H2/H3 false-positive/truncation findings, workspace-kdsn.241.4 remediation pending)
     reminders: bool = True
     model_limits: dict[str, int] = field(default_factory=dict)
     model_aliases: dict[str, str] = field(default_factory=dict)
@@ -287,9 +287,12 @@ def load_config(path: Path) -> AgentConfig:
         top_p = float(top_p)
 
     # degen_detector: streaming degeneration monitor mode (kdsn.241.4).
-    # off = disabled; warn = log trips, never modify output (default, initial
-    # rollout); abort = tear down the stream mid-generation on a trip.
-    degen_detector = agent_section.get("degen_detector", "warn")
+    # off = disabled (default -- Phase 1 code-audit flagged warn-mode false
+    # positives contaminating calibration telemetry, workspace-kdsn.241.4
+    # remediation pending); warn = log trips, never modify output;
+    # abort = tear down the stream mid-generation on a trip (DO NOT ARM --
+    # audit found a truncation-position bug that destroys legitimate output).
+    degen_detector = agent_section.get("degen_detector", "off")
     valid_degen = ("off", "warn", "abort")
     if degen_detector not in valid_degen:
         raise ConfigError(f"degen_detector must be one of {valid_degen}, got: {degen_detector!r}")
