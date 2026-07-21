@@ -351,20 +351,31 @@ class SamplingProfile:
     """Per-model sampling params for OpenAI-compatible providers.
 
     A field set to ``None`` means "do not send this param" (omit); a numeric
-    value means "send exactly this". Penalties only for now — temperature/top_p
-    remain config-driven (and the vendor defaults for GLM-5.2/Kimi K2.6 are
-    already correct: temp=1.0, top_p=0.95 via generation_config.json, so no
-    override is needed). Extend with temperature/top_p fields here if a model
-    ever needs a pinned value that differs from its provider default.
+    value means "send exactly this". Penalties (frequency/presence) and now
+    temperature/top_p (kdsn.241.3.1) are both profile-driven. The vendor
+    defaults for GLM-5.2/Kimi K2.6 are already correct (temp=1.0, top_p=0.95
+    via generation_config.json on Fireworks, which auto-applies the model's
+    own config when the client omits the param) — self-hosted models with no
+    such vendor auto-fill (e.g. MiniMax-M3 on our own llama.cpp server) need
+    an explicit pinned profile instead, since the serving stack's own
+    defaults won't match the vendor's recommended values.
+
+    Precedence: profile temperature/top_p WIN over a caller-supplied
+    per-agent override (``AgentConfig.temperature``/``top_p``) — a profile
+    entry represents a vendor-pinned or hard operational requirement, not a
+    preference. The per-agent override only applies when the resolved
+    profile leaves the field as ``None``.
     """
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
+    temperature: float | None = None
+    top_p: float | None = None
 
 
-# Default: OMIT penalties. This replaces the old unconditional
-# frequency_penalty=0.3, which the LZ-Penalty paper + every vendor's own
-# defaults show is harmful to long-reasoning models and unnecessary elsewhere
-# (kdsn.241.3 / penalty-and-harness-practice.md).
+# Default: OMIT penalties and temperature/top_p. This replaces the old
+# unconditional frequency_penalty=0.3, which the LZ-Penalty paper + every
+# vendor's own defaults show is harmful to long-reasoning models and
+# unnecessary elsewhere (kdsn.241.3 / penalty-and-harness-practice.md).
 _DEFAULT_SAMPLING_PROFILE = SamplingProfile()
 
 # Per-model overrides, fragment-keyed (substring match on api_model.lower(),
@@ -373,9 +384,20 @@ _DEFAULT_SAMPLING_PROFILE = SamplingProfile()
 # hard-errors on nonzero for Kimi; Z.AI omits the param). They currently equal
 # the default, but are enumerated explicitly so a future change to the default
 # can never silently start sending these models a penalty they must not get.
+#
+# MiniMax-M3 (kdsn.241.3.1): pinned to temp=1.0/top_p=0.95, the vendor value
+# (Unsloth model card + vLLM recipes + Unsloth docs all converge on
+# 1.0/0.95/40). Our llama.cpp server's own default is 0.80/0.95/40 (verified
+# via /props + --help) and the GGUF carries no general.default_sampling.* KV
+# pairs to auto-supply it — so unlike Fireworks-hosted GLM/Kimi, nothing
+# upstream fills this in for us. Root cause of the 2026-07-20 runaway-
+# generation incident (task ran 30+ min / 22k+ tokens with no EOS on
+# !pySmWhiuIGZElv1Wul): temp 0.80 without a repeat penalty is a known
+# mode-collapse setup for long structured/reasoning transcripts.
 _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
-    ("glm-5p2",   SamplingProfile(frequency_penalty=None, presence_penalty=None)),
-    ("kimi-k2p6", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    ("minimax-m3", SamplingProfile(temperature=1.0, top_p=0.95)),
 ]
 
 
@@ -1155,8 +1177,8 @@ def _build_openai_kwargs(
     # Default profile omits them; GLM/Kimi pinned to omit. A profile value of
     # None means "don't send"; a number means "send exactly this". Gated by
     # provider support (Google rejects penalty params).
+    _profile = _sampling_profile(api_model)
     if _supports_penalties:
-        _profile = _sampling_profile(api_model)
         if _profile.frequency_penalty is not None:
             api_kwargs["frequency_penalty"] = _profile.frequency_penalty
         if _profile.presence_penalty is not None:
@@ -1164,11 +1186,18 @@ def _build_openai_kwargs(
     if provider_tools:
         api_kwargs["tools"] = provider_tools
     
-    # Add sampling parameters
-    if temperature is not None:
-        api_kwargs["temperature"] = temperature
-    if top_p is not None:
-        api_kwargs["top_p"] = top_p
+    # Add sampling parameters. Profile temperature/top_p (kdsn.241.3.1) win
+    # over the caller-supplied per-agent override — a profile entry is a
+    # vendor-pinned/hard requirement (e.g. MiniMax-M3's 1.0/0.95), not a
+    # preference, so it must not be silently overridable by agent TOML.
+    # Unlike penalties, temperature/top_p are NOT gated by _supports_penalties
+    # (that gate is Google-penalty-specific; Google does support temp/top_p).
+    _temperature = _profile.temperature if _profile.temperature is not None else temperature
+    _top_p = _profile.top_p if _profile.top_p is not None else top_p
+    if _temperature is not None:
+        api_kwargs["temperature"] = _temperature
+    if _top_p is not None:
+        api_kwargs["top_p"] = _top_p
 
     # Build extra_body incrementally — reasoning and provider routing are
     # OpenRouter extensions, not part of the standard OpenAI API.

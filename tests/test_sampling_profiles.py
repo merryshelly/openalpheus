@@ -14,6 +14,7 @@ independent of whatever the default becomes.
 import pytest
 
 from openalph.provider import (
+    _build_anthropic_kwargs,
     _build_openai_kwargs,
     _sampling_profile,
     SamplingProfile,
@@ -126,3 +127,89 @@ class TestProfileApplicationMechanism:
         )
         kw = _build_openai_kwargs(**_base_args(provider_key="openai"))
         assert kw["frequency_penalty"] == 0.0
+
+
+class TestSamplingProfileTemperatureTopP:
+    """kdsn.241.3.1: SamplingProfile extended with temperature/top_p.
+
+    Root cause of the 2026-07-20 MiniMax-M3 runaway-generation incident
+    (task ran 30+ min / 22k+ tokens with no EOS on !pySmWhiuIGZElv1Wul):
+    openalph sent no temperature/top_p override for macstudio models, so
+    the request fell back to llama.cpp server defaults (temp=0.80) instead
+    of MiniMax's vendor-recommended 1.0 — a known mode-collapse setup.
+    """
+
+    def test_default_profile_omits_temperature_and_top_p(self):
+        assert _DEFAULT_SAMPLING_PROFILE.temperature is None
+        assert _DEFAULT_SAMPLING_PROFILE.top_p is None
+
+    def test_minimax_m3_fragment_matches_full_alias(self):
+        prof = _sampling_profile("macstudio/mlx-community/MiniMax-M3-4bit")
+        assert prof.temperature == 1.0
+        assert prof.top_p == 0.95
+
+    def test_minimax_m3_fragment_matches_bare_model_id_case_insensitive(self):
+        prof = _sampling_profile("MiniMax-M3")
+        assert prof.temperature == 1.0
+        assert prof.top_p == 0.95
+
+    def test_minimax_m3_profile_flows_to_request(self):
+        kw = _build_openai_kwargs(**_base_args(
+            api_model="mlx-community/MiniMax-M3-4bit", provider_key="macstudio",
+        ))
+        assert kw["temperature"] == 1.0
+        assert kw["top_p"] == 0.95
+
+    def test_profile_temperature_wins_over_per_agent_override(self):
+        """Profile is a vendor-pinned/hard requirement — it wins over
+        whatever the agent's own TOML config (temperature/top_p) passes in."""
+        kw = _build_openai_kwargs(**_base_args(
+            api_model="mlx-community/MiniMax-M3-4bit",
+            provider_key="macstudio",
+            temperature=0.7,
+            top_p=0.5,
+        ))
+        assert kw["temperature"] == 1.0
+        assert kw["top_p"] == 0.95
+
+    def test_unprofiled_model_keeps_per_agent_override(self):
+        """No profile temperature set -> caller-supplied value passes
+        through unchanged (existing config-driven behavior preserved)."""
+        kw = _build_openai_kwargs(**_base_args(
+            api_model="test/model", temperature=0.7, top_p=0.5,
+        ))
+        assert kw["temperature"] == 0.7
+        assert kw["top_p"] == 0.5
+
+    def test_no_temperature_anywhere_omits_the_param(self):
+        kw = _build_openai_kwargs(**_base_args(api_model="test/model"))
+        assert "temperature" not in kw
+        assert "top_p" not in kw
+
+    def test_profile_temperature_flows_even_to_google(self, monkeypatch):
+        """Unlike penalties, Google DOES support temperature/top_p — the
+        provider support gate (_supports_penalties) is penalty-specific and
+        must not block profile-driven temperature/top_p."""
+        monkeypatch.setattr(
+            "openalph.provider._sampling_profile",
+            lambda m: SamplingProfile(temperature=0.3, top_p=0.8),
+        )
+        kw = _build_openai_kwargs(**_base_args(provider_key="google"))
+        assert kw["temperature"] == 0.3
+        assert kw["top_p"] == 0.8
+
+    def test_anthropic_builder_never_sees_sampling_profiles(self):
+        """_build_anthropic_kwargs has no knowledge of _sampling_profile at
+        all — profile values (e.g. minimax-m3's 1.0/0.95) must never leak
+        into an Anthropic request just because the model string matches."""
+        kw = _build_anthropic_kwargs(
+            api_model="some-anthropic-model-that-happens-to-contain-minimax-m3",
+            system="sys",
+            provider_messages=[{"role": "user", "content": "hi"}],
+            provider_tools=None,
+            max_tokens=1024,
+            thinking_level="off",
+        )
+        assert "temperature" not in kw
+        assert "top_p" not in kw
+
