@@ -690,14 +690,28 @@ def _find_substitution_close(source: str, start: int) -> int | None:
 
 
 # A command substitution is a SAFE CAPTURE only when it is the right-hand
-# side of a shell assignment -- `NAME=$(...)`, `NAME="$(...)"`, `arr[k]=$(...)`
-# -- optionally preceded by other assignments or a keyword like `export`.
-# The regex is matched against the text to the LEFT of the substitution's
-# opener, anchored at its end, with an optional opening double quote allowed
-# between the `=` and the opener.
+# side of a shell assignment IN COMMAND POSITION -- `NAME=$(...)`,
+# `NAME="$(...)"`, `arr[k]=$(...)`, optionally after `export`/`local`/etc. and
+# after other assignments (`A=1 B=$(...)`). The regex is matched against the
+# text to the LEFT of the substitution's opener, anchored at its end.
+#
+# The load-bearing constraint is that the `NAME=` must be a COMMAND WORD, not
+# an argument that merely contains an `=`. A plain space does NOT establish
+# command position: `echo NAME=$(op read x)` prints the secret to stdout (the
+# substitution is an argument to `echo`), yet its left-context ends in
+# `... NAME=` just like a real capture does. So the leading anchor is a real
+# command separator (start-of-string, `;`, `&&`, `||`, `|`, `&`, `(`, `{`,
+# newline) followed only by optional assignment-context words -- NOT `\s`,
+# which would trust any `word=$(...)` argument (a fail-open: `echo NAME=$(op
+# read x)`, `curl -d TOKEN=$(op read x) ...`, `printf tok=$(op read x)` all
+# leak, and all end in a whitespace-preceded `NAME=`).
 _ASSIGNMENT_CAPTURE_PREFIX_RE = re.compile(
-    r"""(?:^|[\s;&|(<>\n])          # start of string or a word/segment boundary
-        [A-Za-z_][A-Za-z0-9_]*      # variable name
+    r"""(?:^|[;&|(){}\n]|\|\||&&)   # start, or a genuine command separator
+        [ \t]*                       # optional inter-token whitespace
+        (?:(?:export|local|declare|readonly|typeset)  # optional declaration keyword
+           (?:[ \t]+-[A-Za-z]+)*[ \t]+)?             # with optional flags (declare -x)
+        (?:[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?=\S*[ \t]+)*  # earlier assignments
+        [A-Za-z_][A-Za-z0-9_]*      # the variable name
         (?:\[[^\]]*\])?             # optional array subscript
         =                           # the assignment
         \"?$                        # optional opening double quote, then the opener

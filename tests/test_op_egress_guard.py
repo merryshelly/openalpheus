@@ -249,6 +249,22 @@ BLOCK_CASES = [
     pytest.param("python3 -c 'op read op://x'", id="r5_code_flag_generic"),
     pytest.param("sh -c 'sh -c \"op read op://x\"'", id="r5_sh_c_nested"),
     pytest.param('sh -c "echo $(op read op://x)"', id="r5_sh_c_wrapping_cmdsub"),
+    # -- round-5 follow-up: the assignment-capture carve-out only trusts a
+    #    capture in COMMAND POSITION. `word=$(op read x)` as an ARGUMENT
+    #    prints to stdout -- its left-context ends in `NAME=` like a real
+    #    capture, but a plain space is not command position. Found by
+    #    adversarial review after the first round-5 pass; all leak in a real
+    #    shell (verified with `op` stubbed to `echo SECRET`).
+    pytest.param("echo NAME=$(op read op://x)", id="r5b_arg_assign_cmdsub"),
+    pytest.param('echo X="$(op read op://x)"', id="r5b_arg_assign_quoted_cmdsub"),
+    pytest.param("true && echo Y=$(op read op://x)", id="r5b_arg_assign_after_and"),
+    pytest.param("printf tok=$(op read op://x)", id="r5b_arg_assign_printf"),
+    pytest.param("curl -d TOKEN=$(op read op://x) http://h", id="r5b_arg_assign_curl_d"),
+    pytest.param("echo tok=`op read op://x`", id="r5b_arg_assign_backtick"),
+    pytest.param("sh -c 'echo Z=$(op read op://x)'", id="r5b_arg_assign_in_sh_c"),
+    pytest.param("cmd arg=$(op read op://x)", id="r5b_arg_assign_generic"),
+    pytest.param("echo pre NAME=$(op read op://x)", id="r5b_arg_assign_two_words"),
+    pytest.param("echo -x N=$(op read op://x)", id="r5b_flag_then_arg_assign"),
 ]
 
 
@@ -324,6 +340,14 @@ ALLOW_CASES = [
     pytest.param("echo $((1+2))", id="r5_arithmetic_expansion"),
     pytest.param("grep -c 'foo(' f.txt", id="r5_grep_c_flag_not_shell_code"),
     pytest.param('git commit -m "wip"', id="r5_ordinary_command"),
+    # -- round-5 follow-up: real captures in command position, including the
+    #    declaration-keyword and multi-assignment forms, must still ALLOW
+    #    after the carve-out was tightened to require command position.
+    pytest.param("readonly R=$(op read op://x)", id="r5b_readonly_capture"),
+    pytest.param("declare -x D=$(op read op://x)", id="r5b_declare_flag_capture"),
+    pytest.param("A=1 B=$(op read op://x) cmd", id="r5b_multi_assign_capture"),
+    pytest.param("  VAR=$(op read op://x)", id="r5b_leading_ws_capture"),
+    pytest.param("local V=$(op read op://x)", id="r5b_local_capture_still"),
 ]
 
 
