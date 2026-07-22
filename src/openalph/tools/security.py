@@ -16,29 +16,37 @@ Architecture:
                                Stateless — the known-value set is passed in
                                by the caller (tools/__init__.py); this module
                                never imports config or holds secrets itself.
-    op_egress_block_reason   — L2 pure predicate (round-4, presence-based):
-                               tokenizes a shell command quote-aware,
-                               splits merged shell-punctuation tokens
-                               (e.g. shlex's `"&&\\n"`), excises ONLY a
-                               genuine, flat, fully-plain `$(...)` span
-                               (the dominant safe capture pattern,
-                               `VAR=$(opread ...)`, is preserved; a bare
-                               `<(...)` process-substitution token is
-                               NEVER an excision opener — it is left in
-                               place, fully scannable — round-4, see
-                               `_excise_command_substitutions`), splits
-                               what remains into top-level segments on
-                               `;`/`&&`/`||`/`&`/`|`/newline, and flags any
-                               SEGMENT that contains an op-egress keyword
-                               (op read / opread / op document get / op
-                               item get --fields|--field|--format|--reveal|
-                               --otp) ANYWHERE in it — no wrapper-stripping,
-                               no flag-arity table, no positional-binary
-                               assumption — returning a redirect message
-                               instead of allowing the secret to reach the
-                               agent's context. Pipe is just another
-                               separator: a piped op-egress command is
-                               BLOCKED, not allowed through.
+    op_egress_block_reason   — L2 pure predicate (round-5, deny-by-default):
+                               splits COMMAND SUBSTITUTIONS off the raw
+                               string first (`$(...)` and backticks, quote-
+                               aware), trusting one and only one shape —
+                               an assignment capture, `NAME=$(...)`, whose
+                               value lands in a shell variable rather than
+                               on stdout. EVERY other substitution is
+                               re-analysed as a command in its own right,
+                               as is shell code passed to a `-c`-shaped
+                               flag or to `eval`. What remains is tokenized
+                               quote-aware, merged shell-punctuation tokens
+                               are split, the result is cut into top-level
+                               segments on `;`/`&&`/`||`/`&`/`|`/newline,
+                               and any SEGMENT containing an op-egress
+                               keyword combination (op read / opread / op
+                               document get / op item get --fields|--field|
+                               --format|--reveal|--otp) is BLOCKED, with a
+                               redirect message returned in place of the
+                               secret. Pipe is just another separator: a
+                               piped op-egress command is BLOCKED.
+
+                               Round-5 replaces round-4's excise-and-trust
+                               stance, which fixed the guard's failures one
+                               decoy shape at a time and still fell open
+                               four ways (SEC-1 `echo $(op read …)`, SEC-2
+                               backticks, SEC-3 `sh -c '…'`, and quoted
+                               `echo "$(op read …)"`). The inversion is the
+                               point: round-4 asked "is this construct one
+                               I recognise as dangerous?", round-5 asks "is
+                               this construct provably a capture?" — and
+                               scans everything else.
 """
 
 import logging
@@ -306,8 +314,11 @@ def redact_known_secrets(
 # between, excising (hiding) it (round-4 H1, empirically confirmed
 # fail-open). Leaving `<(` as an ordinary, always-scannable token is
 # strictly fail-closed and does not touch the dominant safe
-# `VAR=$(opread ...)` pattern (which never uses `<(` at all). See
-# `_excise_command_substitutions` for the full rewritten algorithm.
+# `VAR=$(opread ...)` pattern (which never uses `<(` at all). Round-5 makes
+# this moot for `$(...)`/backticks -- they are now split off the raw string
+# before tokenization by `_split_command_substitutions`, which reads quote
+# state directly and so cannot be fooled by a quoted decoy at all -- but
+# `<(` is still deliberately left as an ordinary, scannable token.
 
 # op item get flags that dump the full/raw field set (rather than a masked
 # overview) to stdout. Matched whole-token or as the LHS of a `--flag=value`
@@ -420,12 +431,14 @@ _TWO_CHAR_SEPARATOR_OPS = frozenset({"&&", "||"})
 
 # The two-character process-substitution "open" marker. Recognised by
 # `_split_punctuation_run` as its own atomic 2-char operator token (so a
-# merged run like `<(true)` still tokenizes sanely) but — round-4, H1 — NOT
-# treated as an excision opener at all: see `_excise_command_substitutions`
-# for why (a quoted decoy `<(` is indistinguishable from a real one once
-# shlex has erased quote provenance, and letting it open a synthetic
-# excision span let a later, unrelated `)` close it across real content in
-# between). It is simply left as an ordinary, always-scannable token.
+# merged run like `<(true)` still tokenizes sanely) but — round-4, H1 — NEVER
+# a structural opener for substitution handling: a quoted decoy `<(` is
+# indistinguishable from a real one once shlex has erased quote provenance,
+# and letting it open a synthetic span let a later, unrelated `)` close it
+# across real content in between. It is simply left as an ordinary,
+# always-scannable token. (Round-5 moved `$(...)`/backtick handling ahead of
+# shlex entirely — see `_split_command_substitutions` — so no token-level
+# span matching remains for a decoy to attack.)
 _PROCESS_SUBSTITUTION_OPEN = "<("
 
 # The two paren characters: structural tokens (a substitution boundary, or —
@@ -446,6 +459,20 @@ _SINGLE_CHAR_PARENS = frozenset({"(", ")"})
 # merged multi-newline run like `"\n\n"` must also count as one separator).
 # Pipe (`|`) is included — round-2 drops the round-1 pipe-allow carve-out.
 _SEGMENT_SEPARATOR_TOKENS = frozenset({";", "&&", "||", "&", "|"})
+
+# Recursion budget for shell code nested inside command substitutions and
+# code-taking flags. Exceeding it BLOCKS (fail closed) rather than allowing:
+# a command nested this deep is pathological, not legitimate operator work.
+_MAX_NESTING_DEPTH = 12
+
+# Flags that take a string of SHELL CODE as their very next argument.
+# Deliberately a FLAG-SHAPE rule, not a list of interpreter binary names:
+# `sh -c`, `bash -lc`, `dash -c`, `zsh -c`, `busybox sh -c`, `python3 -c`,
+# `xargs -I{} sh -c ...` and any future runner all match `-c` (alone or
+# bundled, where `c` must be last since it is the option that consumes the
+# following argument), so the guard does not need to keep a binary list in
+# sync with reality -- the round-2/3 "always one flag behind" trap.
+_CODE_TAKING_FLAG_RE = re.compile(r"^(?:-[A-Za-z]*c|--command|--eval)$")
 
 _OP_EGRESS_BLOCK_MESSAGE = (
     "\u26d4 Blocked: this command prints a 1Password secret to stdout, "
@@ -541,9 +568,9 @@ def _split_punctuation_run(tok: str) -> list[str]:
       - ``&&`` / ``||`` — two-char logical separators.
       - ``<(`` — process-substitution open, recognised as its own atomic
         2-char token (so a merged run like ``<(true)`` still tokenizes
-        sanely) but — round-4 — NEVER treated as an excision opener by
-        ``_excise_command_substitutions`` (see that function's docstring);
-        it stays an ordinary, always-scannable token.
+        sanely); it stays an ordinary, always-scannable token and is never
+        a structural opener for substitution handling (round-5 does that
+        on the raw string — see ``_split_command_substitutions``).
       - ``(`` / ``)`` / ``;`` / newline — the single-char structural/
         separator tokens, always meaningful alone.
       - Any run starting with ``<`` or ``>`` (redirect operators — ``>>``,
@@ -619,130 +646,173 @@ def _split_all_punctuation_runs(tokens: list[str]) -> list[str]:
     return result
 
 
-def _excise_command_substitutions(tokens: list[str]) -> list[str]:
-    """Remove ONLY a genuine, flat, fully-plain ``$(...)`` span, returning
-    the tokens that remain (round-4, H1 — rewritten to be PROVABLY
-    fail-closed by construction, replacing round-3's LIFO-stack matcher;
-    see remediation-spec-r4.md §A and remediation-report-r4.md).
-
-    Round-3's LIFO stack fixed the round-2 "any later `)` closes any
-    earlier opener" bug, but a round-4 re-audit found it still fails open:
-    it treated a bare ``<(`` token as ALWAYS genuine (on the theory that
-    real process substitution's captured stdout never reaches this
-    command's own stdout either). But ``shlex`` erases quote provenance —
-    a SOLO quoted ``'<('`` literal (e.g. ``echo '<('``) is emitted as a
-    bare ``<(`` token indistinguishable from a real opener — and the
-    stack would push it as a genuine open, later popped by whatever ``)``
-    token happened to come next in the stream (e.g. a later, unrelated
-    ``echo ')'``), excising everything between the two — INCLUDING a
-    real top-level ``op read`` sitting in between (empirically confirmed
-    fail-open: ``echo '<('; op read op://x; echo ')'``). The same shape
-    hits a bare ``$``/``(`` word pair split by quoting (``echo '$' '('``).
-
-    Fix — three structural changes that together make this PROVABLY
-    fail-closed rather than merely patched against the latest known
-    decoy shape:
-
-    1. ``<(`` is NEVER an excision opener, full stop. The genuine-opener
-       test below is an EXACT string match ``tok == "("`` — the literal
-       two-character token ``"<("`` can never satisfy that (it is a
-       different string), so it can never be mistaken for one, by
-       construction, regardless of any quoting/decoy trick. It is simply
-       left as an ordinary token, exactly like a bare subshell ``(``
-       always was — fully visible to the segment scan below. (It remains
-       recognised as its own atomic 2-char operator token by
-       ``_split_punctuation_run``, so a merged run like ``<(true)`` still
-       tokenizes sanely — it just never triggers excision.)
-    2. A genuine opener (a ``(`` token whose immediately preceding token
-       in the ORIGINAL stream is exactly ``$`` or ENDS with ``$``, e.g.
-       ``VAR=$``) is matched against the FIRST ``)`` token found scanning
-       forward from it — but the match is only ACCEPTED (and the span
-       excised) if EVERY token strictly between them is "plain": not a
-       separator (``;``/``&&``/``||``/``|``/``&``/newline), not a paren
-       (``(``/``)``), not ``<(``, not a redirect operator run (``>&``,
-       ``>>``, ``<<<``, ...). All of these share one property after
-       ``_split_all_punctuation_runs`` has already run (see
-       ``op_egress_block_reason``'s pipeline — this function always
-       receives ALREADY-punctuation-split tokens): each is composed
-       ENTIRELY of characters from ``_PUNCTUATION_CHARS``. So "plain" is
-       simply "not entirely punctuation characters" — the exact same
-       test ``_split_all_punctuation_runs`` itself already uses to decide
-       whether a token needs splitting, reused here rather than
-       re-deriving a parallel list of "which operator shapes count".
-       A quoted, glued word like ``foo(`` (letters plus a stray paren
-       character, produced by e.g. ``grep -c "foo("``) contains
-       non-punctuation characters and so is correctly treated as plain,
-       ordinary content — not a structural boundary.
-    3. If the content check fails (a separator/paren/``<(``/redirect is
-       found before the first ``)``), or no ``)`` is found at all, the
-       span is simply NOT excised: the opening ``(`` token is left in
-       place as ordinary output and the scan resumes at the very next
-       token — so a later, INDEPENDENT genuine opener (including one
-       that was itself "inside" the rejected span, e.g. a nested
-       ``$(...)`` one level in) still gets its own, fresh chance to be
-       recognised and excised on its own merits.
-
-    This is PROVABLY fail-closed, not just empirically patched: an
-    excised span's content can never contain a separator (rule 2), so it
-    can never hide a top-level ``; op read`` (or any other segment
-    boundary) inside it — by construction, not by enumerating decoy
-    shapes as they're discovered. Anything even slightly ambiguous (a
-    stray paren, an operator, a redirect, an unmatched opener, or simply
-    ``<(`` in any position) is left fully in the scannable output instead.
-
-    On well-formed, non-adversarial input this is behaviourally identical
-    to round-3 for the dominant safe pattern: a standalone
-    ``VAR=$(opread "op://...")`` is still excised in full (the two
-    tokens between its ``(``/``)`` — ``opread`` and the quoted ref — are
-    both plain). It intentionally now also refuses to excise a NESTED
-    genuine span used as an inner argument of an outer one (e.g.
-    ``V=$(op read $(true))`` — the outer span's own first ``)`` is the
-    INNER span's closer, and the inner ``(``/``)`` tokens between them
-    are themselves parens, failing the plain check) — over-inclusive
-    (leaves the outer ``op read`` scannable → BLOCK) rather than
-    under-inclusive; no spec case or existing test requires that shape to
-    ALLOW, and it is exactly the "flat single-command `$(word word …)`"
-    restriction §A calls for.
-
-    A bare ``(`` (no preceding ``$``, and never ``<(`` either) is still
-    never an excision candidate itself: its contents always stay fully
-    visible to the segment scan below, which is what keeps
-    ``(op read x)`` detected as op-egress (BLOCK) while
-    ``VAR=$(opread x)`` has its captured value excised entirely (ALLOW).
-    """
-    n = len(tokens)
-    result: list[str] = []
-    i = 0
+def _find_unescaped(source: str, target: str, start: int) -> int | None:
+    """Index of the next unescaped ``target`` char at/after ``start``, or None."""
+    i, n = start, len(source)
     while i < n:
-        tok = tokens[i]
-        prev_tok = tokens[i - 1] if i > 0 else None
-        is_genuine_open = tok == "(" and prev_tok is not None and (
-            prev_tok == "$" or prev_tok.endswith("$")
-        )
-        if is_genuine_open:
-            close_index = None
-            for j in range(i + 1, n):
-                if tokens[j] == ")":
-                    close_index = j
-                    break
-            if close_index is not None:
-                between = tokens[i + 1:close_index]
-                all_plain = all(
-                    not (t and set(t) <= _PUNCTUATION_CHARS) for t in between
-                )
-                if all_plain:
-                    # Drop the opener, everything between, and the closer;
-                    # resume scanning immediately after the excised span.
-                    i = close_index + 1
-                    continue
-        # Not a genuine opener, OR no matching `)` was found, OR the
-        # content between them was not all plain: leave this single token
-        # exactly as-is and advance by one — never consume a `)` (or
-        # anything else) that a rejected span merely scanned past, so a
-        # later independent genuine opener remains fully discoverable.
-        result.append(tok)
+        if source[i] == "\\":
+            i += 2
+            continue
+        if source[i] == target:
+            return i
         i += 1
-    return result
+    return None
+
+
+def _find_substitution_close(source: str, start: int) -> int | None:
+    """Index of the ``)`` closing a ``$(`` whose body begins at ``start``.
+
+    Tracks nesting depth over unquoted ``(``/``)`` and skips over quoted
+    spans, so an inner ``$(...)``, a literal ``")"`` inside a double-quoted
+    argument, and an arithmetic ``$((...))`` all match correctly. Returns
+    None when the substitution is unterminated."""
+    depth = 1
+    i, n = start, len(source)
+    in_single = in_double = False
+    while i < n:
+        ch = source[i]
+        if ch == "\\" and not in_single:
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return None
+
+
+# A command substitution is a SAFE CAPTURE only when it is the right-hand
+# side of a shell assignment -- `NAME=$(...)`, `NAME="$(...)"`, `arr[k]=$(...)`
+# -- optionally preceded by other assignments or a keyword like `export`.
+# The regex is matched against the text to the LEFT of the substitution's
+# opener, anchored at its end, with an optional opening double quote allowed
+# between the `=` and the opener.
+_ASSIGNMENT_CAPTURE_PREFIX_RE = re.compile(
+    r"""(?:^|[\s;&|(<>\n])          # start of string or a word/segment boundary
+        [A-Za-z_][A-Za-z0-9_]*      # variable name
+        (?:\[[^\]]*\])?             # optional array subscript
+        =                           # the assignment
+        \"?$                        # optional opening double quote, then the opener
+    """,
+    re.VERBOSE,
+)
+
+
+_BACKTICK_UNESCAPE_RE = re.compile(r"\\([`\\\\$])")
+
+
+def _split_command_substitutions(command: str) -> tuple[str, list[str]]:
+    """Separate a command string into (residual_text, inner_command_strings).
+
+    This replaces round-4's token-level ``_excise_command_substitutions``,
+    which was fail-OPEN in three ways that this string-level pass closes by
+    construction (SEC-1, SEC-2, and a fourth shape found while fixing them):
+
+    1. **SEC-1 -- ``echo $(op read op://x)`` leaked.** Round-4 excised ANY
+       ``$(...)`` span whose opener token was preceded by a ``$``, on the
+       stated premise that "the captured value lands in a shell variable ...
+       never directly in stdout." That premise holds ONLY for an assignment.
+       In ``echo $(op read ...)`` / ``printf %s $(op read ...)`` the
+       substitution's stdout becomes the OUTER command's argument and is
+       printed straight to the agent's context. Here, a substitution is
+       excised only when ``_ASSIGNMENT_CAPTURE_PREFIX_RE`` matches the text
+       to its left; in every other position its body is returned as an inner
+       command for the caller to analyse recursively -- deny by default.
+    2. **SEC-2 -- backticks were invisible.** ``shlex`` (as configured in
+       ``_tokenize_shell_command``) treats a backtick as an ordinary word
+       character, so `` echo `op read op://x` `` tokenized as
+       ``['echo', '`op', 'read', 'op://x`']`` -- no token's basename was
+       ever ``op``, and there was no backtick excision path at all, so it
+       ALLOWED. Backtick substitution prints to stdout identically to
+       ``$(...)``; both are handled by the same code path below.
+    3. **Quoted substitutions were invisible.** ``echo "$(op read op://x)"``
+       and ``echo "`op read op://x`"`` collapse to a SINGLE shlex token
+       whose basename is neither ``op`` nor ``opread``, so the segment scan
+       never saw inside them (ALLOW, empirically confirmed). A token-level
+       pass cannot fix this -- by the time shlex has run, the quoting that
+       glued the substitution into one word is gone. Scanning the RAW string
+       before tokenization is what makes these visible.
+
+    Quoting is honoured exactly as the shell does: inside SINGLE quotes a
+    ``$(`` or a backtick is a literal, no substitution occurs, and the text
+    is passed through to the residual untouched (which is what keeps the
+    round-4 quoted-decoy regressions -- ``echo '<('; op read op://x`` and
+    ``echo '$' '('; ...`` -- blocking). Inside double quotes both forms DO
+    substitute, and are handled.
+
+    Each substitution is replaced in the residual by a single space, so the
+    remaining text still tokenizes and segments normally and a
+    ``VAR=$(opread "op://x"); psql`` keeps its ``;`` boundary.
+
+    Fail-closed properties: an UNTERMINATED substitution contributes the
+    rest of the string as an inner command (rather than being dropped); a
+    substitution in any position that is not provably an assignment RHS is
+    analysed rather than trusted; and concatenated substitutions
+    (``X=$(a)$(op read y)``) fall on the deny side because the second
+    opener's left-context is no longer a bare ``NAME=`` -- over-blocking a
+    rare safe shape rather than under-blocking a leak.
+    """
+    residual: list[str] = []
+    inner: list[str] = []
+    i, n = 0, len(command)
+    in_single = in_double = False
+
+    while i < n:
+        ch = command[i]
+
+        if ch == "\\" and not in_single and i + 1 < n:
+            residual.append(command[i:i + 2])
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            residual.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            residual.append(ch)
+            i += 1
+            continue
+
+        is_backtick = ch == "`" and not in_single
+        is_dollar_paren = (
+            ch == "$" and not in_single and i + 1 < n and command[i + 1] == "("
+        )
+        if is_backtick or is_dollar_paren:
+            body_start = i + 1 if is_backtick else i + 2
+            if is_backtick:
+                close = _find_unescaped(command, "`", body_start)
+            else:
+                close = _find_substitution_close(command, body_start)
+            body = command[body_start:close] if close is not None else command[body_start:]
+            if is_backtick:
+                # Inside a backtick substitution the shell strips ONE level of
+                # backslash escaping before executing the body, which is how
+                # backticks nest: `` echo `echo \`op read op://x\`` ``. Without
+                # this the inner `\`` stays escaped, is never recognised as a
+                # substitution opener on recursion, and the nested `op read`
+                # leaks (reproduced). `$(...)` needs no equivalent -- it nests
+                # by paren depth, which `_find_substitution_close` tracks.
+                body = _BACKTICK_UNESCAPE_RE.sub(r"\1", body)
+            if not _ASSIGNMENT_CAPTURE_PREFIX_RE.search("".join(residual)):
+                inner.append(body)
+            residual.append(" ")
+            i = (close + 1) if close is not None else n
+            continue
+
+        residual.append(ch)
+        i += 1
+
+    return "".join(residual), inner
 
 
 def _split_into_segments(tokens: list[str]) -> list[list[str]]:
@@ -807,7 +877,7 @@ def _resolve_op_subcommand_index(later: list[str]) -> int | None:
     return None
 
 
-def _segment_is_op_egress(segment_tokens: list[str]) -> bool:
+def _segment_is_op_egress(segment_tokens: list[str], _depth: int = 0) -> bool:
     """Decide whether ONE top-level segment's tokens are an op-egress
     command (round-3, M-1 — rewritten to locate THE subcommand precisely
     instead of flagging on the presence of ANY later ``read`` token
@@ -850,6 +920,35 @@ def _segment_is_op_egress(segment_tokens: list[str]) -> bool:
     ``/usr/bin/op``/``/usr/bin/opread`` is still recognised. ``opread``
     anywhere is still unconditionally egress, unchanged from round-2.
     """
+    # -- SEC-3: recurse into shell code handed to a command runner ---------
+    # Round-4 detected egress only when a TOKEN's basename was `op`/`opread`.
+    # With `sh -c 'op read op://x'`, shlex emits the whole inner command as
+    # ONE quoted token whose basename is `x` (from `op://x`), so no token
+    # matched and the command ALLOWED -- as did `bash -c "..."`, `eval '...'`
+    # and `env FOO=1 sh -c '...'` (all three reproduced before this fix).
+    # A quoted argument is opaque to a token scan, so it has to be re-entered
+    # and analysed as a command in its own right.
+    #
+    # `eval` concatenates ALL its arguments into one command line, so every
+    # following token is code. Everything else is reached through the
+    # flag-shape rule in `_CODE_TAKING_FLAG_RE`.
+    #
+    # Known limit, stated rather than left implicit: a runner that takes
+    # shell code WITHOUT a `-c`-shaped flag -- `ssh host 'op read x'`,
+    # `perl -e`, `find . -exec op read {} \;` -- is still not re-entered.
+    # Closing that generally would require treating every quoted argument of
+    # every unknown command as code, which would block ordinary things like
+    # `grep "op read" notes.md`. The boundary is drawn here deliberately.
+    for i, tok in enumerate(segment_tokens):
+        if os.path.basename(tok) == "eval":
+            rest = " ".join(segment_tokens[i + 1:]).strip()
+            if rest and op_egress_block_reason(rest, _depth=_depth + 1):
+                return True
+            continue
+        if _CODE_TAKING_FLAG_RE.match(tok) and i + 1 < len(segment_tokens):
+            if op_egress_block_reason(segment_tokens[i + 1], _depth=_depth + 1):
+                return True
+
     for tok in segment_tokens:
         if os.path.basename(tok) == "opread":
             return True
@@ -885,7 +984,7 @@ def _segment_is_op_egress(segment_tokens: list[str]) -> bool:
     return False
 
 
-def op_egress_block_reason(command: str) -> str | None:
+def op_egress_block_reason(command: str, _depth: int = 0) -> str | None:
     """Return a redirect message if `command` would leak a 1Password secret.
 
     Pure predicate, no I/O, no state. Detects shell commands that print a
@@ -895,36 +994,48 @@ def op_egress_block_reason(command: str) -> str | None:
     command is safe to run as-is (including when ``command`` isn't a
     non-blank string at all — the guard is total, never raises).
 
-    Algorithm (round-4, presence-based — see the module-level comment above
-    ``_OP_ITEM_GET_DUMP_FLAGS`` for why this replaced the round-1
-    wrapper-stripping/positional design):
-      1. Quote-aware tokenize via ``shlex`` (``_tokenize_shell_command``).
-         On unbalanced quotes (``ValueError``), fall back to
-         ``_conservative_fallback``'s begins-with check.
-      2. Split any MERGED punctuation token (e.g. shlex's ``"&&\\n"``) back
+    Algorithm (round-5, deny-by-default — see the module-level comment above
+    ``_OP_ITEM_GET_DUMP_FLAGS`` for why presence-scanning replaced the
+    round-1 wrapper-stripping/positional design, and
+    ``_split_command_substitutions`` for why substitution handling moved off
+    the token stream and onto the raw string):
+      1. Delete backslash-newline line continuations, exactly as the shell
+         does before it tokenizes anything.
+      2. Split command substitutions off the RAW string, quote-aware
+         (``_split_command_substitutions``). A substitution that is provably
+         an assignment capture (``NAME=$(…)``, ``NAME="$(…)"``) is dropped —
+         its value lands in a shell variable, never on this command's
+         stdout. EVERY other substitution's body, in any position and in
+         either syntax (``$(…)`` or backticks, bare or double-quoted), is
+         returned for step 3.
+      3. Recurse: any inner command that is itself op-egress blocks the
+         whole command. Depth is bounded by ``_MAX_NESTING_DEPTH``, and
+         exceeding it BLOCKS rather than allows.
+      4. Quote-aware tokenize the residual via ``shlex``
+         (``_tokenize_shell_command``). On unbalanced quotes
+         (``ValueError``), fall back to ``_conservative_fallback``'s
+         begins-with check.
+      5. Split any MERGED punctuation token (e.g. shlex's ``"&&\n"``) back
          into its individual operators (``_split_all_punctuation_runs``).
-      3. Excise ONLY a genuine, flat, fully-plain ``$(...)`` span —
-         (``_excise_command_substitutions``, rewritten round-4 to be
-         PROVABLY fail-closed: an excised span can never contain a
-         separator/paren/redirect/``<(``, so it can never hide a
-         top-level segment boundary) — this is what preserves
-         ``VAR=$(opread "op://...")`` (the dominant safe capture pattern:
-         the value lands in a shell variable, never printed to stdout)
-         while still exposing a BARE ``(op read x)`` subshell group's
-         contents (no preceding ``$`` — not a substitution) AND a bare
-         ``<(...)`` process-substitution token (round-4: NEVER an
-         excision opener at all, regardless of position or quoting).
-      4. Split what remains into top-level SEGMENTS on ``;``, ``&&``,
-         ``||``, ``&``, ``|`` (pipe is now just another separator — pipe-
-         allow is dropped, round-2), and a bare newline
+      6. Split what remains into top-level SEGMENTS on ``;``, ``&&``,
+         ``||``, ``&``, ``|`` (pipe is just another separator — pipe-allow
+         was dropped in round-2), and a bare newline
          (``_split_into_segments``).
-      5. A segment is op-egress by PRESENCE of an op-egress keyword
+      7. A segment is op-egress by PRESENCE of an op-egress keyword
          combination anywhere in its tokens (``_segment_is_op_egress``) —
          no wrapper-stripping, no flag-arity guessing, no positional-binary
          assumption, so ``sudo -u root op read x``, ``time op read x``,
          ``op --debug read x``, and ``(op read x)`` are all caught by the
-         same presence scan.
-      6. If ANY segment is op-egress, the command as a whole is BLOCKED.
+         same presence scan. That scan also re-enters shell code handed to
+         a ``-c``-shaped flag or to ``eval`` (round-5, SEC-3).
+      8. If ANY segment is op-egress, the command as a whole is BLOCKED.
+
+    Residual risk, recorded rather than implied: a captured secret can still
+    be printed by a LATER command (``V=$(op read x); echo "$V"``). This
+    guard is a stdout-shape predicate, not dataflow analysis, and the
+    capture carve-out is what makes the sanctioned ``VAR=$(opread …)``
+    pattern usable at all. The redaction layer, not this predicate, is the
+    control that covers that path.
 
     BLOCKS (examples): ``op read <ref>``, ``opread <ref>``,
     ``op document get <ref>``, ``op item get ... --fields|--field|--format|
@@ -933,7 +1044,13 @@ def op_egress_block_reason(command: str) -> str | None:
     assignment/a boolean global ``op`` flag (``--debug``, ``--no-color``)/
     a value-taking global ``op`` flag (``--account``/``--config``/
     ``--session``) whose value coincidentally spells a subcommand keyword,
-    any of the above as a top-level segment of a
+    any of the above reached through a command substitution in a NON-capture
+    position (``echo $(op read x)``, ``printf %s $(op read x)``, backticks
+    ``echo `op read x` `` including nested/escaped ones, and their double-
+    quoted forms ``echo "$(op read x)"`` — round-5, SEC-1/SEC-2), any of the
+    above passed as shell code to a command runner (``sh -c 'op read x'``,
+    ``bash -lc "…"``, ``eval '…'``, ``env FOO=1 sh -c '…'``, ``xargs -I{} sh
+    -c '…'`` — round-5, SEC-3), any of the above as a top-level segment of a
     ``;``/``&&``/``||``/``&``/``|``/newline-separated sequence (including
     when the separator is glued to adjacent punctuation, e.g. ``&&\\n``,
     or backgrounded, e.g. ``echo x & op read y``), inside a subshell
@@ -954,9 +1071,12 @@ def op_egress_block_reason(command: str) -> str | None:
     ``op readme``/``opreadiness`` (distinct binaries/subcommands — basename
     and whole-token matching, never substring), and — the dominant safe
     pattern — a value captured via command substitution,
-    ``VAR=$(opread "op://...")`` / ``VAR=$(op read "op://...")`` (excised
+    ``VAR=$(opread "op://...")`` / ``VAR=$(op read "op://...")`` /
+    ``VAR="$(op read "op://...")"`` / ``VAR=`op read op://...` `` (dropped
     before the segment scan; the value never reaches this command's stdout,
-    landing in the shell variable instead).
+    landing in the shell variable instead). Note that a SINGLE-quoted
+    ``VAR='$(op read x)'`` is a literal string to the shell, not a
+    substitution, and is likewise not egress.
 
     Args:
         command: The raw shell command string as given to the shell tool.
@@ -968,6 +1088,11 @@ def op_egress_block_reason(command: str) -> str | None:
     """
     if not isinstance(command, str) or not command.strip():
         return None
+
+    # Fail closed on pathological nesting rather than unwinding into an
+    # allow (see `_MAX_NESTING_DEPTH`).
+    if _depth > _MAX_NESTING_DEPTH:
+        return _OP_EGRESS_BLOCK_MESSAGE
 
     # Round-3 (H2): the real shell (dash/bash) deletes a backslash-newline
     # line continuation BEFORE it ever tokenizes the command — `op \<NL>read
@@ -990,19 +1115,30 @@ def op_egress_block_reason(command: str) -> str | None:
     # over-normalizes and over-blocks, never hides egress.
     command = command.replace("\\\r\n", "").replace("\\\n", "")
 
-    tokens = _tokenize_shell_command(command)
+    # Separate command substitutions from the surrounding text BEFORE
+    # tokenizing (see `_split_command_substitutions`): shlex destroys the
+    # quoting that distinguishes `echo "$(op read x)"` from `echo 'op read
+    # x'`, so this cannot be done on tokens. Every substitution that is not
+    # provably an assignment capture is analysed as a command in its own
+    # right -- deny by default, where round-4 excised and trusted it.
+    residual, inner_commands = _split_command_substitutions(command)
+
+    for inner in inner_commands:
+        if op_egress_block_reason(inner, _depth=_depth + 1):
+            return _OP_EGRESS_BLOCK_MESSAGE
+
+    tokens = _tokenize_shell_command(residual)
     if tokens is None:
-        return _conservative_fallback(command)
+        return _conservative_fallback(residual)
     if not tokens:
         return None
 
     tokens = _split_all_punctuation_runs(tokens)
-    tokens = _excise_command_substitutions(tokens)
 
     for segment in _split_into_segments(tokens):
         if not segment:
             continue
-        if _segment_is_op_egress(segment):
+        if _segment_is_op_egress(segment, _depth=_depth):
             return _OP_EGRESS_BLOCK_MESSAGE
 
     return None

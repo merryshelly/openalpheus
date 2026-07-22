@@ -181,6 +181,74 @@ BLOCK_CASES = [
     # -- round-4 additions (H3: singular --field dump-flag alias) --
     pytest.param("op item get Item --field password", id="item_get_singular_field"),
     pytest.param("op item get Item --field=password", id="item_get_singular_field_eq"),
+    # ======================================================================
+    # round-5 additions -- the deny-by-default rewrite (SEC-1/2/3).
+    #
+    # 34 of the 36 cases below were confirmed to ALLOW against the round-4
+    # implementation before the fix, via a differential harness run over
+    # both versions (see the PR description for the transcript); each of
+    # those is a live 1Password secret reaching model context through the
+    # control that exists to prevent exactly that.
+    #
+    # The two exceptions are kept deliberately, marked inline: they already
+    # blocked under round-4 by accident of the old algorithm, and they are
+    # retained as regression guards so the rewrite cannot lose coverage the
+    # previous implementation happened to have.
+    # ======================================================================
+    # -- SEC-1: `$(...)` in a NON-capture position prints to stdout. Round-4
+    #    excised any `$(...)` whose opener followed a `$`, on the premise
+    #    that the value "lands in a shell variable" -- true only for an
+    #    assignment, not for a command's argument.
+    pytest.param("echo $(op read op://vault/item)", id="r5_echo_cmdsub_op_read"),
+    pytest.param("printf %s $(op read op://x)", id="r5_printf_cmdsub_op_read"),
+    pytest.param("echo $(opread op://x)", id="r5_echo_cmdsub_opread"),
+    pytest.param("echo $(op document get Doc)", id="r5_echo_cmdsub_document_get"),
+    pytest.param("echo $(op item get Item --fields password)", id="r5_echo_cmdsub_item_fields"),
+    pytest.param("echo $(  op   read   op://x  )", id="r5_cmdsub_inner_whitespace"),
+    pytest.param('echo "prefix $(op read op://x) suffix"', id="r5_cmdsub_interpolated_in_string"),
+    pytest.param("echo $(echo $(op read op://x))", id="r5_cmdsub_nested"),
+    pytest.param("echo x > $(op read op://x)", id="r5_cmdsub_in_redirect_target"),
+    pytest.param("A=$(true) echo $(op read op://x)", id="r5_capture_then_noncapture_cmdsub"),
+    pytest.param("foo=$(a)$(op read op://x)", id="r5_concatenated_cmdsub_not_capture"),
+    # (already blocked under round-4 -- no closing `)` meant nothing was
+    #  excised, so the tokens stayed scannable; kept as a regression guard)
+    pytest.param("echo $(op read op://x", id="r5_unterminated_cmdsub"),
+    # -- SEC-1b: a DOUBLE-QUOTED substitution collapses to one shlex token
+    #    whose basename is neither `op` nor `opread`, so a token-level scan
+    #    never saw inside it. Found while fixing SEC-1; not in the report.
+    pytest.param('echo "$(op read op://x)"', id="r5_quoted_cmdsub_op_read"),
+    pytest.param('echo "${x}$(op read op://x)"', id="r5_quoted_cmdsub_after_param"),
+    # -- SEC-2: backticks. shlex treats ` as an ordinary word character, so
+    #    `` echo `op read x` `` tokenized as ['echo', '`op', 'read', 'op://x`']
+    #    and no basename ever matched. Backticks print to stdout exactly as
+    #    `$(...)` does.
+    pytest.param("echo `op read op://x`", id="r5_backtick_op_read"),
+    pytest.param('echo "`op read op://x`"', id="r5_quoted_backtick_op_read"),
+    pytest.param("cat <<< `op read op://x`", id="r5_backtick_herestring"),
+    pytest.param("echo `opread op://x`", id="r5_backtick_opread"),
+    pytest.param("echo `echo \\`op read op://x\\``", id="r5_backtick_nested_escaped"),
+    pytest.param("echo `op read op://x", id="r5_unterminated_backtick"),
+    # -- SEC-3: a command runner's quoted argument is opaque to a token
+    #    scan. `sh -c 'op read op://x'` emitted the inner command as ONE
+    #    token whose basename is `x` (from `op://x`), matching nothing.
+    pytest.param("sh -c 'op read op://x'", id="r5_sh_c_op_read"),
+    pytest.param('bash -c "op read op://x"', id="r5_bash_c_op_read"),
+    pytest.param("/bin/sh -c 'op read op://x'", id="r5_abs_sh_c_op_read"),
+    pytest.param("bash -lc 'op read op://x'", id="r5_bash_bundled_flag_op_read"),
+    pytest.param("zsh -c 'op read op://x'", id="r5_zsh_c_op_read"),
+    pytest.param("dash -c 'op read op://x'", id="r5_dash_c_op_read"),
+    pytest.param("busybox sh -c 'op read op://x'", id="r5_busybox_sh_c_op_read"),
+    pytest.param("eval 'op read op://x'", id="r5_eval_quoted_op_read"),
+    # (already blocked under round-4 -- unquoted, so `op`/`read` were plain
+    #  tokens the presence scan saw; kept as a regression guard)
+    pytest.param("eval op read op://x", id="r5_eval_bare_op_read"),
+    pytest.param("env FOO=1 sh -c 'op read op://x'", id="r5_env_sh_c_op_read"),
+    pytest.param("sudo sh -c 'op read op://x'", id="r5_sudo_sh_c_op_read"),
+    pytest.param("xargs -I{} sh -c 'op read op://x'", id="r5_xargs_sh_c_op_read"),
+    pytest.param("timeout 5 sh -c 'op read op://x'", id="r5_timeout_sh_c_op_read"),
+    pytest.param("python3 -c 'op read op://x'", id="r5_code_flag_generic"),
+    pytest.param("sh -c 'sh -c \"op read op://x\"'", id="r5_sh_c_nested"),
+    pytest.param('sh -c "echo $(op read op://x)"', id="r5_sh_c_wrapping_cmdsub"),
 ]
 
 
@@ -237,6 +305,25 @@ ALLOW_CASES = [
     pytest.param('V=$(op read "op://x")', id="cmdsub_op_read_still_allow"),
     pytest.param("op item get Item --show-all-fields", id="field_substring_not_flag_still_allow"),
     pytest.param("op run -- make read", id="op_run_child_read_still_allow"),
+    # -- round-5 additions: the deny-by-default rewrite must not over-block --
+    # The capture carve-out is the ONE trusted shape and must survive in all
+    # of its spellings, including the quoted and backtick forms the SEC-1/2
+    # fixes newly parse.
+    pytest.param('V="$(op read op://x)"', id="r5_quoted_capture_still_allow"),
+    pytest.param("V=`op read op://x`", id="r5_backtick_capture_still_allow"),
+    pytest.param("arr[0]=$(op read op://x)", id="r5_array_subscript_capture"),
+    pytest.param("local V=$(opread op://x)", id="r5_local_capture"),
+    pytest.param("A=1 B=$(op read op://x) cmd", id="r5_env_prefix_capture"),
+    # A SINGLE-quoted substitution is a literal string to the shell -- no
+    # substitution happens, so nothing is printed and nothing is egress.
+    pytest.param("V='$(op read op://x)'", id="r5_single_quoted_literal_not_subst"),
+    # Ordinary substitutions and `-c` flags on non-shell commands must not
+    # be collateral damage of the recursion.
+    pytest.param("echo $(date)", id="r5_benign_cmdsub"),
+    pytest.param("D=$(date); echo $D", id="r5_benign_capture_then_use"),
+    pytest.param("echo $((1+2))", id="r5_arithmetic_expansion"),
+    pytest.param("grep -c 'foo(' f.txt", id="r5_grep_c_flag_not_shell_code"),
+    pytest.param('git commit -m "wip"', id="r5_ordinary_command"),
 ]
 
 
