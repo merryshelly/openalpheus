@@ -174,6 +174,7 @@ class Agent:
         self.system_prompt = assemble_prompt(
             config.workspace,
             model_aliases=config.model_aliases,
+            injection_defense=config.injection_defense,
         )
         self._rooms: dict[str, list[dict]] = {}  # room_id → history
         self.uncached_input_tokens = 0
@@ -194,7 +195,19 @@ class Agent:
             for t in self.tools:
                 params_chars = len(json.dumps(t.parameters)) if isinstance(t.parameters, dict) else 0
                 self._tool_defs_chars += len(t.name) + len(t.description) + params_chars
-        self._current_task: asyncio.Task | None = None
+        # CORE-1: per-room, mirroring `_room_locks` below.
+        #
+        # This was a single `_current_task` slot while room turns run
+        # CONCURRENTLY -- every message is dispatched through
+        # `_fire_background`, and each turn holds only its own per-room lock,
+        # so two rooms can be inside `handle_input` at once. Last writer won,
+        # which broke `/stop` in both directions: a `/stop` in room A could
+        # cancel room B's turn (whichever wrote the slot last), and the
+        # `finally` that nulled the slot when ANY turn ended could leave a
+        # `/stop` cancelling nothing while a turn was genuinely running.
+        # `_halted_rooms` was already correctly per-room, so A's future
+        # messages were dropped while A's actual in-flight turn kept going.
+        self._current_tasks: dict[str, asyncio.Task] = {}
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._room_models: dict[str, str] = {}  # room_id → model override
         self._warned_models: set = set()  # warn-once for unknown model context windows
@@ -597,7 +610,7 @@ class Agent:
         if room_id not in self._room_locks:
             self._room_locks[room_id] = asyncio.Lock()
         async with self._room_locks[room_id]:
-            self._current_task = asyncio.current_task()
+            self._current_tasks[room_id] = asyncio.current_task()
             history = self.history(room_id)
             try:
                 # Build user content (may expand image media tags if vision enabled)
@@ -1138,7 +1151,11 @@ class Agent:
                 self._repair_history(history)
                 raise
             finally:
-                self._current_task = None
+                # Only clear OUR entry, and only if it is still ours: another
+                # turn for the same room must not have its task dropped by a
+                # late-finishing predecessor.
+                if self._current_tasks.get(room_id) is asyncio.current_task():
+                    self._current_tasks.pop(room_id, None)
 
     @staticmethod
     def _repair_history(history: list[dict]) -> None:
@@ -1186,12 +1203,28 @@ class Agent:
             for i in sorted(to_remove, reverse=True):
                 history.pop(i)
 
-    def cancel(self) -> asyncio.Task | None:
-        """Cancel current processing and return the task for awaiting."""
-        task = self._current_task
-        if task:
+    def cancel(self, room_id: str | None = None) -> asyncio.Task | None:
+        """Cancel the in-flight turn for `room_id` and return it for awaiting.
+
+        CORE-1: `room_id` is required in practice -- the `/stop` handler has
+        it in scope. It stays optional only so an out-of-tree caller does not
+        break; passing None cancels every in-flight turn, which is the right
+        behaviour for process shutdown and is what `MatrixBot.shutdown` wants.
+        It is NOT a "cancel the current one" fallback: there is no such thing
+        when rooms run concurrently, and pretending there was is what let a
+        `/stop` in one room kill another room's work.
+        """
+        if room_id is not None:
+            task = self._current_tasks.get(room_id)
+            if task:
+                task.cancel()
+            return task
+
+        last: asyncio.Task | None = None
+        for task in list(self._current_tasks.values()):
             task.cancel()
-        return task
+            last = task
+        return last
 
     def _estimate_content_tokens(self, content: str | list[dict]) -> int:
         """Estimate tokens for a single content (string or list of blocks).

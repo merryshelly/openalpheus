@@ -75,6 +75,7 @@ class AgentConfig:
     top_p: float | None = None
     degen_detector: str = "off"  # streaming degeneration monitor mode: off|warn|abort (default off per Phase 1 code-audit -- H1/H2/H3 false-positive/truncation findings, workspace-kdsn.241.4 remediation pending)
     reminders: bool = True
+    injection_defense: bool = True
     model_limits: dict[str, int] = field(default_factory=dict)
     model_aliases: dict[str, str] = field(default_factory=dict)
 
@@ -260,6 +261,13 @@ def load_config(path: Path) -> AgentConfig:
     reminders = agent_section.get("reminders", True)
     if not isinstance(reminders, bool):
         raise ConfigError("reminders must be a boolean")
+
+    # PHIL-1: injection_defense defaults to True -- the security footer is
+    # appended unless the operator turns it off. Documented and greppable,
+    # where before it was an unconditional hardcoded string.
+    injection_defense = agent_section.get("injection_defense", True)
+    if not isinstance(injection_defense, bool):
+        raise ConfigError("injection_defense must be a boolean")
 
     # vision defaults to False if not specified
     vision = agent_section.get("vision", False)
@@ -451,6 +459,7 @@ def load_config(path: Path) -> AgentConfig:
         truncation_limit=truncation_limit,
         vision=vision,
         reminders=reminders,
+        injection_defense=injection_defense,
         thinking=thinking,
         temperature=temperature,
         top_p=top_p,

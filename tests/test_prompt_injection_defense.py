@@ -83,3 +83,87 @@ class TestInjectionDefenseConstant:
     def test_constant_is_stable(self):
         """Calling it twice produces identical content (no dynamic generation)."""
         assert INJECTION_DEFENSE == INJECTION_DEFENSE  # trivially true, but documents intent
+
+
+# ===========================================================================
+# PHIL-1 — the security footer is operator-owned, not a hardcoded string
+#
+# Until v0.1.3 `assemble_prompt` appended ~44 lines of INJECTION_DEFENSE prose
+# unconditionally: no config flag, no workspace override, and not one of the
+# operator-owned markdown files. The README's headline promise -- "your agent
+# doesn't read a single character you didn't put there" -- was therefore
+# false, and the operator could neither see nor edit the text without reading
+# the source. The text may well be desirable; shipping it as an immutable
+# string is what made the claim untrue.
+# ===========================================================================
+
+import pathlib
+
+import openalph.templates
+from openalph.prompt import (
+    INJECTION_DEFENSE,
+    SECURITY_FOOTER_FILENAME,
+    assemble_prompt,
+)
+
+TEMPLATE_FOOTER = (
+    pathlib.Path(openalph.templates.__file__).parent / SECURITY_FOOTER_FILENAME
+)
+
+
+class TestSecurityFooterIsOperatorOwned:
+
+    def test_template_ships_with_the_package(self):
+        assert TEMPLATE_FOOTER.is_file(), f"Missing: {TEMPLATE_FOOTER}"
+
+    def test_template_matches_the_fallback_constant(self):
+        """The extracted file must be byte-identical to the constant.
+
+        Otherwise upgrading an existing workspace would silently change the
+        agent's instructions.
+        """
+        assert TEMPLATE_FOOTER.read_text().strip() == INJECTION_DEFENSE.strip()
+
+    def test_workspace_file_is_used_when_present(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("test agent\n")
+        (tmp_path / SECURITY_FOOTER_FILENAME).write_text("## My Own Rules\nBe careful.\n")
+
+        prompt = assemble_prompt(tmp_path)
+
+        assert "My Own Rules" in prompt
+        assert "Tool Result Security" not in prompt, (
+            "the hardcoded constant overrode the operator's own file"
+        )
+
+    def test_falls_back_when_workspace_predates_the_file(self, tmp_path):
+        """Upgrading must not silently drop the instruction."""
+        (tmp_path / "SOUL.md").write_text("test agent\n")
+
+        prompt = assemble_prompt(tmp_path)
+
+        assert "Tool Result Security" in prompt
+
+    def test_can_be_switched_off(self, tmp_path):
+        """`[agent] injection_defense = false` appends nothing at all."""
+        (tmp_path / "SOUL.md").write_text("test agent\n")
+        (tmp_path / SECURITY_FOOTER_FILENAME).write_text("## My Own Rules\n")
+
+        prompt = assemble_prompt(tmp_path, injection_defense=False)
+
+        assert "My Own Rules" not in prompt
+        assert "Tool Result Security" not in prompt
+
+    def test_no_behavioural_text_beyond_operator_files(self, tmp_path):
+        """With the footer off, the only framework addition is mechanical.
+
+        The `## Runtime` block names the workspace path; it carries no
+        behavioural instruction. The README names it explicitly rather than
+        claiming nothing is added.
+        """
+        (tmp_path / "SOUL.md").write_text("ONLY THIS.\n")
+
+        prompt = assemble_prompt(tmp_path, injection_defense=False)
+
+        assert prompt.startswith("## SOUL.md\nONLY THIS.")
+        remainder = prompt[len("## SOUL.md\nONLY THIS.\n"):].strip()
+        assert remainder == "" or remainder.startswith("## Runtime"), remainder

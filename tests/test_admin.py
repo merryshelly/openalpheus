@@ -452,3 +452,70 @@ class TestSetupSharedDirWrapper:
     def test_executes_when_not_dry_run(self, mock_exec):
         setup_shared_dir()
         mock_exec.assert_called_once()
+
+
+# ===========================================================================
+# BUG-2 — `new-agent` must not clobber a live agent
+#
+# `execute_plan` deliberately tolerates useradd's exit 9 ("user exists") for
+# idempotency, but then unconditionally rewrote /etc/openalph/agents/<name>.toml
+# with the CHANGE_ME skeleton and overwrote the agent's customized
+# OPERATIONS.md. README and INSTALL present `sudo openalph new-agent <name>`
+# as the normal flow, so an accidental re-run destroyed a running agent's
+# wired-up provider and Matrix config with no prompt -- unlike install.sh
+# step8, which guards on `id oa-<name>` and requires --force.
+# ===========================================================================
+
+from openalph.admin import Operation, execute_plan, plan_create_agent
+
+
+class TestNewAgentDoesNotClobber:
+
+    def test_existing_file_is_not_overwritten(self, tmp_path):
+        live = tmp_path / "agent.toml"
+        live.write_text('LIVE CONFIG\napi_key = "sk-real"\n')
+
+        execute_plan([Operation(
+            kind="write_file", path=live, content="CHANGE_ME skeleton",
+            overwrite=False, description="write config",
+        )])
+
+        assert live.read_text().startswith("LIVE CONFIG")
+
+    def test_force_overwrites(self, tmp_path):
+        live = tmp_path / "agent.toml"
+        live.write_text("LIVE CONFIG\n")
+
+        execute_plan([Operation(
+            kind="write_file", path=live, content="CHANGE_ME skeleton",
+            overwrite=True, description="write config",
+        )])
+
+        assert live.read_text() == "CHANGE_ME skeleton"
+
+    def test_missing_file_is_still_created(self, tmp_path):
+        """The guard must not break the first-run path."""
+        new = tmp_path / "nested" / "agent.toml"
+
+        execute_plan([Operation(
+            kind="write_file", path=new, content="skeleton",
+            overwrite=False, description="write config",
+        )])
+
+        assert new.read_text() == "skeleton"
+
+    def test_default_plan_never_overwrites(self):
+        write_ops = [o for o in plan_create_agent("demo") if o.kind == "write_file"]
+        assert write_ops, "expected the plan to write config and OPERATIONS.md"
+        assert all(not o.overwrite for o in write_ops)
+
+    def test_force_plan_overwrites(self):
+        write_ops = [
+            o for o in plan_create_agent("demo", force=True) if o.kind == "write_file"
+        ]
+        assert all(o.overwrite for o in write_ops)
+
+    def test_config_is_written_640_not_default_umask(self):
+        """Was root:root under the default umask, unlike the installer's 640."""
+        write_ops = [o for o in plan_create_agent("demo") if o.kind == "write_file"]
+        assert any(o.file_mode == "640" for o in write_ops)

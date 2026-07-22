@@ -14,25 +14,79 @@ from openalph.agent import Agent
 
 
 def test_agent_cancel_returns_task():
-    """Agent.cancel() should return the current task and call .cancel() on it."""
+    """Agent.cancel(room) returns that room's task and cancels it."""
     agent = Agent.__new__(Agent)
     mock_task = MagicMock(spec=asyncio.Task)
-    agent._current_task = mock_task
+    agent._current_tasks = {"!room:x": mock_task}
 
-    result = agent.cancel()
+    result = agent.cancel("!room:x")
 
     assert result is mock_task
     mock_task.cancel.assert_called_once()
 
 
 def test_agent_cancel_returns_none_when_no_task():
-    """Agent.cancel() should return None when there is no current task."""
+    """Agent.cancel(room) returns None when that room has no in-flight turn."""
     agent = Agent.__new__(Agent)
-    agent._current_task = None
+    agent._current_tasks = {}
 
-    result = agent.cancel()
+    result = agent.cancel("!room:x")
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# CORE-1 — cancellation is per-room
+#
+# Room turns run concurrently (every message goes through `_fire_background`,
+# and each turn holds only its own per-room lock), but `_current_task` was a
+# single slot, last-writer-wins. Each test below fails against that design.
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_does_not_touch_other_rooms():
+    """A /stop in room A must not cancel room B's in-flight turn.
+
+    Under the single-slot design, whichever room started its turn last owned
+    the slot, so cancelling from A killed B's work instead.
+    """
+    agent = Agent.__new__(Agent)
+    task_a = MagicMock(spec=asyncio.Task)
+    task_b = MagicMock(spec=asyncio.Task)
+    agent._current_tasks = {"!a:x": task_a, "!b:x": task_b}
+
+    result = agent.cancel("!a:x")
+
+    assert result is task_a
+    task_a.cancel.assert_called_once()
+    task_b.cancel.assert_not_called()
+
+
+def test_cancel_unknown_room_is_a_noop():
+    """/stop in a room with no in-flight turn must cancel nothing at all."""
+    agent = Agent.__new__(Agent)
+    task_b = MagicMock(spec=asyncio.Task)
+    agent._current_tasks = {"!b:x": task_b}
+
+    assert agent.cancel("!a:x") is None
+    task_b.cancel.assert_not_called()
+
+
+def test_cancel_without_room_cancels_every_room():
+    """The no-argument form is for shutdown: it must cancel ALL rooms.
+
+    Not "the current one" -- there is no such thing when rooms run
+    concurrently, and treating one as current is the original bug.
+    """
+    agent = Agent.__new__(Agent)
+    task_a = MagicMock(spec=asyncio.Task)
+    task_b = MagicMock(spec=asyncio.Task)
+    agent._current_tasks = {"!a:x": task_a, "!b:x": task_b}
+
+    agent.cancel()
+
+    task_a.cancel.assert_called_once()
+    task_b.cancel.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

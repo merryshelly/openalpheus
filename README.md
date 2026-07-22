@@ -16,7 +16,7 @@ OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix p
 
 All agent frameworks make tradeoffs. We optimized for:
 
-- **Control.** Full control of the system prompt. Your agent doesn't read a single character you didn't put there. Behavior is configured by editing markdown files — no code required.
+- **Control.** Full control of the system prompt. Every instruction your agent receives lives in a markdown file you can read and edit — including the tool-result security footer (`SECURITY_FOOTER.md`), which you can rewrite or switch off entirely with `injection_defense = false`. Behavior is configured by editing markdown files — no code required. The framework adds exactly two things beyond your files, both mechanical rather than behavioural: a `## Runtime` line naming the workspace path, and a `## Model Aliases` table generated from the aliases in your own config.
 - **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
 - **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Sixteen tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
 - **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
@@ -79,7 +79,7 @@ Six workspace markdown files assembled at process start:
 
 **SAFETY → SOUL → OPERATOR → WAKE → ENVIRONMENT → OPERATIONS**
 
-Skills are listed by name in the prompt; the agent reads their content on demand. No hardcoded behavior — everything lives in workspace files the operator controls.
+Skills are listed by name in the prompt; the agent reads their content on demand. No hardcoded behavior — every behavioural instruction lives in one of the seven workspace files the operator controls (`SAFETY.md`, `SOUL.md`, `OPERATOR.md`, `WAKE.md`, `ENVIRONMENT.md`, `OPERATIONS.md`, `SECURITY_FOOTER.md`). Run `openalph prompt <agent>` to see exactly what the agent receives.
 
 ### Tools
 

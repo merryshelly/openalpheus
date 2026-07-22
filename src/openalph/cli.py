@@ -49,6 +49,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = sub.add_parser("new-agent")
     p.add_argument("name")
     p.add_argument("--dry-run", action="store_true", default=False)
+    # BUG-2: without this, a re-run silently replaced a live agent's config
+    # and OPERATIONS.md with the CHANGE_ME skeleton.
+    p.add_argument(
+        "--force", action="store_true", default=False,
+        help="Overwrite an existing agent's config and OPERATIONS.md "
+             "(default: existing files are left alone)",
+    )
 
     # run
     p = sub.add_parser("run")
@@ -157,7 +164,9 @@ def cmd_logs(args):
 
 
 def cmd_new_agent(args):
-    ops = create_agent(args.name, dry_run=args.dry_run)
+    ops = create_agent(
+        args.name, dry_run=args.dry_run, force=getattr(args, "force", False)
+    )
     if args.dry_run:
         print("Dry run — planned operations:")
         for i, op in enumerate(ops, 1):
@@ -408,7 +417,19 @@ def cmd_showprompt(args):
     aliases_section = toml_data.get("model_aliases", {})
     model_aliases = {k: v for k, v in aliases_section.items() if isinstance(v, str)}
 
-    prompt = assemble_prompt(workspace, model_aliases=model_aliases)
+    # PHIL-1: honour the agent's own injection_defense setting, so this
+    # command shows what the agent ACTUALLY receives. A prompt inspector that
+    # ignores a prompt-affecting flag is worse than none -- it is the tool an
+    # operator would use to check the claim.
+    injection_defense = toml_data.get("agent", {}).get("injection_defense", True)
+    if not isinstance(injection_defense, bool):
+        injection_defense = True
+
+    prompt = assemble_prompt(
+        workspace,
+        model_aliases=model_aliases,
+        injection_defense=injection_defense,
+    )
     if prompt:
         print(prompt)
     else:
