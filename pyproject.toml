@@ -9,12 +9,27 @@ dependencies = [
     "openai==2.26.0",
     "matrix-nio==0.25.2",
     "mistune==3.2.0",
+    # Imported directly by provider.py and tools/web.py. Previously undeclared
+    # and present only transitively via anthropic/openai -- so the "four direct
+    # dependencies" claim was inaccurate, and a resolver change that dropped
+    # the transitive edge would have broken both modules at import time.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
+]
+# Semantic half of the hybrid memory search. Optional because llama-cpp-python
+# builds a native extension and pulls a multi-hundred-MB GGUF model; without
+# this extra, memory search degrades to BM25-only and says so in-room (see
+# memory/embeddings.py). `install.sh` installs this extra by default and
+# fetches the model -- before v0.1.3 it installed neither, so every standard
+# install silently had a keyword-only "hybrid" search.
+memory = [
+    "llama-cpp-python==0.3.16",
+    "sqlite-vec==0.1.6",
 ]
 
 [project.scripts]
@@ -28,7 +43,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-openalph = ["templates/*.md", "templates/skills/*.md"]
+openalph = ["templates/*.md", "templates/skills/*.md", "data/*.service"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -52,12 +52,123 @@ readonly DOCKER_DATA_DIR="/var/lib/docker"
 # Sets up logging, color helpers, and confirmation prompt.
 # =============================================================================
 
+# =============================================================================
+# SEC-5 — REGISTRATION RE-LOCK TRAP
+#
+# Step 6 enables Matrix registration BEFORE it creates any accounts, and every
+# failure path in between is a bare `exit 1` under `set -e`. With no cleanup
+# handler, Part G ("disable registration") was simply never reached on any
+# error -- leaving the homeserver running with TUWUNEL_ALLOW_REGISTRATION
+# "true" behind the public Caddy proxy, gated only by a token that is also on
+# disk. A re-run (which INSTALL.md tells operators to do) hits M_USER_IN_USE
+# and exits, so the window stays open indefinitely.
+#
+# This handler runs on EXIT -- normal, error, or interrupt -- and is a no-op
+# unless the override is currently active, so it is safe to install early and
+# safe to run twice. Part G clears the flag once it has re-locked cleanly.
+# =============================================================================
+
+_REG_OVERRIDE_ACTIVE=0
+
+_relock_registration() {
+    local _rc=$?
+    [[ "${_REG_OVERRIDE_ACTIVE}" == "1" ]] || return 0
+    _REG_OVERRIDE_ACTIVE=0
+
+    printf '\n'
+    warn "Installer exiting (status ${_rc}) with Matrix registration still ENABLED."
+    warn "Re-locking registration before exit..."
+
+    rm -f /opt/tuwunel/docker-compose.override.yml
+    if docker compose -f /opt/tuwunel/docker-compose.yml up -d >/dev/null 2>&1; then
+        success "Registration re-locked."
+    else
+        error "COULD NOT re-lock registration automatically."
+        error "Your homeserver may still accept token-gated registrations."
+        error "Run this now:"
+        error "  rm -f /opt/tuwunel/docker-compose.override.yml"
+        error "  docker compose -f /opt/tuwunel/docker-compose.yml up -d"
+    fi
+    return 0
+}
+
+trap _relock_registration EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# =============================================================================
+# PHIL-2 — FETCH THE GGUF EMBEDDING MODEL
+#
+# memory/embeddings.py defaults to
+# /opt/openalph/models/nomic-embed-text-v1.5.Q8_0.gguf, which nothing ever
+# downloaded -- so even where llama_cpp was importable the model load failed
+# and semantic search stayed dark. Checksum-pinned: this file is served over
+# the network and is loaded in-process by every agent.
+# =============================================================================
+
+readonly OPENALPH_MODEL_DIR="/opt/openalph/models"
+readonly OPENALPH_MODEL_NAME="nomic-embed-text-v1.5.Q8_0.gguf"
+readonly OPENALPH_MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
+# TODO(release): fill in before tagging v0.1.3 -- verify with
+#   curl -sL "$OPENALPH_MODEL_URL" | sha256sum
+# An empty value means "unverified"; the installer refuses to install the
+# model rather than trusting an unchecked download (fail closed).
+readonly OPENALPH_MODEL_SHA256=""
+
+_fetch_embedding_model() {
+    local _dest="${OPENALPH_MODEL_DIR}/${OPENALPH_MODEL_NAME}"
+
+    if [[ -f "${_dest}" ]]; then
+        info "Embedding model already present: ${_dest}"
+        return 0
+    fi
+
+    if [[ -z "${OPENALPH_MODEL_SHA256}" ]]; then
+        warn "No pinned checksum for ${OPENALPH_MODEL_NAME}; skipping model download."
+        warn "Memory search will run in keyword-only (BM25) mode."
+        warn "To enable semantic search, fetch the model yourself and place it at:"
+        warn "  ${_dest}"
+        return 0
+    fi
+
+    mkdir -p "${OPENALPH_MODEL_DIR}"
+    local _tmp
+    _tmp="$(mktemp "${OPENALPH_MODEL_DIR}/.${OPENALPH_MODEL_NAME}.XXXXXX")"
+
+    info "Downloading embedding model (~270MB)..."
+    if ! curl -fsSL "${OPENALPH_MODEL_URL}" -o "${_tmp}"; then
+        rm -f "${_tmp}"
+        warn "Model download failed. Memory search will run keyword-only (BM25)."
+        return 0
+    fi
+
+    if ! printf '%s  %s\n' "${OPENALPH_MODEL_SHA256}" "${_tmp}" | sha256sum -c - >/dev/null 2>&1; then
+        rm -f "${_tmp}"
+        error "Embedding model checksum MISMATCH — refusing to install it."
+        error "Memory search will run keyword-only (BM25)."
+        return 0
+    fi
+
+    mv "${_tmp}" "${_dest}"
+    chmod 644 "${_dest}"
+    success "Embedding model installed: ${_dest}"
+}
+
 step0_safety_preamble() {
 
     # -------------------------------------------------------------------------
     # Logging — tee all output to a timestamped log file
     # -------------------------------------------------------------------------
     readonly LOG_FILE="/tmp/openalph-bootstrap-$(date +%s).log"
+    # SEC-4: create the log with 0600 BEFORE any output is tee'd into it.
+    # Under the default umask this file was 0644 in a world-readable /tmp,
+    # and the agent's Matrix password was printed to the tee'd stream (see
+    # the final summary below) -- so any local user could read the agent's
+    # password indefinitely and re-login as the agent. The password is no
+    # longer echoed at all; this narrows the blast radius of anything else
+    # that reaches the log.
+    ( umask 077; : > "$LOG_FILE" )
+    chmod 600 "$LOG_FILE"
     # shellcheck disable=SC2093
     exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -537,11 +648,38 @@ step2_install_openalph() {
         python3 -m venv "${_venv_dir}"
     fi
 
+    # PHIL-2: install the [memory] extra, not the bare package.
+    #
+    # The code imports llama_cpp (memory/embeddings.py) and sqlite_vec
+    # (memory/schema.py) directly, but neither was declared in
+    # pyproject.toml and this line installed the bare package -- so no
+    # standard install ever got the embedding stack. Both imports fail SOFT
+    # (log warning only), so a fresh operator silently got BM25-only
+    # "hybrid" search with no chat-visible signal, while README advertised
+    # "Nomic-embed + BM25 hybrid". requirements.lock.txt pinned both and was
+    # never referenced by anything -- a dead file.
+    #
+    # llama-cpp-python builds a native extension and can fail on hosts
+    # without a toolchain, so a failure here degrades rather than aborts:
+    # the agent still runs with keyword-only search and now says so in-room.
     if ! "${_venv_dir}/bin/pip" install "${_install_url}"; then
         error "pip install failed."
         error "Check the log for details: ${LOG_FILE}"
         error "Docs: ${OPENALPH_DOCS}"
         exit 1
+    fi
+
+    info "Installing semantic-memory extra (llama-cpp-python, sqlite-vec)..."
+    if "${_venv_dir}/bin/pip" install "${_install_url}#egg=openalph[memory]" 2>/dev/null \
+       || "${_venv_dir}/bin/pip" install "llama-cpp-python==0.3.16" "sqlite-vec==0.1.6"; then
+        success "Semantic memory stack installed."
+        _fetch_embedding_model
+    else
+        warn "Could not build the semantic-memory stack (llama-cpp-python needs a"
+        warn "C toolchain). Memory search will run in keyword-only (BM25) mode."
+        warn "To enable it later:"
+        warn "  ${_venv_dir}/bin/pip install 'llama-cpp-python==0.3.16' 'sqlite-vec==0.1.6'"
+        warn "  then re-run this installer, or fetch the model manually (see INSTALL.md)."
     fi
 
     # Symlink the binary so it's on the standard PATH
@@ -554,8 +692,15 @@ step2_install_openalph() {
         exit 1
     fi
 
+    # BUG-16: `openalph --version` is not a real flag -- argparse printed a
+    # usage error that `|| true` swallowed and this line reported as "the
+    # installed version". Read it from package metadata instead, which is
+    # true by construction.
     local _installed_ver
-    _installed_ver="$(openalph --version 2>&1 || true)"
+    _installed_ver="$("${_venv_dir}/bin/python3" -c "
+from importlib.metadata import version
+print(version('openalph'))
+" 2>/dev/null || echo "unknown")"
     success "OpenAlph installed successfully: ${_installed_ver}"
 }
 
@@ -1215,6 +1360,11 @@ OVERRIDE_EOF
 
     _tuwunel_wait "registration enabled"
 
+    # SEC-5: from here until Part G the homeserver accepts token-gated
+    # registrations. Arm the EXIT handler so any failure path -- including the
+    # bare `exit 1`s in Parts B-F -- re-locks on the way out.
+    _REG_OVERRIDE_ACTIVE=1
+
     # =========================================================================
     # PART B — COLLECT OPERATOR CREDENTIALS
     # =========================================================================
@@ -1371,6 +1521,11 @@ OVERRIDE_EOF
 
     _tuwunel_wait "registration disabled"
 
+    # SEC-5: re-locked on the happy path; disarm the EXIT handler so it does
+    # not repeat the work. Deliberately set AFTER _tuwunel_wait returns -- if
+    # the restart never comes up, the handler should still fire.
+    _REG_OVERRIDE_ACTIVE=0
+
     # Verify registration is actually closed — a fresh registration attempt
     # with the old token must return 403, not 401 or 200.
     info "Verifying registration is closed..."
@@ -1498,45 +1653,35 @@ step7_install_systemd_unit() {
     info "Writing ${UNIT_PATH} ..."
 
     # -------------------------------------------------------------------------
-    # Write the template unit.
-    # %i is the systemd instance name (the agent name after the '@').
-    # The heredoc delimiter is quoted ('EOF') so no variable expansion occurs
-    # here — all %i specifiers are preserved literally for systemd to expand.
+    # ARCH-3 / BUG-1: install the CANONICAL unit shipped with the package
+    # rather than re-emitting a heredoc here.
+    #
+    # Three divergent versions of this unit used to exist: the repo's
+    # etc/openalph@.service (whose ExecStart passed a bare TOML path with no
+    # subcommand -- the CLI's subparser is required, so it exited 2 and, with
+    # Restart=on-failure, restart-looped forever), this heredoc, and a third
+    # variant described in SECURITY.md. The test suite validated only the
+    # broken one, so the unit actually deployed was never tested.
+    #
+    # The unit now ships as package data, so it is on disk after pip install
+    # even in the `curl | sudo bash` path where no git checkout exists.
+    # etc/openalph@.service is a symlink to it, and that is what the tests
+    # read -- one file, one behaviour, verified.
     # -------------------------------------------------------------------------
-    cat > "${UNIT_PATH}" <<'EOF'
-[Unit]
-Description=OpenAlph Agent - %i
-After=network-online.target
-Wants=network-online.target
+    local UNIT_SRC
+    UNIT_SRC="$(/opt/openalph-venv/bin/python3 -c "
+import openalph
+import pathlib
+print(pathlib.Path(openalph.__file__).parent / 'data' / 'openalph@.service')
+" 2>/dev/null || true)"
 
-[Service]
-Type=simple
-User=oa-%i
-Group=openalph
-WorkingDirectory=/home/oa-%i
-ExecStart=/usr/local/bin/openalph run %i
-Restart=on-failure
-RestartSec=5
-Environment="PATH=/srv/openalph/shared/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
-Environment="BD_ACTOR=oa-%i"
+    if [[ -z "${UNIT_SRC}" || ! -f "${UNIT_SRC}" ]]; then
+        error "Could not locate the packaged systemd unit (data/openalph@.service)."
+        error "Ensure OpenAlph is installed: /opt/openalph-venv/bin/pip show openalph"
+        exit 1
+    fi
 
-# Hardening
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=tmpfs
-BindPaths=/home/oa-%i /srv/openalph/shared
-BindReadOnlyPaths=/etc/openalph /opt/openalph-venv
-PrivateTmp=yes
-UMask=0027
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 "${UNIT_PATH}"
+    install -m 644 -o root -g root "${UNIT_SRC}" "${UNIT_PATH}"
 
     info "Reloading systemd daemon..."
     systemctl daemon-reload
@@ -2314,7 +2459,22 @@ step13_print_summary() {
     printf "  SAVED CREDENTIALS (back these up!)\n"
     printf "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     printf "\n"
-    warn "  Agent Matrix password: ${OPENALPH_AGENT_PASS}"
+    # SEC-4: this must NOT go to stdout -- stdout is tee'd to $LOG_FILE (see
+    # step0_safety_preamble), so printing the password here wrote it to a
+    # file on disk, contradicting the "never written to any log" invariant
+    # documented above step6. Write it to the controlling terminal only, so
+    # the operator still sees it once and nothing persists it. When there is
+    # no tty (curl | sudo bash with no terminal), fall back to a root-only
+    # file rather than silently dropping a credential the operator needs.
+    if [[ -w /dev/tty ]]; then
+        printf '  Agent Matrix password: %s\n' "${OPENALPH_AGENT_PASS}" > /dev/tty
+    else
+        local _pass_file="/etc/openalph/agent-password-${OPENALPH_AGENT_NAME}"
+        ( umask 077; printf '%s\n' "${OPENALPH_AGENT_PASS}" > "${_pass_file}" )
+        chmod 600 "${_pass_file}"
+        warn "  Agent Matrix password written to ${_pass_file} (mode 600)."
+        warn "  Read it, store it in your password manager, then delete it."
+    fi
     info "  (The agent uses its access token day-to-day, not this password."
     info "   Store it somewhere safe in case you need to re-issue the token.)"
     info "  Registration token: /etc/openalph/reg-token"
