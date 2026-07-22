@@ -117,12 +117,13 @@ class TestSecurityFooterIsOperatorOwned:
         assert TEMPLATE_FOOTER.is_file(), f"Missing: {TEMPLATE_FOOTER}"
 
     def test_template_matches_the_fallback_constant(self):
-        """The extracted file must be byte-identical to the constant.
+        """The shipped file must be BYTE-identical to the fallback constant.
 
-        Otherwise upgrading an existing workspace would silently change the
-        agent's instructions.
+        Otherwise upgrading an existing workspace (which switches an agent
+        from the constant to the file) would silently change the agent's
+        instructions, even if only by a trailing newline.
         """
-        assert TEMPLATE_FOOTER.read_text().strip() == INJECTION_DEFENSE.strip()
+        assert TEMPLATE_FOOTER.read_text() == INJECTION_DEFENSE
 
     def test_workspace_file_is_used_when_present(self, tmp_path):
         (tmp_path / "SOUL.md").write_text("test agent\n")
