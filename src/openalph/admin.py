@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -14,6 +15,9 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 from openalph.config import CONFIG_DIR  # canonical definition in config.py
+from openalph.prompt import INJECTION_DEFENSE  # byte-identical to templates/SECURITY_FOOTER.md
+
+logger = logging.getLogger("openalph.admin")
 
 SHARED_DIR = Path("/srv/openalph/shared")
 OPENALPH_GROUP = "openalph"
@@ -73,6 +77,20 @@ class Operation:
     user: Optional[str] = None
     # write_file
     content: Optional[str] = None
+    # BUG-2: when False (the default), a write_file op SKIPS a path that
+    # already exists instead of replacing it. `new-agent` is documented as
+    # the normal way to add an agent, and `execute_plan` deliberately
+    # tolerates useradd's "user exists" exit 9 for idempotency -- but then
+    # unconditionally overwrote the agent's config and OPERATIONS.md, so an
+    # accidental re-run replaced a live agent's wired-up provider/Matrix
+    # config with the CHANGE_ME skeleton and destroyed its customized
+    # OPERATIONS.md, with no prompt. (install.sh step8 already guarded this
+    # way: it checks `id oa-<name>` and requires --force.)
+    overwrite: Optional[bool] = None
+    # Explicit mode for the file itself. The config was previously written
+    # root:root under the default umask, inconsistent with the installer's
+    # 640 root:openalph.
+    file_mode: Optional[str] = None
     # systemctl
     action: Optional[str] = None
     unit: Optional[str] = None
@@ -158,7 +176,7 @@ def plan_setup_shared_dir() -> list[Operation]:
     return ops
 
 
-def plan_create_agent(name: str) -> list[Operation]:
+def plan_create_agent(name: str, *, force: bool = False) -> list[Operation]:
     validate_agent_name(name)
     username = agent_username(name)
     home = agent_home(name)
@@ -185,7 +203,31 @@ def plan_create_agent(name: str) -> list[Operation]:
         kind="write_file",
         path=home / "workspace" / "OPERATIONS.md",
         content=OPERATIONS_TEMPLATE,
-        description=f"Write OPERATIONS.md template to workspace",
+        overwrite=force,
+        description=(
+            f"Write OPERATIONS.md template to workspace"
+            + ("" if force else " (skipped if it already exists)")
+        ),
+    ))
+
+    # Write the 7th operator-owned prompt file (PHIL-1). Direct `new-agent`
+    # previously did not do this at all -- only install.sh's bootstrap
+    # population step copied it, so an agent created via `sudo openalph
+    # new-agent` alone got correct byte-identical fallback BEHAVIOR (see
+    # prompt.py's INJECTION_DEFENSE constant) but no visible, editable file
+    # until the operator followed the runtime warning and copied it by
+    # hand. Uses the same Python-constant content the fallback already
+    # guarantees byte-identical (no new packaged-file read path), and the
+    # same skip-existing-unless---force contract as every other write here.
+    ops.append(Operation(
+        kind="write_file",
+        path=home / "workspace" / "SECURITY_FOOTER.md",
+        content=INJECTION_DEFENSE,
+        overwrite=force,
+        description=(
+            f"Write SECURITY_FOOTER.md template to workspace"
+            + ("" if force else " (skipped if it already exists)")
+        ),
     ))
 
     # Set home permissions + recursive ownership (after mkdirs)
@@ -200,7 +242,12 @@ def plan_create_agent(name: str) -> list[Operation]:
         kind="write_file",
         path=config_path,
         content=generate_config_skeleton(name),
-        description=f"Write config skeleton to {config_path}",
+        overwrite=force,
+        file_mode="640",
+        description=(
+            f"Write config skeleton to {config_path}"
+            + ("" if force else " (skipped if it already exists)")
+        ),
     ))
 
     # Enable systemd service (do NOT start)
@@ -240,8 +287,20 @@ def execute_plan(ops: list[Operation]) -> None:
                 if result.returncode not in (0, 9):
                     raise AdminError(f"useradd failed with exit code {result.returncode} for {op.username}")
             elif op.kind == "write_file":
+                # BUG-2: never clobber an existing file unless explicitly forced.
+                if op.path.exists() and not op.overwrite:
+                    logger.warning(
+                        "Refusing to overwrite existing %s — re-run with "
+                        "--force to replace it", op.path,
+                    )
+                    continue
                 op.path.parent.mkdir(parents=True, exist_ok=True)
                 op.path.write_text(op.content)
+                if op.file_mode:
+                    subprocess.run(["chmod", op.file_mode, str(op.path)], check=True)
+                    subprocess.run(
+                        ["chgrp", OPENALPH_GROUP, str(op.path)], check=False
+                    )
             elif op.kind == "systemctl":
                 subprocess.run(["systemctl", op.action, op.unit], check=True)
             else:
@@ -254,8 +313,8 @@ def execute_plan(ops: list[Operation]) -> None:
 # High-level wrappers
 # ---------------------------------------------------------------------------
 
-def create_agent(name: str, *, dry_run: bool = False) -> list[Operation]:
-    ops = plan_create_agent(name)
+def create_agent(name: str, *, dry_run: bool = False, force: bool = False) -> list[Operation]:
+    ops = plan_create_agent(name, force=force)
     if not dry_run:
         execute_plan(ops)
     return ops

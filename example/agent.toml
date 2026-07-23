@@ -15,6 +15,13 @@
 [agent]
 name = "merry"
 
+# PHIL-1: append SECURITY_FOOTER.md (the tool-result injection defense) to
+# the system prompt. Defaults to true. Set false to take full control of the
+# prompt -- the agent then reads only the files in its workspace and nothing
+# is added by the framework. To change the TEXT rather than switch it off,
+# edit workspace/SECURITY_FOOTER.md; it is an ordinary prompt file.
+injection_defense = true
+
 # Must be fully qualified as "<provider-key>/<model-id>", where <provider-key>
 # matches a [providers.<key>] section below. Or use a bare alias name if you
 # define [model_aliases] (see bottom of file).

@@ -127,14 +127,17 @@ class TestStopDuringToolLoop:
         task = list(bot._background_tasks)[0]
         assert not task.done()
 
-        # Wire up agent.cancel to actually cancel the task
-        bot.agent.cancel = MagicMock(side_effect=lambda: (task.cancel(), task)[-1])
+        # Wire up agent.cancel to actually cancel this room's task
+        bot.agent.cancel = MagicMock(
+            side_effect=lambda room_id: (task.cancel(), task)[-1]
+        )
 
         # Send /stop — should be processable because _handle_room_message returned
         stop_event = _make_event(body="/stop", event_id="$stop1")
         await bot._handle_room_message(room, stop_event)
 
-        # The task should have been cancelled
+        # The task should have been cancelled for the room that asked
+        bot.agent.cancel.assert_called_once_with(room.room_id)
         assert cancel_event.is_set(), "handle_input was not cancelled by /stop"
 
     @pytest.mark.asyncio
@@ -153,22 +156,28 @@ class TestStopDuringToolLoop:
         await asyncio.sleep(0.01)
 
         task = list(bot._background_tasks)[0]
-        bot.agent.cancel = MagicMock(side_effect=lambda: (task.cancel(), task)[-1])
+        bot.agent.cancel = MagicMock(
+            side_effect=lambda room_id: (task.cancel(), task)[-1]
+        )
 
-        # Set _current_room as _process_message would
-        bot._current_room = room.room_id
+        # A stale global fallback from another room must not affect /stop routing
+        bot._current_room = "!other:matrix.local"
 
-        # Mock bot.send to capture messages
+        # Mock bot.send to capture destination and message
         sent_messages = []
         async def capture_send(room_id, text):
-            sent_messages.append(text)
+            sent_messages.append((room_id, text))
         bot.send = capture_send
 
         stop_event = _make_event(body="/stop", event_id="$stop2")
         await bot._handle_room_message(room, stop_event)
 
-        # Check that "Cancelled." was sent
-        assert any("Cancelled" in m for m in sent_messages),             f"No 'Cancelled.' message sent. Got: {sent_messages}"
+        # Check that cancellation targeted this room and "Cancelled." was sent there
+        bot.agent.cancel.assert_called_once_with(room.room_id)
+        assert any(
+            rid == room.room_id and "Cancelled" in text
+            for rid, text in sent_messages
+        ), f"No 'Cancelled.' message sent to {room.room_id}. Got: {sent_messages}"
 
     @pytest.mark.asyncio
     async def test_background_task_cleanup(self):

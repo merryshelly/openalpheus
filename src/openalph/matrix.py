@@ -294,6 +294,9 @@ class MatrixBot:
             self.umbral = None
         self._running = False
         self._synced = False
+        # CORE-1: retained only as the shutdown-time fallback for the
+        # "Cancelled." notice. It is NOT used to decide WHAT to cancel any
+        # more -- `Agent._current_tasks` is keyed by room for that.
         self._current_room = None
         self._active_rooms = set()
         self._halted_rooms: set[str] = set()
@@ -615,22 +618,32 @@ class MatrixBot:
 
     _CANCEL_TIMEOUT = 5  # seconds to wait for cancelled task before abandoning
 
-    async def _cancel_current(self):
-        """Cancel any current in-flight work.
+    async def _cancel_current(self, room_id: str | None = None):
+        """Cancel in-flight work for `room_id` (or all rooms if None).
 
         - Cancel in-flight LLM call
         - Kill tool subprocesses
-        - Send cancellation notice to room
+        - Send cancellation notice to the room that asked
+
+        CORE-1: this took no argument and cancelled whatever
+        `Agent._current_task` happened to point at, announcing into
+        `self._current_room` -- both single slots overwritten by whichever
+        room started a turn most recently. With concurrent rooms that meant a
+        `/stop` in room A could cancel room B's turn and print "Cancelled."
+        into B. Callers now pass the room explicitly; only `shutdown()` omits
+        it, where cancelling everything is what is actually wanted.
 
         Uses a timeout to prevent blocking the event loop if the cancelled
         task is stuck (e.g., hung httpx call to a slow inference API).
         """
-        # Capture room before cancellation — the task's finally block clears it
-        room = self._current_room
+        # Announce into the room that asked, NOT into whichever room happened
+        # to start a turn last. `_current_room` remains only as the shutdown
+        # fallback, where there is no requesting room.
+        room = room_id if room_id is not None else self._current_room
 
         task = None
         if hasattr(self.agent, "cancel"):
-            task = self.agent.cancel()
+            task = self.agent.cancel(room_id) if room_id is not None else self.agent.cancel()
 
         # Wait for the cancelled task to finish, but not forever.
         # If it doesn't die within _CANCEL_TIMEOUT, abandon it and move on.
@@ -2261,7 +2274,7 @@ class MatrixBot:
             # Clear steering inbox so stale notes don't leak into the next turn
             if hasattr(self, '_steering_inbox'):
                 self._steering_inbox.pop(room_id, None)
-            await self._cancel_current()
+            await self._cancel_current(room_id)
             await self.send(room_id, "Stopped. Room halted \u2014 use `/resume` to re-enable.")
             return
 

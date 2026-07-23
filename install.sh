@@ -2170,7 +2170,11 @@ print(pathlib.Path(openalph.templates.__file__).parent)
     # ── Copy top-level markdown templates ────────────────────────────────────
     # These are the canonical operational documents every agent starts with.
     local doc
-    for doc in SAFETY.md SOUL.md OPERATOR.md WAKE.md ENVIRONMENT.md OPERATIONS.md; do
+    # PHIL-1: SECURITY_FOOTER.md is the 7th operator-owned prompt file. It
+    # carries the tool-result security instructions that used to be a
+    # hardcoded string in prompt.py -- copying it here is what makes the
+    # README's "no hardcoded behavior" claim true for new workspaces.
+    for doc in SAFETY.md SOUL.md OPERATOR.md WAKE.md ENVIRONMENT.md OPERATIONS.md SECURITY_FOOTER.md; do
         local src="${TEMPLATE_DIR}/${doc}"
         if [[ -f "${src}" ]]; then
             cp "${src}" "${WORKSPACE}/${doc}"
