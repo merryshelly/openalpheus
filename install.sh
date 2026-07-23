@@ -277,17 +277,30 @@ step0_safety_preamble() {
     printf "\n"
 
     # -------------------------------------------------------------------------
-    # Confirmation prompt (skipped in non-interactive or CI mode)
-    # -------------------------------------------------------------------------
-    if [[ -t 0 ]] && [[ "${OPENALPH_YES:-}" != "true" ]]; then
-        read -r -p "$(printf "${CLR_BOLD}Proceed with installation? [y/N]${CLR_RESET} ")" _confirm
-        case "${_confirm}" in
-            [yY][eE][sS]|[yY]) ;;
-            *)
-                info "Installation cancelled."
-                exit 0
-                ;;
-        esac
+    # Confirmation prompt.
+    # SEC-7: this used to gate on `[[ -t 0 ]]` (fd 0 is a TTY). Under the
+    # advertised `curl | sudo bash` install, stdin is the pipe, so the guard was
+    # false and the installer proceeded to mutate the system (apt, Docker via
+    # `curl get.docker.com | sh`, Caddy) with NO confirmation ever shown. The
+    # script already reads interactive input from /dev/tty via `_prompt_read`,
+    # which works under `curl | bash`; route consent through it. If there is no
+    # controlling terminal at all and OPENALPH_YES is not set, refuse to proceed
+    # rather than silently installing.
+    if [[ "${OPENALPH_YES:-}" != "true" ]]; then
+        if _has_tty; then
+            _prompt_read -r -p "$(printf "${CLR_BOLD}Proceed with installation? [y/N]${CLR_RESET} ")" _confirm
+            case "${_confirm}" in
+                [yY][eE][sS]|[yY]) ;;
+                *)
+                    info "Installation cancelled."
+                    exit 0
+                    ;;
+            esac
+        else
+            error "No terminal available to confirm installation, and OPENALPH_YES is not set."
+            error "Re-run in a terminal, or set OPENALPH_YES=true to consent non-interactively."
+            exit 1
+        fi
     fi
 }
 
@@ -1204,18 +1217,22 @@ step6_create_accounts() {
         info "Registering @${_localpart}:${OPENALPH_DOMAIN} — phase 1 (session)"
 
         local _phase1_body _phase1_http
-        # Use -w '\n%{http_code}' so we can split body from status code.
-        # Credentials are passed via process substitution to avoid them
-        # appearing in the process table.
-        _phase1_body=$(printf '%s' \
-            "{\"username\":\"${_localpart}\",\"password\":\"${_password}\",\"kind\":\"user\"}")
+        # SEC-6: build the JSON with `jq -n --arg` so a password containing a
+        # quote or backslash can't produce malformed JSON, and pipe the body to
+        # curl on STDIN (`--data @-`) rather than argv. The previous version
+        # interpolated the password straight into `-d "..."`, so it was visible
+        # in /proc/<pid>/cmdline for the life of the request -- exactly what the
+        # nearby comments claimed was avoided.
+        _phase1_body=$(jq -n \
+            --arg u "${_localpart}" --arg p "${_password}" \
+            '{username:$u, password:$p, kind:"user"}')
 
         local _phase1_response
-        _phase1_response=$(curl -s \
+        _phase1_response=$(printf '%s' "${_phase1_body}" | curl -s \
             -w '\n%{http_code}' \
             -X POST "${_endpoint}" \
             -H 'Content-Type: application/json' \
-            -d "${_phase1_body}" 2>&1)
+            --data @- 2>&1)
 
         # Split on the last newline — everything before is the body, last line is code
         _phase1_http="${_phase1_response##*$'\n'}"
@@ -1268,24 +1285,20 @@ step6_create_accounts() {
         # ------------------------------------------------------------------
         info "Registering @${_localpart}:${OPENALPH_DOMAIN} — phase 2 (token auth)"
 
-        # Build the JSON body as a variable — never logged (we don't print it)
+        # SEC-6: jq-built body (correct escaping) delivered on stdin, not argv.
         local _phase2_body
-        _phase2_body=$(printf '%s' \
-            "{\"username\":\"${_localpart}\"," \
-            "\"password\":\"${_password}\"," \
-            "\"kind\":\"user\"," \
-            "\"auth\":{" \
-            "\"type\":\"m.login.registration_token\"," \
-            "\"token\":\"${_token}\"," \
-            "\"session\":\"${_session}\"" \
-            "}}")
+        _phase2_body=$(jq -n \
+            --arg u "${_localpart}" --arg p "${_password}" \
+            --arg t "${_token}" --arg s "${_session}" \
+            '{username:$u, password:$p, kind:"user",
+              auth:{type:"m.login.registration_token", token:$t, session:$s}}')
 
         local _phase2_response _phase2_http _phase2_resp_body
-        _phase2_response=$(curl -s \
+        _phase2_response=$(printf '%s' "${_phase2_body}" | curl -s \
             -w '\n%{http_code}' \
             -X POST "${_endpoint}" \
             -H 'Content-Type: application/json' \
-            -d "${_phase2_body}" 2>&1)
+            --data @- 2>&1)
 
         _phase2_http="${_phase2_response##*$'\n'}"
         _phase2_resp_body="${_phase2_response%$'\n'*}"
@@ -2296,10 +2309,37 @@ step_setup_cinny() {
     # ── Download Cinny release ────────────────────────────────────────────────
     local CINNY_VERSION="v4.11.1"
     local CINNY_URL="https://github.com/cinnyapp/cinny/releases/download/${CINNY_VERSION}/cinny-${CINNY_VERSION}.tar.gz"
+    # SEC-8: pin the tarball's sha256. root serves the extracted contents as the
+    # Matrix login page, so a poisoned or swapped tarball becomes persistent
+    # credential-harvesting JS. When set, a mismatch aborts the install.
+    # TODO(release): fill in before tagging. Verify with:
+    #   curl -sL "$CINNY_URL" | sha256sum
+    local CINNY_SHA256=""
 
     info "Downloading Cinny ${CINNY_VERSION}..."
     mkdir -p /opt/openalph/web
-    curl -sL "${CINNY_URL}" -o /tmp/cinny.tar.gz
+
+    # SEC-8: download to a private mktemp path, not the predictable, world-
+    # writable /tmp/cinny.tar.gz (a local user could pre-create or swap it
+    # between download and extraction).
+    local CINNY_TARBALL
+    CINNY_TARBALL=$(mktemp)
+    if ! curl -fsSL "${CINNY_URL}" -o "${CINNY_TARBALL}"; then
+        rm -f "${CINNY_TARBALL}"
+        error "Failed to download Cinny from ${CINNY_URL}"
+        exit 1
+    fi
+
+    if [[ -n "${CINNY_SHA256}" ]]; then
+        if ! printf '%s  %s\n' "${CINNY_SHA256}" "${CINNY_TARBALL}" | sha256sum -c - >/dev/null 2>&1; then
+            rm -f "${CINNY_TARBALL}"
+            error "Cinny tarball checksum MISMATCH — refusing to serve an unverified web client."
+            exit 1
+        fi
+    else
+        warn "No pinned checksum for Cinny ${CINNY_VERSION}; serving an UNVERIFIED web client."
+        warn "Set CINNY_SHA256 in install.sh to verify this download."
+    fi
 
     # Extract into a staging directory — handle both tarball layouts:
     #   a) top-level dist/ directory  →  copy contents of dist/
@@ -2308,7 +2348,7 @@ step_setup_cinny() {
     # Unix environment variable that controls where temporary files are written.
     local CINNY_TMP
     CINNY_TMP=$(mktemp -d)
-    tar xzf /tmp/cinny.tar.gz -C "${CINNY_TMP}"
+    tar xzf "${CINNY_TARBALL}" -C "${CINNY_TMP}"
 
     local DIST_DIR
     DIST_DIR=$(find "${CINNY_TMP}" -type d -name dist | head -1 || true)
@@ -2321,7 +2361,7 @@ step_setup_cinny() {
         cp -r "${DIST_DIR}"/* /opt/openalph/web/
     fi
 
-    rm -rf "${CINNY_TMP}" /tmp/cinny.tar.gz
+    rm -rf "${CINNY_TMP}" "${CINNY_TARBALL}"
     success "Cinny ${CINNY_VERSION} extracted to /opt/openalph/web/"
 
     # ── Write Cinny config.json ───────────────────────────────────────────────

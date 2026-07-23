@@ -120,13 +120,40 @@ class TestHardening:
             "BindReadOnlyPaths", ""
         )
 
-    def test_bind_readonly_config(self, unit_config):
+    def test_binds_only_own_config(self, unit_config):
+        """SEC-11: the agent must see ONLY its own config, not the whole dir.
+
+        Binding all of /etc/openalph let one agent read another's config (and
+        any inline api_key). The agents dir is now masked with a tmpfs and only
+        this instance's %i.toml is bound in.
+        """
         readonly = unit_config["Service"]["BindReadOnlyPaths"]
-        assert "/etc/openalph" in readonly
+        assert "/etc/openalph/agents/%i.toml" in readonly
+        # the whole-dir bind must be gone
+        assert "/etc/openalph " not in readonly and not readonly.strip().startswith("/etc/openalph ")
+
+    def test_masks_sibling_configs_with_tmpfs(self, unit_config):
+        assert unit_config["Service"]["TemporaryFileSystem"] == "/etc/openalph/agents"
 
     def test_bind_readonly_venv(self, unit_config):
         """The venv the ExecStart binary resolves into must be mounted."""
         assert "/opt/openalph-venv" in unit_config["Service"]["BindReadOnlyPaths"]
+
+    def test_sec10_hardening_directives_present(self, unit_config):
+        """SEC-10: the isolation set a shell-running service should carry."""
+        svc = unit_config["Service"]
+        assert svc["CapabilityBoundingSet"] == ""
+        assert svc["RestrictNamespaces"] == "yes"
+        assert svc["RestrictSUIDSGID"] == "yes"
+        assert svc["LockPersonality"] == "yes"
+        assert svc["PrivateDevices"] == "yes"
+        assert svc["ProtectProc"] == "invisible"
+        assert "@system-service" in svc["SystemCallFilter"]
+        assert "AF_INET" in svc["RestrictAddressFamilies"]
+
+    def test_memory_deny_write_execute_deliberately_absent(self, unit_config):
+        """MDWX breaks the agent's Node/Python tools (JIT); must stay unset."""
+        assert "MemoryDenyWriteExecute" not in unit_config["Service"]
 
     def test_private_tmp(self, unit_config):
         assert unit_config["Service"]["PrivateTmp"] == "yes"
