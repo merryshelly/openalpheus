@@ -16,7 +16,10 @@ Architecture:
                                Stateless — the known-value set is passed in
                                by the caller (tools/__init__.py); this module
                                never imports config or holds secrets itself.
-    op_egress_block_reason   — L2 pure predicate (round-5, deny-by-default):
+    op_egress_block_reason   — L2 pure predicate (round-5/6 — closes named
+                               bypass classes; NOT proven complete, see the
+                               residuals documented in this function's own
+                               docstring):
                                splits COMMAND SUBSTITUTIONS off the raw
                                string first (`$(...)` and backticks, quote-
                                aware), trusting one and only one shape —
@@ -468,11 +471,28 @@ _MAX_NESTING_DEPTH = 12
 # Flags that take a string of SHELL CODE as their very next argument.
 # Deliberately a FLAG-SHAPE rule, not a list of interpreter binary names:
 # `sh -c`, `bash -lc`, `dash -c`, `zsh -c`, `busybox sh -c`, `python3 -c`,
-# `xargs -I{} sh -c ...` and any future runner all match `-c` (alone or
-# bundled, where `c` must be last since it is the option that consumes the
-# following argument), so the guard does not need to keep a binary list in
-# sync with reality -- the round-2/3 "always one flag behind" trap.
-_CODE_TAKING_FLAG_RE = re.compile(r"^(?:-[A-Za-z]*c|--command|--eval)$")
+# `xargs -I{} sh -c ...` and any future runner all match, so the guard
+# does not need to keep a binary list in sync with reality -- the
+# round-2/3 "always one flag behind" trap.
+#
+# Round-6 (post-merge adversarial audit, demonstrated real-shell leak):
+# the original regex required `c` to be the LAST option letter in a
+# single-dash bundle, on the premise that "c is the option that consumes
+# the following argument, so it must be last." That premise is false for
+# real shells -- `bash`/`sh` bundle single-letter options freely, and
+# `-cx`, `-cv`, `-cex` (xtrace/verbose/errexit alongside `-c`) all STILL
+# take the next token as the command string; `c`'s position in the bundle
+# doesn't change what it consumes. `bash -cx 'op read x'` / `sh -cx 'op
+# read x'` were confirmed to leak the secret to stdout in both bash and
+# dash while this guard ALLOWed them -- not a new bypass class, an
+# incomplete match on the flag-shape rule this guard already commits to.
+# Matching `c` ANYWHERE in an all-letter single-dash bundle is strictly a
+# superset of the old match (fail-closed direction: broadening can only
+# cause MORE recursion into a token, never less) -- a non-shell bundle
+# that happens to contain the letter `c` at worst triggers a harmless
+# recursive analysis of its next token, returning None unless that token
+# is itself op-egress-shaped.
+_CODE_TAKING_FLAG_RE = re.compile(r"^(?:-[A-Za-z]*c[A-Za-z]*|--command|--eval)$")
 
 _OP_EGRESS_BLOCK_MESSAGE = (
     "\u26d4 Blocked: this command prints a 1Password secret to stdout, "
@@ -739,7 +759,9 @@ def _split_command_substitutions(command: str) -> tuple[str, list[str]]:
        printed straight to the agent's context. Here, a substitution is
        excised only when ``_ASSIGNMENT_CAPTURE_PREFIX_RE`` matches the text
        to its left; in every other position its body is returned as an inner
-       command for the caller to analyse recursively -- deny by default.
+       command for the caller to analyse recursively, rather than trusted
+       the way round-4 trusted it. (This carve-out itself still has two
+       known residuals -- see ``op_egress_block_reason``'s docstring.)
     2. **SEC-2 -- backticks were invisible.** ``shlex`` (as configured in
        ``_tokenize_shell_command``) treats a backtick as an ordinary word
        character, so `` echo `op read op://x` `` tokenized as
@@ -1008,7 +1030,7 @@ def op_egress_block_reason(command: str, _depth: int = 0) -> str | None:
     command is safe to run as-is (including when ``command`` isn't a
     non-blank string at all — the guard is total, never raises).
 
-    Algorithm (round-5, deny-by-default — see the module-level comment above
+    Algorithm (round-5/6 — see the module-level comment above
     ``_OP_ITEM_GET_DUMP_FLAGS`` for why presence-scanning replaced the
     round-1 wrapper-stripping/positional design, and
     ``_split_command_substitutions`` for why substitution handling moved off
@@ -1051,6 +1073,24 @@ def op_egress_block_reason(command: str, _depth: int = 0) -> str | None:
     pattern usable at all. The redaction layer, not this predicate, is the
     control that covers that path.
 
+    Two more residuals, found by a post-merge adversarial audit (round-6),
+    NOT yet fixed: (1) ``_ASSIGNMENT_CAPTURE_PREFIX_RE`` treats ``{`` and a
+    bare newline as command-position separators, so a parameter-expansion
+    default-assignment (``echo ${X=$(op read x)}`` -- assigns AND expands
+    inline) and a heredoc body line (``cat <<EOF`` / ``MARK=$(op read x)``
+    / ``EOF`` -- literal data fed to ``cat``, not an assignment at all)
+    both misfire as a safe capture and print to stdout. Both are
+    demonstrated real-shell leaks, and fumble-realistic (a heredoc config
+    template is an ordinary way to write a file), not out-of-scope
+    evasion. (2) A PREFIX assignment feeding a command that exposes its
+    own environment (``VAR=$(op read x) env``, ``VAR=$(op read x) printenv
+    VAR``) is correctly classified as a genuine capture (the ``NAME=`` IS
+    command position) but the value still reaches stdout via the command
+    it prefixes -- the same underlying limitation as the two-step residual
+    above, not a new logic gap. This guard is anti-fumble hardening, not a
+    proof of closure; do not read "deny-by-default" anywhere in this module
+    as a completeness claim.
+
     BLOCKS (examples): ``op read <ref>``, ``opread <ref>``,
     ``op document get <ref>``, ``op item get ... --fields|--field|--format|
     --reveal|--otp``, any of the above wrapped in ``sudo``/``sudo -u
@@ -1064,7 +1104,8 @@ def op_egress_block_reason(command: str, _depth: int = 0) -> str | None:
     quoted forms ``echo "$(op read x)"`` — round-5, SEC-1/SEC-2), any of the
     above passed as shell code to a command runner (``sh -c 'op read x'``,
     ``bash -lc "…"``, ``eval '…'``, ``env FOO=1 sh -c '…'``, ``xargs -I{} sh
-    -c '…'`` — round-5, SEC-3), any of the above as a top-level segment of a
+    -c '…'``, or a bundled runner flag (``bash -cx '…'``, ``sh -cex '…'``)
+    — round-5/6, SEC-3), any of the above as a top-level segment of a
     ``;``/``&&``/``||``/``&``/``|``/newline-separated sequence (including
     when the separator is glued to adjacent punctuation, e.g. ``&&\\n``,
     or backgrounded, e.g. ``echo x & op read y``), inside a subshell
@@ -1134,7 +1175,7 @@ def op_egress_block_reason(command: str, _depth: int = 0) -> str | None:
     # quoting that distinguishes `echo "$(op read x)"` from `echo 'op read
     # x'`, so this cannot be done on tokens. Every substitution that is not
     # provably an assignment capture is analysed as a command in its own
-    # right -- deny by default, where round-4 excised and trusted it.
+    # right, rather than trusted the way round-4 trusted it.
     residual, inner_commands = _split_command_substitutions(command)
 
     for inner in inner_commands:

@@ -265,6 +265,16 @@ BLOCK_CASES = [
     pytest.param("cmd arg=$(op read op://x)", id="r5b_arg_assign_generic"),
     pytest.param("echo pre NAME=$(op read op://x)", id="r5b_arg_assign_two_words"),
     pytest.param("echo -x N=$(op read op://x)", id="r5b_flag_then_arg_assign"),
+    # -- round-6 additions: `-c`-bundling gap found by a post-merge
+    #    adversarial audit. The old regex required `c` to be the LAST
+    #    option letter in a single-dash bundle; real shells bundle freely
+    #    and `c`'s position doesn't change what it consumes. All four
+    #    leak in a real shell (verified with `op` stubbed to `echo SECRET`
+    #    under both bash and dash) and were ALLOWed before this fix.
+    pytest.param("bash -cx 'op read op://x'", id="r6_bash_cx_bundle"),
+    pytest.param("sh -cx 'op read op://x'", id="r6_sh_cx_bundle"),
+    pytest.param("bash -cex 'op read op://x'", id="r6_bash_cex_bundle"),
+    pytest.param("env FOO=1 sh -cx 'op read op://x'", id="r6_env_sh_cx_bundle"),
 ]
 
 
@@ -348,6 +358,20 @@ ALLOW_CASES = [
     pytest.param("A=1 B=$(op read op://x) cmd", id="r5b_multi_assign_capture"),
     pytest.param("  VAR=$(op read op://x)", id="r5b_leading_ws_capture"),
     pytest.param("local V=$(op read op://x)", id="r5b_local_capture_still"),
+    # -- round-6: DOCUMENTED RESIDUALS, found by a post-merge adversarial
+    #    audit, NOT fixed. These currently ALLOW and DO leak a secret to
+    #    stdout in a real shell (verified with `op` stubbed to `echo
+    #    SECRET`) -- they are intentionally still here, asserting today's
+    #    known-gap behavior so a future change to this predicate can't
+    #    silently start blocking (or stay silently allowing) them without
+    #    the change being visible in this corpus. See the "Residual risk"
+    #    paragraph in `op_egress_block_reason`'s docstring. Do NOT delete
+    #    these without also updating that docstring.
+    pytest.param("echo ${X=$(op read op://x)}", id="r6_residual_param_expand_default_assign"),
+    pytest.param('echo "${X=$(op read op://x)}"', id="r6_residual_param_expand_quoted"),
+    pytest.param("cat <<EOF\nMARK=$(op read op://x)\nEOF", id="r6_residual_heredoc_body_assign"),
+    pytest.param("VAR=$(op read op://x) env", id="r6_residual_prefix_assign_env"),
+    pytest.param("VAR=$(op read op://x) printenv VAR", id="r6_residual_prefix_assign_printenv"),
 ]
 
 
