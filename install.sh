@@ -1711,7 +1711,12 @@ step8_create_agent() {
     fi
 
     # ── Parse --force flag ────────────────────────────────────────────────────
-    local FORCE=false
+    # BUG-17: `main()` parses a top-level `--force`, exports OPENALPH_FORCE, then
+    # calls `step8_create_agent` with NO args -- so this loop over "$@" (step8's
+    # own, empty, args) never saw it and the documented `--force` re-run was
+    # dead. Seed FORCE from the exported value so the top-level flag takes
+    # effect; a `--force` in step8's own args still works too.
+    local FORCE="${OPENALPH_FORCE:-false}"
     local arg
     for arg in "$@"; do
         if [[ "${arg}" == "--force" ]]; then
