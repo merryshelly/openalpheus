@@ -15,6 +15,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 from openalph.config import CONFIG_DIR  # canonical definition in config.py
+from openalph.prompt import INJECTION_DEFENSE  # byte-identical to templates/SECURITY_FOOTER.md
 
 logger = logging.getLogger("openalph.admin")
 
@@ -205,6 +206,26 @@ def plan_create_agent(name: str, *, force: bool = False) -> list[Operation]:
         overwrite=force,
         description=(
             f"Write OPERATIONS.md template to workspace"
+            + ("" if force else " (skipped if it already exists)")
+        ),
+    ))
+
+    # Write the 7th operator-owned prompt file (PHIL-1). Direct `new-agent`
+    # previously did not do this at all -- only install.sh's bootstrap
+    # population step copied it, so an agent created via `sudo openalph
+    # new-agent` alone got correct byte-identical fallback BEHAVIOR (see
+    # prompt.py's INJECTION_DEFENSE constant) but no visible, editable file
+    # until the operator followed the runtime warning and copied it by
+    # hand. Uses the same Python-constant content the fallback already
+    # guarantees byte-identical (no new packaged-file read path), and the
+    # same skip-existing-unless---force contract as every other write here.
+    ops.append(Operation(
+        kind="write_file",
+        path=home / "workspace" / "SECURITY_FOOTER.md",
+        content=INJECTION_DEFENSE,
+        overwrite=force,
+        description=(
+            f"Write SECURITY_FOOTER.md template to workspace"
             + ("" if force else " (skipped if it already exists)")
         ),
     ))

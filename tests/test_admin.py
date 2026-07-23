@@ -519,3 +519,29 @@ class TestNewAgentDoesNotClobber:
         """Was root:root under the default umask, unlike the installer's 640."""
         write_ops = [o for o in plan_create_agent("demo") if o.kind == "write_file"]
         assert any(o.file_mode == "640" for o in write_ops)
+
+    def test_plan_writes_security_footer(self):
+        """PHIL-1 rollout gap (found in pre-merge review): direct `new-agent`
+        did not write SECURITY_FOOTER.md at all -- only install.sh's bootstrap
+        population step did, so a directly-created agent got the correct
+        byte-identical FALLBACK behavior but no visible, editable file. The
+        plan must now include it, with the same skip-existing-unless-force
+        contract as OPERATIONS.md and the config skeleton, and its content
+        must be exactly the INJECTION_DEFENSE constant prompt.py falls back
+        to (so a freshly-created workspace's footer and an upgraded
+        workspace's fallback are identical from turn one)."""
+        from openalph.prompt import INJECTION_DEFENSE
+
+        write_ops = [o for o in plan_create_agent("demo") if o.kind == "write_file"]
+        footer_ops = [o for o in write_ops if o.path.name == "SECURITY_FOOTER.md"]
+        assert len(footer_ops) == 1, "expected exactly one SECURITY_FOOTER.md write op"
+        op = footer_ops[0]
+        assert op.path.parent.name == "workspace"
+        assert op.content == INJECTION_DEFENSE
+        assert op.overwrite is False
+
+    def test_plan_writes_security_footer_force(self):
+        write_ops = [o for o in plan_create_agent("demo", force=True) if o.kind == "write_file"]
+        footer_ops = [o for o in write_ops if o.path.name == "SECURITY_FOOTER.md"]
+        assert len(footer_ops) == 1
+        assert footer_ops[0].overwrite is True
