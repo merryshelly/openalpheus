@@ -338,42 +338,59 @@ def cmd_monitor(args):
 
         return "\n".join(lines)
 
-    def tail_file(path: Path):
-        """Yield new lines from a file, starting from the end."""
-        try:
-            fh = open(path, "r")
-        except FileNotFoundError:
-            return
-        fh.seek(0, 2)  # seek to end
-        try:
-            while True:
-                line = fh.readline()
-                if line:
-                    yield line
-                else:
-                    time.sleep(0.3)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            fh.close()
-
     def current_log_path():
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         return logs_dir / f"{agent_name}-{date_str}.jsonl"
+
+    def follow(get_path):
+        """Yield new lines from the CURRENT per-day log file, following the
+        rotation across UTC midnight and waiting for the file to appear.
+
+        BUG-11: the old tail_file() opened one fd and looped it forever, so
+        after midnight -- when the agent starts a new <agent>-<date>.jsonl --
+        the monitor went permanently silent (the rotation check had an empty
+        body). And if today's file didn't exist yet at start (agent idle since
+        midnight), it returned immediately and the command exited 0 after the
+        banner, appearing to work while monitoring nothing. This re-resolves
+        the path, reopens on date change, and polls for a missing file instead
+        of giving up.
+        """
+        fh = None
+        cur = None
+        first_open = True
+        try:
+            while True:
+                path = get_path()
+                if fh is None or path != cur:
+                    if fh is not None:
+                        fh.close()
+                        first_open = False  # a rotation, not the initial open
+                    # Wait for the file to exist rather than exiting.
+                    while not path.exists():
+                        time.sleep(0.5)
+                        path = get_path()
+                    fh = open(path, "r")
+                    # Initial open: start at end (only new lines). Rotation:
+                    # start at the beginning so the new day's early entries
+                    # aren't missed.
+                    fh.seek(0, 2) if first_open else fh.seek(0, 0)
+                    cur = path
+                line = fh.readline()
+                if line:
+                    yield line
+                elif get_path() != cur:
+                    continue  # date rolled over — reopen on next loop
+                else:
+                    time.sleep(0.3)
+        finally:
+            if fh is not None:
+                fh.close()
 
     print(f"{BOLD}Monitoring {agent_name}{RESET} — {logs_dir}", file=sys.stderr)
     print(f"{DIM}Ctrl+C to stop{RESET}\n", file=sys.stderr)
 
     try:
-        current_date = None
-        for line in tail_file(current_log_path()):
-            # Check for date rotation
-            new_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            if new_date != current_date:
-                current_date = new_date
-                # Will pick up new file on next iteration naturally
-                # (tail_file follows the current file handle)
-
+        for line in follow(current_log_path):
             line = line.strip()
             if not line:
                 continue

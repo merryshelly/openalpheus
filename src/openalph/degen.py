@@ -145,9 +145,11 @@ class DegenerationMonitor:
 
             # --- Layer 1 state: word ring with newline sequence-breaker ---
             if ch == "\n":
-                if self._cur_word:
-                    self._tail_words.append(self._cur_word)
-                    self._cur_word = ""
+                # ARCH-6: the append below was a dead store -- the very next line
+                # clears _tail_words unconditionally, so pushing _cur_word into
+                # it first accomplished nothing. Only the _cur_word reset and the
+                # streak-clearing matter here.
+                self._cur_word = ""
                 self._tail_words.clear()   # sequence breaker: reset the streak
             elif ch.isspace():
                 if self._cur_word:

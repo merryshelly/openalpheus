@@ -238,7 +238,10 @@ type = "anthropic"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="[Aa]PI key"):
+        # ARCH-2 consolidated api_key/password/access_token resolution into one
+        # `_resolve_secret` helper — the "no source configured" message now
+        # names the actual field consistently ("api_key", not "API key").
+        with pytest.raises(ConfigError, match="api_key"):
             load_config(tmp_path / "agent.toml")
 
     def test_invalid_provider_type(self, tmp_path):

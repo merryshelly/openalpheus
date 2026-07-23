@@ -25,66 +25,67 @@ Agents are now down. Nothing is getting worse. Take a breath.
 
 ---
 
-## Step 1: Identify the Last Known Good Commit
+## Step 1: Identify the Last Known Good Version
+
+ARCH-7: `install.sh` pip-installs OpenAlph into `/opt/openalph-venv` from the
+Codeberg repo (`git+https://codeberg.org/merryshelly/openalph.git@<version>`).
+There is **no git checkout, no source tree, and no test suite on disk** — so
+recovery is a pip reinstall of a known-good ref, not a local `git checkout`.
+
+Find the version currently installed:
 
 ```bash
-cd /opt/openalph
-git log --oneline -20
+/opt/openalph-venv/bin/openalph --version
+/opt/openalph-venv/bin/pip show openalph | grep -i version
 ```
 
-Look for the last commit before the bad change. Commits have descriptive messages.
+Pick the ref to roll back to (a tag or commit that predates the bad change).
+Browse history on the remote — https://codeberg.org/merryshelly/openalph/commits —
+or, if you keep a checkout on a workstation, `git log --oneline` there. Note the
+tag (e.g. `v0.1.2`) or commit SHA.
 
-If you know which file is broken but not which commit:
+---
+
+## Step 2: Reinstall a Known-Good Version
+
+Reinstall the package at the chosen ref into the existing venv. `--force-reinstall`
+replaces the current code; `--no-deps` keeps it fast and avoids churning
+dependencies (add it only if deps are unchanged between the two refs).
 
 ```bash
-# Show commit history for a specific file
-git log --oneline -10 -- src/openalph/agent.py
+sudo /opt/openalph-venv/bin/pip install --force-reinstall \
+    "git+https://codeberg.org/merryshelly/openalph.git@<good-ref>"
+```
 
-# Show what changed in a specific commit
-git show <commit> --stat
+Replace `<good-ref>` with the tag or SHA from Step 1 (e.g. `v0.1.2`).
+
+If pip itself is failing (network, build), and you took a venv snapshot before
+upgrading (recommended: `cp -a /opt/openalph-venv /opt/openalph-venv.bak-<date>`
+before any upgrade), restore it instead:
+
+```bash
+sudo systemctl stop 'openalph@*'
+sudo rm -rf /opt/openalph-venv
+sudo mv /opt/openalph-venv.bak-<date> /opt/openalph-venv
 ```
 
 ---
 
-## Step 2: Revert the Files
+## Step 3: Smoke-Test the Reinstall
 
-**Option A: Revert specific files to a known good commit**
-
-```bash
-cd /opt/openalph
-git checkout <good-commit> -- src/openalph/agent.py src/openalph/tools/__init__.py
-```
-
-This restores those files to their state at `<good-commit>` without affecting anything else.
-
-**Option B: Revert an entire commit (undo the last change)**
+The wheel does not ship the test suite, so verify the install is sane rather
+than running pytest:
 
 ```bash
-cd /opt/openalph
-git revert --no-commit HEAD
+# Right version, and the CLI imports/starts cleanly
+/opt/openalph-venv/bin/openalph --version
+# Assemble a prompt without touching credentials — catches import/config breakage
+sudo /opt/openalph-venv/bin/openalph prompt <name>
 ```
 
-This stages the inverse of the last commit. Review with `git diff --cached`, then `git commit -m "revert: <reason>"`.
-
-**Option C: Hard reset to a known good commit (last resort)**
-
-```bash
-cd /opt/openalph
-git reset --hard <good-commit>
-```
-
-⚠️ This discards all changes after that commit. Only use if you want to throw away everything since then.
-
----
-
-## Step 3: Verify Tests Pass
-
-```bash
-cd /opt/openalph
-.venv/bin/python -m pytest tests/ -q
-```
-
-If tests pass, you're ready to restart. If tests fail, you may need to go further back — repeat Step 1-2.
+If both succeed you're ready to restart. If you want the full test suite, run it
+from a git checkout on a workstation (not on the box):
+`git clone https://codeberg.org/merryshelly/openalph.git && cd openalph && pip install -e ".[dev]" && pytest -q`.
 
 ---
 
@@ -117,16 +118,16 @@ journalctl -u openalph@<name> -n 50 --no-pager
 
 | Component | Path | Notes |
 |-----------|------|-------|
-| Source code | `/opt/openalph/src/openalph/` | Bind-mounted read-only into service |
-| Tests | `/opt/openalph/tests/` | Run from repo root |
-| Virtualenv | `/opt/openalph/.venv/` | Pytest and all deps live here |
+| Installed package | `/opt/openalph-venv/lib/python*/site-packages/openalph/` | The running code (pip-installed; no separate src tree) |
+| Virtualenv | `/opt/openalph-venv/` | The venv the service runs from; bound read-only into it |
+| Tests | not on disk | Ship only in the git repo; run from a workstation checkout |
 | Agent configs | `/etc/openalph/agents/*.toml` | Per-agent config (not in git) |
 | Service unit | `/etc/systemd/system/openalph@.service` | Template unit for all agents |
 | Agent workspaces | `/home/oa-<name>/workspace/` | Per-agent prompts, tools, memory |
 | Shared data | `/srv/openalph/shared/` | Beads DB, shared docs |
 | Git remote | `codeberg.org/merryshelly/openalph` | Full history |
 
-**Key fact:** The source at `/opt/openalph/src/` is bind-mounted read-only into the running services via `BindReadOnlyPaths`. Changes to source files take effect on **next service restart** — not immediately. A stopped service cannot make things worse.
+**Key fact:** The venv at `/opt/openalph-venv` is bind-mounted read-only into the running services via `BindReadOnlyPaths`. A reinstall changes the code on disk, but running services keep the old code until they are **restarted** — so a stopped service cannot make things worse, and your fix does not take effect until Step 4.
 
 ---
 

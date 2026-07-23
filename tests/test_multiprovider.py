@@ -418,7 +418,11 @@ type = "anthropic"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="[Aa]PI key"):
+        # ARCH-2: unified secret resolver names the field literally ("api_key")
+        # rather than the old ad hoc "API key" phrasing; the graceful-degradation
+        # wrapper (ARCH-5, kdsn.155) then re-surfaces it via "No providers loaded
+        # successfully. Skipped: ...".
+        with pytest.raises(ConfigError, match="api_key"):
             load_config(tmp_path / "agent.toml")
 
     def test_load_multi_provider_openai_missing_base_url_raises(self, tmp_path):

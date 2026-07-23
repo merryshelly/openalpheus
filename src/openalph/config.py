@@ -120,63 +120,72 @@ def resolve_model(
     return providers[prefix], remainder
 
 
-def _resolve_api_key(section: dict) -> str:
-    """Resolve API key from provider section using precedence: api_key > api_key_env > api_key_cmd.
-    
-    Args:
-        section: Provider section dict from TOML
-        
-    Returns:
-        Resolved API key string
-        
-    Raises:
-        ConfigError: If no API key source is available or resolution fails
+def _resolve_secret(section: dict, base_key: str, label: str, *, required: bool = True) -> str | None:
+    """Resolve a secret from `<base>`, `<base>_env`, or `<base>_cmd` (in that
+    precedence), with ONE consistent set of validation rules.
+
+    ARCH-2: this logic existed three times -- `_resolve_api_key`, and the
+    hand-rolled `password` and `access_token` ladders in matrix parsing -- with
+    divergent validation. `_resolve_api_key` rejected empty strings and empty
+    command output; the other two did not, so `password = ""` passed config
+    load and failed later at Matrix login (a confusing, far-from-source error)
+    instead of failing loudly here. Consolidated so a fix is written once and
+    every secret is validated identically: a present-but-empty value, an empty
+    env var, or empty command output is an error.
+
+    Returns the resolved secret, or None when `required` is False and no source
+    is configured (callers that accept one of several auth methods).
     """
-    # Try direct api_key first
-    if "api_key" in section:
-        api_key = section["api_key"]
-        if not api_key or not isinstance(api_key, str):
-            raise ConfigError("api_key must be a non-empty string")
-        return api_key
-    
-    # Try api_key_env if no direct key
-    if "api_key_env" in section:
-        env_var_name = section["api_key_env"]
+    direct_key = base_key
+    env_key = f"{base_key}_env"
+    cmd_key = f"{base_key}_cmd"
+
+    if direct_key in section:
+        value = section[direct_key]
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{label} must be a non-empty string")
+        return value
+
+    if env_key in section:
+        env_var_name = section[env_key]
         if not env_var_name or not isinstance(env_var_name, str):
-            raise ConfigError("api_key_env must be a non-empty string")
-        
-        api_key = os.environ.get(env_var_name)
-        if api_key is None:
+            raise ConfigError(f"{label}_env must be a non-empty string")
+        value = os.environ.get(env_var_name)
+        if value is None:
             raise ConfigError(f"Environment variable {env_var_name} is not set")
-        return api_key
-    
-    # Try api_key_cmd if no key yet
-    if "api_key_cmd" in section:
-        cmd = section["api_key_cmd"]
+        if not value:
+            raise ConfigError(f"Environment variable {env_var_name} (for {label}) is empty")
+        return value
+
+    if cmd_key in section:
+        cmd = section[cmd_key]
         if not cmd or not isinstance(cmd, str):
-            raise ConfigError("api_key_cmd must be a non-empty string")
-        
+            raise ConfigError(f"{label}_cmd must be a non-empty string")
         try:
             result = subprocess.run(
-                cmd,
-                shell=True,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
+                cmd, shell=True, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=10,
             )
-            api_key = result.stdout.strip()
-            if not api_key:
-                raise ConfigError("api_key_cmd produced empty output")
-            return api_key
         except subprocess.TimeoutExpired:
-            raise ConfigError("api_key_cmd timed out after 10 seconds")
+            raise ConfigError(f"{label}_cmd timed out after 10 seconds")
         except subprocess.CalledProcessError as e:
-            raise ConfigError(f"api_key_cmd failed with exit code {e.returncode}")
-    
-    # No API key source found
-    raise ConfigError("No API key provided. One of api_key, api_key_env, or api_key_cmd must be set")
+            raise ConfigError(f"{label}_cmd failed with exit code {e.returncode}")
+        value = result.stdout.strip()
+        if not value:
+            raise ConfigError(f"{label}_cmd produced empty output")
+        return value
+
+    if required:
+        raise ConfigError(
+            f"No {label} provided. One of {base_key}, {env_key}, or {cmd_key} must be set"
+        )
+    return None
+
+
+def _resolve_api_key(section: dict) -> str:
+    """Resolve API key: api_key > api_key_env > api_key_cmd. See _resolve_secret."""
+    return _resolve_secret(section, "api_key", "api_key", required=True)
 
 
 def load_config(path: Path) -> AgentConfig:
@@ -207,9 +216,9 @@ def load_config(path: Path) -> AgentConfig:
     except KeyError as e:
         raise ConfigError(f"Missing required section: {e}")
 
-    # Support both inline format (agent.provider, agent.api_key, agent.workspace.path)
-    # and separate section format ([provider], [workspace])
-    provider_section = toml_data.get("provider", {})
+    # ARCH-6: the old inline "[provider]" format is no longer supported (only
+    # [providers.<key>] sections are), so the previously-read `provider_section`
+    # was dead and its comment stale. Removed.
     workspace_section = toml_data.get("workspace", {})
     
     # Check for [providers.*] sections (new multi-provider format)
@@ -537,77 +546,12 @@ def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:
     if not isinstance(retry_max, int) or retry_max <= 0:
         raise ConfigError("matrix.sync.retry_max must be a positive integer")
 
-    # Resolve password with precedence: password > password_env > password_cmd
-    password = None
-
-    if "password" in matrix_section:
-        password = matrix_section["password"]
-        if not isinstance(password, str):
-            raise ConfigError("matrix.password must be a string")
-
-    if password is None and "password_env" in matrix_section:
-        env_var_name = matrix_section["password_env"]
-        if not env_var_name or not isinstance(env_var_name, str):
-            raise ConfigError("matrix.password_env must be a non-empty string")
-        password = os.environ.get(env_var_name)
-        if password is None:
-            raise ConfigError(f"Environment variable {env_var_name} is not set")
-
-    if password is None and "password_cmd" in matrix_section:
-        cmd = matrix_section["password_cmd"]
-        if not cmd or not isinstance(cmd, str):
-            raise ConfigError("matrix.password_cmd must be a non-empty string")
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-            )
-            password = result.stdout.strip()
-        except subprocess.TimeoutExpired:
-            raise ConfigError("matrix.password_cmd timed out after 10 seconds")
-        except subprocess.CalledProcessError as e:
-            raise ConfigError(f"matrix.password_cmd failed with exit code {e.returncode}")
-
-    # Resolve access_token with precedence: access_token > access_token_env > access_token_cmd
-    access_token = None
-
-    if "access_token" in matrix_section:
-        access_token = matrix_section["access_token"]
-        if not isinstance(access_token, str):
-            raise ConfigError("matrix.access_token must be a string")
-
-    if access_token is None and "access_token_env" in matrix_section:
-        env_var_name = matrix_section["access_token_env"]
-        if not env_var_name or not isinstance(env_var_name, str):
-            raise ConfigError("matrix.access_token_env must be a non-empty string")
-        access_token = os.environ.get(env_var_name)
-        if access_token is None:
-            raise ConfigError(f"Environment variable {env_var_name} is not set")
-
-    if access_token is None and "access_token_cmd" in matrix_section:
-        cmd = matrix_section["access_token_cmd"]
-        if not cmd or not isinstance(cmd, str):
-            raise ConfigError("matrix.access_token_cmd must be a non-empty string")
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-            )
-            access_token = result.stdout.strip()
-        except subprocess.TimeoutExpired:
-            raise ConfigError("matrix.access_token_cmd timed out after 10 seconds")
-        except subprocess.CalledProcessError as e:
-            raise ConfigError(f"matrix.access_token_cmd failed with exit code {e.returncode}")
+    # ARCH-2: password and access_token now use the SAME resolver as api_key,
+    # so `matrix.password = ""` is rejected at load time instead of failing
+    # later at Matrix login. Each is optional on its own (one of the two auth
+    # methods is required, checked just below).
+    password = _resolve_secret(matrix_section, "password", "matrix.password", required=False)
+    access_token = _resolve_secret(matrix_section, "access_token", "matrix.access_token", required=False)
 
     # Must have either password or access_token
     if password is None and access_token is None:
