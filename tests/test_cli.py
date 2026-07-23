@@ -185,14 +185,14 @@ class TestCmdNewAgent:
     @patch("openalph.cli.create_agent")
     def test_calls_create_agent(self, mock_create):
         mock_create.return_value = []
-        cmd_new_agent(Namespace(name="watson", dry_run=False))
-        mock_create.assert_called_once_with("watson", dry_run=False)
+        cmd_new_agent(Namespace(name="watson", dry_run=False, force=False))
+        mock_create.assert_called_once_with("watson", dry_run=False, force=False)
 
     @patch("openalph.cli.create_agent")
     def test_dry_run(self, mock_create):
         mock_create.return_value = []
-        cmd_new_agent(Namespace(name="watson", dry_run=True))
-        mock_create.assert_called_once_with("watson", dry_run=True)
+        cmd_new_agent(Namespace(name="watson", dry_run=True, force=False))
+        mock_create.assert_called_once_with("watson", dry_run=True, force=False)
 
 
 # ---------------------------------------------------------------------------
