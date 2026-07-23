@@ -456,3 +456,36 @@ class TestUmbralDriftPrevention:
             )
 
         await um.shutdown()
+
+
+# ===========================================================================
+# BUG-5 — a bad interval in the persisted file must not crash startup
+# BUG-6 — concurrent start() for one room must not orphan an untracked task
+# (both fixed once in RecurringTimerManager; see _timer.py)
+# ===========================================================================
+
+class TestTimerResumeRobustness:
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_bad_intervals_without_crashing(self, tmp_path):
+        import json as _json
+        p = tmp_path / "umbral.json"
+        p.write_text(_json.dumps([
+            {"room_id": "!good:x", "interval_seconds": 0.1, "last_fired_at": None, "directive": None},
+            {"room_id": "!str:x", "interval_seconds": "15m", "last_fired_at": None},
+            {"room_id": "!zero:x", "interval_seconds": 0, "last_fired_at": None},
+            {"room_id": "!neg:x", "interval_seconds": -5, "last_fired_at": None},
+        ]))
+        m = UmbralManager(p, AsyncMock())
+        await m.resume()  # must NOT raise
+        assert sorted(m._tasks.keys()) == ["!good:x"]
+        await m.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_start_leaves_one_task(self, tmp_path):
+        import asyncio as _aio
+        m = UmbralManager(tmp_path / "umbral.json", AsyncMock())
+        await _aio.gather(*[m.start("!room:x", 0.05) for _ in range(8)])
+        live = [t for t in m._tasks.values() if not t.done()]
+        assert len(live) == 1
+        await m.shutdown()
