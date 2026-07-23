@@ -46,7 +46,7 @@ systemd hardening on agent units:
 | `ProtectSystem=strict` | Filesystem read-only except explicit bind mounts |
 | `ProtectHome=tmpfs` | Cannot see other users' home directories |
 | `BindPaths=/home/oa-<name> /srv/openalph/shared` | Only their own home + shared dir |
-| `BindReadOnlyPaths=/etc/openalph /opt/openalph/.venv /opt/openalph/src` | Read-only access to config, venv, source |
+| `BindReadOnlyPaths=/etc/openalph /opt/openalph-venv` | Read-only access to config and the venv |
 | `PrivateTmp=yes` | Isolated /tmp |
 | `UMask=0027` | Files created by agent are not world-readable |
 | `ProtectKernelTunables=yes` | No sysctl writes |

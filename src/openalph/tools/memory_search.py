@@ -26,6 +26,23 @@ logger = logging.getLogger(__name__)
 # Cache MemoryIndexer per workspace to avoid re-loading the model on every call
 _index_cache: dict[str, "MemoryIndexer"] = {}
 
+# PHIL-2: workspaces that have already been told semantic search is
+# unavailable. Every import in the embedding path fails SOFT (log warning
+# only), so before this notice a fresh operator got BM25-only results from a
+# tool the README calls "Nomic-embed + BM25 hybrid" with no chat-visible
+# signal at all -- the failure was legible only in journalctl. The notice is
+# once per workspace per process: enough to be seen, not enough to become
+# noise on every search.
+_degraded_notice_sent: set[str] = set()
+
+_DEGRADED_NOTICE = (
+    "\u26a0 Semantic search unavailable — these results are keyword-only (BM25).\n"
+    "  The embedding stack (llama-cpp-python + sqlite-vec) or the GGUF model at\n"
+    "  {model_path} is missing. To enable it:\n"
+    "    /opt/openalph-venv/bin/pip install 'llama-cpp-python==0.3.16' 'sqlite-vec==0.1.6'\n"
+    "  and place the model file at the path above. Keyword search still works.\n"
+)
+
 
 def _get_scan_paths(workspace: Path, extra_paths: list[str] | None = None) -> list[Path]:
     """Build the list of paths to scan for memory files."""
@@ -168,6 +185,12 @@ async def run_memory_search(
         text_weight = 1.0
         vector_weight = 0.0
 
+    # PHIL-2: distinguish "semantic search is DOWN" from "semantic search ran
+    # and matched nothing". Only the former is worth telling the operator
+    # about, and only the embedder can answer it: a None embedding means the
+    # model or llama_cpp never loaded.
+    semantic_available = query_embedding is not None
+
     # Merge
     results = merge_hybrid_results(
         vector=vector_results,
@@ -193,8 +216,17 @@ async def run_memory_search(
     results = [r for r in results if r.score >= min_score][:max_results]
 
     # Format output
+    notice = ""
+    if not semantic_available and workspace_key not in _degraded_notice_sent:
+        _degraded_notice_sent.add(workspace_key)
+        notice = _DEGRADED_NOTICE.format(
+            model_path=getattr(indexer.embedder, "model", "the configured model path")
+        ) + "\n"
+
     if not results:
-        return ToolResult(content=f"No results found for \"{query}\".", is_error=False)
+        return ToolResult(
+            content=notice + f"No results found for \"{query}\".", is_error=False
+        )
 
     lines = [f"Found {len(results)} results for \"{query}\":\n"]
     for i, r in enumerate(results, 1):
@@ -202,4 +234,4 @@ async def run_memory_search(
         lines.append(f"[{i}] {r.path}:{r.start_line}-{r.end_line} (score: {r.score:.2f})")
         lines.append(f"  {snippet}\n")
 
-    return ToolResult(content="\n".join(lines), is_error=False)
+    return ToolResult(content=notice + "\n".join(lines), is_error=False)

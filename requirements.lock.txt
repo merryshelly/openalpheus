@@ -1,3 +1,11 @@
+# Full transitive lock for a reference install, including the optional
+# [memory] extra (llama_cpp_python, sqlite-vec).
+#
+# NOTE: install.sh does NOT use this file -- it installs the package (plus
+# the [memory] extra) from pyproject.toml, so the pins here are documentation
+# of a known-good resolution, not the thing that runs. Before v0.1.3 this
+# file was the ONLY place llama_cpp_python and sqlite-vec were named, and
+# nothing referenced it, so no install ever got them (PHIL-2).
 aiofiles==24.1.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3

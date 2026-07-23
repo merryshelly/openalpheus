@@ -2,6 +2,15 @@
 
 Verifies the openalph@.service template has correct directives for
 multi-agent isolation and hardening.
+
+ARCH-3/BUG-1: this file used to validate `etc/openalph@.service` while
+`install.sh` deployed a DIFFERENT unit from an inline heredoc -- so the unit
+actually installed on operator machines was untested, and the one under test
+was broken (`test_exec_start_references_config` asserted the crash-looping
+ExecStart, locking the bug in). There is now a single canonical unit shipped
+as package data; `etc/openalph@.service` is a symlink to it and `install.sh`
+copies it from the installed package. `TestSingleSourceOfTruth` below guards
+against the three-way divergence coming back.
 """
 
 import configparser
@@ -11,7 +20,10 @@ from pathlib import Path
 
 import pytest
 
-UNIT_PATH = Path(__file__).parent.parent / "etc" / "openalph@.service"
+REPO_ROOT = Path(__file__).parent.parent
+UNIT_PATH = REPO_ROOT / "etc" / "openalph@.service"
+CANONICAL_UNIT_PATH = REPO_ROOT / "src" / "openalph" / "data" / "openalph@.service"
+INSTALL_SH = REPO_ROOT / "install.sh"
 
 
 @pytest.fixture
@@ -56,9 +68,23 @@ class TestServiceDirectives:
     def test_working_directory(self, unit_config):
         assert unit_config["Service"]["WorkingDirectory"] == "/home/oa-%i"
 
-    def test_exec_start_references_config(self, unit_config):
+    def test_exec_start_invokes_run_subcommand(self, unit_config):
+        """BUG-1: the unit must call the CLI with its required subcommand.
+
+        `ExecStart=/usr/local/bin/openalph /etc/openalph/agents/%i.toml`
+        passes a bare path and no subcommand. `cli.py` sets
+        `sub.required = True`, so argparse exits 2 before doing any work and
+        `Restart=on-failure` turns that into a permanent restart loop. The
+        previous version of this test asserted the broken form, so the suite
+        enforced the bug.
+        """
         exec_start = unit_config["Service"]["ExecStart"]
-        assert "/etc/openalph/agents/%i.toml" in exec_start
+        assert exec_start == "/usr/local/bin/openalph run %i", exec_start
+
+    def test_exec_start_does_not_pass_bare_config_path(self, unit_config):
+        """Regression guard for the exact crash-looping form."""
+        exec_start = unit_config["Service"]["ExecStart"]
+        assert "/etc/openalph/agents/%i.toml" not in exec_start
 
     def test_restart_on_failure(self, unit_config):
         assert unit_config["Service"]["Restart"] == "on-failure"
@@ -82,16 +108,74 @@ class TestHardening:
         bind = unit_config["Service"]["BindPaths"]
         assert "/home/oa-%i" in bind
 
-    def test_bind_readonly_shared(self, unit_config):
-        readonly = unit_config["Service"]["BindReadOnlyPaths"]
-        assert "/srv/openalph/shared" in readonly
+    def test_shared_dir_is_writable(self, unit_config):
+        """ARCH-3: the shared dir is created 2770 group-writable by design.
+
+        The repo unit bound it READ-ONLY while the installed unit bound it
+        read-write -- one of the three-way divergences. Read-only contradicts
+        the design, so the canonical unit binds it read-write.
+        """
+        assert "/srv/openalph/shared" in unit_config["Service"]["BindPaths"]
+        assert "/srv/openalph/shared" not in unit_config["Service"].get(
+            "BindReadOnlyPaths", ""
+        )
 
     def test_bind_readonly_config(self, unit_config):
         readonly = unit_config["Service"]["BindReadOnlyPaths"]
         assert "/etc/openalph" in readonly
 
+    def test_bind_readonly_venv(self, unit_config):
+        """The venv the ExecStart binary resolves into must be mounted."""
+        assert "/opt/openalph-venv" in unit_config["Service"]["BindReadOnlyPaths"]
+
     def test_private_tmp(self, unit_config):
         assert unit_config["Service"]["PrivateTmp"] == "yes"
+
+    def test_environment_has_shared_bin_on_path(self, unit_config):
+        env = unit_config["Service"]["Environment"]
+        assert "/srv/openalph/shared/bin" in env
+
+    def test_environment_has_bd_actor(self, unit_config):
+        """Guards the single-directive form: a second `Environment=` line
+        would be a DuplicateOptionError here, and dropping it silently would
+        unset BD_ACTOR for every agent."""
+        assert "BD_ACTOR=oa-%i" in unit_config["Service"]["Environment"]
+
+    def test_umask_not_world_readable(self, unit_config):
+        """ARCH-3: present in the installed unit, absent from the repo copy."""
+        assert unit_config["Service"]["UMask"] == "0027"
+
+
+class TestSingleSourceOfTruth:
+    """ARCH-3: one unit file, installed and tested, with no second copy."""
+
+    def test_canonical_unit_exists(self):
+        assert CANONICAL_UNIT_PATH.is_file(), f"Missing: {CANONICAL_UNIT_PATH}"
+
+    def test_etc_copy_is_a_symlink_to_canonical(self):
+        assert UNIT_PATH.is_symlink(), (
+            "etc/openalph@.service must be a symlink to the packaged unit, "
+            "not a second copy that can drift"
+        )
+        assert UNIT_PATH.resolve() == CANONICAL_UNIT_PATH.resolve()
+
+    def test_installer_does_not_inline_a_second_unit(self):
+        """The heredoc that produced the divergent installed unit is gone.
+
+        `install.sh` must COPY the packaged unit, not re-emit one. Matching on
+        the section headers catches any reintroduced heredoc regardless of
+        its delimiter.
+        """
+        text = INSTALL_SH.read_text()
+        assert "Description=OpenAlph Agent - %i" not in text, (
+            "install.sh contains an inline unit body again -- it must install "
+            "the packaged data/openalph@.service instead"
+        )
+
+    def test_installer_installs_the_packaged_unit(self):
+        text = INSTALL_SH.read_text()
+        assert "data" in text and "openalph@.service" in text
+        assert 'install -m 644 -o root -g root "${UNIT_SRC}" "${UNIT_PATH}"' in text
 
 
 class TestInstall:

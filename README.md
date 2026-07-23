@@ -8,7 +8,7 @@ Named after the pistol shrimp (*Alpheus*) — a crustacean smaller than your thu
 
 Tiny, self-contained, disproportionately effective.
 
-OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix provides the transport layer. Local JSONL files hold session state. systemd manages the lifecycle. Four direct Python dependencies. No cloud except the ones you explicitly choose.
+OpenAlpheus runs AI agents as isolated Unix processes on your hardware. Matrix provides the transport layer. Local JSONL files hold session state. systemd manages the lifecycle. Five direct Python dependencies. No cloud except the ones you explicitly choose.
 
 **Status: v0.1.2 — early release.** Core is stable and tested (2,420+ tests). The interface may evolve.
 
@@ -20,7 +20,7 @@ All agent frameworks make tradeoffs. We optimized for:
 - **Ease of use.** `systemctl`, `journalctl`, `grep`, `nano` — operate agents with the same Linux tools people have used for decades.
 - **Simplicity.** Each Matrix room is a session with your agent. One messaging protocol. Sixteen tools. For anything that's not a native tool, there's `shell`. No arcane message routing, no opaque session spawning.
 - **Visibility.** All agent actions — tool calls, subagent dispatches, thinking blocks — surface in the chat history.
-- **Maintainability.** ~15,700 LOC source. Full test coverage (2,420+ tests). Four direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
+- **Maintainability.** ~15,700 LOC source. Full test coverage (2,420+ tests). Five direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`, `httpx`. Semantic memory search adds two more (`llama-cpp-python`, `sqlite-vec`) as the optional `[memory]` extra, installed by default by `install.sh`.
 - **Resilience.** Each agent runs as an isolated Unix process with its own filesystem. One agent can crash out, trash its workspace, and the others are unaffected.
 - **Focus.** Matrix is a mature protocol with an array of clients for mobile, desktop, web. No bespoke UI, no custom views to maintain.
 - **Transparency.** Session state is append-only text in JSONL, not a database. `grep` works. `cat` works. No migrations, no schema, no query language needed.
@@ -111,7 +111,7 @@ Any OpenAI-compatible endpoint works with no core changes, so community shims ca
 
 ### Memory
 
-Hybrid semantic + keyword search over workspace files. Nomic-embed-text embeddings combined with BM25 ranking.
+Hybrid semantic + keyword search over workspace files. Nomic-embed-text embeddings combined with BM25 ranking. The semantic half needs the `[memory]` extra and a local GGUF model; without them search degrades to keyword-only (BM25) and says so in-room on the first search, rather than degrading silently.
 
 ### Security
 
@@ -153,7 +153,7 @@ src/openalph/
     └── web.py         web_search (Brave) + web_fetch (HTML→text) + web_fetch_js (Tabstack)
 ```
 
-~15,700 LOC source. 2,420+ tests. 4 direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`.
+~15,700 LOC source. 2,420+ tests. 5 direct dependencies: `anthropic`, `openai`, `matrix-nio`, `mistune`, `httpx` — plus the optional `[memory]` extra (`llama-cpp-python`, `sqlite-vec`) for semantic search.
 
 ## Prerequisites
 
