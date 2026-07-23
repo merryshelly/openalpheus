@@ -1,7 +1,14 @@
 # OpenAlpheus agent config — example
 #
 # This file lives at /etc/openalph/agents/<name>.toml and is owned by root.
-# The agent process (running as Unix user oa-<name>) cannot read its own config.
+#
+# The agent process (Unix user oa-<name>) reads THIS file at startup, and — as
+# of the SEC-11 fix — only this file: its systemd unit masks the agents/ dir
+# with a tmpfs and bind-mounts just <name>.toml, so one agent cannot read
+# another agent's config. An inline `api_key` below is therefore private to
+# this agent, but it is still visible to this agent's own shell tool; prefer
+# `api_key_env` / `api_key_cmd` (see the providers section) to keep the raw key
+# out of the config file entirely.
 #
 # The `openalph new-agent <name>` command writes a skeleton of this shape
 # automatically. You normally edit an existing file rather than writing one

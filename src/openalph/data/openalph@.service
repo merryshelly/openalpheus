@@ -40,12 +40,42 @@ ProtectHome=tmpfs
 # The shared dir is group-writable (2770) by design, so it is bound
 # read-write; only the agent's own home and the shared dir are exposed.
 BindPaths=/home/oa-%i /srv/openalph/shared
-BindReadOnlyPaths=/etc/openalph /opt/openalph-venv
+# SEC-11: agents share Group=openalph and used to bind the WHOLE /etc/openalph
+# read-only, so agent A could read agent B's config (and any inline api_key in
+# it). The agent runtime only ever reads its own agents/%i.toml, so mask the
+# agents directory with an empty tmpfs and bind ONLY this agent's file into it:
+# sibling configs are then not present in the namespace at all -- kernel-
+# enforced isolation, not a group-permission convention. The venv stays bound.
+TemporaryFileSystem=/etc/openalph/agents
+BindReadOnlyPaths=/etc/openalph/agents/%i.toml /opt/openalph-venv
 PrivateTmp=yes
 UMask=0027
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+# SEC-10: additional isolation. The process runs as a non-root user, so it holds
+# no capabilities; the empty bounding set makes that explicit and permanent.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+SystemCallArchitectures=native
+# @system-service is an allowlist that already excludes @privileged/@obsolete/
+# @mount etc.; kept to ONE line so the strict INI parser in test_systemd.py does
+# not see a duplicate key (systemd would merge repeated SystemCallFilter lines).
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# NOTE: MemoryDenyWriteExecute is intentionally NOT set -- the agent's Node/
+# Python tools need writable+executable pages (V8 JIT, ctypes) and would break.
 
 [Install]
 WantedBy=multi-user.target
