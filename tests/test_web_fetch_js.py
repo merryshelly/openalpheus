@@ -891,9 +891,13 @@ def _fetch(body_html: str, max_chars):
     from unittest.mock import patch
     client = _FakeAsyncClient(body_html.encode("utf-8"))
     with patch("openalph.tools.web.httpx.AsyncClient", client):
-        return asyncio.get_event_loop().run_until_complete(
-            web_fetch("https://example.com", max_chars=max_chars)
-        )
+        # asyncio.run() always spins up (and tears down) a fresh event loop.
+        # The previous asyncio.get_event_loop().run_until_complete(...) pattern
+        # depends on an ambient loop existing on the main thread — order-
+        # dependent, and Python 3.13 raises RuntimeError outright when no
+        # loop is current (surfaced here as a full-suite-only failure,
+        # invisible when this test file was run in isolation).
+        return asyncio.run(web_fetch("https://example.com", max_chars=max_chars))
 
 
 class TestWebFetchMaxCharsGuard:
