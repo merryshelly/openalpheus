@@ -404,3 +404,37 @@ class TestStripMentionEdgeCases:
         """@watsonville should NOT be stripped for @watson."""
         result = strip_mention(USER_ID, "@watsonville /status")
         assert result == "@watsonville /status"
+
+
+# ===========================================================================
+# BUG-7 — strip_mention must not corrupt operator text, and an email localpart
+# must not false-trigger a mention (both patterns lacked a leading boundary)
+# ===========================================================================
+
+class TestMentionBoundaryRegressions:
+
+    def test_email_localpart_does_not_trigger_mention(self):
+        r = mentions_me("@watson:matrix.local", {"content": {}},
+                        "please email bob@watson.org about it")
+        assert r.mentioned is False
+
+    def test_real_at_mention_still_detected(self):
+        r = mentions_me("@watson:matrix.local", {"content": {}}, "@watson can you help")
+        assert r.mentioned is True
+
+    def test_strip_does_not_delete_name_inside_a_word(self):
+        # agent "al" must not turn "normal" into "norm"
+        out = strip_mention("@al:matrix.local", "That's normal, al please check")
+        assert "normal" in out
+
+    def test_strip_leaves_midmessage_bare_name_alone(self):
+        out = strip_mention("@al:matrix.local", "the total is normal")
+        assert out == "the total is normal"
+
+    def test_strip_removes_leading_bare_name(self):
+        out = strip_mention("@saw:matrix.local", "saw please run status")
+        assert not out.lower().startswith("saw")
+
+    def test_strip_removes_leading_at_mention(self):
+        out = strip_mention("@saw:matrix.local", "@saw: /status")
+        assert "status" in out and "saw" not in out.lower()

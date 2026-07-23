@@ -338,9 +338,12 @@ class TestCircuitBreaker:
         assert call_count == MAX_ITERATIONS + 1  # iterations + summary
 
     @pytest.mark.asyncio
-    async def test_max_iterations_is_200(self):
-        """Circuit breaker is set to 200 iterations."""
-        assert MAX_ITERATIONS == 200
+    async def test_max_iterations_matches_documented_default(self):
+        """BUG-3: the hard-fallback constant matches the documented/advertised
+        default (100) — the tool schema's `default_max_iterations` and the
+        subagent tool-call description both say 100; the module constant used
+        to silently diverge at 200, doubling the real worst-case runaway cost."""
+        assert MAX_ITERATIONS == 100
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_summary_failure_returns_fallback(self):
@@ -635,3 +638,32 @@ class TestTruncationRecovery:
         summary = summary_entries[-1]
         assert "stop_reason" in summary, f"Summary missing stop_reason: {summary}"
         assert summary["stop_reason"] == "end_turn"
+
+
+# ===========================================================================
+# BUG-14 — concurrent sub-agents must not share one todo list
+# (todo state was keyed on the constant room_id "__sub__")
+# ===========================================================================
+
+class TestSubagentTodoIsolation:
+
+    @pytest.mark.asyncio
+    async def test_distinct_subagents_do_not_share_todo_state(self):
+        from openalph.tools import _execute_todo_write, _TODO_STATE
+
+        cb_a = {"room_id": "__sub__", "call_id": "tc_a"}
+        cb_b = {"room_id": "__sub__", "call_id": "tc_b"}
+
+        await _execute_todo_write(
+            {"todos": [{"content": "A-only task", "status": "pending"}]}, cb_a
+        )
+        await _execute_todo_write(
+            {"todos": [{"content": "B-only task", "status": "pending"}]}, cb_b
+        )
+
+        key_a = ("__sub__", "tc_a")
+        key_b = ("__sub__", "tc_b")
+        assert key_a in _TODO_STATE and key_b in _TODO_STATE
+        assert _TODO_STATE[key_a] != _TODO_STATE[key_b]
+        assert _TODO_STATE[key_a][0]["content"] == "A-only task"
+        assert _TODO_STATE[key_b][0]["content"] == "B-only task"

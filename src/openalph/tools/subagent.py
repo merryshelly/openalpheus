@@ -20,7 +20,12 @@ from openalph.config import AgentConfig
 
 logger = logging.getLogger("openalph.subagent")
 
-MAX_ITERATIONS = 200
+# BUG-3: the schema, config default and docstring all say 100, but the real
+# fallback used to be this module constant at 200 -- double the documented cap
+# and double the worst-case runaway cost. Aligned to the documented default;
+# the config's `default_max_iterations` is now actually threaded through
+# (see execute_tool), so operator tuning of that key takes effect.
+MAX_ITERATIONS = 100
 
 # Safety preamble loaded once at import time — shared across all subagent invocations.
 # This file contains hard safety constraints that every subagent must follow.

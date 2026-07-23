@@ -491,5 +491,11 @@ class TestCoexistenceWithMetricsLog:
 
     @pytest.mark.asyncio
     async def test_max_iterations_constant_unchanged(self):
-        """Sanity: this feature does not touch the existing circuit breaker constant."""
-        assert MAX_ITERATIONS == 200
+        """Sanity: this feature does not touch the circuit breaker constant.
+
+        The constant's value is owned by tools/subagent.py (BUG-3 aligned it
+        to the documented default of 100, down from a stale 200) — this test
+        only guards against the flight-recorder feature silently re-touching
+        it, not against that owning fix.
+        """
+        assert MAX_ITERATIONS == 100

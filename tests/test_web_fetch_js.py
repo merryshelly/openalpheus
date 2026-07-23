@@ -860,3 +860,62 @@ class TestWebFetchJsNocacheRealBool:
 
         assert result.is_error is False
         assert client.post.call_args.kwargs["json"]["nocache"] is True
+
+
+# ===========================================================================
+# BUG-4 — web_fetch with max_chars <= 0 must not return MORE than the input
+# ===========================================================================
+
+class _FakeStreamResp:
+    def __init__(self, body: bytes):
+        self._body = body
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    def raise_for_status(self): return None
+    async def aiter_bytes(self):
+        yield self._body
+
+
+class _FakeAsyncClient:
+    def __init__(self, body: bytes):
+        self._body = body
+    def __call__(self, *a, **k): return self
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    def stream(self, method, url):
+        return _FakeStreamResp(self._body)
+
+
+def _fetch(body_html: str, max_chars):
+    import asyncio
+    from unittest.mock import patch
+    client = _FakeAsyncClient(body_html.encode("utf-8"))
+    with patch("openalph.tools.web.httpx.AsyncClient", client):
+        # asyncio.run() always spins up (and tears down) a fresh event loop.
+        # The previous asyncio.get_event_loop().run_until_complete(...) pattern
+        # depends on an ambient loop existing on the main thread — order-
+        # dependent, and Python 3.13 raises RuntimeError outright when no
+        # loop is current (surfaced here as a full-suite-only failure,
+        # invisible when this test file was run in isolation).
+        return asyncio.run(web_fetch("https://example.com", max_chars=max_chars))
+
+
+class TestWebFetchMaxCharsGuard:
+
+    def test_zero_max_chars_does_not_expand_output(self):
+        src = "abcdefghij" * 60  # 600 chars
+        out = _fetch(f"<html><body>{src}</body></html>", 0)
+        # BUG: max_chars=0 used to return the whole page + a "truncated" marker,
+        # i.e. LONGER than the source. It must not exceed the source length.
+        assert len(out.content) <= len(src) + 10
+
+    def test_negative_max_chars_does_not_expand_output(self):
+        src = "klmnopqrst" * 60
+        out = _fetch(f"<html><body>{src}</body></html>", -10)
+        assert len(out.content) <= len(src) + 10
+
+    def test_positive_max_chars_truncates(self):
+        src = "z" * 600
+        out = _fetch(f"<html><body>{src}</body></html>", 100)
+        assert "truncated" in out.content
+        assert len(out.content) < len(src)

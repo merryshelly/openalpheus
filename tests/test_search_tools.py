@@ -398,3 +398,34 @@ class TestGlob:
         res = await _glob(tmp_path, "*.txt")
         assert not res.is_error, res.content
         assert "root.txt" in res.content, "default root must be the workspace"
+
+
+# ===========================================================================
+# SEC-9 — file/search tools must stay inside the workspace (abs path or ..)
+# ===========================================================================
+
+class TestWorkspaceContainment:
+
+    @pytest.mark.asyncio
+    async def test_grep_absolute_path_outside_workspace_rejected(self, tmp_path):
+        res = await _grep(tmp_path, "root", path="/etc/hostname")
+        assert res.is_error is True
+        assert "workspace" in res.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_grep_dotdot_escape_rejected(self, tmp_path):
+        res = await _grep(tmp_path, "x", path="../../../etc")
+        assert res.is_error is True
+        assert "workspace" in res.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_glob_absolute_escape_rejected(self, tmp_path):
+        res = await _glob(tmp_path, "*", path="/etc")
+        assert res.is_error is True
+
+    @pytest.mark.asyncio
+    async def test_relative_path_inside_workspace_allowed(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.txt").write_text("needle here\n")
+        res = await _grep(tmp_path, "needle", path="sub")
+        assert res.is_error is False
