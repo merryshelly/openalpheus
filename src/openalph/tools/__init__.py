@@ -976,7 +976,14 @@ async def _execute_todo_write(input: dict, callbacks: dict | None) -> "ToolResul
         )
 
     # Determine state key: room_id from callbacks, else id(callbacks) for isolation
-    if callbacks and "room_id" in callbacks:
+    # BUG-14: every sub-agent invocation passes the CONSTANT room_id "__sub__",
+    # so keying on room_id alone made two concurrently-running sub-agents share
+    # (and overwrite) one todo list. When the room is the sub-agent sentinel and
+    # a per-call id is present, key on that id so each sub-agent's todos stay
+    # isolated; top-level rooms are unchanged.
+    if callbacks and callbacks.get("room_id") == "__sub__" and callbacks.get("call_id"):
+        state_key = ("__sub__", callbacks["call_id"])
+    elif callbacks and "room_id" in callbacks:
         state_key = callbacks["room_id"]
     elif callbacks is not None:
         state_key = id(callbacks)
@@ -1220,11 +1227,34 @@ async def _execute_tool_inner(
     # Resolve relative paths for file tools against workspace
     # grep/glob join this tuple ONLY (not the _resolved_path registry tuple
     # below) — a match is not a file read for write-guard purposes (anchors §7.2).
+    #
+    # SEC-9: also ENFORCE workspace containment here. The old code only joined
+    # RELATIVE paths and passed an absolute path straight through, and the
+    # search module resolved absolute paths as-is with no `..` normalisation --
+    # so run_grep(path="/etc/hostname") read /etc/hostname, and `../` climbed
+    # out of the workspace. Containment was delegated entirely to the OS
+    # sandbox, while the README claimed "workspace-scoped". Resolve the target
+    # (absolute or relative, collapsing symlinks and `..`) and reject anything
+    # outside workspace.resolve().
     if name in ("file_read", "file_write", "file_edit", "file_patch", "send_media",
                 "grep", "glob") and "path" in input:
         file_path = input["path"]
-        if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
-            input["path"] = str(agent_config.workspace / file_path)
+        ws = getattr(agent_config, "workspace", None)
+        if ws is not None:
+            ws_resolved = Path(ws).resolve()
+            candidate = Path(file_path)
+            if not candidate.is_absolute():
+                candidate = Path(ws) / candidate
+            resolved = candidate.resolve()
+            if resolved != ws_resolved and ws_resolved not in resolved.parents:
+                return ToolResult(
+                    content=(
+                        f"Error: path escapes the workspace: {file_path!r}. "
+                        f"File and search tools are scoped to {ws_resolved}."
+                    ),
+                    is_error=True,
+                )
+            input["path"] = str(resolved)
 
     # Normalize path to resolved form for registry keys (symlinks, .., relative spellings)
     # so that read via relative and write via absolute always hit the same registry entry.
@@ -1490,6 +1520,12 @@ async def _execute_tool_inner(
         )
     elif name == "subagent":
         from .subagent import run_subagent
+        # BUG-3: honour the documented `default_max_iterations` config key when
+        # the call omits max_iterations, instead of silently falling back to the
+        # module constant. Explicit per-call max_iterations still wins.
+        _sub_max_iters = input.get("max_iterations")
+        if _sub_max_iters is None:
+            _sub_max_iters = tool_config.get("default_max_iterations")
         result = await run_subagent(
             task=input["task"],
             config=agent_config,
@@ -1497,7 +1533,7 @@ async def _execute_tool_inner(
             system_prompt=input.get("system_prompt"),
             model=input.get("model"),
             max_tokens=input.get("max_tokens"),
-            max_iterations=input.get("max_iterations"),
+            max_iterations=_sub_max_iters,
             call_id=callbacks.get("call_id") if callbacks else None,
             # Flight recorder (workspace-kdsn.192): the PARENT room, so the
             # sub's transcript header can cross-reference where it was

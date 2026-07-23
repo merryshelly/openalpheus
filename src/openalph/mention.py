@@ -62,10 +62,14 @@ def mentions_me(user_id: str, event_source: dict, body: str | None) -> MentionCh
         else:
             localpart = user_id
         
-        # Check if @localpart appears with word boundary
-        # Word boundary: end-of-string, whitespace, or punctuation [,;:!?.]
+        # Check if @localpart appears with word boundaries on BOTH sides.
+        # BUG-7: the pattern had only a trailing boundary, so for agent
+        # `@watson` a body containing `bob@watson.` matched (the `@watson`
+        # inside an email address), a false mention. The leading lookbehind
+        # `(?<![\w@])` requires the char before `@localpart` to be a real
+        # boundary, so an email localpart no longer triggers.
         escaped_localpart = re.escape(localpart)
-        pattern = rf"{escaped_localpart}(?=$|\s|[,;:!?.])"
+        pattern = rf"(?<![\w@]){escaped_localpart}(?=$|\s|[,;:!?.])"
         if re.search(pattern, body):
             return MentionCheckResult(mentioned=True, method="body_localpart")
     
@@ -126,16 +130,23 @@ def strip_mention(user_id: str, body: str) -> str:
     localpart = user_id.split(":")[0] if ":" in user_id else user_id
     bare_name = localpart.lstrip("@")
 
-    # Try patterns in order of specificity (case-insensitive)
+    # Try patterns in order of specificity (case-insensitive).
+    # BUG-7: every pattern needs a LEADING boundary too. Without it, stripping
+    # agent `al` from "That's normal, al please check" deleted the `al` inside
+    # "normal" -> "That's norm, al please check", corrupting operator text that
+    # the model then receives. The bare-name fallback is additionally
+    # restricted to message-leading position (`^\s*`): a bare common word like
+    # "al" is only treated as a mention when it opens the message, never
+    # mid-sentence.
+    lead = r"(?<![\w@])"
     patterns = [
-        re.escape(user_id),                     # @saw:matrix.local
-        re.escape(localpart),                    # @saw
-        re.escape(bare_name),                    # saw / SAW
+        (rf"(?i){lead}{re.escape(user_id)}(?=$|\s|[,;:!?.])"),   # @saw:matrix.local
+        (rf"(?i){lead}{re.escape(localpart)}(?=$|\s|[,;:!?.])"),  # @saw
+        (rf"(?i)^\s*{re.escape(bare_name)}(?=$|\s|[,;:!?.])"),   # leading "saw"/"SAW" only
     ]
 
     stripped = False
-    for pat in patterns:
-        full_pattern = rf"(?i){pat}(?=$|\s|[,;:!?.])"
+    for full_pattern in patterns:
         if re.search(full_pattern, body):
             body = re.sub(full_pattern, "", body, count=1)
             stripped = True

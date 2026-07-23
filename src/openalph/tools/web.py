@@ -221,7 +221,17 @@ async def web_fetch(
         # Apply max_chars limit (to the extracted text only; the note is
         # appended AFTER truncation so it's never cut into by the head/tail
         # split below).
-        if max_chars is not None and len(text) > max_chars:
+        # BUG-4: with max_chars<=0, len(text) > max_chars was true, tail_budget
+        # was 0 and text[-0:] returned the WHOLE string, so "truncation"
+        # produced the full page plus a marker (a negative value duplicated
+        # content). Use the same guard web_fetch_js already had: only truncate
+        # for a genuine positive int (and not a bool, which is an int subclass).
+        if (
+            isinstance(max_chars, int)
+            and not isinstance(max_chars, bool)
+            and max_chars > 0
+            and len(text) > max_chars
+        ):
             head_budget = max_chars // 2
             tail_budget = max_chars - head_budget
             text = (

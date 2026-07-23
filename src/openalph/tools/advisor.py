@@ -327,10 +327,22 @@ async def run_advisor(
         # process, so only post-redaction bytes are forwarded to the
         # advisor provider (design Section 4/Section 8 intent).
         rendered_transcript = redact_credentials(rendered_transcript)[0]
+        # SEC-12: also apply the value-based known-secret pass. execute_tool
+        # redacts tool OUTPUT with BOTH redact_credentials (shape-based) and
+        # redact_known_secrets (arbitrary live values, e.g. resolved provider
+        # keys / cached `op read` results). run_advisor applied only the
+        # shape-based pass, so a non-shaped known secret sitting in un-redacted
+        # transcript text (user message or assistant tool-call input) would be
+        # forwarded verbatim to the (possibly third-party) advisor provider.
+        from openalph.tools import _collect_known_secrets
+        from openalph.tools.security import redact_known_secrets
+        _known = _collect_known_secrets(config)
+        rendered_transcript = redact_known_secrets(rendered_transcript, _known)[0]
         # N1 (audit remediation): `focus` is executor-authored and reaches the
         # advisor provider verbatim via closing_text below -- redact it here,
         # same as rendered_transcript above, before it ever leaves the process.
         focus = redact_credentials(focus)[0] if focus else focus
+        focus = redact_known_secrets(focus, _known)[0] if focus else focus
 
         cache_ttl = tool_config.get("cache_ttl", "5m")
         transcript_block = {
