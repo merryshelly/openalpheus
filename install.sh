@@ -1358,12 +1358,18 @@ OVERRIDE_EOF
         -f /opt/tuwunel/docker-compose.override.yml \
         up -d
 
-    _tuwunel_wait "registration enabled"
-
-    # SEC-5: from here until Part G the homeserver accepts token-gated
-    # registrations. Arm the EXIT handler so any failure path -- including the
-    # bare `exit 1`s in Parts B-F -- re-locks on the way out.
+    # SEC-5: the moment `up -d` returns, registration is live on the server --
+    # arm the EXIT handler HERE, before the readiness wait below, not after it.
+    # `_tuwunel_wait` polls for up to 30s and can itself fail/time out (exit 1
+    # under `set -euo pipefail`); arming only after a successful wait left that
+    # entire window where a failure would exit via the trap while
+    # _REG_OVERRIDE_ACTIVE was still 0, making the trap a silent no-op and
+    # leaving registration open with no operator-visible indication (found in
+    # pre-merge review). Arming immediately after `up -d` closes the window:
+    # any failure from here on, including inside `_tuwunel_wait`, re-locks.
     _REG_OVERRIDE_ACTIVE=1
+
+    _tuwunel_wait "registration enabled"
 
     # =========================================================================
     # PART B — COLLECT OPERATOR CREDENTIALS
