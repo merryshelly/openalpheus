@@ -1228,33 +1228,20 @@ async def _execute_tool_inner(
     # grep/glob join this tuple ONLY (not the _resolved_path registry tuple
     # below) — a match is not a file read for write-guard purposes (anchors §7.2).
     #
-    # SEC-9: also ENFORCE workspace containment here. The old code only joined
-    # RELATIVE paths and passed an absolute path straight through, and the
-    # search module resolved absolute paths as-is with no `..` normalisation --
-    # so run_grep(path="/etc/hostname") read /etc/hostname, and `../` climbed
-    # out of the workspace. Containment was delegated entirely to the OS
-    # sandbox, while the README claimed "workspace-scoped". Resolve the target
-    # (absolute or relative, collapsing symlinks and `..`) and reject anything
-    # outside workspace.resolve().
+    # NOTE: this is a convenience default-root join, NOT a security boundary.
+    # Containment is enforced at the OS layer by the systemd sandbox (Unix user
+    # per agent + ProtectHome=tmpfs + BindPaths=/home/oa-%i /srv/openalph/shared),
+    # which deliberately places /srv/openalph/shared INSIDE the sandbox so the
+    # shared-skill/shared-doc symlink convention works. An app-level path
+    # allowlist here (the reverted SEC-9 guard, commit a194f8b) only knew about
+    # the agent's own workspace, drifted out of sync with the real boundary, and
+    # rejected legitimate shared reads. Do not reintroduce it — see
+    # memory/projects/openalph/session-brief-next.md (kdsn.252).
     if name in ("file_read", "file_write", "file_edit", "file_patch", "send_media",
                 "grep", "glob") and "path" in input:
         file_path = input["path"]
-        ws = getattr(agent_config, "workspace", None)
-        if ws is not None:
-            ws_resolved = Path(ws).resolve()
-            candidate = Path(file_path)
-            if not candidate.is_absolute():
-                candidate = Path(ws) / candidate
-            resolved = candidate.resolve()
-            if resolved != ws_resolved and ws_resolved not in resolved.parents:
-                return ToolResult(
-                    content=(
-                        f"Error: path escapes the workspace: {file_path!r}. "
-                        f"File and search tools are scoped to {ws_resolved}."
-                    ),
-                    is_error=True,
-                )
-            input["path"] = str(resolved)
+        if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
+            input["path"] = str(agent_config.workspace / file_path)
 
     # Normalize path to resolved form for registry keys (symlinks, .., relative spellings)
     # so that read via relative and write via absolute always hit the same registry entry.

@@ -271,8 +271,8 @@ Enabled by `.toml` files in `workspace/tools/`. Empty file = enabled with defaul
 | `file_patch` | Apply multiple SEARCH/REPLACE hunks to a file atomically |
 | `web_search` | Web search (requires Brave Search API key in TOML) |
 | `web_fetch` | Fetch + extract text from URLs |
-| `grep` | Search file contents by regex (bounded, workspace-scoped) |
-| `glob` | Find files by name pattern (bounded, workspace-scoped) |
+| `grep` | Search file contents by regex (bounded, workspace-rooted) |
+| `glob` | Find files by name pattern (bounded, workspace-rooted) |
 | `subagent` | Spawn sub-agents for complex tasks |
 | `memory_search` | Semantic + keyword search over workspace |
 | `send_media` | Send files to Matrix room |
