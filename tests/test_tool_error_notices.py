@@ -126,13 +126,16 @@ def _notice_contents(bot):
 
 
 # ===========================================================================
-# Non-error + todo_write: BYTE-IDENTICAL to today (GREEN guardrails)
+# Success notices: abbreviated body preserved, full call+result now furled
+# (workspace-kdsn.247.1 — generalizes the collapsed-<details> disclosure to
+# EVERY generic tool notice, not just errors)
 # ===========================================================================
 
 class TestNoticeInvariantsPinned:
     @pytest.mark.asyncio
-    async def test_non_error_notice_byte_identical(self, tmp_path):
-        """Non-error tool notice is byte-identical to today's plain format (§8b)."""
+    async def test_non_error_body_stays_abbreviated_line(self, tmp_path):
+        """The default/unfurled body stays the short abbreviated line, unchanged
+        from today's plain format — only formatted_body gains the fold (247.1)."""
         bot, agent = _make_bot_with_real_agent(tmp_path)
         _tool_notice, _tool_intent = bot._make_tool_callbacks(ROOM)
 
@@ -142,22 +145,28 @@ class TestNoticeInvariantsPinned:
         contents = _notice_contents(bot)
         assert len(contents) == 1, f"expected exactly one notice, got {len(contents)}"
         c = contents[0]
-        # Byte-identical: plain m.notice, exact body, NO html formatting fields.
-        assert c == {"msgtype": "m.notice",
-                     "body": "🔧 file_read `/x/y.txt` ✅"}, \
-            f"non-error notice must be byte-identical to today's format; got {c!r}"
+        assert c["body"] == "🔧 file_read `/x/y.txt` ✅", \
+            f"abbreviated body must be unchanged from today's format; got {c['body']!r}"
+        assert c["msgtype"] == "m.notice"
 
     @pytest.mark.asyncio
-    async def test_non_error_notice_no_details_block(self, tmp_path):
-        """Non-error notice must NOT gain a <details> block (§8b)."""
+    async def test_non_error_notice_furls_full_call_and_result(self, tmp_path):
+        """Non-error notice now carries a collapsed <details> with the FULL call
+        (all params) and FULL result — the 247.1 disclosure, closed by default."""
         bot, agent = _make_bot_with_real_agent(tmp_path)
         _tool_notice, _ = bot._make_tool_callbacks(ROOM)
-        await _tool_notice("tc1", "shell", {"command": "echo hi"},
+        await _tool_notice("tc1", "shell", {"command": "echo hi", "cwd": "/tmp"},
                            "ok output", False)
         c = _notice_contents(bot)[0]
-        assert "formatted_body" not in c, "non-error notice must stay plain (no html)"
-        assert "<details>" not in c.get("body", ""), \
-            "non-error notice body must not contain a details block"
+        fb = c.get("formatted_body", "")
+        assert c.get("format") == "org.matrix.custom.html"
+        assert "<details>" in fb, "success notice must now furl a <details> block"
+        assert "📥 Full call" in fb and "📤 Full result" in fb, \
+            "success notice must furl both the full call and the full result"
+        # Full input = ALL params, not just the single abbreviated field.
+        assert "command" in fb and "cwd" in fb, \
+            "furled call must contain every input param, not just the summary field"
+        assert "ok output" in fb, "furled result must contain the result content"
 
     @pytest.mark.asyncio
     async def test_todo_write_notice_path_unaffected(self, tmp_path):
@@ -233,20 +242,103 @@ class TestErrorNoticeDetail:
             "raw secret must NEVER appear in the notice (post-redaction guarantee, V6)"
 
     @pytest.mark.asyncio
-    async def test_error_notice_detail_capped_2000_with_marker(self, tmp_path):
-        """Error detail capped at 2000 chars + '[error detail truncated]' marker (§8b)."""
+    async def test_error_detail_head_tail_truncated_not_hard_2000(self, tmp_path):
+        """Over-long detail is head+tail truncated (truncate_result marker), NOT
+        hard-cut at 2000 — the 247.1 point is seeing MORE than the abbreviated
+        line, while a per-notice cap keeps it under the Matrix PDU limit."""
         bot, agent = _make_bot_with_real_agent(tmp_path)
         _tool_notice, _ = bot._make_tool_callbacks(ROOM)
 
-        big = "Z" * 5000
+        big = "Z" * 40000
         await _tool_notice("tc1", "shell", {"command": "run"}, big, True)
 
         c = _notice_contents(bot)[0]
         fb = c.get("formatted_body", "")
-        assert "[error detail truncated]" in fb, \
-            "over-long error detail must carry the '[error detail truncated]' marker"
-        assert fb.count("Z") <= 2000, \
-            f"error detail must be capped at 2000 chars; got {fb.count('Z')}"
+        assert "[truncated:" in fb, \
+            "over-long detail must carry the head+tail truncate_result marker"
+        # Shows MORE than the old 2000 hard cap...
+        assert fb.count("Z") > 2000, \
+            "furled detail must surface more than the old 2000-char hard cut"
+        # ...but the whole notice stays well under the ~25K Matrix PDU limit.
+        assert len(fb) < 25000, \
+            f"notice must stay under the Matrix PDU limit; got {len(fb)} chars"
+
+
+# ===========================================================================
+# Field-picker + furled-detail (workspace-kdsn.247.1)
+# ===========================================================================
+
+class TestAbbreviatedLineFieldPicker:
+    @pytest.mark.asyncio
+    async def test_grep_abbreviated_line_shows_pattern(self, tmp_path):
+        """grep's REQUIRED param is 'pattern' (path is optional/omitted); the
+        abbreviated line must show it instead of a context-free '🔧 grep ✅'."""
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        _tool_notice, _ = bot._make_tool_callbacks(ROOM)
+        await _tool_notice("tc1", "grep", {"pattern": "TODO|FIXME"},
+                           "3 matches", False)
+        c = _notice_contents(bot)[0]
+        assert c["body"] == "🔧 grep `TODO|FIXME` ✅", \
+            f"grep abbreviated line must surface the pattern; got {c['body']!r}"
+
+    @pytest.mark.asyncio
+    async def test_glob_abbreviated_line_shows_pattern(self, tmp_path):
+        """glob likewise keys on 'pattern'."""
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        _tool_notice, _ = bot._make_tool_callbacks(ROOM)
+        await _tool_notice("tc1", "glob", {"pattern": "**/*.py"}, "12 files", False)
+        c = _notice_contents(bot)[0]
+        assert c["body"] == "🔧 glob `**/*.py` ✅", \
+            f"glob abbreviated line must surface the pattern; got {c['body']!r}"
+
+    @pytest.mark.asyncio
+    async def test_grep_pattern_wins_over_optional_path(self, tmp_path):
+        """When grep supplies BOTH pattern and the optional path, the meaningful
+        field (pattern) wins, and the optional glob filter is appended."""
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        _tool_notice, _ = bot._make_tool_callbacks(ROOM)
+        await _tool_notice("tc1", "grep",
+                           {"pattern": "needle", "path": "/src", "glob": "*.py"},
+                           "1 match", False)
+        c = _notice_contents(bot)[0]
+        assert c["body"] == "🔧 grep `needle` (glob: `*.py`) ✅", \
+            f"pattern must win over path, with glob filter appended; got {c['body']!r}"
+
+
+class TestFurledResultRedaction:
+    @pytest.mark.asyncio
+    async def test_success_furled_result_is_post_redaction(self, tmp_path):
+        """The furled FULL result on SUCCESS must surface only post-redaction
+        content — the whole reason the old success path hid the result. A
+        planted secret arrives already redacted (execute_tool → on_tool_call)."""
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        _tool_notice, _ = bot._make_tool_callbacks(ROOM)
+
+        raw = f"config loaded, token={FAKE_SECRET}"
+        redacted, events = _redact(raw)
+        assert events, "sanity: planted secret must match a redaction pattern"
+        wrapped = wrap_tool_result(redacted, "shell", "tc1")
+
+        await _tool_notice("tc1", "shell", {"command": "cat cfg"}, wrapped, False)
+
+        c = _notice_contents(bot)[0]
+        fb = c.get("formatted_body", "")
+        assert "[REDACTED" in fb, "furled result must show the [REDACTED:*] marker"
+        assert FAKE_SECRET not in fb, \
+            "raw secret must NEVER appear in the furled result (post-redaction)"
+
+    @pytest.mark.asyncio
+    async def test_furled_result_strips_tool_result_envelope(self, tmp_path):
+        """The furled result unwraps the <tool_result tool/id> provenance
+        envelope — its call id is noise in an operator notice."""
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        _tool_notice, _ = bot._make_tool_callbacks(ROOM)
+        wrapped = wrap_tool_result("clean output", "shell", "toolu_ENVELOPE_ID")
+        await _tool_notice("tc1", "shell", {"command": "echo"}, wrapped, False)
+        c = _notice_contents(bot)[0]
+        fb = c.get("formatted_body", "")
+        assert "clean output" in fb
+        assert "toolu_ENVELOPE_ID" not in fb, "envelope call id must be stripped"
 
 
 # ===========================================================================

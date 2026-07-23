@@ -10,6 +10,7 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 
 import asyncio
 import hashlib
+import json
 import logging
 import tempfile
 import time
@@ -43,7 +44,7 @@ from openalph.session import SessionLog
 from openalph.mention import mentions_me, is_gated, strip_mention, MentionCheckResult
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
-from openalph.tools import escape_system_reminder_tags
+from openalph.tools import escape_system_reminder_tags, truncate_result
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,89 @@ def _escape_preserve_breaks(text: str) -> str:
     esc = html_escape(str(text))
     esc = esc.replace("\r\n", "\n").replace("\r", "\n")
     return esc.replace("\n", "<br>")
+
+
+# Per-notice furled-detail caps. The furled block exists to show MORE than the
+# abbreviated one-line summary, so these are head+tail truncated (via
+# truncate_result) rather than hard-cut — but both the raw budget and the
+# post-escape ceiling are bounded so a single notice stays comfortably under
+# the Matrix PDU limit (~25K chars) even when html_escape expands the content
+# (worst case ~6x for all-`"`/`<`/`&` text; realistic tool output ~1.05x).
+_FURL_INPUT_RAW_CAP = 3000        # pretty-printed input_data, pre-escape
+_FURL_RESULT_RAW_CAP = 12000      # full result content, pre-escape
+_FURL_INPUT_ESC_CAP = 4000        # post-escape ceiling for the input fold
+_FURL_RESULT_ESC_CAP = 16000      # post-escape ceiling for the result fold
+
+
+def _unwrap_tool_result(text: str) -> str:
+    """Strip the ``<tool_result tool="..." id="...">\\n … \\n</tool_result>``
+    envelope that agent.py's wrap_tool_result adds before handing content to
+    on_tool_call. The envelope's provenance attributes (tool name + call id)
+    are noise in an operator-facing notice — the same reasoning the todo_write
+    branch used to render from structured input rather than the wrapped string.
+    Non-envelope text (e.g. an early guard-refusal string) is returned as-is."""
+    s = str(text)
+    open_tag = "<tool_result "
+    if s.startswith(open_tag) and s.rstrip().endswith("</tool_result>"):
+        gt = s.find(">")
+        if gt != -1:
+            inner = s[gt + 1:s.rstrip().rfind("</tool_result>")]
+            return inner.strip("\n")
+    return s
+
+
+def _escape_capped(text: str, raw_cap: int, esc_cap: int) -> str:
+    """Head+tail truncate `text` to `raw_cap`, html-escape it, then bound the
+    escaped result to `esc_cap` (entity-safe: never cuts inside an `&…;`).
+    Both bounds matter — raw_cap keeps the common case readable, esc_cap keeps
+    the PDU size bounded regardless of how far escaping expands the content."""
+    esc = html_escape(truncate_result(str(text), raw_cap))
+    if len(esc) <= esc_cap:
+        return esc
+    cut = esc[:esc_cap]
+    # Avoid slicing through an HTML entity (`&amp;` etc.): if an unterminated
+    # `&` opened before the cut, drop back to just before it.
+    amp = cut.rfind("&")
+    if amp != -1 and ";" not in cut[amp:]:
+        cut = cut[:amp]
+    return cut + "\n[truncated]"
+
+
+def _furl_tool_call_detail(input_data, result, is_error: bool) -> str:
+    """Build the collapsed <details> disclosure appended to a generic tool-call
+    notice: the FULL structured input (all params, pretty-printed) and the FULL
+    result content, each furled/closed by default — the same click-to-expand UX
+    the subagent/advisor/todo_write notices already use.
+
+    Security invariants carried from those precedents:
+      * html_escape (never raw mistune/HTML) on all tool-influenced text —
+        tool inputs and outputs are adversarial-input surface (R8).
+      * `result` is already post-redaction here: execute_tool applies
+        redact_credentials/redact_known_secrets before agent.py hands the
+        wrapped content to on_tool_call, so the furled result cannot surface a
+        raw credential the abbreviated line would have hidden.
+    """
+    parts = []
+    if input_data is not None:
+        try:
+            dumped = json.dumps(input_data, indent=2, ensure_ascii=False,
+                                sort_keys=False, default=str)
+        except (TypeError, ValueError):
+            dumped = repr(input_data)
+        input_esc = _escape_capped(dumped, _FURL_INPUT_RAW_CAP, _FURL_INPUT_ESC_CAP)
+        parts.append(
+            "<details><summary>📥 Full call</summary>\n"
+            f"<pre>{input_esc}</pre></details>"
+        )
+    result_str = _unwrap_tool_result(result) if result else ""
+    if result_str:
+        result_esc = _escape_capped(result_str, _FURL_RESULT_RAW_CAP, _FURL_RESULT_ESC_CAP)
+        summary = "⚠️ Error output" if is_error else "📤 Full result"
+        parts.append(
+            f"<details><summary>{summary}</summary>\n"
+            f"<pre>{result_esc}</pre></details>"
+        )
+    return "".join(f"\n{p}" for p in parts)
 
 
 def format_model_list(aliases: dict[str, str], current_model: str) -> str:
@@ -755,12 +839,23 @@ class MatrixBot:
             status = "❌ error" if is_error else "✅"
             detail = ""
             if isinstance(input_data, dict):
-                # Pick the most informative input field per tool type
-                for key in ("path", "file_path", "command", "query", "url"):
+                # Pick the most informative input field per tool type.
+                # "pattern" leads: grep/glob's sole REQUIRED param is "pattern"
+                # ("path" is optional and usually omitted), so without it those
+                # notices rendered as a context-free "🔧 grep ✅". "task" trails
+                # for defensive completeness (subagent is special-cased below
+                # and never reaches this generic path, but a future task-bearing
+                # tool would otherwise render blank).
+                for key in ("pattern", "path", "file_path", "command",
+                            "query", "url", "task"):
                     if key in input_data:
                         val = str(input_data[key])[:120]
                         detail = f" `{val}`"
                         break
+                # grep's optional glob filter is meaningful context for the
+                # abbreviated line — append it after the pattern.
+                if name == "grep" and input_data.get("glob"):
+                    detail += f" (glob: `{str(input_data['glob'])[:60]}`)"
             # Refresh typing indicator — Matrix expires it after ~30s,
             # so long tool loops look dead without this.
             try:
@@ -924,34 +1019,26 @@ class MatrixBot:
                         except Exception:
                             pass
             else:
+                # Generic tool-call notice. The plain-text `body` stays the
+                # short abbreviated line (default/unfurled view); the
+                # formatted_body adds the FULL call+result behind collapsed
+                # <details> folds — matching the subagent/advisor/todo_write
+                # click-to-expand pattern, and now applied on SUCCESS too (not
+                # just errors). _furl_tool_call_detail carries the R8 escaping
+                # and post-redaction guarantees (see its docstring).
                 notice_body = f"🔧 {name}{detail} {status}"
-                if is_error:
-                    result_str = str(result) if result else ""
-                    if len(result_str) > 2000:
-                        detail_text = result_str[:2000] + "\n[error detail truncated]"
-                    else:
-                        detail_text = result_str
-                    error_html = (
-                        html_escape(notice_body)
-                        + '\n<details>\n<summary>⚠️ Error detail</summary>\n'
-                        + html_escape(detail_text)
-                        + '</details>'
-                    )
-                    content_msg = {
-                        "msgtype": "m.notice",
-                        "body": notice_body,
-                        "format": "org.matrix.custom.html",
-                        "formatted_body": error_html,
-                    }
-                    try:
-                        await self._room_send_with_retry(room_id, content_msg)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        await self.send_notice(room_id, notice_body)
-                    except Exception:
-                        pass
+                detail_html = _furl_tool_call_detail(input_data, result, is_error)
+                formatted_body = html_escape(notice_body) + detail_html
+                content_msg = {
+                    "msgtype": "m.notice",
+                    "body": notice_body,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": formatted_body,
+                }
+                try:
+                    await self._room_send_with_retry(room_id, content_msg)
+                except Exception:
+                    pass
             # Append tool result to session log
             _sl = getattr(self, 'session_log', None)
             if _sl:
