@@ -171,3 +171,46 @@ class TestEdgeCases:
         chunks = chunk_file(text, "unicode.md")
         assert len(chunks) >= 1
         assert "セクション" in chunks[0].text
+
+
+# ===========================================================================
+# BUG-8 — _split_large_section must not emit the final subsection twice
+# BUG-15 — paragraph line numbers must survive separators with 3+ newlines
+# ===========================================================================
+
+class TestChunkerRegressions:
+
+    def _oversized_h3_section(self):
+        body = "## Big Section\n\n"
+        for name, word in (("Sub A", "alpha"), ("Sub B", "bravo"), ("Sub C", "charlie")):
+            body += f"### {name}\n" + (f"{word} line of text padded out here\n" * 20) + "\n"
+        assert len(body) > 1500  # ensure chunk_file routes into _split_large_section
+        return body
+
+    def test_no_duplicate_final_subsection(self):
+        """BUG-8: the last ### subsection was emitted twice (sentinel + trailing)."""
+        chunks = chunk_file(self._oversized_h3_section(), "notes.md")
+        texts = [c.text for c in chunks]
+        assert len(texts) == len(set(texts)), "a chunk was emitted more than once"
+
+    def test_final_subsection_present_exactly_once(self):
+        chunks = chunk_file(self._oversized_h3_section(), "notes.md")
+        charlie = [c for c in chunks if "charlie" in c.text]
+        assert len(charlie) == 1
+
+    def test_paragraph_line_numbers_survive_wide_separators(self):
+        """BUG-15: citations must point at the paragraph's real lines."""
+        txt = "para one is here\n\n\n\npara two is here\n\n\n\npara three is here"
+        lines = txt.split("\n")
+        for c in chunk_file(txt, "plain.txt"):
+            actual = "\n".join(lines[c.start_line - 1:c.end_line]).strip()
+            assert actual == c.text.strip(), (
+                f"L{c.start_line}-{c.end_line} cites {c.text!r} but file has {actual!r}"
+            )
+
+    def test_paragraph_line_numbers_with_leading_blank_lines(self):
+        txt = "\n\nfirst para\n\n\nsecond para"
+        lines = txt.split("\n")
+        for c in chunk_file(txt, "plain.txt"):
+            actual = "\n".join(lines[c.start_line - 1:c.end_line]).strip()
+            assert actual == c.text.strip()

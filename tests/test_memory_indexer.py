@@ -364,3 +364,40 @@ class TestEmbeddingDimensionGuard:
             "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
         assert non_null >= 1
         conn.close()
+
+
+# ===========================================================================
+# BUG-9 — one unreadable file must not abort the whole index pass
+# BUG-10 — a per-row vec-insert guard, not one blanket except over the loop
+# ===========================================================================
+
+class TestIndexerRobustness:
+
+    @pytest.mark.asyncio
+    async def test_unreadable_file_is_skipped_not_fatal(self, tmp_path):
+        """BUG-9: read_text had no error handling, so a non-UTF-8/deleted file
+        raised out of index_all and aborted indexing for every other file."""
+        (tmp_path / "good.md").write_text("## Good\n\n" + "plenty of indexable content in this file. " * 3 + "\n")
+        (tmp_path / "bad.md").write_bytes(b"## Bad\n\n\xff\xfe not utf-8 \xff\n")
+
+        conn = init_db(tmp_path / "idx.db", dimensions=4)
+        indexer = MemoryIndexer(conn, _make_embedder_mock(), "test-model")
+
+        stats = await indexer.index_all([tmp_path])  # must not raise
+
+        paths = [row[0] for row in conn.execute("SELECT DISTINCT path FROM chunks")]
+        assert any("good.md" in p for p in paths)
+        assert not any("bad.md" in p for p in paths)
+
+    @pytest.mark.asyncio
+    async def test_indexes_when_vec_table_absent(self, tmp_path):
+        """BUG-10: without sqlite-vec the chunks_vec table doesn't exist; the
+        per-row guard must skip vector inserts while still indexing for FTS."""
+        (tmp_path / "a.md").write_text("## A\n\n" + "searchable keyword content in this doc. " * 3 + "\n")
+        conn = init_db(tmp_path / "idx.db", dimensions=4)  # no load_vec_extension
+        indexer = MemoryIndexer(conn, _make_embedder_mock(), "test-model")
+
+        stats = await indexer.index_all([tmp_path])  # must not raise
+
+        n = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        assert n >= 1

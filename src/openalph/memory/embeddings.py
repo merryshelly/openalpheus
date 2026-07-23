@@ -68,6 +68,21 @@ class EmbeddingProvider:
         with suppress_stdout_stderr():
             return llm.create_embedding(text)
 
+    def _ensure_and_create(self, text: str):
+        """Load the model (if needed) and embed one text -- all synchronous, so
+        it can be dispatched to a worker thread in one hop (BUG-9)."""
+        llm = self._ensure_model()
+        if llm is None:
+            return None
+        return self._create_embedding(llm, text)
+
+    def _ensure_and_embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+        """Load the model (if needed) and embed a batch, synchronously (BUG-9)."""
+        llm = self._ensure_model()
+        if llm is None:
+            return [None] * len(texts)
+        return self._embed_batch_sync(llm, texts)
+
     async def embed(self, text: str) -> list[float] | None:
         """Embed a single text string.
 
@@ -76,10 +91,14 @@ class EmbeddingProvider:
         """
         try:
             async with self._lock:
-                llm = self._ensure_model()
-                if llm is None:
-                    return None
-                result = await asyncio.to_thread(self._create_embedding, llm, text)
+                # BUG-9: run the model load inside the thread as well. Only the
+                # create_embedding call used to be dispatched via to_thread; the
+                # first `_ensure_model()` did a multi-hundred-MB GGUF `Llama(...)`
+                # load INLINE in the coroutine, freezing the event loop (Matrix
+                # sync stalls, other rooms' turns halt, heartbeat timers slip).
+                result = await asyncio.to_thread(self._ensure_and_create, text)
+            if result is None:
+                return None
             return result["data"][0]["embedding"]
         except Exception as e:
             logger.warning("Embedding failed: %s", e)
@@ -108,10 +127,8 @@ class EmbeddingProvider:
             return []
         try:
             async with self._lock:
-                llm = self._ensure_model()
-                if llm is None:
-                    return [None] * len(texts)
-                return await asyncio.to_thread(self._embed_batch_sync, llm, texts)
+                # BUG-9: load the model inside the thread (see embed()).
+                return await asyncio.to_thread(self._ensure_and_embed_batch, texts)
         except Exception as e:
             logger.warning("Batch embedding failed: %s", e)
             return [None] * len(texts)

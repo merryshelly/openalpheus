@@ -1,6 +1,10 @@
 """SQLite schema creation and sqlite-vec loading."""
+import logging
+import re
 import sqlite3
 from pathlib import Path
+
+logger = logging.getLogger("openalph.memory.schema")
 
 
 def init_db(db_path: Path, dimensions: int) -> sqlite3.Connection:
@@ -96,18 +100,43 @@ def load_vec_extension(conn: sqlite3.Connection) -> bool:
     """
     try:
         import sqlite_vec
-        
-        # Enable extension loading
+
+        # Enable extension loading only for the duration of the load.
         conn.enable_load_extension(True)
-        
-        # Load sqlite-vec extension
-        sqlite_vec.load(conn)
-        
+        try:
+            sqlite_vec.load(conn)
+        finally:
+            # SEC-13: leaving extension loading enabled for the connection's
+            # whole lifetime lets any later statement load an arbitrary shared
+            # library. Disable it again the moment sqlite-vec is loaded; the
+            # capability is needed for exactly that one call.
+            conn.enable_load_extension(False)
+
         # Get dimensions from config table, default to 768 if not found
         cursor = conn.execute("SELECT value FROM _config WHERE key = 'dimensions'")
         row = cursor.fetchone()
         dimensions = int(row[0]) if row else 768
-        
+
+        # BUG-10: if a chunks_vec table already exists at a DIFFERENT width
+        # (the operator changed the embedding model/dimension), CREATE ... IF
+        # NOT EXISTS silently keeps the OLD width. Every new-width insert then
+        # fails and -- with the indexer's per-row guard -- is dropped, leaving
+        # a permanently keyword-only index while the operator believes semantic
+        # search is live. Detect the mismatch against the ACTUAL table schema
+        # and rebuild, so a dimension change self-heals on the next index pass.
+        existing = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_vec'"
+        ).fetchone()
+        if existing and existing[0]:
+            m = re.search(r"float\[(\d+)\]", existing[0])
+            existing_dim = int(m.group(1)) if m else None
+            if existing_dim is not None and existing_dim != dimensions:
+                logger.warning(
+                    "Embedding dimension changed (%s -> %s); rebuilding chunks_vec.",
+                    existing_dim, dimensions,
+                )
+                conn.execute("DROP TABLE IF EXISTS chunks_vec")
+
         # Create vec0 virtual table with the configured dimensions
         conn.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
@@ -115,9 +144,9 @@ def load_vec_extension(conn: sqlite3.Connection) -> bool:
                 embedding float[{dimensions}]
             )
         """)
-        
+
         conn.commit()
     except Exception:
         return False
-    
+
     return True

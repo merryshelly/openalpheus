@@ -3,6 +3,7 @@
 Ties together the chunker, embeddings, and schema modules.
 """
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -103,11 +104,19 @@ class MemoryIndexer:
         """Index a single file: read → chunk → embed → store in DB.
         First deletes any existing chunks for this path, then inserts new ones.
         Returns number of chunks created."""
-        # Read file content
-        text = Path(file_info.path).read_text()
+        # BUG-9: read + chunk off the event loop, and never let one unreadable
+        # file abort the whole index pass. `read_text` had no error handling, so
+        # a single deleted / non-UTF-8 / permission-denied file raised straight
+        # out of `index_all`. Treat such a file as "no chunks" and move on.
+        def _read_and_chunk() -> list:
+            text = Path(file_info.path).read_text(encoding="utf-8")
+            return chunk_file(text, file_info.path)
 
-        # Chunk the file
-        chunks = chunk_file(text, file_info.path)
+        try:
+            chunks = await asyncio.to_thread(_read_and_chunk)
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("Skipping unreadable file %s: %s", file_info.path, e)
+            return 0
 
         if not chunks:
             return 0
@@ -179,20 +188,40 @@ class MemoryIndexer:
                 )
             )
 
-        # Insert embeddings into vec table for KNN search (skip None/malformed)
-        try:
-            for i, chunk in enumerate(chunks):
-                emb_bytes = emb_bytes_list[i]
-                if emb_bytes is not None:
-                    chunk_id = hashlib.sha256(
-                        f"{file_info.path}:{chunk.start_line}:{i}".encode()
-                    ).hexdigest()
-                    self.db.execute(
-                        "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
-                        (chunk_id, emb_bytes)
-                    )
-        except Exception:
-            pass  # chunks_vec may not exist if sqlite-vec not loaded
+        # Insert embeddings into vec table for KNN search (skip None/malformed).
+        # BUG-10: the guard is PER ROW, not one try around the whole loop. The
+        # old blanket except meant the FIRST failing insert (e.g. a width the
+        # vec table no longer expects after a dimension change) dropped ALL
+        # remaining chunks silently -- a permanently keyword-only index while
+        # the operator believed semantic search was live. A per-row failure now
+        # skips just that row and is logged; a MissingTable-style error (sqlite-
+        # vec not loaded) short-circuits the loop once instead of per row.
+        for i, chunk in enumerate(chunks):
+            emb_bytes = emb_bytes_list[i]
+            if emb_bytes is None:
+                continue
+            chunk_id = hashlib.sha256(
+                f"{file_info.path}:{chunk.start_line}:{i}".encode()
+            ).hexdigest()
+            try:
+                self.db.execute(
+                    "INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)",
+                    (chunk_id, emb_bytes)
+                )
+            except sqlite3.OperationalError as e:
+                # No chunks_vec table at all (sqlite-vec not loaded) -> stop
+                # trying for this file; it is keyword-only by configuration.
+                if "no such table" in str(e).lower():
+                    break
+                logger.warning(
+                    "Vector insert failed for %s chunk %d: %s",
+                    file_info.path, i, e,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Vector insert failed for %s chunk %d: %s",
+                    file_info.path, i, e,
+                )
 
         self.db.commit()
         return len(chunks)

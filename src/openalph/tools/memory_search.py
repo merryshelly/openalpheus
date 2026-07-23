@@ -4,8 +4,8 @@ Thin wrapper around MemoryIndex that handles tool config,
 workspace resolution, and output formatting.
 """
 
+import asyncio
 import logging
-import re
 from pathlib import Path
 
 from openalph.memory.schema import init_db, load_vec_extension
@@ -17,7 +17,6 @@ from openalph.memory.search import (
     merge_hybrid_results,
     apply_temporal_decay,
     mmr_rerank,
-    SearchResult,
 )
 from openalph.tools import ToolResult
 
@@ -25,6 +24,15 @@ logger = logging.getLogger(__name__)
 
 # Cache MemoryIndexer per workspace to avoid re-loading the model on every call
 _index_cache: dict[str, "MemoryIndexer"] = {}
+
+# BUG-13: one lock per workspace, guarding all use of that workspace's shared
+# sqlite connection. `_index_cache` hands the SAME MemoryIndexer (and thus the
+# same sqlite3.Connection) to every concurrent caller, and run_memory_search
+# awaits the embedder BETWEEN its FTS and vector `execute` calls -- so two
+# concurrent searches could interleave un-synchronized statements on one
+# connection ("Recursive use of cursors not allowed"). Only the embedder was
+# lock-guarded. Serialize each workspace's index + query section instead.
+_index_locks: dict[str, asyncio.Lock] = {}
 
 # PHIL-2: workspaces that have already been told semantic search is
 # unavailable. Every import in the embedding path fails SOFT (log warning
@@ -42,6 +50,14 @@ _DEGRADED_NOTICE = (
     "    /opt/openalph-venv/bin/pip install 'llama-cpp-python==0.3.16' 'sqlite-vec==0.1.6'\n"
     "  and place the model file at the path above. Keyword search still works.\n"
 )
+
+
+def _get_index_lock(workspace_key: str) -> asyncio.Lock:
+    lock = _index_locks.get(workspace_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _index_locks[workspace_key] = lock
+    return lock
 
 
 def _get_scan_paths(workspace: Path, extra_paths: list[str] | None = None) -> list[Path]:
@@ -109,6 +125,17 @@ async def run_memory_search(
 
     indexer = _index_cache[workspace_key]
 
+    # BUG-13: hold the per-workspace lock across the entire index + query
+    # section, since all of it touches the one shared sqlite connection.
+    async with _get_index_lock(workspace_key):
+        result = await _index_and_search(
+            indexer, workspace, query, config, max_results, min_score
+        )
+    return result
+
+
+async def _index_and_search(indexer, workspace, query, config, max_results, min_score):
+    workspace_key = str(workspace)
     # Ensure index is up to date
     scan_paths = _get_scan_paths(workspace, config.get("extra_paths"))
     stats = await indexer.index_all(scan_paths)

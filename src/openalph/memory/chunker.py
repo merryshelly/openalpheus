@@ -88,23 +88,28 @@ def _split_large_section(text: str, base_start_line: int) -> list[tuple[int, int
 
     if h3_indices:
         chunks = []
-        # If there's content before the first ###, include it
-        boundaries = h3_indices + [len(lines)]
+        # BUG-8: iterate over the ### boundaries only. The previous version
+        # appended a `len(lines)` sentinel to `boundaries` AND kept a separate
+        # "handle last segment" block below -- so the final subsection was
+        # emitted TWICE (once when the loop reached the sentinel, once by the
+        # trailing block, whose `prev` still pointed at the last ###). Both
+        # copies got distinct sha256 ids, were embedded and inserted -- doubling
+        # that chunk's embedding cost and skewing BM25 corpus stats -- while the
+        # search-side dedup hid it from query output (mis-attributing the cause
+        # to "re-index churn"). The sentinel is gone; the trailing block alone
+        # closes the final segment, emitted exactly once.
         prev = 0
-        for idx in boundaries:
-            if idx == prev and idx in h3_indices:
-                prev = idx
-                continue
+        for idx in h3_indices:
             if idx > prev:
                 chunk_text = "\n".join(lines[prev:idx]).rstrip()
                 if chunk_text:
                     start = base_start_line + prev
                     end = base_start_line + idx - 1
                     chunks.append((start, end, chunk_text))
-            if idx in h3_indices:
-                prev = idx
+            prev = idx
 
-        # Handle last segment
+        # Final segment: from the last ### to the end (or from 0 if the section
+        # opened with content before any ###).
         if prev < len(lines):
             chunk_text = "\n".join(lines[prev:]).rstrip()
             if chunk_text:
@@ -125,37 +130,71 @@ def _split_large_section(text: str, base_start_line: int) -> list[tuple[int, int
 
 
 def _split_paragraphs(text: str, base_start_line: int) -> list[tuple[int, int, str]]:
-    """Split text on double-newline paragraph boundaries."""
-    parts = re.split(r"\n\n+", text)
-    if len(parts) <= 1:
-        end_line = base_start_line + text.count("\n")
-        return [(base_start_line, end_line, text)]
+    """Split text on blank-line paragraph boundaries, tracking real offsets.
 
-    chunks = []
-    current_line = base_start_line
-    for part in parts:
-        part = part.strip()
+    BUG-15: the previous version advanced the running line number by
+    `part.count("\n") + 2`, hard-coding a two-newline separator even though it
+    split on `\n\n+`. Any separator with 3+ newlines (and the leading blank
+    lines that `.strip()` discarded) shifted every subsequent chunk's recorded
+    start/end -- and those numbers are surfaced to the agent as `path:start-end`
+    citations, so a drifted citation points the operator at the wrong lines.
+    Line numbers are now derived from each paragraph's actual character span via
+    `re.finditer`, so any separator width is exact.
+    """
+    # Walk the non-empty segments between blank-line separators, recovering
+    # each paragraph's exact character offset (and thus line number).
+    chunks: list[tuple[int, int, str]] = []
+    pos = 0
+    seps = list(re.finditer(r"\n\n+", text))
+    boundaries = [(m.start(), m.end()) for m in seps]
+    segments: list[tuple[int, int]] = []
+    for start, end in boundaries:
+        segments.append((pos, start))
+        pos = end
+    segments.append((pos, len(text)))
+
+    if len([seg for seg in segments if text[seg[0]:seg[1]].strip()]) <= 1:
+        end_line = base_start_line + text.count("\n")
+        return [(base_start_line, end_line, text.strip() or text)]
+
+    for seg_start, seg_end in segments:
+        raw = text[seg_start:seg_end]
+        part = raw.strip()
         if not part:
             continue
-        line_count = part.count("\n")
-        chunks.append((current_line, current_line + line_count, part))
-        # +2 for the double newline separator
-        current_line += line_count + 2
+        # Offset of the stripped paragraph within `text`, in lines.
+        lead_ws = len(raw) - len(raw.lstrip())
+        start_off = seg_start + lead_ws
+        start_line = base_start_line + text.count("\n", 0, start_off)
+        end_line = start_line + part.count("\n")
+        chunks.append((start_line, end_line, part))
 
     return chunks
 
 
 def _split_plain_text(text: str) -> list[tuple[int, str]]:
     """Split non-markdown text on paragraph boundaries, then fixed windows."""
-    paragraphs = re.split(r"\n\n+", text)
-    if len(paragraphs) > 1:
+    # BUG-15: derive line numbers from real character spans rather than
+    # assuming a 2-newline separator (see `_split_paragraphs`).
+    seps = list(re.finditer(r"\n\n+", text))
+    if seps:
         sections = []
-        current_line = 0
-        for para in paragraphs:
-            para = para.strip()
-            if para:
-                sections.append((current_line + 1, para))  # 1-indexed
-            current_line += para.count("\n") + 2  # +2 for separator
+        pos = 0
+        spans = [(m.start(), m.end()) for m in seps]
+        segments = []
+        for start, end in spans:
+            segments.append((pos, start))
+            pos = end
+        segments.append((pos, len(text)))
+        for seg_start, seg_end in segments:
+            raw = text[seg_start:seg_end]
+            para = raw.strip()
+            if not para:
+                continue
+            lead_ws = len(raw) - len(raw.lstrip())
+            start_off = seg_start + lead_ws
+            start_line = text.count("\n", 0, start_off) + 1  # 1-indexed
+            sections.append((start_line, para))
         return sections
 
     # No paragraph breaks — use fixed windows
