@@ -228,7 +228,15 @@ class StreamEvent:
 def _supports_adaptive_thinking(model_id: str) -> bool:
     """Returns True for models that support adaptive thinking (type=adaptive + effort).
 
-    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, sonnet-4-6, sonnet-5, mythos, fable.
+    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, opus-5, sonnet-4-6, sonnet-5,
+    mythos, fable.
+
+    "opus-5" is a distinct fragment from "opus-4-5"/etc (no "-4-" substring in
+    common), so it cannot collide with the existing opus-4.x entries -- verified
+    via substring regression tests in test_opus5_upgrade.py. Without this entry,
+    claude-opus-5 would silently fall through to the legacy budget_tokens branch
+    instead of adaptive+effort (the exact bug class test_sonnet5_upgrade.py exists
+    to prevent).
 
     Case-insensitive (matches model_context_window / _model_output_cap).
     """
@@ -240,6 +248,7 @@ def _supports_adaptive_thinking(model_id: str) -> bool:
         or "sonnet-5" in model_id
         or "opus-4-7" in model_id
         or "opus-4-8" in model_id
+        or "opus-5" in model_id
         or "mythos" in model_id
         or "fable" in model_id
     )
@@ -304,6 +313,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None]] = [
     ("opus-4-6",  1_048_576, 128_000),
     ("opus-4-7",  1_048_576, 128_000),
     ("opus-4-8",  1_048_576, 128_000),
+    ("opus-5",    1_048_576, 128_000),
     ("fable",     1_048_576, 128_000),
     # Fireworks / open
     ("glm-5p2",   1_048_576, None),
@@ -439,6 +449,7 @@ CACHE_WRITE_1H_MULT = 2.0    # 1-hour cache write   = 2.0x base input
 # before lookup. Sonnet 5 carries an effective-date schedule (intro rates
 # through 2026-08-31, standard from 2026-09-01).
 _MODEL_PRICING: dict[str, dict] = {
+    "claude-opus-5":     {"input": 5.0,  "output": 25.0},
     "claude-opus-4-8":   {"input": 5.0,  "output": 25.0},
     "claude-opus-4-7":   {"input": 5.0,  "output": 25.0},
     "claude-opus-4-6":   {"input": 5.0,  "output": 25.0},
