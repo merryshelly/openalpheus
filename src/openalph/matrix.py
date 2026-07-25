@@ -888,15 +888,19 @@ class MatrixBot:
                 # are tool-influenced text and must never pass raw HTML to the
                 # client. Cosmetic markdown loss here is an accepted tradeoff
                 # (audit decision).
+                # kdsn.257: _escape_preserve_breaks (html_escape + nl->br) —
+                # parity with the advisor notice fix (kdsn.198.9, dc9b550).
+                # Plain html_escape left multi-line briefs/results as a
+                # run-on line (HTML folds literal '\n' to a space).
                 if task_preview:
                     html += (
                         f'\n<details><summary>📋 Task brief</summary>\n'
-                        f'{html_escape(task_preview)}</details>'
+                        f'{_escape_preserve_breaks(task_preview)}</details>'
                     )
                 if result_preview:
                     html += (
                         f'\n<details><summary>📨 Result</summary>\n'
-                        f'{html_escape(result_preview)}</details>'
+                        f'{_escape_preserve_breaks(result_preview)}</details>'
                     )
                 body_text = f"{summary_line}\n\nTask: {task_preview[:200]}"
                 content_msg = {
@@ -1079,10 +1083,12 @@ class MatrixBot:
                     html = f'<b>{summary}</b>'
                     # R8: html.escape (not raw mistune.html) — the dispatch task
                     # brief is tool-influenced text; never pass raw HTML through.
+                    # kdsn.257: _escape_preserve_breaks — parity with the
+                    # advisor spawn-notice fix (kdsn.198.9).
                     if task_preview:
                         html += (
                             f'\n<details><summary>📋 Task brief</summary>\n'
-                            f'{html_escape(task_preview)}</details>'
+                            f'{_escape_preserve_breaks(task_preview)}</details>'
                         )
                     body_text = f"{summary}: {task_preview[:200]}"
                     dispatch_msg = {

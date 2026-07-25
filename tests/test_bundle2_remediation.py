@@ -738,6 +738,55 @@ class TestR8SubagentNotice:
 
 
 # ===========================================================================
+# kdsn.257 — subagent notice line-break parity with the advisor fix
+# (kdsn.198.9, dc9b550): _escape_preserve_breaks instead of plain html_escape
+# ===========================================================================
+
+class TestSubagentNoticeLineBreaks:
+    """The subagent spawn (task brief) and return (task brief + result) notice
+    folds must preserve real newlines as <br> — the same fix already applied
+    to the advisor spawn/return notices (kdsn.198.9) — instead of collapsing
+    a multi-line brief/result to a run-on line via plain html_escape."""
+
+    def test_return_notice_task_and_result_preserve_line_breaks(self, tmp_path):
+        bot, _ = _make_bot_with_real_agent(tmp_path)
+        tool_notice, _ = bot._make_tool_callbacks(ROOM)
+        task = "Step one.\nStep two.\n\nFinal step."
+        result = "Found A.\nFound B.\n\nDone."
+        await_(tool_notice("c4", "subagent", {"task": task, "model": "m"},
+                          result, False))
+        c = _notice_contents(bot)[0]
+        fb = c.get("formatted_body", "")
+        assert "Step one.<br>Step two.<br><br>Final step." in fb, (
+            "return-notice task brief must keep line breaks (<br>), not fold to a run-on")
+        assert "Found A.<br>Found B.<br><br>Done." in fb, (
+            "return-notice result must keep line breaks (<br>), not fold to a run-on")
+        assert "Step one.\nStep two." not in fb, (
+            "literal-newline run-on (folded to a space by clients) must be gone")
+        # Still html.escape'd, not raw HTML / markdown-rendered.
+        await_(tool_notice("c5", "subagent", {"task": "line1\n<b>x</b>", "model": "m"},
+                          "res1\n<i>y</i>", False))
+        fb2 = _notice_contents(bot)[1].get("formatted_body", "")
+        assert "line1<br>&lt;b&gt;x&lt;/b&gt;" in fb2, (
+            "task brief must be html.escape'd with breaks preserved (no raw <b>)")
+        assert "res1<br>&lt;i&gt;y&lt;/i&gt;" in fb2, (
+            "result must be html.escape'd with breaks preserved (no raw <i>)")
+
+    def test_spawn_notice_task_brief_preserves_line_breaks(self, tmp_path):
+        bot, _ = _make_bot_with_real_agent(tmp_path)
+        _, tool_intent = bot._make_tool_callbacks(ROOM)
+        task = "Do X.\nThen Y.\n\nReport back."
+        tc = ToolCall(id="c6", name="subagent", input={"task": task, "model": "m"})
+        await_(tool_intent([tc], ""))
+        c = _notice_contents(bot)[0]
+        fb = c.get("formatted_body", "")
+        assert "Do X.<br>Then Y.<br><br>Report back." in fb, (
+            "spawn-notice task brief must keep line breaks (<br>), not fold to a run-on")
+        assert "Do X.\nThen Y." not in fb, (
+            "literal-newline run-on (folded to a space by clients) must be gone")
+
+
+# ===========================================================================
 # R9 (MEDIUM) — tools/__init__.py: redaction on EVERY return path
 # ===========================================================================
 
