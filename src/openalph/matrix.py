@@ -1210,6 +1210,17 @@ class MatrixBot:
                         detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
                     )
 
+        async def _on_degenerate(model=None, generation_id=None, **kw):
+            """Emit an m.notice when the degen detector flags a response."""
+            body = f"⚠️ Degeneration detected — model: {model or 'unknown'}"
+            if generation_id:
+                body += f", generation: {generation_id}"
+            content_msg = {
+                "msgtype": "m.notice",
+                "body": body,
+            }
+            await self._room_send_with_retry(room_id, content_msg)
+
         async def _keepalive_miss_notice(_room_id=None):
             """Emit notice + system log when cache keepalive detects a write (miss)."""
             rid = _room_id or room_id
@@ -1259,6 +1270,7 @@ class MatrixBot:
             "send_media": _upload_callback,
             "on_redaction": _redaction_notice,
             "on_keepalive_miss": _keepalive_miss_notice,
+            "on_degenerate": _on_degenerate,
             "context_status": _context_status_callback,
             "send_notice": _reminder_send_notice,
             "log_reminder": _log_reminder,

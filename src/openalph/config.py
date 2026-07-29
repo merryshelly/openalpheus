@@ -55,6 +55,7 @@ class ProviderConfig:
     cache_bust_notices: bool = False  # Emit in-room notice on full prompt cache miss
     subagent_cache_keepalive: bool = False  # Refresh parent prompt cache during long subagent runs (Anthropic only)
     routing: dict | None = None  # OpenRouter provider routing preferences
+    degen_detector: str | None = None  # streaming degeneration monitor mode override: off|warn|abort (provider-level takes precedence over agent-level; kdsn.241.21)
 
 
 @dataclass
@@ -384,7 +385,12 @@ def load_config(path: Path) -> AgentConfig:
         routing = section_data.get("routing")
         if routing is not None and not isinstance(routing, dict):
             raise ConfigError(f"routing must be a table/dict, got: {type(routing).__name__}")
-        
+
+        provider_degen = section_data.get("degen_detector")
+        if provider_degen is not None:
+            if provider_degen not in ("off", "warn", "abort"):
+                raise ConfigError(f"degen_detector must be one of ('off', 'warn', 'abort'), got: {provider_degen!r}")
+
         providers[provider_key] = ProviderConfig(
             key=provider_key,
             type=provider_type,
@@ -395,6 +401,7 @@ def load_config(path: Path) -> AgentConfig:
             cache_bust_notices=cache_bust_notices,
             subagent_cache_keepalive=subagent_cache_keepalive,
             routing=routing,
+            degen_detector=provider_degen,
         )
 
     # Check if any providers loaded at all

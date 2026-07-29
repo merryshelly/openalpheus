@@ -882,6 +882,22 @@ class Agent:
                             thinking=effective_thinking,
                         )
 
+                    # Streaming degeneration monitor (kdsn.241.21): fire a
+                    # generic callback when the response was flagged. Covers
+                    # both the streaming "done" path (event.response.degenerate
+                    # set by provider.stream()) and the non-streaming complete()
+                    # fallback above (._detect_and_truncate_degeneration sets
+                    # .degenerate the same way). All Matrix rendering lives in
+                    # matrix.py -- the agent only fires a generic callback and
+                    # never imports anything Matrix-specific.
+                    if getattr(response, 'degenerate', False):
+                        _on_degenerate = (callbacks or {}).get("on_degenerate")
+                        if _on_degenerate:
+                            try:
+                                await _on_degenerate(model=self.get_model(room_id), generation_id=getattr(response, 'generation_id', None))
+                            except Exception:
+                                logger.debug("on_degenerate callback raised (ignored)", exc_info=True)
+
                     latency_ms = (time.monotonic() - start_time) * 1000
 
                     self._record_turn_usage(

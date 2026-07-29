@@ -1457,7 +1457,8 @@ async def stream(
         # Warn-only by default: logs trips, never modifies output. "abort" mode is
         # config-gated and dormant (its mid-stream teardown + truncation precision
         # are validated in Phase 2 before it is armed in production).
-        degen_monitor = DegenerationMonitor(mode=getattr(config, "degen_detector", "warn"))
+        _degen_mode = provider_cfg.degen_detector if provider_cfg.degen_detector is not None else getattr(config, "degen_detector", "off")
+        degen_monitor = DegenerationMonitor(mode=_degen_mode)
 
         api_kwargs = _build_openai_kwargs(
             api_model=api_model,
