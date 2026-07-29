@@ -77,6 +77,24 @@ async def run_shell(
                 content="Command exceeded timeout",
                 is_error=True,
             )
+        finally:
+            # CancelledError cleanup (kdsn.144): if the task is cancelled
+            # (/stop or systemctl stop) while the subprocess is still running,
+            # kill its process group before letting CancelledError propagate.
+            # CancelledError is a BaseException, so the outer ``except Exception``
+            # does NOT catch it — without this finally, the subprocess would be
+            # orphaned in its own process group (start_new_session=True) and
+            # run to completion, surviving both /stop and systemctl stop.
+            # On normal/timeout paths, returncode is set and this is a no-op.
+            if proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                try:
+                    await proc.wait()
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
