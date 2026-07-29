@@ -223,6 +223,7 @@ class StreamEvent:
     stop_reason: str = ""
     model: str = ""
     response: Response | None = None
+    generation_id: str = ""  # for degenerate events (kdsn.241.21)
 
 
 def _supports_adaptive_thinking(model_id: str) -> bool:
@@ -1516,6 +1517,10 @@ async def stream(
                                 "degeneration detected on stream: layer=%s pos=%s model=%s gen=%s mode=%s",
                                 degen_monitor.trigger_layer, degen_monitor.trigger_pos,
                                 api_model, generation_id, degen_monitor.mode,
+                            )
+                            yield StreamEvent(
+                                type="degenerate", model=api_model,
+                                generation_id=generation_id,
                             )
                             if degen_monitor.mode == "abort":
                                 degen_aborted = True

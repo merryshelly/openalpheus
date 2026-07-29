@@ -394,3 +394,117 @@ class TestMatrixNotice:
         assert room_id == "!room:server"
         assert content["msgtype"] == "m.notice"
         assert "macstudio" in content["body"] or "MiniMax" in content["body"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Mid-stream degenerate event (kdsn.241.21 — real-time notice)
+# ---------------------------------------------------------------------------
+
+class TestMidStreamDegenerateEvent:
+    """The provider yields a 'degenerate' StreamEvent at the trip point (not
+    after done), so the agent can fire on_degenerate mid-stream — while there's
+    still time for the operator to intervene on a runaway generation."""
+
+    @pytest.mark.asyncio
+    async def test_provider_yields_degenerate_event_mid_stream(self):
+        """provider.stream() yields a type='degenerate' event when the monitor
+        trips, BEFORE the done event."""
+        cfg = _cfg(agent_degen="off", provider_degen="warn")
+        events = []
+        chunks = [_text_chunk(t) for t in _LOOP] + [_finish_chunk()]
+        st = CountingStream(chunks)
+        with patch("openalph.provider._get_client") as gc:
+            client = MagicMock()
+            gc.return_value = client
+            client.chat.completions.create = AsyncMock(return_value=st)
+            events = await _collect(stream(
+                config=cfg, system="sys",
+                messages=[{"role": "user", "content": "go"}],
+            ))
+        degen_events = [e for e in events if e.type == "degenerate"]
+        done_events = [e for e in events if e.type == "done"]
+        assert len(degen_events) == 1  # exactly once
+        assert len(done_events) == 1
+        # Degenerate event comes before done
+        assert events.index(degen_events[0]) < events.index(done_events[0])
+        # Carries model + generation_id for the notice
+        assert "MiniMax" in degen_events[0].model
+
+    @pytest.mark.asyncio
+    async def test_agent_fires_callback_mid_stream(self, tmp_path):
+        """When the agent receives a 'degenerate' stream event, it fires
+        on_degenerate immediately — before the done event."""
+        config = _make_agent_config(tmp_path)
+        agent = Agent(config)
+
+        degenerate_event = StreamEvent(
+            type="degenerate",
+            model="macstudio/mlx-community/MiniMax-M3-4bit",
+            generation_id="gen-mid-1",
+        )
+        resp = _make_response(content="loop loop", degenerate=True,
+                              generation_id="gen-mid-1")
+        with patch("openalph.agent.stream", new=_make_stream_fn([
+            [StreamEvent(type="text", content="loop loop"),
+             degenerate_event,
+             StreamEvent(type="done", response=resp, stop_reason="end_turn",
+                         model="macstudio/mlx-community/MiniMax-M3-4bit")],
+        ])):
+            cb = AsyncMock()
+            result = await agent.handle_input(
+                "Hi", callbacks={"on_degenerate": cb},
+            )
+
+        assert cb.called
+        assert cb.call_count == 1  # exactly once — mid-stream, not double-fired
+        assert result == "loop loop"
+
+    @pytest.mark.asyncio
+    async def test_no_double_fire_mid_stream_then_backstop(self, tmp_path):
+        """When both a mid-stream degenerate event AND response.degenerate=True
+        are present, the callback fires exactly ONCE (mid-stream), not twice."""
+        config = _make_agent_config(tmp_path)
+        agent = Agent(config)
+
+        degenerate_event = StreamEvent(
+            type="degenerate",
+            model="macstudio/mlx-community/MiniMax-M3-4bit",
+            generation_id="gen-mid-2",
+        )
+        resp = _make_response(content="loop", degenerate=True,
+                              generation_id="gen-mid-2")
+        with patch("openalph.agent.stream", new=_make_stream_fn([
+            [StreamEvent(type="text", content="loop"),
+             degenerate_event,
+             StreamEvent(type="done", response=resp, stop_reason="end_turn",
+                         model="macstudio/mlx-community/MiniMax-M3-4bit")],
+        ])):
+            cb = AsyncMock()
+            await agent.handle_input(
+                "Hi", callbacks={"on_degenerate": cb},
+            )
+
+        assert cb.call_count == 1  # mid-stream fires, post-stream backstop skips
+
+    @pytest.mark.asyncio
+    async def test_backstop_still_fires_for_complete_fallback(self, tmp_path):
+        """When NO mid-stream degenerate event is present (complete() fallback),
+        the post-stream backstop still fires the callback."""
+        config = _make_agent_config(tmp_path)
+        agent = Agent(config)
+
+        resp = _make_response(content="loop loop", degenerate=True,
+                              generation_id="gen-back-1")
+        with patch("openalph.agent.stream", new=_make_stream_fn([
+            # stream() yields nothing → complete() fallback; no degenerate event
+            [],
+        ])), patch("openalph.agent.complete",
+                   new=AsyncMock(return_value=resp)):
+            cb = AsyncMock()
+            result = await agent.handle_input(
+                "Hi", callbacks={"on_degenerate": cb},
+            )
+
+        assert cb.called
+        assert cb.call_count == 1
+        assert result == "loop loop"

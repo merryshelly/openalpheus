@@ -838,6 +838,7 @@ class Agent:
                     # cache key. The hit-check catches drift (one bounded write) but
                     # preventing it is cheaper -- keep such mutations append-only.
                     _ka_request_messages = list(history)
+                    _degenerate_notified = False
 
                     async for event in stream(
                         config=self.config,
@@ -863,6 +864,22 @@ class Agent:
                             pass
                         elif event.type == "tool_done":
                             tool_calls.append(event.tool_call)
+                        elif event.type == "degenerate":
+                            # Mid-stream degeneration notice (kdsn.241.21): fire
+                            # on_degenerate immediately so the operator sees the
+                            # notice while the generation is still in flight, not
+                            # after it completes. The provider's monitor.tripped
+                            # flag ensures this event fires exactly once.
+                            _on_degenerate = (callbacks or {}).get("on_degenerate")
+                            if _on_degenerate:
+                                try:
+                                    await _on_degenerate(
+                                        model=event.model,
+                                        generation_id=event.generation_id,
+                                    )
+                                except Exception:
+                                    logger.debug("on_degenerate callback raised (ignored)", exc_info=True)
+                            _degenerate_notified = True
                         elif event.type == "done":
                             response = event.response
                             # Fire done signals
@@ -882,15 +899,11 @@ class Agent:
                             thinking=effective_thinking,
                         )
 
-                    # Streaming degeneration monitor (kdsn.241.21): fire a
-                    # generic callback when the response was flagged. Covers
-                    # both the streaming "done" path (event.response.degenerate
-                    # set by provider.stream()) and the non-streaming complete()
-                    # fallback above (._detect_and_truncate_degeneration sets
-                    # .degenerate the same way). All Matrix rendering lives in
-                    # matrix.py -- the agent only fires a generic callback and
-                    # never imports anything Matrix-specific.
-                    if getattr(response, 'degenerate', False):
+                    # Post-stream degeneration backstop (kdsn.241.21): if the
+                    # mid-stream degenerate event didn't fire (e.g. the complete()
+                    # fallback path has no stream events), check response.degenerate
+                    # here. Skipped if the mid-stream handler already notified.
+                    if not _degenerate_notified and getattr(response, 'degenerate', False):
                         _on_degenerate = (callbacks or {}).get("on_degenerate")
                         if _on_degenerate:
                             try:
