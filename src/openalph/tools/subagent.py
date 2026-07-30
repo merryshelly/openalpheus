@@ -219,9 +219,12 @@ async def run_subagent(
         from openalph.config import resolve_model
         _sub_pcfg, _sub_api_model = resolve_model(config.default_model, config.providers,
                                                   aliases=config.model_aliases)
-        _sub_is_anthropic = getattr(_sub_pcfg, "type", None) == "anthropic"
+        _sub_provider_key = getattr(_sub_pcfg, "key", None)
+        _sub_provider_type = getattr(_sub_pcfg, "type", None)
     except Exception:
-        _sub_is_anthropic = False
+        _sub_api_model = None
+        _sub_provider_key = None
+        _sub_provider_type = None
 
     def _write_subagent_bridge() -> None:
         """Fail-soft: write frozen sub-run cost to the callbacks bridge for
@@ -247,7 +250,9 @@ async def run_subagent(
             # re-audit LOW-1: fall back to the resolved API model if a response
             # omits .model, mirroring the advisor path's `_api_model` fallback.
             _cr = compute_cost(model_s or _sub_api_model, usage_obj,
-                               cache_ttl_fallback="1h", is_anthropic=_sub_is_anthropic)
+                               cache_ttl_fallback="1h",
+                               provider_key=_sub_provider_key,
+                               provider_type=_sub_provider_type)
             sub_cost += _cr.cost_usd
             sub_unpriced += _cr.unpriced_tokens
         except Exception:

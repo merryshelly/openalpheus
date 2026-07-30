@@ -1372,3 +1372,204 @@ class TestExistingBehavior:
 
         kw = client.chat.completions.create.call_args.kwargs
         assert "frequency_penalty" not in kw
+
+
+# ---------------------------------------------------------------------------
+# Tests: Fireworks session-affinity request hint (Area B1)
+#
+# These tests specify the session-affinity feature that the build will add:
+# `stream()` / `complete()` gain a `room_id: str | None = None` kwarg, and for
+# Fireworks ONLY an affinity hint is attached to the outgoing request. They are
+# expected to FAIL until the feature is implemented.
+# ---------------------------------------------------------------------------
+
+
+class TestSessionAffinity:
+    """Spec for the Fireworks session-affinity request hint (not yet built)."""
+
+    @pytest.mark.asyncio
+    async def test_fireworks_request_carries_affinity(self):
+        """For Fireworks + room_id, the request carries user + x-session-affinity."""
+        import hashlib
+        from openalph.provider import SALT, stream
+
+        fw_config = make_config(
+            providers={"fireworks": make_provider(
+                key="fireworks", type="openai",
+                api_key="sk-test",
+                base_url="https://api.fireworks.ai/inference/v1")},
+            default_model="fireworks/accounts/fireworks/models/glm-5p2",
+        )
+        chunks = [
+            _openai_text_chunk("ok", finish_reason="stop"),
+            _openai_usage_chunk(),
+        ]
+
+        room = "!room:tuwunel.local"
+        expected = hashlib.sha256((SALT + room).encode()).hexdigest()[:32]
+
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(chunks),
+            )
+
+            await collect_events(stream(
+                config=fw_config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+                room_id=room,
+            ))
+
+        kw = client.chat.completions.create.call_args.kwargs
+        assert kw["user"] == expected
+        assert kw["extra_headers"]["x-session-affinity"] == expected
+
+    @pytest.mark.asyncio
+    async def test_affinity_is_32_lowercase_hex(self):
+        """The affinity value is 32 chars of lowercase hex."""
+        from openalph.provider import SALT, stream
+
+        fw_config = make_config(
+            providers={"fireworks": make_provider(
+                key="fireworks", type="openai",
+                api_key="sk-test",
+                base_url="https://api.fireworks.ai/inference/v1")},
+            default_model="fireworks/accounts/fireworks/models/glm-5p2",
+        )
+        chunks = [
+            _openai_text_chunk("ok", finish_reason="stop"),
+            _openai_usage_chunk(),
+        ]
+
+        room = "!room:tuwunel.local"
+
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(chunks),
+            )
+
+            await collect_events(stream(
+                config=fw_config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+                room_id=room,
+            ))
+
+        kw = client.chat.completions.create.call_args.kwargs
+        assert len(kw["user"]) == 32
+        assert all(c in "0123456789abcdef" for c in kw["user"])
+
+    @pytest.mark.asyncio
+    async def test_affinity_deterministic(self):
+        """Same room_id yields the same affinity across two stream() drives."""
+        from openalph.provider import SALT, stream
+
+        fw_config = make_config(
+            providers={"fireworks": make_provider(
+                key="fireworks", type="openai",
+                api_key="sk-test",
+                base_url="https://api.fireworks.ai/inference/v1")},
+            default_model="fireworks/accounts/fireworks/models/glm-5p2",
+        )
+        room = "!room:tuwunel.local"
+        user_values = []
+
+        for _ in range(2):
+            chunks = [
+                _openai_text_chunk("ok", finish_reason="stop"),
+                _openai_usage_chunk(),
+            ]
+            with patch("openalph.provider._get_client") as mock_gc:
+                client = MagicMock()
+                mock_gc.return_value = client
+                client.chat.completions.create = AsyncMock(
+                    return_value=MockOpenAIStream(chunks),
+                )
+
+                await collect_events(stream(
+                    config=fw_config, system="Test",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    room_id=room,
+                ))
+
+            user_values.append(
+                client.chat.completions.create.call_args.kwargs["user"],
+            )
+
+        assert user_values[0] == user_values[1]
+
+    @pytest.mark.asyncio
+    async def test_affinity_differs_by_room(self):
+        """Different room_ids yield different affinity values."""
+        from openalph.provider import SALT, stream
+
+        fw_config = make_config(
+            providers={"fireworks": make_provider(
+                key="fireworks", type="openai",
+                api_key="sk-test",
+                base_url="https://api.fireworks.ai/inference/v1")},
+            default_model="fireworks/accounts/fireworks/models/glm-5p2",
+        )
+        rooms = ["!a:tuwunel.local", "!b:tuwunel.local"]
+        user_values = []
+
+        for room in rooms:
+            chunks = [
+                _openai_text_chunk("ok", finish_reason="stop"),
+                _openai_usage_chunk(),
+            ]
+            with patch("openalph.provider._get_client") as mock_gc:
+                client = MagicMock()
+                mock_gc.return_value = client
+                client.chat.completions.create = AsyncMock(
+                    return_value=MockOpenAIStream(chunks),
+                )
+
+                await collect_events(stream(
+                    config=fw_config, system="Test",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    room_id=room,
+                ))
+
+            user_values.append(
+                client.chat.completions.create.call_args.kwargs["user"],
+            )
+
+        assert user_values[0] != user_values[1]
+
+    @pytest.mark.asyncio
+    async def test_non_fireworks_openai_no_affinity(self):
+        """Non-Fireworks openai-type providers do NOT get the affinity hint."""
+        from openalph.provider import stream
+
+        or_config = make_config(
+            providers={"openrouter": make_provider(
+                key="openrouter", type="openai",
+                api_key="sk-test", base_url="http://localhost/v1")},
+            default_model="openrouter/some-model",
+        )
+        chunks = [
+            _openai_text_chunk("ok", finish_reason="stop"),
+            _openai_usage_chunk(),
+        ]
+
+        room = "!room:tuwunel.local"
+
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(chunks),
+            )
+
+            await collect_events(stream(
+                config=or_config, system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+                room_id=room,
+            ))
+
+        kw = client.chat.completions.create.call_args.kwargs
+        assert "user" not in kw
+        assert "extra_headers" not in kw

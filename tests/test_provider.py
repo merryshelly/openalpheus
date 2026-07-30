@@ -324,8 +324,8 @@ class TestResponseNormalization:
         assert response.model == "test-model"
         assert response.usage.input_tokens == 200
         assert response.usage.output_tokens == 60
-        assert response.usage.cache_read_tokens is None
-        assert response.usage.cache_creation_tokens is None
+        assert response.usage.cache_read_tokens == 0
+        assert response.usage.cache_creation_tokens == 0
         assert response.stop_reason == "stop"
 
 
@@ -864,3 +864,144 @@ class TestBuildOpenaiKwargs:
             thinking_level="xhigh", provider_key="openrouter",
         ))
         assert kw["extra_body"]["reasoning"] == {"effort": "xhigh"}
+
+
+# --- B2: OpenAI/Fireworks cached-token normalization (RED) ---
+
+
+class TestOpenAICacheNormalization:
+    """Tests for the shared _openai_usage normalizer called at both parse sites.
+
+    These are RED tests for a feature that does not exist yet. The helper
+    `_openai_usage` is imported INSIDE each function so a missing symbol fails
+    only that one test, not the whole file at collection time.
+    """
+
+    # --- 1) Pure helper tests (SimpleNamespace; MagicMock would auto-vivify) ---
+
+    def test_usage_cached_present(self):
+        from types import SimpleNamespace
+        from openalph.provider import _openai_usage
+
+        u = SimpleNamespace(
+            prompt_tokens=200,
+            completion_tokens=60,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=120),
+        )
+        usage = _openai_usage(u)
+        assert usage.input_tokens == 80
+        assert usage.output_tokens == 60
+        assert usage.cache_read_tokens == 120
+        assert usage.cache_creation_tokens == 0
+
+    def test_usage_clamped(self):
+        from types import SimpleNamespace
+        from openalph.provider import _openai_usage
+
+        u = SimpleNamespace(
+            prompt_tokens=200,
+            completion_tokens=10,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=250),
+        )
+        usage = _openai_usage(u)
+        assert usage.input_tokens == 0
+        assert usage.cache_read_tokens == 200
+        assert usage.cache_creation_tokens == 0
+
+    def test_usage_details_absent(self):
+        from types import SimpleNamespace
+        from openalph.provider import _openai_usage
+
+        u = SimpleNamespace(prompt_tokens=200, completion_tokens=60)
+        usage = _openai_usage(u)
+        assert usage.input_tokens == 200
+        assert usage.cache_read_tokens == 0
+        assert usage.cache_creation_tokens == 0
+
+    def test_usage_garbage_cached_coerced_to_zero(self):
+        # A non-int cached_tokens (malformed provider response, or a MagicMock
+        # usage object in a mock-based test) must be treated as 0, never crash on
+        # min(non-int, int). Matches the spec's "clamp against a buggy provider"
+        # ethos; also keeps every existing MagicMock-usage streaming test green
+        # once B2 wires _openai_usage into the parse sites.
+        from types import SimpleNamespace
+        from openalph.provider import _openai_usage
+
+        u = SimpleNamespace(prompt_tokens=200, completion_tokens=60,
+                            prompt_tokens_details=SimpleNamespace(cached_tokens="oops"))
+        usage = _openai_usage(u)
+        assert usage.input_tokens == 200
+        assert usage.cache_read_tokens == 0
+        assert usage.cache_creation_tokens == 0
+
+    # --- 2) Non-streaming wiring: _parse_openai_response ---
+
+    def test_parse_openai_normalizes_cache(self):
+        from unittest.mock import MagicMock
+        from openalph.provider import _parse_openai_response
+
+        resp = MagicMock()
+        msg = resp.choices[0].message
+        msg.content = "hi"
+        msg.tool_calls = None
+        msg.reasoning = None
+        msg.reasoning_content = None
+        resp.model = "accounts/fireworks/models/kimi-k2p6"
+        resp.usage.prompt_tokens = 200
+        resp.usage.completion_tokens = 60
+        resp.usage.prompt_tokens_details.cached_tokens = 120
+
+        r = _parse_openai_response(resp)
+        assert r.usage.input_tokens == 80
+        assert r.usage.cache_read_tokens == 120
+        assert r.usage.cache_creation_tokens == 0
+        assert r.usage.output_tokens == 60
+
+    # --- 3) Streaming wiring: via complete() (mirrors test_openai_response_fields) ---
+
+    @pytest.mark.asyncio
+    async def test_streaming_normalizes_cache(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from openalph.provider import complete
+
+        config = make_config(
+            providers={
+                "openrouter": make_provider(
+                    key="openrouter", type="openai", api_key="sk-test",
+                    base_url="http://localhost/v1"
+                )
+            },
+            default_model="openrouter/test-model"
+        )
+
+        text_chunk = MagicMock()
+        text_chunk.choices = [MagicMock()]
+        text_chunk.choices[0].delta = MagicMock()
+        text_chunk.choices[0].delta.content = "Test"
+        text_chunk.choices[0].delta.tool_calls = None
+        text_chunk.choices[0].finish_reason = "stop"
+        text_chunk.usage = None
+
+        usage_chunk = MagicMock()
+        usage_chunk.choices = []
+        usage_chunk.usage = MagicMock()
+        usage_chunk.usage.prompt_tokens = 200
+        usage_chunk.usage.completion_tokens = 60
+        usage_chunk.usage.prompt_tokens_details.cached_tokens = 120
+
+        with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
+            client = MockClient.return_value
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream([text_chunk, usage_chunk])
+            )
+
+            response = await complete(
+                config=config,
+                system="Test",
+                messages=[{"role": "user", "content": "Hi"}],
+            )
+
+        assert response.usage.input_tokens == 80
+        assert response.usage.cache_read_tokens == 120
+        assert response.usage.cache_creation_tokens == 0
+        assert response.usage.output_tokens == 60

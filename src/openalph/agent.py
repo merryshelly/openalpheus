@@ -264,21 +264,24 @@ class Agent:
             }
         return self._room_usage[room_id]
 
-    def _provider_is_anthropic(self, model_str: str) -> bool:
-        """Resolve whether `model_str` routes to an Anthropic-typed provider —
-        the authoritative gate for USD cost pricing (F2, kdsn.218). Fail-soft:
-        an unknown model or resolution error returns False (the call is tallied
-        as unpriced, never mispriced at Anthropic rates, never a crash)."""
+    def _provider_gate(self, model_str: str) -> tuple[str | None, str | None]:
+        """Resolve the (provider_key, provider_type) pricing gate for `model_str`
+        — the authoritative gate for USD cost pricing (F2, kdsn.218). The pair is
+        passed to compute_cost, which namespaces pricing by them (anthropic by
+        type, else by key). Fail-soft: an unknown model or resolution error
+        returns (None, None), so the call is tallied unpriced rather than
+        mispriced at another provider's rates, and never crashes."""
         try:
             from openalph.config import resolve_model
             pcfg, _ = resolve_model(model_str, self.config.providers,
                                     aliases=self.config.model_aliases)
-            return getattr(pcfg, "type", None) == "anthropic"
+            return getattr(pcfg, "key", None), getattr(pcfg, "type", None)
         except Exception:
-            return False
+            return None, None
 
     def _record_turn_usage(self, room_id: str, usage, model: str, cache_ttl: str | None,
-                           is_anthropic: bool | None = None) -> None:
+                           provider_key: str | None = None,
+                           provider_type: str | None = None) -> None:
         """Called once per API call (text + tool turns + summary). Updates globals
         AND per-room token counters, and stores the per-turn delta for the serializer.
         `usage` is a provider Usage object (.input_tokens, .output_tokens,
@@ -286,7 +289,7 @@ class Agent:
         `model` is the resolved/authoritative model string for this call (used to
         freeze cost); `cache_ttl` is the room's cache TTL label, used only as the
         aggregate-cache-write fallback multiplier inside compute_cost.
-        `is_anthropic` gates pricing by provider type (F2)."""
+        `provider_key`/`provider_type` gate pricing by provider (F2)."""
         cr = usage.cache_read_tokens or 0
         cc = usage.cache_creation_tokens or 0
         # globals (unchanged semantics)
@@ -305,7 +308,8 @@ class Agent:
         # on failure record $0 and move on.
         try:
             cr_result = compute_cost(model, usage, cache_ttl_fallback=cache_ttl or "1h",
-                                     is_anthropic=is_anthropic)
+                                     provider_key=provider_key,
+                                     provider_type=provider_type)
             _cost_usd = cr_result.cost_usd
             _unpriced = cr_result.unpriced_tokens
         except Exception:
@@ -848,6 +852,7 @@ class Agent:
                         model=self.get_model(room_id),
                         thinking=effective_thinking,
                         cache_ttl=cache_ttl,
+                        room_id=room_id,
                     ):
                         if event.type == "text":
                             accumulated_text += event.content
@@ -897,6 +902,7 @@ class Agent:
                             tools=tools_arg,
                             model=self.get_model(room_id),
                             thinking=effective_thinking,
+                            room_id=room_id,
                         )
 
                     # Post-stream degeneration backstop (kdsn.241.21): if the
@@ -913,9 +919,10 @@ class Agent:
 
                     latency_ms = (time.monotonic() - start_time) * 1000
 
+                    _pkey, _ptype = self._provider_gate(self.get_model(room_id))
                     self._record_turn_usage(
                         room_id, response.usage, response.model, cache_ttl,
-                        is_anthropic=self._provider_is_anthropic(self.get_model(room_id)))
+                        provider_key=_pkey, provider_type=_ptype)
                     usage = response.usage
 
                     # Check if response has tool calls
@@ -1132,6 +1139,7 @@ class Agent:
                         messages=list(history),
                         tools=None,  # no tools — force text response
                         model=self.get_model(room_id),
+                        room_id=room_id,
                         # Force thinking off for the forced summary: it must produce
                         # visible output, and extended thinking here could consume the
                         # whole budget and return empty with no recovery path (the same
@@ -1149,9 +1157,10 @@ class Agent:
                                 await on_text_delta("", done=True)
 
                     if summary_response:
+                        _pkey, _ptype = self._provider_gate(self.get_model(room_id))
                         self._record_turn_usage(
                             room_id, summary_response.usage, summary_response.model, cache_ttl,
-                            is_anthropic=self._provider_is_anthropic(self.get_model(room_id)))
+                            provider_key=_pkey, provider_type=_ptype)
                         if on_cache_status:
                             try:
                                 await on_cache_status(summary_response.usage, self.get_model(room_id))

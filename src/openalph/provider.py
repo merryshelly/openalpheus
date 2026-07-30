@@ -6,6 +6,7 @@ The adapter handles the differences in API shapes and response formats between p
 """
 
 import copy
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -433,6 +434,14 @@ def _cc_split(usage, attr: str) -> int | None:
     return getattr(cc, attr, None)
 
 
+# Stable salt for the Fireworks session-affinity routing hint (design #5). Its
+# job is to obscure the raw room_id / homeserver in the request `user` field and
+# the x-session-affinity header, NOT to be secret (Fireworks already sees our
+# per-account traffic). Must stay stable across restarts so a room's affinity
+# key is deterministic — a hardcoded literal, never a per-process random value.
+SALT = "openalph-fireworks-affinity-v1"
+
+
 # ---- Session USD cost pricing (Anthropic only) --------------------------
 # Verified 2026-07-09 against platform.claude.com/docs/en/about-claude/pricing
 # (official Anthropic docs). Base rates in USD per MTok. Cache costs derive
@@ -445,27 +454,42 @@ CACHE_WRITE_1H_MULT = 2.0    # 1-hour cache write   = 2.0x base input
 # per SB (2026-07-09); the historical surcharge was a Sonnet 4.5 1M-beta
 # artifact, retired. Rates are flat across all context sizes.
 #
-# Keyed by BARE resolved model string. compute_cost() normalizes off a
-# provider prefix ("anthropic/...") and a trailing -YYYYMMDD date suffix
-# before lookup. Sonnet 5 carries an effective-date schedule (intro rates
-# through 2026-08-31, standard from 2026-09-01).
+# Provider-NAMESPACED by the pricing namespace compute_cost selects (design
+# decision #1): the "anthropic" namespace = provider TYPE, the "fireworks"
+# namespace = provider KEY (openai-type backends can't be told apart by .type
+# alone). Within a namespace, keyed by BARE resolved model string —
+# compute_cost() normalizes off a provider prefix ("anthropic/..." /
+# "accounts/fireworks/models/...") and a trailing -YYYYMMDD date suffix before
+# lookup. Sonnet 5 carries an effective-date schedule (intro rates through
+# 2026-08-31, standard from 2026-09-01).
 _MODEL_PRICING: dict[str, dict] = {
-    "claude-opus-5":     {"input": 5.0,  "output": 25.0},
-    "claude-opus-4-8":   {"input": 5.0,  "output": 25.0},
-    "claude-opus-4-7":   {"input": 5.0,  "output": 25.0},
-    "claude-opus-4-6":   {"input": 5.0,  "output": 25.0},
-    "claude-opus-4-5":   {"input": 5.0,  "output": 25.0},
-    "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0},
-    "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0},
-    "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0},
-    "claude-fable-5":    {"input": 10.0, "output": 50.0},
-    "claude-mythos-5":   {"input": 10.0, "output": 50.0},
-    "claude-sonnet-5": {
-        # (effective_date, rates) — pick the latest date <= call date.
-        "effective": [
-            (date(1970, 1, 1),  {"input": 2.0, "output": 10.0}),   # introductory
-            (date(2026, 9, 1),  {"input": 3.0, "output": 15.0}),   # standard
-        ],
+    "anthropic": {
+        "claude-opus-5":     {"input": 5.0,  "output": 25.0},
+        "claude-opus-4-8":   {"input": 5.0,  "output": 25.0},
+        "claude-opus-4-7":   {"input": 5.0,  "output": 25.0},
+        "claude-opus-4-6":   {"input": 5.0,  "output": 25.0},
+        "claude-opus-4-5":   {"input": 5.0,  "output": 25.0},
+        "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0},
+        "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0},
+        "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0},
+        "claude-fable-5":    {"input": 10.0, "output": 50.0},
+        "claude-mythos-5":   {"input": 10.0, "output": 50.0},
+        "claude-sonnet-5": {
+            # (effective_date, rates) — pick the latest date <= call date.
+            "effective": [
+                (date(1970, 1, 1),  {"input": 2.0, "output": 10.0}),   # introductory
+                (date(2026, 9, 1),  {"input": 3.0, "output": 15.0}),   # standard
+            ],
+        },
+    },
+    "fireworks": {
+        # VERIFIED 2026-07 against docs.fireworks.ai/serverless/pricing
+        # (Fireworks' stated source-of-truth table), STANDARD serving tier.
+        # input/output/cached_input in USD per MTok. cached_input is a genuine
+        # per-model rate (never a fixed multiplier — see compute_cost).
+        "kimi-k3":    {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+        "kimi-k2p6":  {"input": 0.95, "output": 4.00,  "cached_input": 0.16},
+        "glm-5p2":    {"input": 1.40, "output": 4.40,  "cached_input": 0.14},
     },
 }
 
@@ -496,28 +520,42 @@ def _resolve_rates(entry: dict, now: date) -> dict:
 
 _warned_unpriced_anthropic: set[str] = set()
 
+# Warn-once (per process, keyed by bare model) when a priced openai/fireworks
+# model lacks a per-model cached_input rate and has cache_read > 0 — its
+# cache-read tokens are costed at the FULL input rate (never Anthropic's 0.1x),
+# so the honest over-count is observable rather than silent (design #4).
+_warned_missing_cached_rate: set[str] = set()
+
 
 def compute_cost(model: str, usage: Usage, *, cache_ttl_fallback: str = "1h",
                  now: date | datetime | None = None,
-                 is_anthropic: bool | None = None) -> CostResult:
-    """Frozen USD cost of one Anthropic API call. Pure (except a warn-once log).
+                 provider_key: str | None = None,
+                 provider_type: str | None = None) -> CostResult:
+    """Frozen USD cost of one API call. Pure (except a warn-once log).
 
-    Cache-write tokens are costed per their TTL bucket using the SDK's 5m/1h
-    split (Usage.cache_creation_5m_tokens / _1h_tokens). If only an aggregate
-    is available (older/edge responses), it is costed at `cache_ttl_fallback`
-    (default "1h", the platform default and the conservative choice).
+    Pricing is provider-namespaced (design decision #1): the namespace is
+    ``"anthropic"`` when ``provider_type == "anthropic"``, otherwise it is
+    ``provider_key`` (openai-type backends — Fireworks, OpenRouter, … — can't
+    be told apart by ``.type`` alone). A namespace or model entry that is absent
+    yields an unpriced result, so a NON-Anthropic provider serving a
+    claude-shaped id is never dollar-costed at Anthropic rates, and vice-versa
+    (kdsn.218 remediation F2, preserved in both directions).
 
-    `is_anthropic` is the authoritative provider-type gate (kdsn.218 remediation
-    F2): pass `False` to force unpriced when the serving provider is NOT
-    Anthropic-typed — so a non-Anthropic provider returning a claude-shaped
-    model id (e.g. an OpenAI-compatible router) is never dollar-costed at
-    Anthropic rates. `None` (default) keeps pure string-shape classification for
-    unit tests / legacy callers; production call sites always pass an explicit
-    bool resolved from the provider config.
+    Legacy/unit-test path: when BOTH ``provider_key`` and ``provider_type`` are
+    ``None``, fall back to pure string-shape classification — the Anthropic
+    namespace only (claude-* priced, everything else unpriced) — so existing
+    bare ``compute_cost(model, usage)`` calls keep working. Production call
+    sites always pass explicit values.
 
-    Non-Anthropic or unlisted-Anthropic models are never dollar-costed: their
-    whole token count goes to `unpriced_tokens`. `now` selects the effective
-    rate for date-scheduled models (Sonnet 5); default is today's UTC date.
+    Anthropic namespace: cache-read at 0.1x input and cache-write per the SDK's
+    5m/1h TTL split (or ``cache_ttl_fallback`` for an aggregate-only response).
+    OpenAI/Fireworks namespace: cache-read at the model's ``cached_input`` rate
+    when present, else at the FULL input rate + warn-once (never inherits
+    Anthropic's 0.1x); no cache-write terms (cache_creation is normalized to 0).
+
+    Non-priced models are never dollar-costed: their whole token count goes to
+    ``unpriced_tokens``. ``now`` selects the effective rate for date-scheduled
+    models (Sonnet 5); default is today's UTC date.
     """
     if now is None:
         now = datetime.now(timezone.utc).date()
@@ -531,61 +569,84 @@ def compute_cost(model: str, usage: Usage, *, cache_ttl_fallback: str = "1h",
     cc_5m = usage.cache_creation_5m_tokens
     cc_1h = usage.cache_creation_1h_tokens
 
-    # Provider-type gate (F2): a caller that knows the serving provider is not
-    # Anthropic-typed forces unpriced regardless of the model string's shape.
-    if is_anthropic is False:
+    def _unpriced() -> CostResult:
         unpriced = in_tok + out_tok + cache_read + cc_total
-        logger.debug("cost: unpriced (non-Anthropic provider) model %r", model)
         return CostResult(cost_usd=0.0, unpriced_tokens=unpriced, priced=False)
+
+    # Namespace selection (the security gate). Legacy callers (both None) use
+    # the Anthropic namespace with string-shape classification.
+    legacy = provider_key is None and provider_type is None
+    if legacy:
+        ns = "anthropic"
+    else:
+        ns = "anthropic" if provider_type == "anthropic" else provider_key
+    table = _MODEL_PRICING.get(ns) if ns is not None else None
+    if table is None:
+        logger.debug("cost: unpriced (no pricing namespace %r) model %r", ns, model)
+        return _unpriced()
 
     # Normalize: strip provider prefix (last path component), then date suffix.
     base = model.rsplit("/", 1)[-1] if "/" in model else model
-    entry = _MODEL_PRICING.get(base)
+    entry = table.get(base)
     if entry is None:
         stripped = re.sub(r"-\d{8}$", "", base)
-        entry = _MODEL_PRICING.get(stripped)
+        entry = table.get(stripped)
         if entry is not None:
             base = stripped
 
     if entry is None:
-        unpriced = in_tok + out_tok + cache_read + cc_total
-        if base.startswith("claude"):
+        if ns == "anthropic" and base.startswith("claude"):
             if base not in _warned_unpriced_anthropic:
                 _warned_unpriced_anthropic.add(base)
                 logger.warning(
                     "cost: unlisted Anthropic model %r — add it to _MODEL_PRICING",
                     model)
         else:
-            logger.debug("cost: unpriced (non-Anthropic) model %r", model)
-        return CostResult(cost_usd=0.0, unpriced_tokens=unpriced, priced=False)
+            logger.debug("cost: unpriced (unlisted in %r namespace) model %r", ns, model)
+        return _unpriced()
 
     rates = _resolve_rates(entry, now)
     in_rate = rates["input"]
     out_rate = rates["output"]
 
     cost = in_tok * in_rate + out_tok * out_rate
-    cost += cache_read * in_rate * CACHE_READ_MULT
-    # Cache-write cost by TTL bucket. F8 (kdsn.218 remediation): treat a
-    # present-but-zero split the same as an absent split, and cost any residual
-    # (split sum < aggregate) at the fallback multiplier — so an SDK-inconsistent
-    # cache_creation object can never silently under-cost the write.
-    split_5m = cc_5m or 0
-    split_1h = cc_1h or 0
-    split_sum = split_5m + split_1h
-    _fallback_mult = CACHE_WRITE_5M_MULT if cache_ttl_fallback == "5m" else CACHE_WRITE_1H_MULT
-    if split_sum == 0 and cc_total > 0:
-        cost += cc_total * in_rate * _fallback_mult
-        logger.debug("cost: cache_creation split absent/zero; costed %d tokens at "
-                     "%s fallback multiplier", cc_total, cache_ttl_fallback)
+    if ns == "anthropic":
+        cost += cache_read * in_rate * CACHE_READ_MULT
+        # Cache-write cost by TTL bucket. F8 (kdsn.218 remediation): treat a
+        # present-but-zero split the same as an absent split, and cost any residual
+        # (split sum < aggregate) at the fallback multiplier — so an SDK-inconsistent
+        # cache_creation object can never silently under-cost the write.
+        split_5m = cc_5m or 0
+        split_1h = cc_1h or 0
+        split_sum = split_5m + split_1h
+        _fallback_mult = CACHE_WRITE_5M_MULT if cache_ttl_fallback == "5m" else CACHE_WRITE_1H_MULT
+        if split_sum == 0 and cc_total > 0:
+            cost += cc_total * in_rate * _fallback_mult
+            logger.debug("cost: cache_creation split absent/zero; costed %d tokens at "
+                         "%s fallback multiplier", cc_total, cache_ttl_fallback)
+        else:
+            cost += split_5m * in_rate * CACHE_WRITE_5M_MULT
+            cost += split_1h * in_rate * CACHE_WRITE_1H_MULT
+            residual = cc_total - split_sum
+            if residual > 0:
+                cost += residual * in_rate * _fallback_mult
+                logger.debug("cost: cache_creation split (%d) < aggregate (%d); costed "
+                             "residual %d at %s fallback", split_sum, cc_total, residual,
+                             cache_ttl_fallback)
     else:
-        cost += split_5m * in_rate * CACHE_WRITE_5M_MULT
-        cost += split_1h * in_rate * CACHE_WRITE_1H_MULT
-        residual = cc_total - split_sum
-        if residual > 0:
-            cost += residual * in_rate * _fallback_mult
-            logger.debug("cost: cache_creation split (%d) < aggregate (%d); costed "
-                         "residual %d at %s fallback", split_sum, cc_total, residual,
-                         cache_ttl_fallback)
+        # OpenAI/Fireworks priced namespace: cache-read at the per-model
+        # cached_input rate, else at the FULL input rate + warn-once. No
+        # cache-write terms (cache_creation is normalized to 0 upstream).
+        cached_rate = rates.get("cached_input")
+        if cached_rate is not None:
+            cost += cache_read * cached_rate
+        else:
+            cost += cache_read * in_rate
+            if cache_read > 0 and base not in _warned_missing_cached_rate:
+                _warned_missing_cached_rate.add(base)
+                logger.warning(
+                    "cost: %r model %r has no cached_input rate — costing cache_read "
+                    "at the full input rate (never Anthropic's 0.1x)", ns, model)
     cost /= 1_000_000.0
     return CostResult(cost_usd=cost, unpriced_tokens=0, priced=True)
 
@@ -995,6 +1056,34 @@ def _parse_anthropic_response(response) -> Response:
     )
 
 
+def _openai_usage(u) -> Usage:
+    """Normalize an OpenAI-shaped usage object into OA's Usage.
+
+    Applies the uniform token-normalization contract (design decision #3):
+    `input_tokens` is the UNCACHED prompt (`prompt_tokens - cached_tokens`),
+    `cache_read_tokens` carries the prefix-cache hit count, and
+    `cache_creation_tokens` is 0 (OpenAI-compat backends surface no write
+    event). `cached_tokens` is read from `prompt_tokens_details.cached_tokens`,
+    defaulting to 0 when the details object or field is absent.
+
+    Defensive against a buggy provider (or a MagicMock usage in tests): a
+    non-int / None `cached_tokens` coerces to 0 (never raises on
+    `min(garbage, int)`), and the value is clamped to `[0, prompt_tokens]`.
+    """
+    prompt = u.prompt_tokens or 0
+    details = getattr(u, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", 0)
+    if not isinstance(cached, int) or isinstance(cached, bool):
+        cached = 0
+    cached = max(0, min(cached, prompt))
+    return Usage(
+        input_tokens=prompt - cached,
+        output_tokens=u.completion_tokens or 0,
+        cache_read_tokens=cached,
+        cache_creation_tokens=0,
+    )
+
+
 def _parse_openai_response(response) -> Response:
     """Parse OpenAI response into normalized Response."""
     message = response.choices[0].message
@@ -1036,10 +1125,7 @@ def _parse_openai_response(response) -> Response:
         tool_calls=tool_calls,
         thinking=thinking_blocks,
         model=response.model,
-        usage=Usage(
-            input_tokens=response.usage.prompt_tokens,
-            output_tokens=response.usage.completion_tokens,
-        ),
+        usage=_openai_usage(response.usage),
         stop_reason=response.choices[0].finish_reason,
         generation_id=getattr(response, "id", "") or "",
     )
@@ -1345,6 +1431,7 @@ async def stream(
     model: str | None = None,
     thinking: str | None = None,
     cache_ttl: str | None = None,
+    room_id: str | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """
     Stream completion events from Anthropic or OpenAI SDK based on config.providers.
@@ -1478,7 +1565,18 @@ async def stream(
         # Add streaming-specific kwargs
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
-        
+
+        # Session-affinity routing hint (design #5), gated to Fireworks ONLY —
+        # a salted hash of room_id sent as both the `user` body field and the
+        # x-session-affinity header, so serverless prompt-cache hits land on a
+        # stable backend. Never sent to real OpenAI / Google / codex-sidecar /
+        # local (they may reject unknown fields; the routing hint is Fireworks-
+        # specific). Output-safe: it only steers routing, never the completion.
+        if provider_cfg.key == "fireworks" and room_id:
+            affinity = hashlib.sha256((SALT + room_id).encode()).hexdigest()[:32]
+            api_kwargs["user"] = affinity
+            api_kwargs["extra_headers"] = {"x-session-affinity": affinity}
+
         try:
             response = await client.chat.completions.create(**api_kwargs)
             
@@ -1498,10 +1596,7 @@ async def stream(
 
                 # Handle usage chunk
                 if chunk.usage:
-                    usage = Usage(
-                        input_tokens=chunk.usage.prompt_tokens,
-                        output_tokens=chunk.usage.completion_tokens,
-                    )
+                    usage = _openai_usage(chunk.usage)
                 
                 # Process content deltas
                 if chunk.choices:
@@ -1667,6 +1762,7 @@ async def complete(
     model: str | None = None,
     thinking: str | None = None,
     cache_ttl: str | None = None,
+    room_id: str | None = None,
 ) -> Response:
     """
     Route to Anthropic or OpenAI SDK based on config.providers.
@@ -1689,6 +1785,7 @@ async def complete(
         model=model,
         thinking=thinking,
         cache_ttl=cache_ttl,
+        room_id=room_id,
     ):
         if event.type == "done":
             response = event.response

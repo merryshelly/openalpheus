@@ -182,9 +182,10 @@ class TestPricingTable:
             "claude-haiku-4-5": (1.0, 5.0),
             "claude-fable-5": (10.0, 50.0),
         }
+        anthropic_table = _MODEL_PRICING["anthropic"]
         for model, (inp, out) in exp.items():
-            assert model in _MODEL_PRICING, f"{model} missing from pricing table"
-            entry = _MODEL_PRICING[model]
+            assert model in anthropic_table, f"{model} missing from pricing table"
+            entry = anthropic_table[model]
             # entry may carry effective-date structure; a plain-rate accessor
             # is exercised via compute_cost — here just assert the base rates
             # are discoverable as numbers somewhere in the entry.
@@ -687,7 +688,8 @@ class TestProviderTypeGate:
         tallied unpriced, never Anthropic-priced (scope: Anthropic-only)."""
         assert compute_cost is not None, NOT_IMPL_CALC
         usage = _u(input_tokens=100_000, output_tokens=50_000)
-        r = compute_cost("claude-opus-4-8", usage, is_anthropic=False)
+        r = compute_cost("claude-opus-4-8", usage,
+                         provider_key="fireworks", provider_type="openai")
         assert r.priced is False
         assert r.cost_usd == 0.0
         assert r.unpriced_tokens == 150_000
@@ -695,12 +697,13 @@ class TestProviderTypeGate:
     def test_is_anthropic_true_prices_normally(self):
         assert compute_cost is not None, NOT_IMPL_CALC
         usage = _u(input_tokens=100_000, output_tokens=50_000)
-        r = compute_cost("claude-opus-4-8", usage, is_anthropic=True)
+        r = compute_cost("claude-opus-4-8", usage,
+                         provider_key="anthropic", provider_type="anthropic")
         assert r.priced is True
         assert r.cost_usd == pytest.approx(1.75, abs=APPROX)
 
     def test_none_default_preserves_string_shape_classification(self):
-        """Legacy/pure-fn callers (is_anthropic=None) keep string-shape
+        """Legacy/pure-fn callers (both gate kwargs absent) keep string-shape
         classification so existing unit fixtures are unaffected."""
         assert compute_cost is not None, NOT_IMPL_CALC
         r = compute_cost("claude-opus-4-8", _u(input_tokens=100_000, output_tokens=50_000))
@@ -708,9 +711,9 @@ class TestProviderTypeGate:
 
     def test_agent_provider_is_anthropic_helper(self, tmp_path):
         agent = Agent(_cfg(_setup_workspace(tmp_path)))
-        assert agent._provider_is_anthropic("anthropic/claude-opus-4-8") is True
-        # unknown model / resolution failure -> False (fail-soft, never mispriced)
-        assert agent._provider_is_anthropic("nonesuch/whatever") is False
+        assert agent._provider_gate("anthropic/claude-opus-4-8") == ("anthropic", "anthropic")
+        # unknown model / resolution failure -> (None, None) (fail-soft, never mispriced)
+        assert agent._provider_gate("nonesuch/whatever") == (None, None)
 
 
 # --- F1: alias priced from served model + F2 non-Anthropic sub -----------
@@ -885,7 +888,8 @@ class TestFailSoft:
         agent = Agent(_cfg(_setup_workspace(tmp_path)))
         with patch("openalph.agent.compute_cost", side_effect=RuntimeError("boom")):
             agent._record_turn_usage(ROOM, _u(input_tokens=10, output_tokens=5),
-                                     "claude-opus-4-8", "1h", is_anthropic=True)
+                                     "claude-opus-4-8", "1h",
+                                     provider_key="anthropic", provider_type="anthropic")
         # turn survived; cost recorded $0; token counters (which precede the
         # cost block) still updated
         assert agent._usage_for(ROOM)["main_cost_usd"] == 0.0
@@ -899,7 +903,8 @@ class TestKeepaliveUncosted:
         agent = Agent(_cfg(_setup_workspace(tmp_path)))
         # baseline main cost from one real turn
         agent._record_turn_usage(ROOM, _u(input_tokens=100_000, output_tokens=50_000),
-                                 "claude-opus-4-8", "1h", is_anthropic=True)
+                                 "claude-opus-4-8", "1h",
+                                 provider_key="anthropic", provider_type="anthropic")
         baseline = agent._usage_for(ROOM)["main_cost_usd"]
         recorded = []
         orig = agent._record_turn_usage
@@ -995,3 +1000,212 @@ class TestSubagentCostFailSoft:
         assert result.is_error is False   # accounting failure != work failure
         info = callbacks["subagent_results"][(ROOM, "tc_sub")]
         assert info["cost_usd"] == 0.0
+
+
+# =========================================================================
+# AREA A (RED) — provider-keyed pricing + Fireworks cost.
+# These tests specify a feature that does NOT exist yet:
+#   - _MODEL_PRICING becomes provider-namespaced ({"anthropic": {...},
+#     "fireworks": {...}}) instead of a flat bare-model dict.
+#   - compute_cost gains keyword-only `provider_key` and `provider_type`,
+#     and the `is_anthropic` bool is REPLACED by them.
+# Expected pre-build state: the feature-keyed tests fail (TypeError: compute_cost()
+# got an unexpected keyword argument 'provider_key', or KeyError on the
+# namespaced table); the legacy fallback tests stay green. The build will
+# implement the feature and flip these to green. Imports are inside each test
+# function so a missing symbol fails ONE test, never the whole module.
+# =========================================================================
+
+class TestFireworksCost:
+    """Fireworks cost (non-anthropic priced formula): cost = (uncached_input*in
+    + output*out + cache_read*cached_rate) / 1_000_000, with a normalized Usage
+    (input_tokens = uncached only, cache_creation_tokens = 0). Uses the literal
+    pre-computed dollar values; mirror TestComputeCost for approx style and
+    TestProviderTypeGate for Usage construction."""
+
+    def test_glm_cached(self):
+        from openalph.provider import compute_cost, Usage
+        usage = Usage(input_tokens=2000, output_tokens=2000,
+                      cache_read_tokens=8000, cache_creation_tokens=0)
+        r = compute_cost("accounts/fireworks/models/glm-5p2", usage,
+                         provider_key="fireworks", provider_type="openai")
+        assert r.priced is True
+        assert r.unpriced_tokens == 0
+        assert r.cost_usd == pytest.approx(0.01272, abs=APPROX)
+
+    def test_kimi_k3_cached(self):
+        from openalph.provider import compute_cost, Usage
+        usage = Usage(input_tokens=10000, output_tokens=5000,
+                      cache_read_tokens=90000, cache_creation_tokens=0)
+        r = compute_cost("accounts/fireworks/models/kimi-k3", usage,
+                         provider_key="fireworks", provider_type="openai")
+        assert r.priced is True
+        assert r.unpriced_tokens == 0
+        assert r.cost_usd == pytest.approx(0.132, abs=APPROX)
+
+    def test_kimi_k2p6_uncached(self):
+        from openalph.provider import compute_cost, Usage
+        usage = Usage(input_tokens=20000, output_tokens=1000,
+                      cache_read_tokens=0, cache_creation_tokens=0)
+        r = compute_cost("accounts/fireworks/models/kimi-k2p6", usage,
+                         provider_key="fireworks", provider_type="openai")
+        assert r.priced is True
+        assert r.unpriced_tokens == 0
+        assert r.cost_usd == pytest.approx(0.023, abs=APPROX)
+
+
+class TestFireworksMissingCachedRate:
+    """A fireworks-namespaced model with NO cached_input rate: cache_read is
+    costed at the FULL input rate (never Anthropic's 0.1x), and a warn-once is
+    emitted via a NEW module-level set _warned_missing_cached_rate. The model
+    row is injected with patch.dict so this is catalog-independent and safe
+    pre-/post-build (patch.dict adds the 'fireworks' key if absent)."""
+
+    def test_missing_cached_rate_full_rate(self):
+        from openalph.provider import compute_cost, Usage, _MODEL_PRICING
+        from openalph import provider
+        with patch.dict(provider._MODEL_PRICING,
+                        {"fireworks": {"sizetier-test":
+                                       {"input": 0.90, "output": 0.90}}}):
+            usage = Usage(input_tokens=6000, output_tokens=1000,
+                          cache_read_tokens=4000, cache_creation_tokens=0)
+            r = compute_cost("sizetier-test", usage,
+                             provider_key="fireworks", provider_type="openai")
+            assert r.priced is True
+            assert r.cost_usd == pytest.approx(0.0099, abs=APPROX)
+
+    def test_missing_cached_rate_warns_once(self, caplog):
+        import logging
+        from openalph.provider import compute_cost, Usage
+        from openalph import provider
+        # Reset guard (safe pre- and post-build).
+        s = getattr(provider, "_warned_missing_cached_rate", None)
+        if s is not None:
+            s.discard("sizetier-test")
+        with patch.dict(provider._MODEL_PRICING,
+                        {"fireworks": {"sizetier-test":
+                                       {"input": 0.90, "output": 0.90}}}):
+            usage = Usage(input_tokens=6000, output_tokens=1000,
+                          cache_read_tokens=4000, cache_creation_tokens=0)
+            with caplog.at_level(logging.WARNING, logger="openalph.provider"):
+                compute_cost("sizetier-test", usage,
+                             provider_key="fireworks", provider_type="openai")
+                compute_cost("sizetier-test", usage,
+                             provider_key="fireworks", provider_type="openai")
+            warns = [rec for rec in caplog.records
+                     if "sizetier-test" in rec.getMessage()]
+            assert len(warns) == 1
+
+
+class TestFireworksProviderGate:
+    """Provider-gate matrix mirroring TestProviderTypeGate's Usage/call style.
+    Namespace selection: ns = 'anthropic' if provider_type == 'anthropic' else
+    provider_key; table = _MODEL_PRICING.get(ns)."""
+
+    def test_fireworks_priced(self):
+        from openalph.provider import compute_cost, Usage
+        usage = Usage(input_tokens=1000, output_tokens=1000)
+        r = compute_cost("accounts/fireworks/models/glm-5p2", usage,
+                         provider_key="fireworks", provider_type="openai")
+        assert r.priced is True
+        assert r.cost_usd == pytest.approx(0.0058, abs=APPROX)
+        assert r.unpriced_tokens == 0
+
+    def test_other_openai_key_unpriced(self):
+        from openalph.provider import compute_cost, Usage
+        usage = Usage(input_tokens=1000, output_tokens=1000)
+        r = compute_cost("some-model", usage,
+                         provider_key="openrouter", provider_type="openai")
+        assert r.priced is False
+        assert r.cost_usd == 0.0
+        assert r.unpriced_tokens == 2000
+
+    def test_nonanthropic_serving_claude_unpriced(self):
+        from openalph.provider import compute_cost, Usage
+        usage = Usage(input_tokens=1000, output_tokens=1000)
+        r = compute_cost("claude-opus-5", usage,
+                         provider_key="fireworks", provider_type="openai")
+        assert r.priced is False
+        assert r.cost_usd == 0.0
+        assert r.unpriced_tokens == 2000
+
+    def test_anthropic_unchanged(self):
+        from openalph.provider import compute_cost, Usage
+        usage = Usage(input_tokens=1000, output_tokens=1000)
+        r = compute_cost("claude-opus-5", usage,
+                         provider_key="anthropic", provider_type="anthropic")
+        assert r.priced is True
+        assert r.cost_usd == pytest.approx(0.03, abs=APPROX)
+
+
+class TestLegacyGateFallback:
+    """EXPECTED-PASS regression guards: they call the CURRENT signature with NO
+    gate kwargs (provider_key/provider_type both absent -> legacy string-shape
+    classification). They pass now and must keep passing post-build."""
+
+    def test_legacy_claude_priced(self):
+        from openalph.provider import compute_cost, Usage
+        r = compute_cost("claude-opus-5", Usage(input_tokens=1000,
+                                                output_tokens=1000))
+        assert r.priced is True
+        assert r.cost_usd == pytest.approx(0.03, abs=APPROX)
+
+    def test_legacy_fireworks_unpriced(self):
+        from openalph.provider import compute_cost, Usage
+        r = compute_cost("accounts/fireworks/models/glm-5p2",
+                         Usage(input_tokens=1000, output_tokens=1000))
+        assert r.priced is False
+
+
+class TestFireworksPricingTable:
+    """The namespaced Fireworks pricing table (mirror TestPricingTable for
+    table-shape assertions). Pre-build this raises KeyError because the table
+    is still flat, not namespaced under 'fireworks'."""
+
+    def test_fireworks_rates(self):
+        from openalph import provider
+        assert provider._MODEL_PRICING["fireworks"]["glm-5p2"] == {
+            "input": 1.40, "output": 4.40, "cached_input": 0.14}
+        assert provider._MODEL_PRICING["fireworks"]["kimi-k3"] == {
+            "input": 3.00, "output": 15.00, "cached_input": 0.30}
+        assert provider._MODEL_PRICING["fireworks"]["kimi-k2p6"] == {
+            "input": 0.95, "output": 4.00, "cached_input": 0.16}
+
+
+# =========================================================================
+# AREA INT (RED) — Fireworks REAL-PATH end-to-end cost + cache-read.
+# Mirrors TestRealPathMainCost::test_real_turn_freezes_cost_in_room_usage and
+# ::test_context_status_carries_cost_fields EXACTLY for harness (_make_bot,
+# _single_turn_stream, patch("openalph.agent.stream", ...), ROOM, APPROX).
+# The ONE difference: a Fireworks-configured bot via _make_bot's agent_kw
+# passthrough (-> _cfg). Forces the build to thread provider_key through
+# agent.py's cost path (today it resolves is_anthropic=False for Fireworks ->
+# turn left UNPRICED -> main_cost_usd == 0.0, not 0.374). That gap is the red.
+# Additive only — reuses module-level helpers; no new imports or redefinitions.
+# =========================================================================
+
+class TestFireworksRealPathCost:
+    @pytest.mark.asyncio
+    async def test_fireworks_turn_priced_and_cached(self, tmp_path):
+        fw_providers = {"fireworks": ProviderConfig(
+            key="fireworks", type="openai", api_key="sk-test",
+            base_url="https://api.fireworks.ai/inference/v1", quirks=[])}
+        bot, agent = _make_bot(
+            tmp_path,
+            default_model="fireworks/accounts/fireworks/models/glm-5p2",
+            providers=fw_providers)
+        cb = bot._build_agent_callbacks(ROOM, None)
+        usage = _u(input_tokens=100000, output_tokens=50000,
+                   cache_read_tokens=100000, cache_creation_tokens=0)
+        stream_fn = _single_turn_stream(
+            usage, model="accounts/fireworks/models/glm-5p2", text="done")
+        with patch("openalph.agent.stream", side_effect=stream_fn):
+            await agent.handle_input("hi", ROOM, callbacks=cb, cache_ttl="1h")
+        # glm-5p2 @ input 1.40 / output 4.40 / cached_input 0.14 per MTok:
+        # 100000*1.40 + 50000*4.40 + 100000*0.14 = 374000, /1e6 = 0.374.
+        assert agent._usage_for(ROOM)["main_cost_usd"] == pytest.approx(0.374, abs=APPROX)
+        assert agent.last_turn_usage(ROOM)["cost_usd"] == pytest.approx(0.374, abs=APPROX)
+        cs = bot._build_context_status(ROOM)
+        if "cache_read_tokens" not in cs:
+            print("context_status keys:", sorted(cs.keys()))
+        assert cs["cache_read_tokens"] == 100000

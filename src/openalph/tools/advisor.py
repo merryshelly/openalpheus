@@ -455,7 +455,8 @@ async def run_advisor(
                     _priced_model = getattr(response, "model", None) or _api_model
                     _cr = compute_cost(
                         _priced_model, _u, cache_ttl_fallback=cache_ttl,
-                        is_anthropic=(getattr(provider_cfg, "type", None) == "anthropic"))
+                        provider_key=getattr(provider_cfg, "key", None),
+                        provider_type=getattr(provider_cfg, "type", None))
                     _cost_usd = _cr.cost_usd
                     _unpriced_tokens = _cr.unpriced_tokens
                 # R5 (audit remediation): key by (room_id, call_id) -- the

@@ -270,7 +270,7 @@ class TestOpus5Pricing:
 
     def test_priced_not_unpriced(self):
         usage = Usage(input_tokens=1_000_000, output_tokens=1_000_000)
-        result = compute_cost("anthropic/claude-opus-5", usage, is_anthropic=True)
+        result = compute_cost("anthropic/claude-opus-5", usage, provider_type="anthropic")
         assert result.priced is True
         assert result.unpriced_tokens == 0
         # $5 input + $25 output per MTok, 1M tokens each => $5 + $25 = $30
@@ -278,6 +278,6 @@ class TestOpus5Pricing:
 
     def test_matches_opus48_rate(self):
         usage = Usage(input_tokens=1_000_000, output_tokens=1_000_000)
-        opus5 = compute_cost("anthropic/claude-opus-5", usage, is_anthropic=True)
-        opus48 = compute_cost("anthropic/claude-opus-4-8", usage, is_anthropic=True)
+        opus5 = compute_cost("anthropic/claude-opus-5", usage, provider_type="anthropic")
+        opus48 = compute_cost("anthropic/claude-opus-4-8", usage, provider_type="anthropic")
         assert opus5.cost_usd == pytest.approx(opus48.cost_usd)
