@@ -299,10 +299,10 @@ class SessionLog:
         """Build LLM conversation context from JSONL entries.
 
         Maps session log entries to the format agent.py expects:
-            - user → {"role": "user", "content": ...}
-            - assistant → {"role": "assistant", "content": ..., ["tool_calls": ...]}
-            - tool → {"role": "tool", "tool_call_id": ..., "content": ...}
-            - system → skipped by default
+            - user -> {"role": "user", "content": ...}
+            - assistant -> {"role": "assistant", "content": ..., ["tool_calls": ...]}
+            - tool -> {"role": "tool", "tool_call_id": ..., "content": ...}
+            - system -> skipped by default
 
         Args:
             room_id: Matrix room ID
@@ -344,7 +344,7 @@ class SessionLog:
                 if _source == "steer":
                     _user_content = f"[Operator steering — mid-turn guidance]: {_user_content}"
                 elif _source not in ("reminder", "steer"):
-                    # R2-A: Escape user-origin <system-reminder> tags in context
+                    # R2-A: Escape user-origin &lt;system-reminder&gt; tags in context
                     # to prevent spoofing.  Reminder entries (source="reminder")
                     # are trusted harness content replayed verbatim.  JSONL stores
                     # raw user text; escaping is context-only (audit fidelity).
@@ -528,3 +528,61 @@ class SessionLog:
                 break  # restart scan since indices shifted
 
         return context
+
+
+# ---------------------------------------------------------------------------
+# persist_assistant_turn — hoisted from MatrixBot (kdsn.237 Phase 1)
+# ---------------------------------------------------------------------------
+
+def persist_assistant_turn(agent, session_log, room_id, *, content, tool_calls=None) -> None:
+    """Single serializer for assistant turns. Captures content + tool_calls +
+    thinking (from agent.history[-1]) + usage (from agent.last_turn_usage).
+    Used by BOTH the tool-use path (_tool_intent) and the final-text paths.
+
+    INVARIANT (RC1): This method reads thinking from agent.history(room_id)[-1].
+    It is correct ONLY because the caller (agent.handle_input) always appends the
+    assistant message to history immediately before this serializer runs. Any future
+    change that inserts a history mutation between that append and this call will
+    silently break thinking capture.
+    """
+    if not session_log:
+        return
+    # thinking: read from the current last assistant turn in history
+    thinking = None
+    try:
+        hist = agent.history(room_id)
+        if hist and hist[-1].get("role") == "assistant":
+            thinking = hist[-1].get("thinking")
+    except Exception:
+        logger.debug("persist_assistant_turn: thinking capture failed", exc_info=True)
+        thinking = None
+    # usage: per-turn delta; isinstance guard so MagicMock agents (tests) -> {}
+    usage = {}
+    try:
+        lu = agent.last_turn_usage(room_id)
+        if isinstance(lu, dict):
+            usage = dict(lu)
+            usage["tool_calls"] = len(tool_calls or [])
+    except Exception:
+        logger.debug("persist_assistant_turn: usage capture failed", exc_info=True)
+        usage = {}
+    kwargs = dict(role="assistant", sender=session_log.agent_user_id,
+                  room=room_id, event_id=None, content=content or "")
+    if tool_calls is not None:
+        logged = []
+        for tc in tool_calls:
+            entry = {"call_id": tc.id, "name": tc.name, "input": tc.input}
+            # Persist opaque provider metadata (e.g. Google's
+            # extra_content.google.thought_signature) so it survives
+            # rehydration and can be echoed back on a later turn — see
+            # ToolCall.extra_content docstring / bead workspace-kdsn.186.18.
+            extra_content = getattr(tc, "extra_content", None)
+            if extra_content:
+                entry["extra_content"] = extra_content
+            logged.append(entry)
+        kwargs["tool_calls"] = logged
+    if thinking:
+        kwargs["thinking"] = thinking
+    if usage:
+        kwargs["usage"] = usage
+    session_log.append(**kwargs)

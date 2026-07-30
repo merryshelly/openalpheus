@@ -9,6 +9,8 @@ directly with a different CommsSinks implementation.
 from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
+import sys
+
 import mistune
 
 
@@ -36,6 +38,47 @@ class CommsSinks(Protocol):
 # ---------------------------------------------------------------------------
 # MatrixSinks — wraps a MatrixBot instance
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# HeadlessSinks — CommsSinks for CLI/headless mode (kdsn.237 Phase 1)
+# ---------------------------------------------------------------------------
+
+class HeadlessSinks:
+    """CommsSinks for headless/CLI mode. Notices → stderr, no file delivery."""
+
+    def __init__(self, session_log=None, agent_user_id=None):
+        self._sl = session_log
+        self._uid = agent_user_id or (session_log.agent_user_id if session_log else "cli")
+
+    async def send_notice(self, room_id, body, **kw):
+        print(body, file=sys.stderr, flush=True)
+
+    async def log_reminder(self, room_id, reminder):
+        if self._sl:
+            self._sl.append(
+                role="user",
+                sender=self._uid,
+                room=room_id,
+                event_id=None,
+                content=reminder.content,
+                source="reminder",
+                trigger=reminder.trigger,
+            )
+        print(reminder.content, file=sys.stderr, flush=True)
+
+    async def send_media(self, file_path, content_type, filename, caption=None):
+        raise RuntimeError(f"No delivery sink available in CLI mode — file remains at: {file_path}")
+
+    async def on_redaction(self, tool_name, events):
+        for event in events:
+            print(f"🔒 Credential redacted in {tool_name}: {event.pattern_name}", file=sys.stderr)
+
+    async def on_keepalive_miss(self, room_id=None):
+        print("⚠️ cache keepalive missed", file=sys.stderr)
+
+    async def on_degenerate(self, model=None, generation_id=None, **kw):
+        print(f"⚠️ Degeneration detected — model: {model or 'unknown'}", file=sys.stderr)
 
 class MatrixSinks:
     """CommsSinks backed by a live MatrixBot + nio client."""

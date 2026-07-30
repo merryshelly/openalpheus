@@ -67,6 +67,7 @@ class AgentConfig:
     providers: dict[str, ProviderConfig]
     workspace: Path
     model_max_tokens: int = 200000
+    user_id: str | None = None  # kdsn.237 Phase 1: CLI session identity independent of matrix.user_id
     matrix: MatrixConfig | None = None
     max_iterations: int = 100
     truncation_limit: int = 50000

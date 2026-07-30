@@ -44,7 +44,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-openalph = ["templates/*.md", "templates/skills/*.md", "data/*.service"]
+openalph = ["templates/*.md", "templates/skills/*.md", "data/*.service", "data/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

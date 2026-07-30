@@ -36,7 +36,7 @@ from nio import (
 from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.provider import ProviderError
 from openalph.config import MatrixConfig
-from openalph.session import SessionLog
+from openalph.session import SessionLog, persist_assistant_turn
 from openalph.mention import mentions_me, is_gated, strip_mention
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
@@ -758,58 +758,16 @@ class MatrixBot:
 
     def _persist_assistant_turn(self, room_id: str, *, content: str,
                              tool_calls=None) -> None:
-        """Single serializer for assistant turns. Captures content + tool_calls +
-        thinking (from agent.history[-1]) + usage (from agent.last_turn_usage).
-        Used by BOTH the tool-use path (_tool_intent) and the final-text paths.
-
-        INVARIANT (RC1): This method reads thinking from agent.history(room_id)[-1].
-        It is correct ONLY because the caller (agent.handle_input) always appends the
-        assistant message to history immediately before this serializer runs. Any future
-        change that inserts a history mutation between that append and this call will
-        silently break thinking capture.
+        """Single serializer for assistant turns. Delegates to the shared
+        module-level function in session.py (kdsn.237 Phase 1).
         """
-        _sl = getattr(self, "session_log", None)
-        if not _sl:
-            return
-        # thinking: read from the current last assistant turn in history
-        thinking = None
-        try:
-            hist = self.agent.history(room_id)
-            if hist and hist[-1].get("role") == "assistant":
-                thinking = hist[-1].get("thinking")
-        except Exception:
-            logger.debug("_persist_assistant_turn: thinking capture failed", exc_info=True)
-            thinking = None
-        # usage: per-turn delta; isinstance guard so MagicMock agents (tests) -> {}
-        usage = {}
-        try:
-            lu = self.agent.last_turn_usage(room_id)
-            if isinstance(lu, dict):
-                usage = dict(lu)
-                usage["tool_calls"] = len(tool_calls or [])
-        except Exception:
-            logger.debug("_persist_assistant_turn: usage capture failed", exc_info=True)
-            usage = {}
-        kwargs = dict(role="assistant", sender=self.config.user_id,
-                      room=room_id, event_id=None, content=content or "")
-        if tool_calls is not None:
-            logged = []
-            for tc in tool_calls:
-                entry = {"call_id": tc.id, "name": tc.name, "input": tc.input}
-                # Persist opaque provider metadata (e.g. Google's
-                # extra_content.google.thought_signature) so it survives
-                # rehydration and can be echoed back on a later turn — see
-                # ToolCall.extra_content docstring / bead workspace-kdsn.186.18.
-                extra_content = getattr(tc, "extra_content", None)
-                if extra_content:
-                    entry["extra_content"] = extra_content
-                logged.append(entry)
-            kwargs["tool_calls"] = logged
-        if thinking:
-            kwargs["thinking"] = thinking
-        if usage:
-            kwargs["usage"] = usage
-        _sl.append(**kwargs)
+        persist_assistant_turn(
+            self.agent,
+            getattr(self, "session_log", None),
+            room_id,
+            content=content,
+            tool_calls=tool_calls,
+        )
 
     def _advisor_display_model(self, mdl) -> str:
         """Expand a model alias to its full provider/model for display in the

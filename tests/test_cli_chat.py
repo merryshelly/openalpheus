@@ -66,14 +66,16 @@ def run_chat(inputs, env, args=None):
 
 
 @pytest.fixture
-def fake_config():
+def fake_config(tmp_path):
     """Minimal AgentConfig mock — no [matrix] section."""
     config = MagicMock()
     config.name = "test-agent"
     config.model = "claude-haiku-4-5"
-    config.workspace = Path("/tmp/test-workspace")
+    config.workspace = tmp_path
+    config.user_id = "@test:server"
     config.matrix = None
     config.model_max_tokens = 200000
+    config.default_model = "claude-haiku-4-5"
     return config
 
 
@@ -83,6 +85,10 @@ def mock_agent():
     agent = MagicMock()
     agent.handle_input = AsyncMock(return_value="Hello from the agent!")
     agent.history.return_value = MagicMock()  # must be MagicMock so .clear() and .extend() are trackable
+    agent.last_turn_usage = MagicMock(return_value={})  # real dict, not MagicMock (JSON-serializable)
+    agent.restore_usage = MagicMock()
+    agent.rehydrate_reminders = MagicMock()
+    agent.system_prompt = "test system prompt"
     agent.status.return_value = {
         "name": "test-agent",
         "model": "claude-haiku-4-5",
@@ -212,7 +218,8 @@ class TestChatMessages:
         """Tool notices go to stderr, not stdout."""
         agent = chat_env["agent"]
 
-        async def handle_with_tool(text, room_id, *, on_tool_call=None, on_tool_intent=None):
+        async def handle_with_tool(text, room_id, *, on_tool_call=None, on_tool_intent=None,
+                                   callbacks=None, **kwargs):
             if on_tool_call:
                 await on_tool_call(
                     "call-1", "shell", {"command": "ls"}, "/tmp\n/var", False
@@ -232,7 +239,8 @@ class TestChatMessages:
         """Tool errors show 'error' status in notice."""
         agent = chat_env["agent"]
 
-        async def handle_with_error(text, room_id, *, on_tool_call=None, on_tool_intent=None):
+        async def handle_with_error(text, room_id, *, on_tool_call=None, on_tool_intent=None,
+                                    callbacks=None, **kwargs):
             if on_tool_call:
                 await on_tool_call(
                     "call-2", "shell", {"command": "bad"}, "command not found", True

@@ -306,7 +306,7 @@ def cmd_monitor(args):
             tc_input = tc.get("input", {})
             is_err = tc.get("is_error", False)
             color = RED if is_err else YELLOW
-            status = "✗" if is_err else "→"
+            status = "x" if is_err else "->"
 
             # Compact input preview
             if name == "shell":
@@ -334,7 +334,7 @@ def cmd_monitor(args):
 
         # Content preview (if any, and not just tool calls)
         if preview:
-            lines.append(f"  {MAGENTA}▸{RESET} {DIM}{preview}{RESET}")
+            lines.append(f"  {MAGENTA}>{RESET} {DIM}{preview}{RESET}")
 
         return "\n".join(lines)
 
@@ -465,11 +465,175 @@ def cmd_showprompt(args):
         print("\n(no tools configured)", file=sys.stderr)
 
 
-def cmd_chat(args):
-    """Interactive CLI session with an agent."""
-    from openalph.agent import Agent, ContextOverflowError
+# ---------------------------------------------------------------------------
+# CLI helpers — kdsn.237 Phase 1 (headless session support)
+# ---------------------------------------------------------------------------
 
-    # Suppress library noise (httpx, anthropic, etc.) — tool notices handle
+def _generate_session_name() -> str:
+    """Generate a random 3-word bip39 mnemonic as a session name."""
+    import secrets
+    from pathlib import Path
+    wordlist_path = Path(__file__).parent / "data" / "bip39-english.txt"
+    words = [w.strip() for w in wordlist_path.read_text().splitlines() if w.strip()]
+    return " ".join(secrets.choice(words) for _ in range(3))
+
+
+def _sanitize_room_label(label: str) -> str:
+    """Sanitize a --room label for use as a session key. Rejects path traversal."""
+    if not label:
+        raise ValueError("Room label cannot be empty")
+    if any(c in label for c in ("/", "\\", "..")):
+        raise ValueError(f"Room label contains forbidden characters: {label!r}")
+    import re as _re
+    if not _re.fullmatch(r'[a-zA-Z0-9_\-.]+', label):
+        raise ValueError(f"Room label contains invalid characters: {label!r}")
+    return label
+
+
+def _setup_cli_session(config, agent, room_id, *, explicit_room=False):
+    """Create or resume a CLI session. Returns (session_log, room_name, is_new)."""
+    from openalph.session import SessionLog
+    # Resolve user_id: Phase 1 agents have config.user_id; legacy agents use matrix.user_id
+    uid = getattr(config, "user_id", None) or (config.matrix.user_id if config.matrix else "cli")
+    sl = SessionLog(config.workspace, uid)
+    entries = sl.read(room_id)
+
+    if entries:
+        # Resume: find stored room_name from session_start
+        room_name = None
+        for e in entries:
+            if e.get("role") == "system" and e.get("event") == "session_start":
+                room_name = e.get("room_name")
+                break
+        # Rehydrate history + usage + reminders
+        history = agent.history(room_id)
+        history.clear()
+        history.extend(sl.build_context(room_id))
+        agent.restore_usage(room_id, sl.usage_totals(room_id))
+        try:
+            agent.rehydrate_reminders(room_id, entries)
+        except AttributeError:
+            pass
+        # Log resume
+        sl.append(
+            role="system", sender=uid, room=room_id,
+            event="session_resume", detail="CLI session resumed",
+        )
+        return (sl, room_name, False)
+
+    # New session
+    room_name = room_id if explicit_room else _generate_session_name()
+    sl.append(
+        role="system", sender=uid, room=room_id,
+        event="session_start", room_name=room_name, detail="CLI session started",
+    )
+    return (sl, room_name, True)
+
+
+async def _process_cli_line(agent, session_log, callbacks, room_id, config, line):
+    """Process one line: slash command or regular message. Returns (response, should_exit)."""
+    from openalph.session import persist_assistant_turn
+    stripped = line.strip()
+    if not stripped:
+        return (None, False)
+
+    if stripped in ("/quit", "/exit"):
+        return (None, True)
+
+    if stripped == "/help":
+        print("/status  - agent status", file=sys.stderr)
+        print("/quit    - exit", file=sys.stderr)
+        print("/showprompt - display system prompt", file=sys.stderr)
+        print("/model <name> - switch model", file=sys.stderr)
+        print("--room <name>  - use at launch for separate sessions", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Sessions are persisted to local JSONL.", file=sys.stderr)
+        return (None, False)
+
+    if stripped == "/status":
+        s = agent.status(room_id)
+        parts = [f"{s.get('name', config.name)} ({s.get('model', config.default_model)})"]
+        if "turns" in s:
+            parts.append(f"{s['turns']} turns")
+        if "context_pct" in s:
+            parts.append(f"context {s['context_pct']}%")
+        if "context_tokens" in s:
+            parts.append(f"~{s['context_tokens']:,} tokens")
+        if "context_remaining" in s:
+            parts.append(f"{s['context_remaining']:,} remaining")
+        if "total_tool_calls" in s:
+            parts.append(f"{s['total_tool_calls']} tool calls")
+        print(" - ".join(parts), file=sys.stderr)
+        return (None, False)
+
+    if stripped == "/showprompt":
+        print(agent.system_prompt, file=sys.stderr)
+        return (None, False)
+
+    if stripped.startswith("/model"):
+        parts = stripped.split(None, 1)
+        if len(parts) == 1:
+            print(f"Current model: {config.default_model}", file=sys.stderr)
+        else:
+            result = agent.switch_model(parts[1], room_id)
+            print(f"Model set: {result}", file=sys.stderr)
+            session_log.append(
+                role="system", sender=session_log.agent_user_id, room=room_id,
+                event="model_override", detail=parts[1],
+            )
+        return (None, False)
+
+    if stripped.startswith("/thinking"):
+        print("Thinking override not supported in CLI mode.", file=sys.stderr)
+        return (None, False)
+
+    # Regular message
+    session_log.append(
+        role="user", sender="operator", room=room_id, content=line,
+    )
+
+    async def _tool_notice(call_id, name, input_data, result, is_error):
+        status = "error" if is_error else "ok"
+        preview = str(result)[:200].replace('\n', ' ')
+        print(f"🔧 {name}: ({status}) {preview}", file=sys.stderr, flush=True)
+        session_log.append(
+            role="tool", sender=session_log.agent_user_id, room=room_id,
+            call_id=call_id, name=name, output=result, is_error=is_error,
+        )
+
+    async def _tool_intent(tool_calls, content_text):
+        from openalph.session import persist_assistant_turn
+        persist_assistant_turn(agent, session_log, room_id, content=content_text, tool_calls=tool_calls)
+
+    try:
+        response = await agent.handle_input(
+            line, room_id,
+            on_tool_call=_tool_notice,
+            on_tool_intent=_tool_intent,
+            callbacks=callbacks,
+        )
+    except Exception as exc:
+        from openalph.agent import ContextOverflowError
+        if isinstance(exc, ContextOverflowError):
+            print(f"\n! Context overflow - ~{exc.current_tokens:,} / {exc.max_tokens:,} tokens. "
+                  f"Restart with --room for a fresh session.", file=sys.stderr)
+        elif isinstance(exc, asyncio.CancelledError):
+            print("\nCancelled.", file=sys.stderr)
+            raise
+        else:
+            print(f"\nError: {exc}", file=sys.stderr)
+        return (None, False)
+
+    persist_assistant_turn(agent, session_log, room_id, content=response)
+    return (response, False)
+
+
+def cmd_chat(args):
+    """Interactive CLI session with an agent (Phase 1: persisted sessions)."""
+    from openalph.agent import Agent, ContextOverflowError
+    from openalph.callbacks import HeadlessSinks, build_callbacks
+
+    # Suppress library noise (httpx, anthropic, etc.) - tool notices handle
     # user-facing feedback. Only show errors unless -v was passed.
     if not args.verbose:
         logging.getLogger().setLevel(logging.ERROR)
@@ -481,66 +645,45 @@ def cmd_chat(args):
         sys.exit(1)
 
     agent = Agent(config)
-    room_id = args.room or "_cli"
 
-    # Wire tool notices to stderr
-    async def tool_notice(call_id, name, input_data, result, is_error):
-        status = "error" if is_error else "ok"
-        preview = str(result)[:80].replace('\n', ' ')
-        print(f"🔧 {name}: ({status}) {preview}", file=sys.stderr, flush=True)
+    explicit_room = bool(args.room)
+    room_id = _sanitize_room_label(args.room) if args.room else "_cli"
+
+    session_log, room_name, is_new = _setup_cli_session(
+        config, agent, room_id, explicit_room=explicit_room,
+    )
+
+    uid = getattr(config, "user_id", None) or (config.matrix.user_id if config.matrix else "cli")
+    sinks = HeadlessSinks(session_log=session_log, agent_user_id=uid)
+    callbacks = build_callbacks(
+        agent, room_id, sinks,
+        turn_source=None, session_log=session_log, room_name=room_name,
+    )
+
+    # Ready banner
+    status = "new" if is_new else "resumed"
+    print(f"{config.name} ready (model: {config.default_model})  [{room_name}] ({status}). "
+          f"Type /help for commands, Ctrl+D to exit.", file=sys.stderr)
 
     async def chat_loop():
         import readline  # noqa: F401  -- enables arrow keys, history
 
-        print(f"{config.name} ready (model: {config.default_model}). "
-              f"Type /help for commands, Ctrl+D to exit.", file=sys.stderr)
-
         while True:
             try:
-                line = input(f"\n{config.name}> ")
+                prompt = f"\n{config.name}> "
+                line = input(prompt)
             except (EOFError, KeyboardInterrupt):
                 print("\nGoodbye.", file=sys.stderr)
                 break
 
-            line = line.strip()
-            if not line:
-                continue
-
-            # Commands
-            if line == "/quit" or line == "/exit":
+            response, should_exit = await _process_cli_line(
+                agent, session_log, callbacks, room_id, config, line,
+            )
+            if should_exit:
                 print("Goodbye.", file=sys.stderr)
                 break
-
-            if line == "/help":
-                print("/status        — agent status", file=sys.stderr)
-                print("/quit          — exit", file=sys.stderr)
-                print("--room <name>  — use at launch for separate sessions", file=sys.stderr)
-                print("", file=sys.stderr)
-                print("Sessions are in-memory only — history is lost on exit.", file=sys.stderr)
-                continue
-
-            if line == "/status":
-                s = agent.status(room_id)
-                print(f"{s['name']} ({s['model']}) — "
-                      f"{s['turns']} turns, ~{s['context_tokens']:,} tokens "
-                      f"({s['context_pct']}%), "
-                      f"{s['total_tool_calls']} tool calls", file=sys.stderr)
-                continue
-
-            # Regular message
-            try:
-                response = await agent.handle_input(line, room_id, on_tool_call=tool_notice)
+            if response is not None:
                 print(f"\n{response}")
-            except ContextOverflowError as e:
-                print(f"\n⚠️ Context overflow — ~{e.current_tokens:,} / "
-                      f"{e.max_tokens:,} tokens. Restart with --room for a fresh session.",
-                      file=sys.stderr)
-            except asyncio.CancelledError:
-                print("\nCancelled.", file=sys.stderr)
-            except Exception as e:
-                print(f"\nError: {e}", file=sys.stderr)
-            finally:
-                pass
 
     asyncio.run(chat_loop())
 
