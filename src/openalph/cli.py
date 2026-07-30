@@ -490,7 +490,7 @@ def cmd_chat(args):
         print(f"🔧 {name}: ({status}) {preview}", file=sys.stderr, flush=True)
 
     async def chat_loop():
-        import readline  # enables arrow keys, history
+        import readline  # noqa: F401  -- enables arrow keys, history
 
         print(f"{config.name} ready (model: {config.default_model}). "
               f"Type /help for commands, Ctrl+D to exit.", file=sys.stderr)

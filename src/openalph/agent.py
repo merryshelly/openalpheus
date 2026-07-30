@@ -17,8 +17,8 @@ from pathlib import Path
 
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
-from openalph.provider import complete, stream, ping_cache, StreamEvent, ThinkingBlock, compute_cost
-from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, BUILTIN_TOOLS, _TODO_STATE
+from openalph.provider import complete, stream, ping_cache, ThinkingBlock, compute_cost
+from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
 
 logger = logging.getLogger(__name__)

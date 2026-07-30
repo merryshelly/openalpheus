@@ -12,8 +12,6 @@ drift-corrected variant is UmbralManager. Both now share one implementation.
 """
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Awaitable, Callable
 
 from openalph._timer import RecurringTimerManager
 

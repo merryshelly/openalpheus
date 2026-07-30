@@ -145,11 +145,9 @@ def strip_mention(user_id: str, body: str) -> str:
         (rf"(?i)^\s*{re.escape(bare_name)}(?=$|\s|[,;:!?.])"),   # leading "saw"/"SAW" only
     ]
 
-    stripped = False
     for full_pattern in patterns:
         if re.search(full_pattern, body):
             body = re.sub(full_pattern, "", body, count=1)
-            stripped = True
             break
 
     # Collapse runs of whitespace left by removal, then strip edges

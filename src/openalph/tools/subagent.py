@@ -15,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from openalph.provider import complete, compute_cost
-from openalph.tools import ToolDef, ToolResult, tool_schemas, truncate_result, wrap_tool_result
+from openalph.tools import ToolDef, ToolResult, truncate_result, wrap_tool_result
 from openalph.config import AgentConfig
 
 logger = logging.getLogger("openalph.subagent")

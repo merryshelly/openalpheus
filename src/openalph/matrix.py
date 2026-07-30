@@ -33,18 +33,18 @@ from nio import (
     UploadError,
 )
 
-# Constants for media handling
-MAX_MEDIA_BYTES = 20_000_000  # 20 MB
-MEDIA_DIR = "media"
-
 from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.provider import ProviderError
 from openalph.config import MatrixConfig
 from openalph.session import SessionLog
-from openalph.mention import mentions_me, is_gated, strip_mention, MentionCheckResult
+from openalph.mention import mentions_me, is_gated, strip_mention
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
 from openalph.tools import escape_system_reminder_tags, truncate_result
+
+# Constants for media handling
+MAX_MEDIA_BYTES = 20_000_000  # 20 MB
+MEDIA_DIR = "media"
 
 logger = logging.getLogger(__name__)
 
@@ -2171,7 +2171,7 @@ class MatrixBot:
                 code = f" ({e.status_code})" if e.status_code else ""
                 logger.warning("Provider error%s in %s: %s", code, room_id, e)
                 await self.send(room_id, f"⚠️ **Provider error:** {e}")
-            except Exception as e:
+            except Exception:
                 # Agent error: send generic message to avoid leaking exception details
                 logger.exception("Agent error processing message in %s", room_id)
                 await self.send(room_id, "⚠️ Internal error — check agent logs for details.")
@@ -2478,8 +2478,8 @@ class MatrixBot:
             lines = [
                 f"### {status['name']}",
                 "",
-                f"| | |",
-                f"|---|---|",
+                "| | |",
+                "|---|---|",
                 f"| **Model** | `{status['model']}` |",
                 f"| **Turns** | {status['turns']} |",
                 f"| **Context** | {bar} {ctx_pct}% (~{ctx:,} / {ctx_max:,}) |",
@@ -2642,7 +2642,7 @@ class MatrixBot:
                 value = "1h"
             valid_values = ("5m", "1h")
             if value not in valid_values:
-                await self.send(room_id, f"Invalid value. Use: `/cache 1h`, `/cache 5m`, or `/cache off`")
+                await self.send(room_id, "Invalid value. Use: `/cache 1h`, `/cache 5m`, or `/cache off`")
                 return
             # Check if current model uses Anthropic provider
             try:

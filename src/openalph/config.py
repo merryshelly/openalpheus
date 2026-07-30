@@ -363,7 +363,7 @@ def load_config(path: Path) -> AgentConfig:
             if base_url is None:
                 raise ConfigError(f"base_url is required for {section_name} provider")
             if not isinstance(base_url, str) or not base_url:
-                raise ConfigError(f"base_url must be a non-empty string")
+                raise ConfigError("base_url must be a non-empty string")
         
         quirks = section_data.get("quirks", [])
         if not isinstance(quirks, list):
@@ -376,11 +376,11 @@ def load_config(path: Path) -> AgentConfig:
         
         cache_bust_notices = section_data.get("cache_bust_notices", False)
         if not isinstance(cache_bust_notices, bool):
-            raise ConfigError(f"cache_bust_notices must be a boolean")
+            raise ConfigError("cache_bust_notices must be a boolean")
 
         subagent_cache_keepalive = section_data.get("subagent_cache_keepalive", False)
         if not isinstance(subagent_cache_keepalive, bool):
-            raise ConfigError(f"subagent_cache_keepalive must be a boolean")
+            raise ConfigError("subagent_cache_keepalive must be a boolean")
         
         routing = section_data.get("routing")
         if routing is not None and not isinstance(routing, dict):

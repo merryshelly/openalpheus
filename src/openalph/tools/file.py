@@ -50,7 +50,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
         # Handle offset (1-indexed)
         if offset is not None:
             if offset < 1:
-                return ToolResult(content=f"Error: offset must be >= 1", is_error=True)
+                return ToolResult(content="Error: offset must be >= 1", is_error=True)
             start_idx = offset - 1
         else:
             start_idx = 0
@@ -58,7 +58,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
         # Handle limit
         if limit is not None:
             if limit < 0:
-                return ToolResult(content=f"Error: limit must be >= 0", is_error=True)
+                return ToolResult(content="Error: limit must be >= 0", is_error=True)
             end_idx = start_idx + limit
         else:
             end_idx = len(lines)

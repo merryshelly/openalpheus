@@ -6,7 +6,6 @@ Stateless subprocess execution. Each call is independent.
 import asyncio
 import os
 import signal
-from typing import Any
 
 from . import ToolResult, truncate_result
 from .security import op_egress_block_reason

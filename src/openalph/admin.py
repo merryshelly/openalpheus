@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -205,7 +205,7 @@ def plan_create_agent(name: str, *, force: bool = False) -> list[Operation]:
         content=OPERATIONS_TEMPLATE,
         overwrite=force,
         description=(
-            f"Write OPERATIONS.md template to workspace"
+            "Write OPERATIONS.md template to workspace"
             + ("" if force else " (skipped if it already exists)")
         ),
     ))
@@ -225,7 +225,7 @@ def plan_create_agent(name: str, *, force: bool = False) -> list[Operation]:
         content=INJECTION_DEFENSE,
         overwrite=force,
         description=(
-            f"Write SECURITY_FOOTER.md template to workspace"
+            "Write SECURITY_FOOTER.md template to workspace"
             + ("" if force else " (skipped if it already exists)")
         ),
     ))

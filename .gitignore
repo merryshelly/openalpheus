@@ -11,3 +11,7 @@ models/
 *.backup
 *.bak
 tmp/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
