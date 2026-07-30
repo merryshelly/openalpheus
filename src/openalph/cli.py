@@ -2,10 +2,13 @@
 
 import argparse
 import asyncio
+import getpass
 import logging
+import os
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 from openalph.config import CONFIG_DIR, load_agent_config, ConfigError
 from openalph.admin import create_agent
@@ -74,6 +77,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = sub.add_parser("chat", help="Interactive CLI session with an agent")
     p.add_argument("agent")
     p.add_argument("--room", default=None, help="Custom room ID for session isolation")
+    p.add_argument("--truncate", type=int, default=None,
+                     help="Tool-result preview character limit (default 200, 0=unlimited)")
 
     return parser.parse_args(argv)
 
@@ -530,7 +535,55 @@ def _setup_cli_session(config, agent, room_id, *, explicit_room=False):
     return (sl, room_name, True)
 
 
-async def _process_cli_line(agent, session_log, callbacks, room_id, config, line):
+def _check_workspace_writable(config) -> bool:
+    """Check if the workspace is writable by the current user."""
+    ws = Path(config.workspace)
+    if not ws.exists():
+        print(
+            f"⚠️ Workspace {ws} is not writable by current user ({getpass.getuser()}).\n"
+            f"   Run as the agent user: sudo -u oa-{config.name} openalph chat {config.name}",
+            file=sys.stderr,
+        )
+        return False
+    # os.access() is bypassed by root; also check stat bits for any write permission
+    st = ws.stat()
+    if not os.access(str(ws), os.W_OK) or not (st.st_mode & 0o222):
+        print(
+            f"⚠️ Workspace {ws} is not writable by current user ({getpass.getuser()}).\n"
+            f"   Run as the agent user: sudo -u oa-{config.name} openalph chat {config.name}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _get_truncate_limit(*, args=None) -> int | None:
+    """Get the tool-result preview truncation limit.
+
+    Precedence: --truncate arg > OPENALPH_TRUNCATE env > default 200.
+    Returns None for 0 (no truncation).
+    """
+    # CLI arg takes precedence
+    if args is not None and getattr(args, 'truncate', None) is not None:
+        val = args.truncate
+        if val == 0:
+            return None
+        return val
+    # Env var
+    env_val = os.environ.get("OPENALPH_TRUNCATE")
+    if env_val:
+        try:
+            val = int(env_val)
+            if val == 0:
+                return None
+            return val
+        except ValueError:
+            pass  # fall through to default
+    # Default
+    return 200
+
+
+async def _process_cli_line(agent, session_log, callbacks, room_id, config, line, *, truncate_limit=200):
     """Process one line: slash command or regular message. Returns (response, should_exit)."""
     from openalph.session import persist_assistant_turn
     stripped = line.strip()
@@ -541,8 +594,8 @@ async def _process_cli_line(agent, session_log, callbacks, room_id, config, line
         return (None, True)
 
     if stripped == "/help":
-        print("/status  - agent status", file=sys.stderr)
-        print("/quit    - exit", file=sys.stderr)
+        print("/status    - agent status", file=sys.stderr)
+        print("/quit      - exit", file=sys.stderr)
         print("/showprompt - display system prompt", file=sys.stderr)
         print("/model <name> - switch model", file=sys.stderr)
         print("--room <name>  - use at launch for separate sessions", file=sys.stderr)
@@ -594,7 +647,10 @@ async def _process_cli_line(agent, session_log, callbacks, room_id, config, line
 
     async def _tool_notice(call_id, name, input_data, result, is_error):
         status = "error" if is_error else "ok"
-        preview = str(result)[:200].replace('\n', ' ')
+        if truncate_limit is not None:
+            preview = str(result)[:truncate_limit].replace('\n', ' ')
+        else:
+            preview = str(result).replace('\n', ' ')
         print(f"🔧 {name}: ({status}) {preview}", file=sys.stderr, flush=True)
         session_log.append(
             role="tool", sender=session_log.agent_user_id, room=room_id,
@@ -644,6 +700,9 @@ def cmd_chat(args):
         print(f"Config error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    if not _check_workspace_writable(config):
+        sys.exit(1)
+
     agent = Agent(config)
 
     explicit_room = bool(args.room)
@@ -668,6 +727,8 @@ def cmd_chat(args):
     async def chat_loop():
         import readline  # noqa: F401  -- enables arrow keys, history
 
+        truncate_limit = _get_truncate_limit(args=args)
+
         while True:
             try:
                 prompt = f"\n{config.name}> "
@@ -678,6 +739,7 @@ def cmd_chat(args):
 
             response, should_exit = await _process_cli_line(
                 agent, session_log, callbacks, room_id, config, line,
+                truncate_limit=truncate_limit,
             )
             if should_exit:
                 print("Goodbye.", file=sys.stderr)
