@@ -41,6 +41,7 @@ from openalph.mention import mentions_me, is_gated, strip_mention
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
 from openalph.tools import escape_system_reminder_tags, truncate_result
+from openalph.callbacks import build_callbacks, build_context_status, MatrixSinks, CommsSinks
 
 # Constants for media handling
 MAX_MEDIA_BYTES = 20_000_000  # 20 MB
@@ -1149,139 +1150,27 @@ class MatrixBot:
         turn_source, read_registry, room_id, context_status, send_media,
         on_redaction.
         """
-
-        async def _reminder_send_notice(_room_id, body, **kw):
-            """Emit collapsed <details> m.notice for reminders.
-
-            Summary holds the header line (lines[0]); the details body
-            renders only the remainder, so the header isn't re-rendered
-            inside the expanded body (mirrors the thinking-block pattern).
-            """
-            lines = body.split('\n')
-            html = (
-                '<details>\n<summary>' + lines[0] + '</summary>\n'
-                + mistune.html('\n'.join(lines[1:]).strip()) +
-                '</details>'
-            )
-            content_msg = {
-                "msgtype": "m.notice",
-                "body": body,
-                "format": "org.matrix.custom.html",
-                "formatted_body": html,
-            }
-            await self._room_send_with_retry(_room_id, content_msg)
-
-        async def _log_reminder(_room_id, reminder):
-            """Log reminder to JSONL with source='reminder' + trigger."""
-            _sl = getattr(self, 'session_log', None)
-            if _sl:
-                _sl.append(
-                    role="user",
-                    sender=self.config.user_id,
-                    room=_room_id,
-                    event_id=None,
-                    content=reminder.content,
-                    source="reminder",
-                    trigger=reminder.trigger,
-                )
-
-        async def _context_status_callback(req_room_id=None):
-            return self._build_context_status(req_room_id or room_id)
-
-        async def _upload_callback(file_path, content_type, filename, caption=None):
-            await self.upload_and_send(room_id, file_path, content_type, filename, caption)
-
-        async def _redaction_notice(tool_name, events):
-            """Emit in-room notice when credentials are redacted from tool output."""
-            for event in events:
-                notice = f"🔒 Credential redacted in {tool_name} output: {event.pattern_name} ({event.char_count} chars)"
-                try:
-                    await self.send_notice(room_id, notice)
-                except Exception as exc:
-                    logger.error("Redaction notice failed in %s: %s", room_id, exc, exc_info=True)
-                _sl = getattr(self, 'session_log', None)
-                if _sl:
-                    _sl.append(
-                        role="system",
-                        sender=self.config.user_id,
-                        room=room_id,
-                        event_id=None,
-                        event="credential_redaction",
-                        detail=f"tool={tool_name} pattern={event.pattern_name} chars={event.char_count}",
-                    )
-
-        async def _on_degenerate(model=None, generation_id=None, **kw):
-            """Emit an m.notice when the degen detector flags a response."""
-            body = f"⚠️ Degeneration detected — model: {model or 'unknown'}"
-            if generation_id:
-                body += f", generation: {generation_id}"
-            content_msg = {
-                "msgtype": "m.notice",
-                "body": body,
-            }
-            await self._room_send_with_retry(room_id, content_msg)
-
-        async def _keepalive_miss_notice(_room_id=None):
-            """Emit notice + system log when cache keepalive detects a write (miss)."""
-            rid = _room_id or room_id
-            notice = ("⚠️ cache keepalive missed (wrote instead of read) -- "
-                      "disabling for this turn; next resume may bust cache")
-            try:
-                await self.send_notice(rid, notice)
-            except Exception as exc:
-                logger.error("cache keepalive miss notice failed in %s: %s", rid, exc, exc_info=True)
-            _sl = getattr(self, 'session_log', None)
-            if _sl:
-                _sl.append(
-                    role="system",
-                    sender=self.config.user_id,
-                    room=rid,
-                    event_id=None,
-                    event="cache_keepalive_miss",
-                    detail="ping wrote instead of read",
-                )
-
-        # R1-1: per-room read registry for file_write guard
-        # Use getattr for compatibility with mocked agents in test suites
-        _registries = getattr(self.agent, '_read_registries', None)
-        if _registries is None:
-            _registries = {}
-            try:
-                self.agent._read_registries = _registries
-            except AttributeError:
-                pass  # spec-mocked agent, read_registry will be empty dict
-        _read_registry = _registries.setdefault(room_id, {})
-
-        # advisor: per-room consult counter (getattr for mocked-agent compatibility)
-        _advisor_uses = getattr(self.agent, '_advisor_uses', None)
-        if _advisor_uses is None:
-            _advisor_uses = {}
-            try:
-                self.agent._advisor_uses = _advisor_uses
-            except AttributeError:
-                pass
+        # resolve room_name from nio for the context_status callback
+        room = self.client.rooms.get(room_id) if getattr(self, 'client', None) else None
+        room_name = room.named_room_name() if room else None
+        sinks = MatrixSinks(self, room_id)
         # Lazy-init for tests that construct MatrixBot via __new__
         if not hasattr(self, '_advisor_results'):
             self._advisor_results = {}
         if not hasattr(self, '_subagent_results'):
             self._subagent_results = {}
-
-        return {
-            "send_media": _upload_callback,
-            "on_redaction": _redaction_notice,
-            "on_keepalive_miss": _keepalive_miss_notice,
-            "on_degenerate": _on_degenerate,
-            "context_status": _context_status_callback,
-            "send_notice": _reminder_send_notice,
-            "log_reminder": _log_reminder,
-            "turn_source": turn_source,
-            "read_registry": _read_registry,       # R1-1
-            "room_id": room_id,                    # R1-2
-            "get_transcript": lambda: (self.agent.system_prompt, list(self.agent.history(room_id))),
-            "advisor_uses": _advisor_uses,
-            "advisor_results": self._advisor_results,
-            "subagent_results": self._subagent_results,
-        }
+        return build_callbacks(
+            self.agent,
+            room_id,
+            sinks,
+            turn_source=turn_source,
+            session_log=getattr(self, 'session_log', None),
+            heartbeat=getattr(self, 'heartbeat', None),
+            umbral=getattr(self, 'umbral', None),
+            advisor_results=self._advisor_results,
+            subagent_results=self._subagent_results,
+            room_name=room_name,
+        )
 
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
         """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
@@ -1449,68 +1338,15 @@ class MatrixBot:
         and room identity for the given room ID. Sync-safe: calls only sync
         methods on self.agent, self.session_log, self.heartbeat, self.umbral.
         """
-        from datetime import datetime, timezone
-        _hist = self.session_log.build_context(rid) if getattr(self, 'session_log', None) else None
-        status_data = self.agent.status(rid, history=_hist)
-
-        # Session age
-        if getattr(self, 'session_log', None):
-            entries = self.session_log.read(rid)
-            if entries:
-                first_ts = entries[0].get("ts", "")
-                try:
-                    first_dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
-                    age = (datetime.now(timezone.utc) - first_dt).total_seconds() / 60
-                    status_data["session_age_minutes"] = round(age)
-                except (ValueError, TypeError):
-                    status_data["session_age_minutes"] = None
-            else:
-                status_data["session_age_minutes"] = None
-        else:
-            status_data["session_age_minutes"] = None
-
-        # Heartbeat state
-        hb = getattr(self, 'heartbeat', None)
-        if hb and hb.is_active(rid):
-            hb_entries = hb.status()
-            hb_entry = next((e for e in hb_entries if e.room_id == rid), None)
-            if hb_entry:
-                status_data["heartbeat_active"] = True
-                status_data["heartbeat_interval_minutes"] = round(hb_entry.interval_seconds / 60)
-                status_data["heartbeat_next_minutes"] = round(hb_entry.seconds_until_next / 60)
-            else:
-                status_data["heartbeat_active"] = False
-                status_data["heartbeat_interval_minutes"] = None
-                status_data["heartbeat_next_minutes"] = None
-        else:
-            status_data["heartbeat_active"] = False
-            status_data["heartbeat_interval_minutes"] = None
-            status_data["heartbeat_next_minutes"] = None
-
-        # Umbral state (context rotation timer)
-        um = getattr(self, 'umbral', None)
-        if um and um.is_active(rid):
-            um_entries = um.status()
-            um_entry = next((e for e in um_entries if e.room_id == rid), None)
-            if um_entry:
-                status_data["umbral_active"] = True
-                status_data["umbral_interval_minutes"] = round(um_entry.interval_seconds / 60)
-                status_data["umbral_next_minutes"] = round(um_entry.seconds_until_next / 60)
-            else:
-                status_data["umbral_active"] = False
-                status_data["umbral_interval_minutes"] = None
-                status_data["umbral_next_minutes"] = None
-        else:
-            status_data["umbral_active"] = False
-            status_data["umbral_interval_minutes"] = None
-            status_data["umbral_next_minutes"] = None
-
-        # Room identity
-        status_data["room_id"] = rid
         room = self.client.rooms.get(rid) if getattr(self, 'client', None) else None
-        status_data["room_name"] = room.named_room_name() if room else None
-
-        return status_data
+        room_name = room.named_room_name() if room else None
+        return build_context_status(
+            self.agent, rid,
+            room_name=room_name,
+            session_log=getattr(self, 'session_log', None),
+            heartbeat=getattr(self, 'heartbeat', None),
+            umbral=getattr(self, 'umbral', None),
+        )
 
     async def _inject_heartbeat(self, room_id: str) -> None:
         """Process a heartbeat as if the agent received a wake message."""
