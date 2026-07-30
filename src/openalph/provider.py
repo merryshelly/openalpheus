@@ -319,6 +319,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None]] = [
     ("fable",     1_048_576, 128_000),
     # Fireworks / open
     ("glm-5p2",   1_048_576, None),
+    ("kimi-k3",     1_048_576, None),
     ("kimi-k2p6",   262_144, None),
     # Local
     ("qwen3.5",     262_144, None),
@@ -408,6 +409,7 @@ _DEFAULT_SAMPLING_PROFILE = SamplingProfile()
 # mode-collapse setup for long structured/reasoning transcripts.
 _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    ("kimi-k3",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("minimax-m3", SamplingProfile(temperature=1.0, top_p=0.95)),
 ]
