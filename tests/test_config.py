@@ -387,7 +387,9 @@ class TestLoadAgentConfig:
     def test_discovers_and_loads(self, tmp_path, monkeypatch):
         config_dir = tmp_path / "agents"
         config_dir.mkdir()
-        (config_dir / "watson.toml").write_text(VALID_AGENT_TOML)
+        toml = VALID_AGENT_TOML.replace(
+            "/home/oa-watson/workspace", str(tmp_path))
+        (config_dir / "watson.toml").write_text(toml)
         monkeypatch.setattr("openalph.config.CONFIG_DIR", config_dir)
         config = load_agent_config("watson")
         assert config.name == "watson"
