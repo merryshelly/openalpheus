@@ -12,6 +12,7 @@ Design decisions:
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
 import os
 import subprocess
 import tomllib
@@ -71,6 +72,12 @@ class AgentConfig:
     matrix: MatrixConfig | None = None
     max_iterations: int = 100
     truncation_limit: int = 50000
+    # Per-turn stall watchdog: cancel a turn that has made no room-observable
+    # progress for this many seconds. 0 disables the watchdog entirely.
+    # Guards against the provider-retry wedge (RCA 2026-08-03): the SDK retry
+    # loop holds both per-room locks with no socket, no room output and no log
+    # above DEBUG, so nothing raises and the room silently looks dead.
+    turn_stall_timeout_seconds: float = 900
     vision: bool = False
     thinking: str = "off"
     temperature: float | None = None
@@ -267,6 +274,28 @@ def load_config(path: Path) -> AgentConfig:
     truncation_limit = agent_section.get("truncation_limit", 50000)
     if not isinstance(truncation_limit, int) or truncation_limit <= 0:
         raise ConfigError("truncation_limit must be a positive integer")
+
+    # turn_stall_timeout_seconds defaults to 900 (15 min) if not specified.
+    # 0 is legal and disables the stall watchdog (unlike max_iterations, where
+    # 0 is meaningless), so the check is non-negative rather than positive.
+    #
+    # F5 (round-2 review): math.isfinite is REQUIRED, not decorative. TOML has
+    # first-class `nan` / `inf` / `-inf` float literals, and neither compares
+    # less than zero, so a naive `< 0` check accepts all three:
+    #   nan  -> `nan > 0` is also False, so the watchdog is silently DISABLED
+    #           while the operator believes a finite timeout is in force;
+    #   inf  -> arms a watchdog whose `idle > timeout` can never be true;
+    #   -inf -> `-inf < 0` actually does reject, but only by luck of ordering.
+    # All three violate the documented finite-timeout semantics, so reject any
+    # non-finite value outright.
+    turn_stall_timeout_seconds = agent_section.get("turn_stall_timeout_seconds", 900)
+    if (isinstance(turn_stall_timeout_seconds, bool)
+            or not isinstance(turn_stall_timeout_seconds, (int, float))
+            or not math.isfinite(turn_stall_timeout_seconds)
+            or turn_stall_timeout_seconds < 0):
+        raise ConfigError(
+            "turn_stall_timeout_seconds must be a finite non-negative number")
+    turn_stall_timeout_seconds = float(turn_stall_timeout_seconds)
 
     # reminders defaults to True if not specified
     reminders = agent_section.get("reminders", True)
@@ -474,6 +503,7 @@ def load_config(path: Path) -> AgentConfig:
         matrix=matrix,
         max_iterations=max_iterations,
         truncation_limit=truncation_limit,
+        turn_stall_timeout_seconds=turn_stall_timeout_seconds,
         vision=vision,
         reminders=reminders,
         injection_defense=injection_defense,

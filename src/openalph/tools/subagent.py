@@ -269,6 +269,51 @@ async def run_subagent(
     # inner call's tc.id; we drain it after each tool batch into sub_cost.
     _sub_advisor_results: dict = {}
 
+    # --- Parent-turn liveness from REAL sub-run milestones (round-2 F3) -------
+    #
+    # A sub run produces no output in the parent's room, so without a liveness
+    # signal the matrix-layer turn stall watchdog (MatrixBot._process_message,
+    # RCA 2026-08-03) would cancel a perfectly healthy long sub run.
+    #
+    # The signal must be EVIDENCE OF PROGRESS, never elapsed time. The first
+    # design pinged every 60s merely because run_subagent had not returned; a
+    # sub parked in the same SDK rate-limit retry storm therefore reset the
+    # parent watchdog forever while both parent room locks stayed held —
+    # preserving the exact incident the watchdog was built to stop.
+    #
+    # So we fire only on things that actually happened:
+    #   * every provider response returned by complete() (including the
+    #     truncation-continuation and circuit-breaker summary round trips), and
+    #   * every completed tool-call iteration.
+    #
+    # INTENDED CONSEQUENCE, not a gap: a sub parked inside ONE silent provider
+    # call for longer than the parent's turn_stall_timeout_seconds emits no
+    # milestone and the parent turn IS cancelled — identical treatment to a
+    # stalled parent turn, and the whole point of the unwedge. Do not add a
+    # timer-based fallback here.
+    #
+    # Fail-soft and strictly out-of-band: the hook can never mutate `messages`
+    # or the returned ToolResult, and a raising/missing hook (headless + CLI
+    # callers have none) must never turn a good sub run into an error.
+    _progress_cb = (callbacks or {}).get("turn_progress")
+
+    def _milestone(what: str) -> None:
+        if not callable(_progress_cb):
+            return
+        try:
+            _res = _progress_cb()
+            # A coroutine would need awaiting; we are deliberately sync here so
+            # this can be called from anywhere in the loop. Close it to avoid a
+            # "never awaited" warning and log — the matrix hook is a plain
+            # function by contract.
+            if asyncio.iscoroutine(_res):
+                _res.close()
+                logger.debug(
+                    "subagent milestone hook returned a coroutine (%s); "
+                    "turn_progress must be a plain callable", what)
+        except Exception:
+            logger.debug("subagent milestone hook failed (%s)", what, exc_info=True)
+
     try:
         for iteration in range(iteration_limit):
             iter_start = time.time()
@@ -279,6 +324,8 @@ async def run_subagent(
                 tools=tools_arg,
                 max_tokens=max_tokens,
             )
+            # Milestone: a real provider response came back.
+            _milestone("provider_response")
 
             # Accumulate token counts
             if response.usage:
@@ -454,6 +501,9 @@ async def run_subagent(
                 "elapsed_seconds": round(iter_elapsed, 3),
             })
             completed_iterations += 1
+            # Milestone: a tool-call iteration actually completed (tools ran and
+            # their results were folded back into the conversation).
+            _milestone("tool_iteration")
 
         # Circuit breaker — request summary from the model
         logger.warning("Sub-agent tool call limit (%d) reached", iteration_limit)
@@ -488,6 +538,8 @@ async def run_subagent(
                 tools=None,  # no tools — force text response
                 max_tokens=max_tokens,
             )
+            # Milestone: the summary round trip is a real provider response too.
+            _milestone("provider_response")
             if summary.usage:
                 _accrue_cost(summary.model, summary.usage)
             final_content = (

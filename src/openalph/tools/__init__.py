@@ -16,6 +16,12 @@ import tomllib
 
 logger = logging.getLogger(__name__)
 
+# NOTE: there is deliberately no subagent progress-ping cadence constant here.
+# Parent-turn liveness during a sub run comes from REAL milestones emitted by
+# run_subagent (see tools/subagent.py), never from a blind elapsed-time
+# heartbeat — which would mask the provider wedge the turn stall watchdog exists
+# to catch (RCA 2026-08-03, round-2 review).
+
 
 # --- API key resolution cache ---
 #
@@ -1513,6 +1519,19 @@ async def _execute_tool_inner(
         _sub_max_iters = input.get("max_iterations")
         if _sub_max_iters is None:
             _sub_max_iters = tool_config.get("default_max_iterations")
+        # Parent-turn liveness while we are blocked here is emitted by
+        # run_subagent itself, from REAL sub-run milestones (each provider
+        # response, each completed tool-call iteration) via
+        # callbacks['turn_progress'].
+        #
+        # There is deliberately NO time-based pinger here (removed round 2). A
+        # blind "still running" heartbeat reports elapsed time, not progress: a
+        # sub parked in the SAME provider retry storm the parent's stall
+        # watchdog exists to break would have reset that watchdog forever while
+        # both parent room locks stayed held — recreating the exact incident.
+        # A sub with no milestone for longer than the parent's
+        # turn_stall_timeout_seconds SHOULD be cancelled; see the note above
+        # the milestone hook in tools/subagent.py.
         result = await run_subagent(
             task=input["task"],
             config=agent_config,

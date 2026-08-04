@@ -9,6 +9,7 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -390,6 +391,10 @@ class MatrixBot:
         self._room_timesense = {}   # Room-scoped timesense toggle (prepend timestamp to user messages)
         self._background_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # R3-1: per-room ACTIVATION mutex. See `_activate_room_once` for the
+        # lock-ordering contract (activation lock is leaf-level and is always
+        # released before `_session_locks[room_id]` is acquired).
+        self._activate_locks: dict[str, asyncio.Lock] = {}
         self._steering_inbox: dict[str, list[str]] = {}
         self._active_turns: set[str] = set()
         self._advisor_results: dict[tuple, dict] = {}  # R5: keyed (room_id, call_id)
@@ -701,6 +706,42 @@ class MatrixBot:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    # Upper bound on the best-effort stall notice (F4). self.send makes three
+    # Matrix attempts, each able to wait out the client's network timeout, so an
+    # unbounded notice task could outlive the turn it describes by many minutes.
+    _STALL_NOTICE_TIMEOUT = 30
+
+    async def _send_stall_notice(self, room_id: str, stall_minutes: float) -> None:
+        """Best-effort, separately-bounded stall notice (F4).
+
+        Runs OUTSIDE the turn's locked section as a background task so a Matrix
+        outage cannot delay releasing `_session_locks[room_id]` — the whole point
+        of the watchdog's cancel is to make the room usable again immediately.
+        Never raises: the turn has already been cancelled and re-raised, and a
+        failed courtesy notice must not surface as a background-task error.
+        """
+        try:
+            await asyncio.wait_for(
+                self.send(
+                    room_id,
+                    f"⚠️ **Turn stalled** — no progress for "
+                    f"{stall_minutes:.0f} min; cancelled to unwedge this "
+                    f"room. Please re-send your message.",
+                ),
+                timeout=self._STALL_NOTICE_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            # Shutdown or an explicit cancel of this helper: propagate, never
+            # swallow (async invariant).
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Stall notice to %s timed out after %ss — room was already "
+                "unwedged", room_id, self._STALL_NOTICE_TIMEOUT,
+            )
+        except Exception:
+            logger.exception("Failed to send stall notice to %s", room_id)
+
     _CANCEL_TIMEOUT = 5  # seconds to wait for cancelled task before abandoning
 
     async def _cancel_current(self, room_id: str | None = None):
@@ -768,6 +809,134 @@ class MatrixBot:
             content=content,
             tool_calls=tool_calls,
         )
+
+    # --- Durable Matrix-event membership (round-2 F2b) -----------------------
+    #
+    # `_known_event_ids[room_id]` is the set of Matrix event_ids this room has
+    # already durably processed. It is hydrated ONCE per activation from the room
+    # JSONL (`_activate_room`) and maintained incrementally at every append site
+    # that carries an event_id, so the per-message redelivery check stays O(1).
+    #
+    # It replaces the tail-equality guard, which compared only the newest
+    # non-null event_id and therefore missed both batched wakes (two events
+    # back-filled, only the newer one matching) and any redelivery with an
+    # intervening event. It also replaces the per-message
+    # `SessionLog.last_event_id()` call, a whole-file JSON scan run while the
+    # event loop and both room locks were held.
+    #
+    # Deliberately NOT persisted separately: the JSONL is already the durable
+    # record, and the set is rebuilt from it on every activation (including after
+    # an umbral archive+wipe, which discards the room from `_active_rooms` and so
+    # forces re-activation against the now-empty log — stale ids cannot suppress
+    # post-reset messages).
+
+    def _note_event_id(self, room_id: str, event_id: str | None) -> None:
+        """Record a Matrix event_id as durably processed for `room_id`.
+
+        No-op for falsy ids: synthetic turns (heartbeat/umbral/steer) and
+        assistant entries carry `event_id=None`, and a None must never become a
+        membership key or every id-less message would look like a redelivery of
+        every other.
+        """
+        if not event_id:
+            return
+        if not hasattr(self, '_known_event_ids'):
+            self._known_event_ids = {}
+        self._known_event_ids.setdefault(room_id, set()).add(event_id)
+
+    @staticmethod
+    def _event_ts(event) -> int | float | None:
+        """`server_timestamp` of a Matrix event as a real number, else None.
+
+        Guards the gap-fill boundary comparison: unit-test doubles (and, in
+        principle, a malformed server event) can leave `server_timestamp` as a
+        MagicMock or a string, and `int > MagicMock` raises TypeError rather
+        than comparing. `bool` is excluded because it is an `int` subclass and a
+        `True` timestamp is meaningless. None means "unknown age", which the
+        boundary treats as old history — the conservative direction, since a
+        back-filled message is still deduped by event_id.
+        """
+        ts = getattr(event, 'server_timestamp', None)
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            return None
+        return ts
+
+    def _is_known_event_id(self, room_id: str, event_id: str | None) -> bool:
+        """True when `event_id` was already durably processed for this room.
+
+        False for falsy ids (see `_note_event_id`) and for rooms with no
+        hydrated set, so an un-activated/legacy path degrades to the pre-fix
+        behaviour rather than dropping messages.
+        """
+        if not event_id:
+            return False
+        return event_id in getattr(self, '_known_event_ids', {}).get(room_id, ())
+
+    # --- Serialized lazy wake (round-3 R3-1) --------------------------------
+    #
+    # LOCK ORDER, and why activation needs its own lock at all.
+    #
+    # `_activate_room` is network-bound: it awaits `client.room_messages` for
+    # gap-fill, and only adds the room to `_active_rooms` at the very END. The
+    # `room_id not in self._active_rooms` test therefore stays true across those
+    # awaits, so two live events arriving on a DORMANT room (batched wake, sync
+    # reconnect replay, a user sending twice in a row) both saw it as inactive
+    # and both activated. That double activation:
+    #
+    #   * ran gap-fill twice, appending the same back-filled history to the
+    #     JSONL twice and writing two `session_resume` markers;
+    #   * assigned a FRESH `_known_event_ids[room_id]` set each time, so the
+    #     second assignment clobbered the first and genuine redeliveries walked
+    #     straight through the F2b gate;
+    #   * let one caller's gap-fill back-fill the OTHER caller's live event, so
+    #     that event's own dispatch then looked like a redelivery and its turn
+    #     was silently skipped.
+    #
+    # The fix is a per-room activation mutex plus a double-checked inactivity
+    # test: acquire, RE-CHECK `_active_rooms` (the previous holder may have just
+    # finished activating), and only then activate.
+    #
+    # ORDERING CONTRACT: `_activate_locks[room_id]` is LEAF-LEVEL. It is
+    # acquired and fully released inside this helper, and is never held across
+    # the acquisition of `_session_locks[room_id]` (or of the Agent's per-room
+    # lock, taken further in, inside `handle_input`). Every caller therefore
+    # takes activation first and session second, never the reverse, and no
+    # cycle can form. `async with` guarantees release on the exception path too,
+    # so a failed activation cannot wedge the room's next message.
+
+    async def _activate_room_once(self, room_id: str, **kwargs) -> None:
+        """Activate `room_id` at most once, even under concurrent live events.
+
+        No-op when the room is already active. `kwargs` are forwarded verbatim
+        to `_activate_room` (room_name / trigger_event_id / trigger_ts) and are
+        only used by the caller that actually performs the activation — which is
+        correct: the winner's trigger boundary is the one that matches the
+        gap-fill it runs, and any racing event is dispatched separately anyway.
+        """
+        if not hasattr(self, '_active_rooms'):
+            self._active_rooms = set()
+        # Fast path: no lock, no await — the overwhelmingly common case is an
+        # already-active room, and taking a lock there would serialise every
+        # message in the room behind a mutex it does not need.
+        if room_id in self._active_rooms:
+            return
+
+        if not hasattr(self, '_activate_locks'):
+            self._activate_locks = {}
+        lock = self._activate_locks.get(room_id)
+        if lock is None:
+            # Created without awaiting, so two callers in the same event-loop
+            # step cannot end up with different Lock objects for one room.
+            lock = self._activate_locks[room_id] = asyncio.Lock()
+
+        async with lock:
+            # Double check: a racing caller may have completed activation while
+            # we waited here. Re-testing membership (rather than trusting the
+            # pre-lock read) is what makes this mutual exclusion, not just
+            # serialisation.
+            if room_id in self._active_rooms:
+                return
+            await self._activate_room(room_id, **kwargs)
 
     def _advisor_display_model(self, mdl) -> str:
         """Expand a model alias to its full provider/model for display in the
@@ -1136,9 +1305,12 @@ class MatrixBot:
         Extracted from _inject_heartbeat for reuse by _inject_umbral.
         Raises on error — caller is responsible for error handling.
         """
-        # Activate room if not already active
+        # Activate room if not already active.
+        # R3-1: shares the per-room activation mutex with the live-message
+        # paths, so a heartbeat firing as a live message wakes the room cannot
+        # produce two concurrent gap-fills.
         if room_id not in self._active_rooms:
-            await self._activate_room(room_id)
+            await self._activate_room_once(room_id)
 
         # -- tool-use callbacks (same as normal message path) --
         _tool_notice, _tool_intent = self._make_tool_callbacks(room_id)
@@ -1417,16 +1589,58 @@ class MatrixBot:
                 f"Manual intervention required. Error: {e}",
             )
 
-    async def _activate_room(self, room_id: str, room_name: str = ""):
+    async def _activate_room(self, room_id: str, room_name: str = "", *,
+                             trigger_event_id: str | None = None,
+                             trigger_ts: int | None = None):
         """Load session history on first message (lazy wake).
 
         New architecture: reads local JSONL instead of paginating Matrix history.
         If entries exist, does gap-fill from last known event. If new room, starts fresh.
+
+        TRIGGER-AWARE GAP-FILL (round-2 F2a). Activation is always caused by some
+        live event, and that event is dispatched to `_process_message` separately
+        — which is the ONE writer that persists it, in its canonical form. So the
+        triggering event, and anything NEWER than it (the live sync loop will
+        dispatch those too), form an UPPER BOUNDARY: gap-fill back-fills strictly
+        older messages and must not persist the boundary itself.
+
+        Without this, gap-fill wrote its own copy of the trigger from the raw
+        Matrix `body`, and `_process_message` then wrote a second — the 2026-08-03
+        JSONL duplication. It also corrupted media triggers, whose raw `body` is a
+        bare filename while the canonical record is
+        `[media: media/<hash>/<file> (<mime>, <size>)]` — the only form that lets
+        the model locate the downloaded file or vision expand the image.
+
+        Args:
+            trigger_event_id: event_id of the live event that caused activation.
+                Excluded from back-fill persistence (its own dispatch persists it).
+            trigger_ts: `server_timestamp` of that event. Anything at-or-after it
+                is also excluded, covering batched wakes where the server already
+                returns events newer than the one whose callback we are inside.
         """
         session_log = getattr(self, 'session_log', None)
 
+        # Per-room known-event-ID membership set (round-2 F2b). Hydrated ONCE
+        # here from the JSONL and then maintained incrementally by
+        # `_note_event_id` at every append site, so the per-message redelivery
+        # check in `_process_message` is O(1). The previous design called
+        # `SessionLog.last_event_id()` on EVERY ungated message: a synchronous
+        # open + whole-file JSON decode performed while the event loop and both
+        # room locks were held, which could pause unrelated rooms on long
+        # sessions — and, being only the tail, it missed batched wakes and
+        # non-tail redeliveries entirely.
+        if not hasattr(self, '_known_event_ids'):
+            self._known_event_ids = {}
+        _known_set: set = set()
+        self._known_event_ids[room_id] = _known_set
+
         if session_log:
             existing = session_log.read(room_id)
+
+            for _e in existing:
+                _eid = _e.get("event_id") if isinstance(_e, dict) else None
+                if _eid:
+                    _known_set.add(_eid)
 
             if existing:
                 # Gap-fill: fetch Matrix messages since the last known event
@@ -1437,6 +1651,55 @@ class MatrixBot:
                         # we find overlap with known session history (or hit the cap).
                         GAP_FILL_MAX = 500  # safety cap to avoid infinite paging
                         known_ids = {e.get("event_id") for e in existing if e.get("event_id")}
+
+                        # Normalise once: a non-numeric trigger_ts (test double,
+                        # malformed event) disables the timestamp half of the
+                        # boundary rather than raising inside the hot loop.
+                        _trigger_ts = (
+                            None if isinstance(trigger_ts, bool)
+                            or not isinstance(trigger_ts, (int, float))
+                            else trigger_ts
+                        )
+
+                        def _at_or_after_trigger(msg, ev_id) -> bool:
+                            """True when `msg` IS the activation trigger, or is
+                            strictly newer than it — i.e. an event the live sync
+                            loop dispatches itself (F2a upper boundary).
+
+                            Two independent tests:
+
+                            * exact event_id — always applied, and the only test
+                              that matters for the trigger itself. It is exact,
+                              so it cannot be defeated by clock weirdness.
+                            * strictly-greater timestamp — covers BATCHED wakes:
+                              when E1 and E2 arrive together we may be inside
+                              E1's callback while `room_messages` already returns
+                              E2. E2 is newer, has its own pending dispatch, and
+                              must not be back-filled here or it would be
+                              persisted twice.
+
+                            STRICT `>`, not `>=`. Equal timestamps are common and
+                            do NOT imply "sibling of this wake": Matrix
+                            `server_timestamp` has millisecond resolution, so
+                            ordinary older history can share the trigger's
+                            millisecond, and `>=` would silently drop real gap
+                            messages — the exact failure mode this whole fix
+                            exists to prevent. The residual case (a genuine
+                            same-millisecond sibling) degrades benignly: it is
+                            back-filled here, recorded via `_note_event_id`, and
+                            its own live dispatch is then absorbed by the
+                            redelivery gate in `_process_message`. Its content is
+                            durably logged and hydrated; only its separate model
+                            turn is skipped.
+                            """
+                            if trigger_event_id and ev_id == trigger_event_id:
+                                return True
+                            if _trigger_ts is None:
+                                return False
+                            _ts = self._event_ts(msg)
+                            if _ts is None:
+                                return False   # unknown age -> treat as old history
+                            return _ts > _trigger_ts
                         new_messages = []
                         start_token = None  # None = start from current position
                         found_overlap = False
@@ -1454,6 +1717,13 @@ class MatrixBot:
                                 if ev_id and ev_id in known_ids:
                                     found_overlap = True
                                     break
+                                # F2a: skip the activation trigger and anything
+                                # newer. `continue`, never `break` — the chunk is
+                                # newest-first, so older messages we DO want
+                                # follow the boundary, and a `break` here would
+                                # silently drop the real gap.
+                                if _at_or_after_trigger(msg, ev_id):
+                                    continue
                                 if hasattr(msg, 'body') and msg.sender != self.config.user_id and not _is_streaming_edit(msg):
                                     new_messages.append(msg)
 
@@ -1485,6 +1755,10 @@ class MatrixBot:
                                 event_id=ev_id,
                                 content=msg_body,
                             )
+                            # F2b: a back-filled event is durably processed —
+                            # record it so a later live redelivery of the same
+                            # event is recognised without re-scanning the file.
+                            self._note_event_id(room_id, ev_id)
                         session_log.append(
                             role="system",
                             sender=self.agent_user_id if hasattr(self, 'agent_user_id') else self.config.user_id,
@@ -1683,14 +1957,17 @@ class MatrixBot:
 
                 # Always buffer to session log
                 if session_log:
+                    _buffered_event_id = getattr(event, 'event_id', None)
                     session_log.append(
                         role="user",
                         sender=event.sender,
                         room=room_id,
-                        event_id=getattr(event, 'event_id', None),
+                        event_id=_buffered_event_id,
                         content=body,
                         mentioned=mention.mentioned,
                     )
+                    # F2b: the gated buffer is this event's durable claim.
+                    self._note_event_id(room_id, _buffered_event_id)
 
                 if not mention.mentioned:
                     logger.debug("Gated room %s: not mentioned (%s), skipping",
@@ -1713,11 +1990,25 @@ class MatrixBot:
                 user_already_in_history = True
             # --- End mention gating ---
 
-            # Lazy wake: activate room on first live message
+            # Lazy wake: activate room on first live message.
+            #
+            # F2a: the event we are processing IS the activation trigger, so it
+            # is threaded into gap-fill as the upper boundary. Gap-fill then
+            # back-fills strictly older history and leaves this event (and
+            # anything newer, which the sync loop dispatches separately) alone —
+            # the ungated append below is its single writer, which is what keeps
+            # a media trigger's canonical `[media: …]` tag as the durable record
+            # instead of the raw Matrix body.
+            # R3-1: serialized through `_activate_room_once`, so two live events
+            # on a dormant room cannot both run the network-bound activation.
             if room_id not in self._active_rooms:
                 room_name = getattr(room, 'name', '') or getattr(room, 'display_name', '') or room_id
-                await self._activate_room(room_id, room_name=room_name)
-                # _activate_room hydrates history from JSONL (which already includes
+                await self._activate_room_once(
+                    room_id, room_name=room_name,
+                    trigger_event_id=getattr(event, 'event_id', None),
+                    trigger_ts=self._event_ts(event),
+                )
+                # Activation hydrates history from JSONL (which already includes
                 # the current user message for gated rooms).  Mark it so handle_input
                 # does not re-append.
                 if gated and self.session_log:
@@ -1734,6 +2025,55 @@ class MatrixBot:
             _session_lock = self._session_locks[room_id]
             await _session_lock.acquire()
 
+            # --- REDELIVERY GATE (round-2 F2b) ------------------------------
+            #
+            # Post-lock, pre-agent. If this event_id was already durably
+            # processed for this room, this delivery is a DUPLICATE: log it and
+            # return without running a turn. Matrix redelivers on reconnect and
+            # after a restart resumes from a stale sync token, and the previous
+            # (round-1) guard only suppressed the duplicate APPEND — the model
+            # still ran and the room still received a second reply.
+            #
+            # Membership is the in-memory `_known_event_ids[room_id]` set,
+            # hydrated once at activation and updated at every append site, so
+            # this is O(1). The removed round-1 guard called
+            # `SessionLog.last_event_id()` here on EVERY ungated message: a
+            # synchronous whole-file JSON scan run while the event loop and both
+            # room locks were held, which also missed batched wakes (only the
+            # tail id was compared) and any redelivery with an intervening event.
+            #
+            # SCOPED TO UNGATED ROOMS, deliberately. The invariant is "whichever
+            # path APPENDS the trigger claims it". In a gated room the trigger is
+            # always buffered BEFORE this point — by `_handle_room_message` (and
+            # then hydrated into the set by activation) or by the gated buffer
+            # above — so the event is legitimately "known" on its FIRST delivery
+            # and gating here would suppress every gated turn. On the ungated
+            # path `_process_message` is the sole writer and appends just below,
+            # after this gate, so membership can only mean a genuine earlier
+            # dispatch or durable history from a previous process lifetime.
+            #
+            # Gated rooms are NOT unprotected: round-3 R3-2 moved their
+            # redelivery decision UPSTREAM, to `_handle_room_message` immediately
+            # BEFORE the gating buffer append (and, for media, to the top of
+            # `_handle_media_message`), which is the only place the check can sit
+            # ahead of the claim. See the comment there.
+            #
+            # Falsy event_ids never match (see `_is_known_event_id`), so
+            # synthetic turns — heartbeat, umbral, steering — are unaffected.
+            #
+            # Early return is lock-safe: the outer `finally` releases
+            # `_session_locks[room_id]` and discards `_active_turns` on every
+            # path, and neither typing nor the steering drain has been armed yet.
+            _trigger_event_id = getattr(event, 'event_id', None)
+            if not gated and self._is_known_event_id(room_id, _trigger_event_id):
+                # No logging args: the message is pre-formatted so downstream
+                # record inspection (`record.message`) is complete on its own.
+                logger.info(
+                    f"Duplicate delivery of event {_trigger_event_id} in "
+                    f"{room_id} — already processed; skipping turn"
+                )
+                return
+
             # Append user message to session log (only for ungated rooms — gated already buffered above)
             if not gated:
                 if session_log:
@@ -1741,9 +2081,12 @@ class MatrixBot:
                         role="user",
                         sender=event.sender,
                         room=room_id,
-                        event_id=getattr(event, 'event_id', None),
+                        event_id=_trigger_event_id,
                         content=body,
                     )
+                    # F2b: this append is the durable claim on the event; record
+                    # it so a later redelivery hits the gate above.
+                    self._note_event_id(room_id, _trigger_event_id)
 
             # Regular message: process through agent
             # Timesense: prepend timestamp to user message for LLM context
@@ -1754,7 +2097,31 @@ class MatrixBot:
             await self._set_typing(room_id, True)
 
             # Wire tool visibility for this turn
-            _tool_notice, _tool_intent = self._make_tool_callbacks(room_id)
+            _raw_tool_notice, _raw_tool_intent = self._make_tool_callbacks(room_id)
+
+            # --- Turn stall watchdog state (RCA 2026-08-03) ---------------------
+            # _last_progress is a mutable cell poked by every room-observable
+            # progress signal (text/thinking deltas, tool callbacks, steering
+            # deliveries, and the explicit callbacks['turn_progress'] hook the
+            # subagent tool pings). The watchdog cancels the turn when nothing
+            # has poked it for turn_stall_timeout_seconds, so a provider retry
+            # storm can no longer hold both per-room locks indefinitely.
+            _turn_task = asyncio.current_task()
+            _last_progress = [time.monotonic()]
+            _stall_fired = [False]
+
+            def _turn_progress(*_args, **_kwargs):
+                """Reset the stall window. Plain (non-async) callable so tools can
+                poke it without awaiting."""
+                _last_progress[0] = time.monotonic()
+
+            async def _tool_notice(*args, **kwargs):
+                _turn_progress()
+                return await _raw_tool_notice(*args, **kwargs)
+
+            async def _tool_intent(*args, **kwargs):
+                _turn_progress()
+                return await _raw_tool_intent(*args, **kwargs)
 
             try:
                 # Resolve thinking level: room override > config
@@ -1771,10 +2138,12 @@ class MatrixBot:
                 _thinking_notified = False
 
                 async def _text_delta(text: str, done: bool):
+                    _turn_progress()
                     await streaming.push(text, done=done)
 
                 async def _thinking_delta(text: str, done: bool):
                     nonlocal _thinking_done, _thinking_notified
+                    _turn_progress()
                     if not done:
                         _thinking_buffer.append(text)
                         # Send a one-time notice on first thinking chunk
@@ -1865,6 +2234,8 @@ class MatrixBot:
 
                 async def _drain_steering() -> list:
                     notes = self._steering_inbox.pop(room_id, [])
+                    if notes:
+                        _turn_progress()
                     for _n in notes:
                         # Log to JSONL: role=user, source=steer, original text
                         _sl2 = getattr(self, 'session_log', None)
@@ -1892,7 +2263,45 @@ class MatrixBot:
                 # when drain_steering= kwarg is None.
                 callbacks['drain_steering'] = _drain_steering
 
-                response = await self.agent.handle_input(
+                # Liveness hook for the tool layer (e.g. the subagent tool pings
+                # this while blocked on a long sub run). Added here rather than in
+                # _build_agent_callbacks so that builder's pinned key set — and the
+                # heartbeat/CLI paths that share it — stay unchanged.
+                callbacks['turn_progress'] = _turn_progress
+
+                # Arm the stall watchdog. Read defensively: many tests build bots
+                # with MagicMock agents, where a bare attribute read would yield a
+                # MagicMock and make the arithmetic below nonsense.
+                _stall_timeout = getattr(
+                    getattr(self.agent, 'config', None), 'turn_stall_timeout_seconds', 0)
+                if isinstance(_stall_timeout, bool) or not isinstance(_stall_timeout, (int, float)):
+                    _stall_timeout = 0
+                _watchdog = None
+
+                async def _stall_watchdog(timeout: float):
+                    _poll = min(30.0, timeout / 4) or 0.05
+                    while True:
+                        await asyncio.sleep(_poll)
+                        _idle = time.monotonic() - _last_progress[0]
+                        if _idle > timeout:
+                            _stall_fired[0] = True
+                            logger.warning(
+                                "Turn stall watchdog firing in %s — no observable "
+                                "progress for %.0fs (timeout %.0fs); cancelling turn",
+                                room_id, _idle, timeout,
+                            )
+                            if _turn_task is not None:
+                                _turn_task.cancel()
+                            return
+
+                if _stall_timeout > 0:
+                    _watchdog = asyncio.create_task(
+                        _stall_watchdog(float(_stall_timeout)),
+                        name=f"turn-stall-watchdog:{room_id}",
+                    )
+
+                try:
+                    response = await self.agent.handle_input(
                         body, room_id,
                         on_tool_call=_tool_notice,
                         on_tool_intent=_tool_intent,
@@ -1904,6 +2313,31 @@ class MatrixBot:
                         cache_ttl=_cache_ttl,
                         append_user=not user_already_in_history,
                     )
+                finally:
+                    # Disarm immediately — a tight finally around handle_input (not
+                    # the outer one) minimises the window in which a watchdog that
+                    # fires just as the turn returns could land its CancelledError
+                    # on a later await and lose the response.
+                    #
+                    # F1 (CRITICAL, round-2 review): collect the child with
+                    # `gather(..., return_exceptions=True)`, NOT
+                    # `contextlib.suppress(CancelledError) + await _watchdog`.
+                    # `suppress` cannot distinguish the child watchdog's EXPECTED
+                    # cancellation from a cancellation delivered to THIS turn task
+                    # at that very await, so in the tight return/disarm window the
+                    # latter was swallowed and the turn went on to persist and
+                    # send `response` with `current_task().cancelling() == 1` —
+                    # a watchdog / operator `/stop` / shutdown cancel could be
+                    # acknowledged and then ignored.
+                    #
+                    # gather() consumes the child's CancelledError into its
+                    # results list (return_exceptions=True) while cancellation
+                    # aimed at the CURRENT task still propagates out of the
+                    # gather await, so the invariant "CancelledError always
+                    # re-raises" holds. Verified both ways before adopting.
+                    if _watchdog is not None:
+                        _watchdog.cancel()
+                        await asyncio.gather(_watchdog, return_exceptions=True)
                 # Append assistant response to session log
                 if response and response.strip():
                     self._persist_assistant_turn(room_id, content=response)
@@ -1956,6 +2390,35 @@ class MatrixBot:
                         pass
                 except Exception:
                     pass
+            except asyncio.CancelledError:
+                # Distinguish the watchdog's cancel from an operator /stop or a
+                # process-shutdown cancel: only the former sets _stall_fired, and
+                # only the former explains itself in-room. ALWAYS re-raise so the
+                # finally blocks below run (locks release, typing clears,
+                # _active_turns is discarded) and /stop behaviour is unchanged.
+                if _stall_fired[0]:
+                    _stall_minutes = float(_stall_timeout) / 60
+                    logger.warning(
+                        "Turn cancelled by stall watchdog in %s after %.0f min "
+                        "without observable progress",
+                        room_id, _stall_minutes,
+                    )
+                    # F4 (round-2 review): capture the notice and hand it to a
+                    # SEPARATELY-BOUNDED background task, then re-raise with ZERO
+                    # awaits in between. Awaiting self.send here delayed the very
+                    # unwedge this branch performs: send makes three Matrix
+                    # attempts and each request can wait out the client's network
+                    # timeout, so a Matrix outage kept _session_locks[room] (and
+                    # the agent's room lock, released only as handle_input
+                    # unwinds) held for minutes AFTER the provider stall had been
+                    # successfully cancelled — and `/stop` could not reliably
+                    # interrupt that phase because the Agent has already dropped
+                    # its current-task entry. Scheduling instead means the outer
+                    # `finally` blocks reach the lock release immediately and the
+                    # room is usable while the notice is still in flight.
+                    self._fire_background(self._send_stall_notice(
+                        room_id, _stall_minutes))
+                raise
             except AgentOverflowError as e:
                 logger.warning("Context overflow in %s: %s", room_id, e)
                 await self.send(room_id,
@@ -2014,6 +2477,25 @@ class MatrixBot:
 
         # Skip own messages
         if event.sender == self.config.user_id:
+            return
+
+        # --- MEDIA REDELIVERY GATE (round-3 R3-3) --------------------------
+        #
+        # Ahead of the download, deliberately. The redelivery gate in
+        # `_process_message` sits far downstream of this handler, so a
+        # redelivered media event used to re-fetch the whole file over HTTP and
+        # rewrite it to disk before anything could recognise it as a duplicate —
+        # wasted bandwidth and disk on an event whose turn was then skipped
+        # anyway. Matrix redelivers on reconnect, so this is routine, not rare.
+        #
+        # Falsy event_ids never match (see `_is_known_event_id`), so an event
+        # without an id keeps the pre-fix behaviour rather than being dropped.
+        _media_event_id = getattr(event, 'event_id', None)
+        if self._is_known_event_id(room.room_id, _media_event_id):
+            logger.info(
+                f"Duplicate delivery of media event {_media_event_id} in "
+                f"{room.room_id} — already processed; skipping download"
+            )
             return
 
         # Get filename from event
@@ -2130,16 +2612,64 @@ class MatrixBot:
             event_source = getattr(event, 'source', {}) or {}
             mention = mentions_me(self.config.user_id, event_source, body)
 
+            # --- GATED REDELIVERY GATE (round-3 R3-2) --------------------
+            #
+            # UPSTREAM of the buffer append, and this position is the whole
+            # point. The post-lock gate in `_process_message` is necessarily
+            # `not gated`: a gated room's trigger is buffered and CLAIMED right
+            # below, before `_process_message` ever runs, so by the time that
+            # gate is reached the event is legitimately "known" on its FIRST
+            # delivery and checking there would suppress every gated turn. That
+            # left gated rooms — the production 3+ member rooms — with no
+            # redelivery protection at all: a sync reconnect or a restart
+            # resuming from a stale sync token produced a second buffer entry, a
+            # second model turn and a second assistant reply.
+            #
+            # Checking BEFORE the append restores the invariant "whichever path
+            # appends the trigger claims it": membership here can only mean an
+            # EARLIER delivery already appended it (this process) or durable
+            # history from a previous process lifetime (hydrated at activation).
+            # Skipping entirely — no buffer append, no dispatch, not even the
+            # bare-command hint — makes the duplicate completely inert, so it
+            # cannot reappear in hydrated context either.
+            #
+            # Falsy event_ids never match (see `_is_known_event_id`), so
+            # id-less events keep the pre-fix behaviour.
+            #
+            # KNOWN LIMITATION (dormant gated room): the membership set is
+            # hydrated from the JSONL by `_activate_room`, which for a gated
+            # room runs AFTER this point. A redelivery that is the very FIRST
+            # event to wake a dormant room therefore still slips through this
+            # check. It remains a strict improvement — every subsequent
+            # redelivery in the room's lifetime is caught — and closing it needs
+            # activation to move ahead of the gated buffer, which would make
+            # non-mentioned messages activate rooms (a behaviour change out of
+            # scope here).
+            _gated_event_id = getattr(event, 'event_id', None)
+            if self._is_known_event_id(room_id, _gated_event_id):
+                # Pre-formatted: no logging args, so downstream record
+                # inspection (`record.message`) is complete on its own.
+                logger.info(
+                    f"Duplicate delivery of event {_gated_event_id} in gated "
+                    f"room {room_id} — already processed; skipping"
+                )
+                return
+
             # Buffer ALL messages to session log (mentioned or not)
             if self.session_log:
+                _buffered_event_id = getattr(event, 'event_id', None)
                 self.session_log.append(
                     role="user",
                     sender=event.sender,
                     room=room_id,
-                    event_id=getattr(event, 'event_id', None),
+                    event_id=_buffered_event_id,
                     content=body,
                     mentioned=mention.mentioned,
                 )
+                # F2b: this buffer is the event's durable claim. Recorded here
+                # too so that once the room is active a redelivery is visible in
+                # the membership set without re-reading the JSONL.
+                self._note_event_id(room_id, _buffered_event_id)
 
             if not mention.mentioned:
                 # Not mentioned — send hint for bare commands, then skip
@@ -2165,7 +2695,19 @@ class MatrixBot:
             self._active_rooms = set()
         if room_id not in self._active_rooms:
             room_name = getattr(room, 'name', '') or getattr(room, 'display_name', '') or room_id
-            await self._activate_room(room_id, room_name=room_name)
+            # F2a: this is the production text path and it activates BEFORE
+            # dispatching _process_message, so the trigger must be threaded in
+            # here too — otherwise gap-fill back-fills the very event that is
+            # about to be processed and the JSONL gets two copies.
+            #
+            # R3-1: `_activate_room_once` serialises this with the lazy wake in
+            # `_process_message` (and with a second concurrent live event here),
+            # so only one gap-fill ever runs per dormant room.
+            await self._activate_room_once(
+                room_id, room_name=room_name,
+                trigger_event_id=getattr(event, 'event_id', None),
+                trigger_ts=self._event_ts(event),
+            )
 
         # --- Slash commands ---
         if body == "/stop":
