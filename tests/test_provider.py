@@ -866,6 +866,67 @@ class TestBuildOpenaiKwargs:
         assert kw["extra_body"]["reasoning"] == {"effort": "xhigh"}
 
 
+class TestDSV4FEffortPrefix:
+    """DeepSeek-V4-Flash effort support (workspace-im7t.9.13): DSv4's
+    reasoning_effort is a text-prefix mechanism (no API param; the baked
+    llama.cpp template has no effort handling), so OA injects the vendor's
+    prefix text for high/xhigh/max and sends explicit effort="none" for off."""
+
+    def _args(self, **overrides):
+        defaults = dict(
+            api_model="macstudio/deepseek-v4-flash",
+            system="sys",
+            provider_messages=[{"role": "user", "content": "hi"}],
+            provider_tools=None,
+            max_tokens=1024,
+            thinking_level="off",
+            quirks=[],
+            provider_key="macstudio",
+        )
+        defaults.update(overrides)
+        return defaults
+
+    def test_high_injects_prefix_into_system_message(self):
+        kw = _build_openai_kwargs(**self._args(thinking_level="high"))
+        sysmsg = kw["messages"][0]
+        assert sysmsg["role"] == "system"
+        assert sysmsg["content"].startswith("Reasoning Effort: Absolute maximum")
+        assert sysmsg["content"].endswith("sys")
+        assert kw["extra_body"]["reasoning"] == {"effort": "high"}
+
+    def test_max_and_xhigh_inject_beyond_maximum_prefix(self):
+        for level in ("max", "xhigh"):
+            kw = _build_openai_kwargs(**self._args(thinking_level=level))
+            assert kw["messages"][0]["content"].startswith(
+                "Reasoning Effort: Beyond maximum")
+
+    def test_low_and_medium_inject_nothing(self):
+        for level in ("low", "medium"):
+            kw = _build_openai_kwargs(**self._args(thinking_level=level))
+            assert kw["messages"][0]["content"] == "sys"
+
+    def test_off_sends_reasoning_none(self):
+        """DSv4 thinks by default; off must send top-level reasoning_effort='none'
+        (llama.cpp ignores the nested reasoning.effort form — verified live)."""
+        kw = _build_openai_kwargs(**self._args(thinking_level="off"))
+        assert kw["extra_body"]["reasoning_effort"] == "none"
+        assert kw["messages"][0]["content"] == "sys"
+
+    def test_off_other_models_send_nothing(self):
+        """Non-DSv4F models keep the old behavior: off = no reasoning field."""
+        kw = _build_openai_kwargs(**self._args(
+            api_model="macstudio/mlx-community/MiniMax-M3-4bit",
+            thinking_level="off"))
+        assert "extra_body" not in kw
+
+    def test_caller_messages_not_mutated(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = _build_openai_kwargs(**self._args(
+            provider_messages=msgs, thinking_level="max"))
+        assert msgs == [{"role": "user", "content": "hi"}]
+        assert kw["messages"][1]["content"] == "hi"
+
+
 # --- B2: OpenAI/Fireworks cached-token normalization (RED) ---
 
 

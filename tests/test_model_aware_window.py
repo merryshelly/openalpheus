@@ -73,6 +73,35 @@ class TestResolveModelLimitLayering:
         # opus-4-8 fragment matches -> 1_048_576
         assert agent._resolve_model_limit(room) == 1_048_576
 
+    def test_room_alias_override_resolves_expanded_window(self, tmp_path):
+        """Room model stored as a bare alias (/model deepseek) resolves the
+        expanded model's window, not the model_max_tokens fallback.
+        Regression test for 2026-08-03 alias-blindness: wonmun room ran
+        deepseek-v4-flash at a 262K window instead of 1M."""
+        agent = make_agent(
+            tmp_path,
+            default_model="anthropic/claude-opus-4-8",
+            model_max_tokens=200_000,
+            model_limits={"macstudio/deepseek-v4-flash": 1_048_576},
+            model_aliases={"deepseek": "macstudio/deepseek-v4-flash"},
+        )
+        # Direct lookup with the bare alias (what a /model override stores)
+        assert agent._resolve_model_limit_for("deepseek") == 1_048_576
+        # End-to-end via a room override
+        agent._room_models["!test:alias"] = "deepseek"
+        assert agent._resolve_model_limit("!test:alias") == 1_048_576
+
+    def test_room_alias_override_hits_curated_without_config_entry(self, tmp_path):
+        """Alias expansion also feeds Layer 2 (curated substring fragments)."""
+        agent = make_agent(
+            tmp_path,
+            default_model="anthropic/claude-opus-4-8",
+            model_max_tokens=200_000,
+            model_limits={},
+            model_aliases={"opus": "anthropic/claude-opus-4-8"},
+        )
+        assert agent._resolve_model_limit_for("opus") == 1_048_576
+
     def test_fallback_to_model_max_tokens_and_single_warn(self, tmp_path, caplog):
         """Unknown model falls back to model_max_tokens and logs exactly one WARNING."""
         agent = make_agent(

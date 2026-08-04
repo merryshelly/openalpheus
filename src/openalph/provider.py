@@ -322,6 +322,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None]] = [
     ("kimi-k3",     1_048_576, None),
     ("kimi-k2p6",   262_144, None),
     # Local
+    ("deepseek-v4-flash", 1_048_576, None),
     ("qwen3.5",     262_144, None),
     ("qwen3p5",     262_144, None),
     ("qwen3.6",     262_144, None),
@@ -412,6 +413,7 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     ("kimi-k3",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("minimax-m3", SamplingProfile(temperature=1.0, top_p=0.95)),
+    ("deepseek-v4-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
 ]
 
 
@@ -1229,6 +1231,46 @@ def _build_anthropic_kwargs(
     return api_kwargs
 
 
+# DeepSeek-V4-Flash reasoning_effort prefixes — verbatim from DeepSeek's
+# encoding spec (repo encoding/README.md). DSv4's effort is a TEXT-PREFIX-ONLY
+# mechanism: no API parameter exists, the baked chat template has no effort
+# handling, and llama.cpp only honors reasoning_effort="none" natively.
+# "low"/"medium" map to the vendor default (no prefix injected).
+_DSV4F_EFFORT_PREFIXES = {
+    "high": (
+        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+        "You MUST be very thorough in your thinking and comprehensively decompose "
+        "the problem to resolve the root cause, rigorously stress-testing your "
+        "logic against all potential paths, edge cases, and adversarial scenarios.\n"
+        "Explicitly write out your entire deliberation process, documenting every "
+        "intermediate step, considered alternative, and rejected hypothesis to "
+        "ensure absolutely no assumption is left unchecked."
+    ),
+    "xhigh": (
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and "
+        "uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely "
+        "nothing to chance: exhaustively decompose the problem into its most "
+        "fundamental components, trace every causal chain to its root, and resolve "
+        "the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the solution "
+        "from multiple angles and are certain that no assumption remains unchecked "
+        "and no error remains undiscovered."
+    ),
+    "max": (
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and "
+        "uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely "
+        "nothing to chance: exhaustively decompose the problem into its most "
+        "fundamental components, trace every causal chain to its root, and resolve "
+        "the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the solution "
+        "from multiple angles and are certain that no assumption remains unchecked "
+        "and no error remains undiscovered."
+    ),
+}
+
+
 def _build_openai_kwargs(
     api_model: str,
     system: str,
@@ -1266,7 +1308,17 @@ def _build_openai_kwargs(
     else:
         # Normal: prepend system message to messages list
         messages_with_system = [{"role": "system", "content": system}] + provider_messages
-    
+
+    # DeepSeek-V4-Flash effort support (2026-08-03, workspace-im7t.9.13): inject
+    # the vendor's effort prefix at the head of the prompt (= head of the system
+    # message, which renders immediately after BOS in the baked template).
+    if "deepseek-v4-flash" in api_model.lower():
+        _prefix = _DSV4F_EFFORT_PREFIXES.get(thinking_level)
+        if _prefix and messages_with_system:
+            first = messages_with_system[0].copy()
+            first["content"] = _prefix + "\n\n" + (first.get("content") or "")
+            messages_with_system = [first] + messages_with_system[1:]
+
     _token_key = "max_completion_tokens" if _uses_max_completion_tokens else "max_tokens"
     api_kwargs = {
         "model": api_model,
@@ -1304,6 +1356,11 @@ def _build_openai_kwargs(
     extra_body = {}
     if thinking_level != "off" and _supports_reasoning_extra:
         extra_body["reasoning"] = {"effort": thinking_level}
+    elif thinking_level == "off" and "deepseek-v4-flash" in api_model.lower():
+        # DSv4 thinks BY DEFAULT (template enable_thinking=true). llama.cpp
+        # disables thinking only on TOP-LEVEL reasoning_effort="none" (verified
+        # 2026-08-03: nested reasoning.effort is ignored by the current build).
+        extra_body["reasoning_effort"] = "none"
     if routing:
         extra_body["provider"] = routing
     if extra_body:

@@ -379,6 +379,13 @@ class Agent:
     def _resolve_model_limit_for(self, model_str: str) -> int:
         """3-layer window resolution for an explicit model string (config override
         -> curated default -> model_max_tokens fallback + warn-once)."""
+        # Room model strings may be bare aliases (e.g. a persisted `/model deepseek`
+        # override): expand before lookup, otherwise Layer 1 (full-string keys)
+        # and Layer 2 (substring fragments) both silently miss and the model
+        # falls through to the model_max_tokens fallback (found 2026-08-03:
+        # wonmun room ran deepseek-v4-flash at a 262K window instead of 1M).
+        if model_str in self.config.model_aliases:
+            model_str = self.config.model_aliases[model_str]
         if model_str in self.config.model_limits:
             return self.config.model_limits[model_str]
         from openalph.provider import model_context_window
