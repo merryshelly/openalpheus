@@ -9,7 +9,6 @@ Connects an Agent to a Matrix room via matrix-nio. Handles:
 """
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import logging
@@ -42,7 +41,7 @@ from openalph.mention import mentions_me, is_gated, strip_mention
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
 from openalph.tools import escape_system_reminder_tags, truncate_result
-from openalph.callbacks import build_callbacks, build_context_status, MatrixSinks, CommsSinks
+from openalph.callbacks import build_callbacks, build_context_status, MatrixSinks
 
 # Constants for media handling
 MAX_MEDIA_BYTES = 20_000_000  # 20 MB

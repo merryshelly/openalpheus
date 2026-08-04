@@ -686,7 +686,7 @@ async def _process_cli_line(agent, session_log, callbacks, room_id, config, line
 
 def cmd_chat(args):
     """Interactive CLI session with an agent (Phase 1: persisted sessions)."""
-    from openalph.agent import Agent, ContextOverflowError
+    from openalph.agent import Agent
     from openalph.callbacks import HeadlessSinks, build_callbacks
 
     # Suppress library noise (httpx, anthropic, etc.) - tool notices handle
