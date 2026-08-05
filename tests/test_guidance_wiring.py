@@ -126,7 +126,7 @@ def _make_bot(**overrides):
     bot._current_room = None
     bot._synced = True
     bot._active_rooms = {ROOM}
-    bot._room_thinking = {}
+    bot._room_effort = {}
     bot._room_cache_ttl = {}
     bot._room_timesense = {}
     bot._halted_rooms = set()

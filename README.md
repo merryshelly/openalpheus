@@ -186,7 +186,7 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 |---------|--------|
 | `/status` | Model, context usage, token counts |
 | `/model <provider/model\|list>` | Switch model for this room, or list configured aliases |
-| `/thinking <off\|low\|medium\|high\|xhigh\|max>` | Set extended thinking level for this room (`xhigh`/`max` require supported models; no argument shows the current level) |
+| `/effort <off\|low\|medium\|high\|xhigh\|max>` | Set reasoning effort level for this room (`xhigh`/`max` require supported models; no argument shows the current level) |
 | `/heartbeat start <interval> [directive]` | Start recurring timer (e.g., `5m`, `1h`); optional trailing directive becomes the turn content on each fire (else a WAKE pointer) |
 | `/heartbeat stop` | Stop heartbeat |
 | `/heartbeat status` | List active heartbeats across rooms |

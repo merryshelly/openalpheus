@@ -246,7 +246,7 @@ def _make_bot_with_real_agent(tmp_path):
     bot._current_room = None
     bot._synced = True
     bot._active_rooms = set()
-    bot._room_thinking = {}
+    bot._room_effort = {}
     bot._room_cache_ttl = {}
     bot._room_timesense = {}
     bot._halted_rooms = set()

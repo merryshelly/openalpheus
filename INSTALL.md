@@ -349,7 +349,7 @@ openalph showprompt <name>                    # view assembled prompt
 
 **Change model:** edit `default_model` in the TOML → restart. Or use `/model <provider/model>` in-room (per-room, no restart).
 
-**In-room commands:** `/status`, `/model`, `/thinking`, `/heartbeat`, `/umbral`, `/cache`, `/stop`, `/resume` — see [README.md](README.md) for full reference.
+**In-room commands:** `/status`, `/model`, `/effort`, `/heartbeat`, `/umbral`, `/cache`, `/stop`, `/resume` — see [README.md](README.md) for full reference.
 
 ---
 

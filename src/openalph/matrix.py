@@ -385,7 +385,7 @@ class MatrixBot:
         self._current_room = None
         self._active_rooms = set()
         self._halted_rooms: set[str] = set()
-        self._room_thinking = {}
+        self._room_effort = {}
         self._room_cache_ttl = {}   # Room-scoped cache TTL overrides (e.g. "5m"; default is "1h")
         self._room_timesense = {}   # Room-scoped timesense toggle (prepend timestamp to user messages)
         self._background_tasks: set[asyncio.Task] = set()
@@ -1318,8 +1318,9 @@ class MatrixBot:
         try:
             await self._set_typing(room_id, True)
 
-            # Resolve thinking level: room override > config
-            _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
+            # Resolve effort level: room override > config
+            # Room effort override maps to the API `thinking` level.
+            _effort_override = getattr(self, '_room_effort', {}).get(room_id)
             _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
             _thinking_buffer = []
             _thinking_done = False
@@ -1413,7 +1414,7 @@ class MatrixBot:
                 room_id,
                 on_tool_call=_tool_notice,
                 on_tool_intent=_tool_intent,
-                thinking=_thinking_override,
+                thinking=_effort_override,
                 on_thinking_delta=_thinking_delta,
                 on_cache_status=_cache_status,
                 cache_ttl=_cache_ttl,
@@ -1443,7 +1444,7 @@ class MatrixBot:
                         room_id,
                         on_tool_call=_tool_notice,
                         on_tool_intent=_tool_intent,
-                        thinking=_thinking_override,
+                        thinking=_effort_override,
                         on_thinking_delta=_thinking_delta,
                         on_cache_status=_cache_status,
                         cache_ttl=_cache_ttl,
@@ -1813,10 +1814,10 @@ class MatrixBot:
                     else:
                         _TODO_STATE[room_id] = []
 
-                # Restore per-room overrides (model, thinking) from session log.
+                # Restore per-room overrides (model, effort) from session log.
                 # Scan all entries — last override wins (user may have switched multiple times).
                 _restored_model = None
-                _restored_thinking = None
+                _restored_effort = None
                 _restored_cache_ttl = None
                 _restored_timesense = None
                 for entry in existing:
@@ -1826,11 +1827,13 @@ class MatrixBot:
                         if ev == "model_override" and detail:
                             self.agent._room_models[room_id] = detail
                             _restored_model = detail
-                        elif ev == "thinking_override" and detail:
-                            if not hasattr(self, "_room_thinking"):
-                                self._room_thinking = {}
-                            self._room_thinking[room_id] = detail
-                            _restored_thinking = detail
+                        # Legacy "thinking_override" accepted read-only (pre-rename
+                        # data migration); the write side only emits "effort_override".
+                        elif ev in ("effort_override", "thinking_override") and detail:
+                            if not hasattr(self, "_room_effort"):
+                                self._room_effort = {}
+                            self._room_effort[room_id] = detail
+                            _restored_effort = detail
                         elif ev == "cache_ttl_override" and detail:
                             if not hasattr(self, "_room_cache_ttl"):
                                 self._room_cache_ttl = {}
@@ -1848,8 +1851,8 @@ class MatrixBot:
                 parts = [f"🔄 **Session resumed** — {len(existing)} prior entries"]
                 if _restored_model:
                     parts.append(f"Model override: `{_restored_model}`")
-                if _restored_thinking:
-                    parts.append(f"Thinking: `{_restored_thinking}`")
+                if _restored_effort:
+                    parts.append(f"Effort: `{_restored_effort}`")
                 if _restored_cache_ttl:
                     parts.append(f"Cache TTL: `{_restored_cache_ttl}`")
                 if _restored_timesense:
@@ -2123,8 +2126,8 @@ class MatrixBot:
                 return await _raw_tool_intent(*args, **kwargs)
 
             try:
-                # Resolve thinking level: room override > config
-                _thinking_override = getattr(self, '_room_thinking', {}).get(room_id)
+                # Resolve effort level: room override > config
+                _effort_override = getattr(self, '_room_effort', {}).get(room_id)
                 _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
 
                 # R1 refactor: use shared _build_agent_callbacks for identical wiring
@@ -2306,7 +2309,7 @@ class MatrixBot:
                         on_tool_intent=_tool_intent,
                         on_text_delta=_text_delta,
                         on_thinking_delta=_thinking_delta,
-                        thinking=_thinking_override,
+                        thinking=_effort_override,
                         callbacks=callbacks,
                         on_cache_status=_cache_status,
                         cache_ttl=_cache_ttl,
@@ -2808,7 +2811,7 @@ class MatrixBot:
             filled = round(bar_len * ctx_pct / 100)
             bar = "█" * filled + "░" * (bar_len - filled)
             # Resolve room-scoped overrides
-            _thinking = getattr(self, '_room_thinking', {}).get(room_id) or self.agent.config.thinking
+            _effort = getattr(self, '_room_effort', {}).get(room_id) or self.agent.config.thinking
             _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id) or "1h (default)"
             lines = [
                 f"### {status['name']}",
@@ -2836,7 +2839,7 @@ class MatrixBot:
                     f"| **Unpriced** | {status.get('unpriced_tokens', 0):,} tokens (non-Anthropic or unlisted model) |"
                 )
             lines += [
-                f"| **Thinking** | {_thinking} |",
+                f"| **Effort** | {_effort} |",
                 f"| **Cache TTL** | {_cache_ttl} |",
                 f"| **Timesense** | {'on' if getattr(self, '_room_timesense', {}).get(room_id) else 'off'} |",
             ]
@@ -2881,24 +2884,24 @@ class MatrixBot:
                 await self.send(room_id, f"Model switched to **{new_model}**")
             return
 
-        if body.startswith("/thinking"):
+        if body.startswith("/effort"):
             parts = body.split(None, 1)
             if len(parts) < 2:
-                # Show current thinking level
-                current = self._room_thinking.get(room_id)
+                # Show current effort level
+                current = self._room_effort.get(room_id)
                 if current is None:
                     current = getattr(self.agent.config, 'thinking', 'off')
                     source = "config"
                 else:
                     source = "override"
-                await self.send(room_id, f"Thinking: **{current}** ({source})")
+                await self.send(room_id, f"Effort: **{current}** ({source})")
                 return
             level = parts[1].strip().lower()
             valid_levels = ("off", "low", "medium", "high", "xhigh", "max")
             if level not in valid_levels:
                 await self.send(room_id, f"Invalid level. Use: {', '.join(valid_levels)}")
                 return
-            self._room_thinking[room_id] = level
+            self._room_effort[room_id] = level
             # Persist override so it survives process restarts
             if self.session_log:
                 self.session_log.append(
@@ -2906,10 +2909,10 @@ class MatrixBot:
                     sender=event.sender,
                     room=room_id,
                     event_id=None,
-                    event="thinking_override",
+                    event="effort_override",
                     detail=level,
                 )
-            await self.send(room_id, f"Thinking set to **{level}** for this room")
+            await self.send(room_id, f"Effort set to **{level}** for this room")
             return
 
         if body.startswith("/cache"):

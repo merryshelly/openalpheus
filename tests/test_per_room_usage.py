@@ -109,7 +109,7 @@ def make_bot(tmp_path):
     bot._synced = True
     bot._active_rooms = set()
     bot._halted_rooms = set()
-    bot._room_thinking = {}
+    bot._room_effort = {}
     bot._background_tasks = set()
     bot._session_locks = {}
     bot.session_log = SessionLog(tmp_path, AGENT_USER)
@@ -524,7 +524,7 @@ class TestRealToolTurnPersistsThinking:
         bot._background_tasks = set()
         bot._current_room = None
         bot._halted_rooms = set()
-        bot._room_thinking = {}
+        bot._room_effort = {}
         bot.session_log = sl
 
         # Get REAL _tool_intent and _tool_notice from bot

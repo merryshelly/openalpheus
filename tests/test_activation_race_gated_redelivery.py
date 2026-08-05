@@ -184,7 +184,7 @@ def make_bot(tmp_path):
     bot._synced = True
     bot._active_rooms = set()          # dormant -> lazy wake fires
     bot._halted_rooms = set()
-    bot._room_thinking = {}
+    bot._room_effort = {}
     bot._room_cache_ttl = {}
     bot._room_timesense = {}
     bot._background_tasks = set()

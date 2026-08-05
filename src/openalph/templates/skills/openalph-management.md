@@ -395,7 +395,7 @@ See "Fixing Orphaned Heartbeats" in the Heartbeat System section above.
 | `/status` | Show model, context usage, token counts |
 | `/showprompt` | Display assembled system prompt |
 | `/model <provider/model>` | Switch model for this room (persisted) |
-| `/thinking <off\|low\|medium\|high>` | Set thinking level for this room (persisted) |
+| `/effort <off\|low\|medium\|high\|xhigh\|max>` | Set reasoning effort level for this room (persisted) |
 | `/cache` | Show current cache TTL for this room |
 | `/cache 1h` | Set 1-hour Anthropic prompt cache TTL (persisted, room-scoped) |
 | `/cache 5m` or `/cache off` | Revert to default 5-minute TTL |
@@ -405,7 +405,7 @@ See "Fixing Orphaned Heartbeats" in the Heartbeat System section above.
 | `/heartbeat stop` | Stop heartbeat for this room |
 | `/steer <message>` | Inject a mid-turn steering note into the **active** turn (real-time steering). Logged + delivered to the agent at the next tool-call boundary as a user message. Requires an active turn; deposits without interrupting. |
 
-All overrides (`/model`, `/thinking`, `/cache`) are room-scoped, persisted to JSONL, and restored on session resume. They self-clean when the session ends.
+All overrides (`/model`, `/effort`, `/cache`) are room-scoped, persisted to JSONL, and restored on session resume. They self-clean when the session ends.
 
 ## Deep Reference
 

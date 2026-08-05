@@ -80,7 +80,7 @@ def make_bot(agent=None, config=None, **overrides):
     bot._current_room = None
     bot._synced = True
     bot._active_rooms = set()
-    bot._room_thinking = {}
+    bot._room_effort = {}
     bot._halted_rooms = set()
     bot._background_tasks = set()
     bot._session_locks = {}
@@ -426,8 +426,16 @@ class TestCommands:
         bot.agent.handle_input.assert_not_called()
 
 
-class TestThinkingCommand:
-    """Tests for /thinking command — per-room thinking level control."""
+class TestEffortCommand:
+    """Tests for /effort command — per-room effort level control.
+
+    Renamed from /thinking (kdsn.265, hard cut — no backcompat alias) so
+    harness vocabulary matches provider "reasoning effort" language. Only
+    the room-override surface (command, `_room_effort` state, JSONL event,
+    user-facing strings) carries the new name; the `handle_input`
+    `thinking=` kwarg and `[agent] thinking` config field are unchanged
+    (provider/API vocabulary).
+    """
 
     def _make_bot(self):
         config = make_matrix_config(user_id="@merry:matrix.local")
@@ -436,16 +444,16 @@ class TestThinkingCommand:
         agent.config.thinking = "off"
 
         bot = make_bot(agent, config)
-        bot._room_thinking = {}
+        bot._room_effort = {}
         return bot
 
     @pytest.mark.asyncio
-    async def test_thinking_show_default(self):
-        """/thinking with no args shows config default when no room override."""
+    async def test_effort_show_default(self):
+        """/effort with no args shows config default when no room override."""
         bot = self._make_bot()
         bot.agent.config.thinking = "medium"
 
-        event = make_room_message("@sb:matrix.local", "/thinking")
+        event = make_room_message("@sb:matrix.local", "/effort")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
 
@@ -455,16 +463,17 @@ class TestThinkingCommand:
             await asyncio.gather(*bot._background_tasks)
 
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "Effort" in sent.get("body", "")
         assert "medium" in sent.get("body", "")
         assert "config" in sent.get("body", "")
 
     @pytest.mark.asyncio
-    async def test_thinking_show_override(self):
-        """/thinking with no args shows room override when set."""
+    async def test_effort_show_override(self):
+        """/effort with no args shows room override when set."""
         bot = self._make_bot()
-        bot._room_thinking["!test:matrix.local"] = "high"
+        bot._room_effort["!test:matrix.local"] = "high"
 
-        event = make_room_message("@sb:matrix.local", "/thinking")
+        event = make_room_message("@sb:matrix.local", "/effort")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
 
@@ -474,15 +483,16 @@ class TestThinkingCommand:
             await asyncio.gather(*bot._background_tasks)
 
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "Effort" in sent.get("body", "")
         assert "high" in sent.get("body", "")
         assert "override" in sent.get("body", "")
 
     @pytest.mark.asyncio
-    async def test_thinking_set_valid_level(self):
-        """/thinking high sets room-level override."""
+    async def test_effort_set_valid_level(self):
+        """/effort high sets room-level override."""
         bot = self._make_bot()
 
-        event = make_room_message("@sb:matrix.local", "/thinking high")
+        event = make_room_message("@sb:matrix.local", "/effort high")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
 
@@ -491,17 +501,18 @@ class TestThinkingCommand:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        assert bot._room_thinking["!test:matrix.local"] == "high"
+        assert bot._room_effort["!test:matrix.local"] == "high"
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        assert "Effort set to" in sent.get("body", "")
         assert "high" in sent.get("body", "")
 
     @pytest.mark.asyncio
-    async def test_thinking_set_off(self):
-        """/thinking off disables thinking for the room."""
+    async def test_effort_set_off(self):
+        """/effort off disables effort for the room."""
         bot = self._make_bot()
-        bot._room_thinking["!test:matrix.local"] = "high"
+        bot._room_effort["!test:matrix.local"] = "high"
 
-        event = make_room_message("@sb:matrix.local", "/thinking off")
+        event = make_room_message("@sb:matrix.local", "/effort off")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
 
@@ -510,14 +521,14 @@ class TestThinkingCommand:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        assert bot._room_thinking["!test:matrix.local"] == "off"
+        assert bot._room_effort["!test:matrix.local"] == "off"
 
     @pytest.mark.asyncio
-    async def test_thinking_invalid_level_rejected(self):
-        """/thinking banana rejects invalid levels."""
+    async def test_effort_invalid_level_rejected(self):
+        """/effort banana rejects invalid levels."""
         bot = self._make_bot()
 
-        event = make_room_message("@sb:matrix.local", "/thinking banana")
+        event = make_room_message("@sb:matrix.local", "/effort banana")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
 
@@ -526,16 +537,16 @@ class TestThinkingCommand:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        assert "!test:matrix.local" not in bot._room_thinking
+        assert "!test:matrix.local" not in bot._room_effort
         sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
         assert "Invalid" in sent.get("body", "")
 
     @pytest.mark.asyncio
-    async def test_thinking_case_insensitive(self):
-        """/thinking HIGH is normalized to lowercase."""
+    async def test_effort_case_insensitive(self):
+        """/effort HIGH is normalized to lowercase."""
         bot = self._make_bot()
 
-        event = make_room_message("@sb:matrix.local", "/thinking HIGH")
+        event = make_room_message("@sb:matrix.local", "/effort HIGH")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
 
@@ -544,14 +555,14 @@ class TestThinkingCommand:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        assert bot._room_thinking["!test:matrix.local"] == "high"
+        assert bot._room_effort["!test:matrix.local"] == "high"
 
     @pytest.mark.asyncio
-    async def test_thinking_does_not_reach_agent(self):
-        """/thinking command does not trigger agent processing."""
+    async def test_effort_does_not_reach_agent(self):
+        """/effort command does not trigger agent processing."""
         bot = self._make_bot()
 
-        event = make_room_message("@sb:matrix.local", "/thinking low")
+        event = make_room_message("@sb:matrix.local", "/effort low")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
 
@@ -563,12 +574,16 @@ class TestThinkingCommand:
         bot.agent.handle_input.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_thinking_override_used_in_processing(self):
-        """Room thinking override is passed to agent.handle_input."""
+    async def test_effort_override_used_in_processing(self):
+        """Room effort override is passed to agent.handle_input.
+
+        The kwarg stays named `thinking` (provider/API vocabulary) even
+        though the room surface is now `effort`.
+        """
         bot = self._make_bot()
         bot.agent.handle_input = AsyncMock(return_value="OK")
         bot._active_rooms = {"!test:matrix.local"}
-        bot._room_thinking["!test:matrix.local"] = "high"
+        bot._room_effort["!test:matrix.local"] = "high"
         bot.session_log = None
 
         event = make_room_message("@sb:matrix.local", "hello")
@@ -585,28 +600,176 @@ class TestThinkingCommand:
         assert call_kwargs.get("thinking") == "high"
 
     @pytest.mark.asyncio
-    async def test_thinking_set_max(self):
-        """/thinking max sets room-level override."""
+    async def test_effort_set_max(self):
+        """/effort max sets room-level override."""
         bot = self._make_bot()
-        event = make_room_message("@sb:matrix.local", "/thinking max")
+        event = make_room_message("@sb:matrix.local", "/effort max")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
         await bot._handle_room_message(room, event)
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
-        assert bot._room_thinking["!test:matrix.local"] == "max"
+        assert bot._room_effort["!test:matrix.local"] == "max"
 
     @pytest.mark.asyncio
-    async def test_thinking_set_xhigh(self):
-        """/thinking xhigh sets room-level override."""
+    async def test_effort_set_xhigh(self):
+        """/effort xhigh sets room-level override."""
         bot = self._make_bot()
-        event = make_room_message("@sb:matrix.local", "/thinking xhigh")
+        event = make_room_message("@sb:matrix.local", "/effort xhigh")
         room = MagicMock()
         room.room_id = "!test:matrix.local"
         await bot._handle_room_message(room, event)
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
-        assert bot._room_thinking["!test:matrix.local"] == "xhigh"
+        assert bot._room_effort["!test:matrix.local"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_thinking_command_hard_cut(self):
+        """/thinking is no longer a command (hard cut, kdsn.265).
+
+        It must NOT set a room effort override and must fall through to
+        ordinary agent processing like any unrecognized slash-prefixed text.
+        """
+        bot = self._make_bot()
+        bot.agent.handle_input = AsyncMock(return_value="OK")
+        bot._active_rooms = {"!test:matrix.local"}
+        bot.session_log = None
+
+        event = make_room_message("@sb:matrix.local", "/thinking high")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+        room.users = {"@sb:matrix.local": MagicMock(), "@merry:matrix.local": MagicMock()}
+
+        await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert "!test:matrix.local" not in bot._room_effort
+        bot.agent.handle_input.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_status_shows_effort_row(self):
+        """/status renders the room effort level in an **Effort** row."""
+        bot = self._make_bot()
+        bot.agent.status.return_value = {
+            "name": "test", "model": "claude-3", "turns": 0,
+            "context_tokens": 0, "context_max": 200000, "context_pct": 0,
+            "uncached_input_tokens": 0, "cache_read_tokens": 0,
+            "cache_creation_tokens": 0, "total_output_tokens": 0,
+            "total_tool_calls": 0,
+        }
+        bot._room_effort["!test:matrix.local"] = "high"
+        bot.session_log = None
+
+        event = make_room_message("@sb:matrix.local", "/status")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        sent = bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else bot.client.room_send.call_args.kwargs.get("content", {})
+        body = sent.get("body", "")
+        assert "**Effort**" in body
+        assert "high" in body
+
+
+class TestEffortOverrideRestore:
+    """Restore of the per-room effort override from session JSONL on activation.
+
+    Write side only ever emits `effort_override` (kdsn.265). The reader
+    also honors legacy pre-rename `thinking_override` entries as a
+    read-only data migration, so rooms with saved overrides do not
+    silently revert to config default on restart.
+    """
+
+    def _make_bot_with_entries(self, entries):
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent._rooms = {}
+        agent.handle_input = AsyncMock(return_value="response")
+        agent.history = MagicMock(side_effect=lambda rid: agent._rooms.setdefault(rid, []))
+        agent.cancel = MagicMock()
+
+        bot = make_bot(agent, config)
+        bot._room_effort = {}
+
+        session_log = MagicMock()
+        session_log.read.return_value = entries
+        session_log.last_event_id.return_value = "$known_last"
+        session_log.build_context.return_value = []
+        bot.session_log = session_log
+
+        # Gap-fill: first page overlaps a known event immediately (no pagination)
+        page = MagicMock()
+        page.chunk = [make_room_message("@sb:matrix.local", "old", "$known_last")]
+        page.end = "token_p2"
+        bot.client.room_messages = AsyncMock(return_value=page)
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_effort_override_restored_on_activation(self):
+        """effort_override JSONL entries restore into _room_effort; the
+        session-resume notice renders the new vocabulary."""
+        entries = [
+            {"role": "user", "content": "old", "event_id": "$known_last"},
+            {"role": "system", "event": "effort_override", "detail": "high", "event_id": None},
+        ]
+        bot = self._make_bot_with_entries(entries)
+
+        room = MagicMock()
+        room.room_id = "!room:matrix.local"
+        event = make_room_message("@sb:matrix.local", "trigger")
+        await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert bot._room_effort.get("!room:matrix.local") == "high"
+        sent_bodies = " ".join(str(c) for c in bot.client.room_send.call_args_list)
+        assert "Effort: `high`" in sent_bodies
+
+    @pytest.mark.asyncio
+    async def test_legacy_thinking_override_restored_as_effort(self):
+        """Legacy pre-rename thinking_override entries restore (read-only migration)."""
+        entries = [
+            {"role": "user", "content": "old", "event_id": "$known_last"},
+            {"role": "system", "event": "thinking_override", "detail": "max", "event_id": None},
+        ]
+        bot = self._make_bot_with_entries(entries)
+
+        room = MagicMock()
+        room.room_id = "!room:matrix.local"
+        event = make_room_message("@sb:matrix.local", "trigger")
+        await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert bot._room_effort.get("!room:matrix.local") == "max"
+
+    @pytest.mark.asyncio
+    async def test_last_override_wins_across_legacy_and_new(self):
+        """Sequential scan, last entry wins — regardless of old/new event name."""
+        entries = [
+            {"role": "user", "content": "old", "event_id": "$known_last"},
+            {"role": "system", "event": "thinking_override", "detail": "high", "event_id": None},
+            {"role": "system", "event": "effort_override", "detail": "low", "event_id": None},
+        ]
+        bot = self._make_bot_with_entries(entries)
+
+        room = MagicMock()
+        room.room_id = "!room:matrix.local"
+        event = make_room_message("@sb:matrix.local", "trigger")
+        await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        assert bot._room_effort.get("!room:matrix.local") == "low"
 
 
 # --- Typing Indicator ---

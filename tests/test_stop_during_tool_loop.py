@@ -57,7 +57,7 @@ def _make_bot():
     bot._current_room = None
     bot._synced = True
     bot._active_rooms = {"!room:matrix.local"}
-    bot._room_thinking = {}
+    bot._room_effort = {}
     bot._halted_rooms = set()
     bot._background_tasks = set()
     bot._session_locks = {}

@@ -636,8 +636,8 @@ async def _process_cli_line(agent, session_log, callbacks, room_id, config, line
             )
         return (None, False)
 
-    if stripped.startswith("/thinking"):
-        print("Thinking override not supported in CLI mode.", file=sys.stderr)
+    if stripped.startswith("/effort"):
+        print("Effort override not supported in CLI mode.", file=sys.stderr)
         return (None, False)
 
     # Regular message
