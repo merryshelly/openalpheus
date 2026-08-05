@@ -30,7 +30,7 @@ All agent frameworks make tradeoffs. We optimized for:
 One command takes a fresh Linux machine to a running agent:
 
 ```bash
-curl -fsSL https://codeberg.org/merryshelly/openalpheus/raw/branch/main/install.sh | sudo bash
+curl -fsSL https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus/raw/branch/main/install.sh | sudo bash
 ```
 
 Non-interactive:
@@ -240,4 +240,4 @@ openalph showprompt <name>        Display the assembled system prompt + tool lis
 
 [AGPL-3.0](LICENSE)
 
-**Repository:** [codeberg.org/merryshelly/openalpheus](https://codeberg.org/merryshelly/openalpheus)
+**Repository:** [forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus](https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus)
