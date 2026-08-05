@@ -62,6 +62,8 @@ class ReminderEngine:
         self._t1_session_fires: int = 0     # T1: ≤2 per session
         self._t2_fired: bool = False        # T2: once per session
         self._t3_fired: bool = False        # T3: once per session
+        self._t5_fired: bool = False        # T5: once per session
+        self._t6_fired: bool = False        # T6: once per session
         # Per-turn state
         self._t4_fired_this_turn: bool = False  # T4: once per turn
 
@@ -130,6 +132,55 @@ class ReminderEngine:
                 ),
             ))
 
+        # T5: memory-salience-deep — boundary, ≥50K absolute tokens,
+        # memory_search enabled, zero memory_search calls this session,
+        # user-sourced turn; once per session.  Absolute tokens, NOT % of
+        # window: salience tracks information mass ingested (v1.1 spec,
+        # kdsn.186.22).  t5_fired_now defers T6 by one boundary so the two
+        # never fire at the same boundary (reminders dilute).
+        t5_fired_now = False
+        if (state.evaluation_point == "tool_loop_boundary"
+                and state.context_tokens >= 50000
+                and "memory_search" in state.enabled_tools
+                and state.tool_calls_session.get("memory_search", 0) == 0
+                and state.turn_source is None
+                and not self._t5_fired):
+            self._t5_fired = True
+            t5_fired_now = True
+            results.append(Reminder(
+                trigger="memory-salience-deep",
+                text=(
+                    "You are deep into this session and have not consulted "
+                    "memory. Before asserting anything about prior work, "
+                    "decisions, dates, people, or preferences, run "
+                    "memory_search."
+                ),
+            ))
+
+        # T6: advisor-salience — boundary, ≥75K absolute tokens, advisor
+        # enabled, zero advisor calls this session, user-sourced turn
+        # (interactive-only is load-bearing: automated sessions are rote by
+        # nature, SB 2026-08-05); once per session.  Deferred one boundary
+        # when T5 fires at the same boundary (v1.1 spec, kdsn.186.24).
+        if (state.evaluation_point == "tool_loop_boundary"
+                and state.context_tokens >= 75000
+                and "advisor" in state.enabled_tools
+                and state.tool_calls_session.get("advisor", 0) == 0
+                and state.turn_source is None
+                and not t5_fired_now
+                and not self._t6_fired):
+            self._t6_fired = True
+            results.append(Reminder(
+                trigger="advisor-salience",
+                text=(
+                    "You are deep into a substantial task and have not "
+                    "consulted the advisor. Before a non-obvious design "
+                    "decision, a first substantive write, or declaring "
+                    "complex work done, a second-model opinion is cheap "
+                    "insurance — consider the advisor tool."
+                ),
+            ))
+
         # T4: iteration-budget — boundary, iteration==floor(0.8*max); once/turn
         threshold = math.floor(0.8 * state.max_iterations)
         if (state.evaluation_point == "tool_loop_boundary"
@@ -166,6 +217,10 @@ class ReminderEngine:
                 self._t2_fired = True
             elif trigger == "memory-salience":
                 self._t3_fired = True
+            elif trigger == "memory-salience-deep":
+                self._t5_fired = True
+            elif trigger == "advisor-salience":
+                self._t6_fired = True
             # T4 is per-turn — not rehydrated across sessions
 
     def reset(self) -> None:
@@ -173,6 +228,8 @@ class ReminderEngine:
         self._t1_session_fires = 0
         self._t2_fired = False
         self._t3_fired = False
+        self._t5_fired = False
+        self._t6_fired = False
         self._t4_fired_this_turn = False
 
     def reset_turn(self) -> None:

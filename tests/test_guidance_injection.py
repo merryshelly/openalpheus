@@ -96,6 +96,23 @@ T2_ID = "context-pressure"
 T3_ID = "memory-salience"
 T4_ID = "iteration-budget"
 
+# Trigger IDs (v1.1 — reminders-t5/t6 specs, beads kdsn.186.22 / kdsn.186.24)
+T5_ID = "memory-salience-deep"
+T6_ID = "advisor-salience"
+T5_THRESHOLD = 50000
+T6_THRESHOLD = 75000
+T5_TEXT = (
+    "You are deep into this session and have not consulted memory. Before "
+    "asserting anything about prior work, decisions, dates, people, or "
+    "preferences, run memory_search."
+)
+T6_TEXT = (
+    "You are deep into a substantial task and have not consulted the advisor. "
+    "Before a non-obvious design decision, a first substantive write, or "
+    "declaring complex work done, a second-model opinion is cheap insurance — "
+    "consider the advisor tool."
+)
+
 
 def _cfg(workspace, **kw):
     """Shorthand AgentConfig builder."""
@@ -1373,3 +1390,457 @@ class TestIntegrationG:
         assert all(isinstance(m, dict) for m in history), "History must be clean dicts"
         orphans = [m for m in history if m.get("role") == "assistant" and m.get("tool_calls")]
         assert not orphans, "Orphaned tool_calls must be stripped by _repair_history"
+
+
+# ============================================================================
+# H. v1.1 salience triggers — T5 memory-salience-deep, T6 advisor-salience
+#    (specs: reminders-t5-memory-salience-deep.md, reminders-t6-advisor-salience.md)
+# ============================================================================
+
+def _t5_state(**kw):
+    """ReminderState with every T5 gate satisfied (override via kw).
+
+    Note: enabled_tools deliberately excludes "advisor" so T5 tests below
+    75K are isolated from T6; stagger tests pass both tools explicitly.
+    """
+    defaults = dict(
+        evaluation_point="tool_loop_boundary",
+        context_tokens=T5_THRESHOLD,
+        turn_source=None,
+        tool_calls_session={},
+        enabled_tools={"memory_search", "shell"},
+    )
+    defaults.update(kw)
+    return _state(**defaults)
+
+
+def _t6_state(**kw):
+    """ReminderState with every T6 gate satisfied (override via kw).
+
+    Note: enabled_tools deliberately excludes "memory_search" so T5 stays
+    gated off and T6 assertions are isolated; stagger tests pass both tools
+    explicitly.
+    """
+    defaults = dict(
+        evaluation_point="tool_loop_boundary",
+        context_tokens=T6_THRESHOLD,
+        turn_source=None,
+        tool_calls_session={},
+        enabled_tools={"advisor", "shell"},
+    )
+    defaults.update(kw)
+    return _state(**defaults)
+
+
+class TestT5Salience:
+    """T5 memory-salience-deep — spec §5 cases 1–10."""
+
+    # -- case 1: absolute-token breakpoint --
+
+    def test_t5_fires_at_50k(self, tmp_path):
+        """T5 §5.1: fires at boundary when context_tokens >= 50000."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t5_state(context_tokens=T5_THRESHOLD))
+        t5 = [r for r in res if r.trigger == T5_ID]
+        assert t5, "T5 must fire at exactly 50,000 context tokens"
+        assert t5[0].text == T5_TEXT, f"T5 text drifted from spec: {t5[0].text!r}"
+        assert t5[0].content == _framed(T5_TEXT), \
+            "T5 content property must equal the exact framed spec text"
+
+    def test_t5_not_at_49999(self, tmp_path):
+        """T5 §5.1: does NOT fire at 49,999."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t5_state(context_tokens=T5_THRESHOLD - 1))
+        assert not any(r.trigger == T5_ID for r in res), \
+            "T5 must not fire at 49,999 context tokens"
+
+    # -- case 2: shared gate — suppressed after any memory_search this session --
+
+    def test_t5_suppressed_after_memory_search(self, tmp_path):
+        """T5 §5.2: suppressed after any memory_search call this session."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t5_state(context_tokens=60000,
+                                     tool_calls_session={"memory_search": 1}))
+        assert not any(r.trigger == T5_ID for r in res), \
+            "T5 must not fire once memory_search has been called this session"
+
+    # -- case 3: tool gate --
+
+    def test_t5_suppressed_when_memory_search_disabled(self, tmp_path):
+        """T5 §5.3: suppressed when memory_search tool is disabled."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t5_state(context_tokens=60000,
+                                     enabled_tools={"advisor", "shell"}))
+        assert not any(r.trigger == T5_ID for r in res), \
+            "T5 must not fire when memory_search is not enabled"
+
+    # -- case 4: turn-source gate (heartbeat/umbral skip) --
+
+    def test_t5_suppressed_on_heartbeat(self, tmp_path):
+        """T5 §5.4: suppressed on heartbeat-sourced turns, even past 50K."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t5_state(context_tokens=60000,
+                                     turn_source="heartbeat"))
+        assert not any(r.trigger == T5_ID for r in res), \
+            "T5 must skip heartbeat-sourced turns"
+
+    def test_t5_suppressed_on_umbral(self, tmp_path):
+        """T5 §5.4: suppressed on umbral-sourced turns, even past 50K."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t5_state(context_tokens=60000,
+                                     turn_source="umbral"))
+        assert not any(r.trigger == T5_ID for r in res), \
+            "T5 must skip umbral-sourced turns"
+
+    # -- case 5: the T3 gap — fires mid-turn on turn 1 --
+
+    def test_t5_fires_mid_turn_turn_1(self, tmp_path):
+        """T5 §5.5: fires mid-turn on turn 1 (completed_turns == 1) where T3
+        (turn-start, completed >= 2) structurally cannot."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t5_state(completed_turns=1, context_tokens=52000))
+        assert any(r.trigger == T5_ID for r in res), \
+            "T5 must fire mid-turn on turn 1 — the deep single-turn gap T3 misses"
+
+    # -- case 6: T3∩T5 escalation matrix (independent triggers, shared gate) --
+
+    def test_t5_t3_escalation_after_ignored_t3(self, tmp_path):
+        """T5 §5.6a: T3 fires turn-2 start; agent ignores; context crosses 50K
+        mid-turn-2 → T5 fires (escalation, not redundancy)."""
+        eng = _engine(tmp_path)
+        r1 = eng.evaluate(_state(evaluation_point="turn_start", completed_turns=2,
+                                 turn_source=None, tool_calls_session={},
+                                 enabled_tools={"memory_search", "shell"}))
+        assert any(r.trigger == T3_ID for r in r1), "Precondition: T3 fires at turn 2"
+        r2 = eng.evaluate(_t5_state(context_tokens=51000))
+        assert any(r.trigger == T5_ID for r in r2), \
+            "T5 must fire as escalation when T3 was ignored and the session deepened"
+
+    def test_t5_t3_shared_gate_search_after_t3(self, tmp_path):
+        """T5 §5.6b: agent searches after T3 → T5 never fires (shared gate)."""
+        eng = _engine(tmp_path)
+        r1 = eng.evaluate(_state(evaluation_point="turn_start", completed_turns=2,
+                                 turn_source=None, tool_calls_session={},
+                                 enabled_tools={"memory_search", "shell"}))
+        assert any(r.trigger == T3_ID for r in r1), "Precondition: T3 fires at turn 2"
+        r2 = eng.evaluate(_t5_state(context_tokens=60000,
+                                    tool_calls_session={"memory_search": 1}))
+        assert not any(r.trigger == T5_ID for r in r2), \
+            "T5 must never fire once the shared memory_search gate is closed"
+
+    def test_t5_t3_escalation_t3_after_ignored_t5(self, tmp_path):
+        """T5 §5.6c: T5 fires turn 1; agent ignores; turn-2 start → T3 fires
+        (reverse escalation — worst case 2 memory nudges/session)."""
+        eng = _engine(tmp_path)
+        r1 = eng.evaluate(_t5_state(completed_turns=1, context_tokens=51000))
+        assert any(r.trigger == T5_ID for r in r1), "Precondition: T5 fires on turn 1"
+        r2 = eng.evaluate(_state(evaluation_point="turn_start", completed_turns=2,
+                                 turn_source=None, tool_calls_session={},
+                                 enabled_tools={"memory_search", "shell"}))
+        assert any(r.trigger == T3_ID for r in r2), \
+            "T3 must still fire at turn 2 when T5 was ignored (independent triggers)"
+
+    def test_t5_t3_shared_gate_search_after_t5(self, tmp_path):
+        """T5 §5.6d: agent searches after T5 → T3 never fires at turn 2."""
+        eng = _engine(tmp_path)
+        r1 = eng.evaluate(_t5_state(completed_turns=1, context_tokens=51000))
+        assert any(r.trigger == T5_ID for r in r1), "Precondition: T5 fires on turn 1"
+        r2 = eng.evaluate(_state(evaluation_point="turn_start", completed_turns=2,
+                                 turn_source=None,
+                                 tool_calls_session={"memory_search": 1},
+                                 enabled_tools={"memory_search", "shell"}))
+        assert not any(r.trigger == T3_ID for r in r2), \
+            "T3 must never fire once the shared memory_search gate is closed"
+
+    # -- case 7: fired-state rehydration --
+
+    def test_t5_rehydration_no_refire(self, tmp_path):
+        """T5 §5.7: JSONL with a T5 entry → restart → no re-fire even though
+        context_tokens is still >= 50K."""
+        sl = SessionLog(workspace=tmp_path, agent_user_id=AGENT_USER)
+        sl.append(role="user", sender=AGENT_USER, room=ROOM, event_id=None,
+                  content=_framed(T5_TEXT), source="reminder", trigger=T5_ID)
+        eng = _engine(tmp_path)
+        eng.rehydrate(sl.read(ROOM))
+        res = eng.evaluate(_t5_state(context_tokens=80000))
+        assert not any(r.trigger == T5_ID for r in res), \
+            "T5 must not re-fire after rehydration (fired-state derived from JSONL)"
+
+    # -- case 8: umbral reset re-arms --
+
+    def test_t5_umbral_reset_rearms(self, tmp_path):
+        """T5 §5.8: engine.reset() (umbral wipe = new session) re-arms T5."""
+        eng = _engine(tmp_path)
+        eng.evaluate(_t5_state())  # fires
+        eng.reset()
+        res = eng.evaluate(_t5_state())
+        assert any(r.trigger == T5_ID for r in res), \
+            "T5 must fire again after umbral reset"
+
+    # -- case 9: kill-switch --
+
+    def test_t5_killswitch(self, tmp_path):
+        """T5 §5.9: reminders = false → no T5 injection."""
+        eng = _engine(tmp_path, reminders=False)
+        res = eng.evaluate(_t5_state(context_tokens=80000))
+        assert res == [], f"reminders=false must suppress T5; got {res}"
+
+    # -- case 10: JSONL entry shape + replay byte-identity (v1 patterns) --
+
+    def test_t5_jsonl_entry_and_replay_identity(self, tmp_path):
+        """T5 §5.10: JSONL entry role/user, source/reminder, trigger id, exact
+        framed content; build_context() replays verbatim (I1 byte-identity)."""
+        sl = SessionLog(workspace=tmp_path, agent_user_id=AGENT_USER)
+        framed = _framed(T5_TEXT)
+        sl.append(role="user", sender=AGENT_USER, room=ROOM, event_id=None,
+                  content=framed, source="reminder", trigger=T5_ID)
+        entries = sl.read(ROOM)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["role"] == "user"
+        assert e["source"] == "reminder"
+        assert e["trigger"] == T5_ID
+        assert e["content"] == framed
+        context = sl.build_context(ROOM)
+        assert len(context) == 1
+        assert context[0]["content"] == framed, \
+            "build_context must replay T5 entries verbatim (byte-identity)"
+        assert Reminder(trigger=T5_ID, text=T5_TEXT).content == framed, \
+            "Live-framed content must equal the persisted bytes (stored == seen)"
+
+    @pytest.mark.asyncio
+    async def test_t5_integration_deep_single_turn(self, tmp_path):
+        """T5 §5.10: live agent loop — deep single turn with no memory_search →
+        T5 injected into history at a tool-loop boundary + 🔔 Matrix notice.
+        (Wiring proof: agent.py must feed a real context estimate to the engine.)"""
+        ws = _setup_workspace(tmp_path)
+        config = _cfg(ws, max_iterations=10, truncation_limit=250000)
+        agent = Agent(config)
+        big = "x" * 220_000  # ≈55K tokens at chars÷4 — crosses the 50K breakpoint
+        stream_fn, _ = _make_capturing_stream(tool_iterations=1)
+        mock_exec = AsyncMock(return_value=ToolResult(content=big, is_error=False))
+        notices = []
+
+        async def capture_notice(room_id, body, **kw):
+            notices.append(body)
+
+        with patch("openalph.agent.stream", side_effect=stream_fn), \
+             patch("openalph.agent.execute_tool", mock_exec):
+            await agent.handle_input("work", room_id=ROOM,
+                                     callbacks={"send_notice": capture_notice})
+
+        history = agent.history(ROOM)
+        t5_msgs = [m for m in history
+                   if REMINDER_TAG_OPEN in str(m.get("content", ""))
+                   and "deep into this session" in str(m.get("content", ""))]
+        assert t5_msgs, (
+            "T5 must fire in a live deep single-turn loop (completed_turns == 1 — "
+            "the T3 gap). No framed T5 text found in history."
+        )
+        t5_notices = [n for n in notices
+                      if f"System reminder ({T5_ID})" in n]
+        assert t5_notices, "T5 injection must emit a 🔔 Matrix notice (I2)"
+
+
+class TestT6Salience:
+    """T6 advisor-salience — spec §4 cases 1–7."""
+
+    # -- case 1: absolute-token breakpoint --
+
+    def test_t6_fires_at_75k(self, tmp_path):
+        """T6 §4.1: fires at boundary when context_tokens >= 75000."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t6_state(context_tokens=T6_THRESHOLD))
+        t6 = [r for r in res if r.trigger == T6_ID]
+        assert t6, "T6 must fire at exactly 75,000 context tokens"
+        assert t6[0].text == T6_TEXT, f"T6 text drifted from spec: {t6[0].text!r}"
+        assert t6[0].content == _framed(T6_TEXT), \
+            "T6 content property must equal the exact framed spec text"
+
+    def test_t6_not_at_74999(self, tmp_path):
+        """T6 §4.1: does NOT fire at 74,999."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t6_state(context_tokens=T6_THRESHOLD - 1))
+        assert not any(r.trigger == T6_ID for r in res), \
+            "T6 must not fire at 74,999 context tokens"
+
+    # -- case 2: suppressed after any advisor call this session --
+
+    def test_t6_suppressed_after_advisor_call(self, tmp_path):
+        """T6 §4.2: suppressed after any advisor call this session."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t6_state(context_tokens=90000,
+                                     tool_calls_session={"advisor": 1}))
+        assert not any(r.trigger == T6_ID for r in res), \
+            "T6 must not fire once advisor has been called this session"
+
+    # -- case 3: tool gate --
+
+    def test_t6_suppressed_when_advisor_disabled(self, tmp_path):
+        """T6 §4.3: suppressed when advisor tool is not enabled — two-call
+        form so T5 precedence cannot mask the gate (S4 sabotage finding):
+        T5 fires on the first deep boundary; a second deep boundary proves
+        T6 stays gated rather than merely deferred."""
+        eng = _engine(tmp_path)
+        st = _t6_state(context_tokens=90000,
+                       enabled_tools={"memory_search", "shell"})
+        r1 = eng.evaluate(st)
+        assert any(r.trigger == T5_ID for r in r1), \
+            "Sanity: T5 eligible in this state — evaluation actually ran"
+        assert not any(r.trigger == T6_ID for r in r1), \
+            "T6 must not fire when advisor is not enabled"
+        r2 = eng.evaluate(st)
+        assert not any(r.trigger == T6_ID for r in r2), \
+            "T6 must stay gated on later deep boundaries — not merely deferred"
+
+    # -- case 4: turn-source gate (load-bearing: interactive-only) --
+
+    def test_t6_suppressed_on_heartbeat(self, tmp_path):
+        """T6 §4.4: suppressed on heartbeat-sourced turns, even past 75K."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t6_state(context_tokens=90000,
+                                     turn_source="heartbeat"))
+        assert not any(r.trigger == T6_ID for r in res), \
+            "T6 must skip heartbeat-sourced turns (interactive-only by design)"
+
+    def test_t6_suppressed_on_umbral(self, tmp_path):
+        """T6 §4.4: suppressed on umbral-sourced turns, even past 75K."""
+        eng = _engine(tmp_path)
+        res = eng.evaluate(_t6_state(context_tokens=90000,
+                                     turn_source="umbral"))
+        assert not any(r.trigger == T6_ID for r in res), \
+            "T6 must skip umbral-sourced turns (interactive-only by design)"
+
+    # -- case 5: once per session; rehydration; umbral reset --
+
+    def test_t6_once_per_session(self, tmp_path):
+        """T6 §4.5: fires at most once per session."""
+        eng = _engine(tmp_path)
+        r1 = eng.evaluate(_t6_state(context_tokens=90000))
+        assert any(r.trigger == T6_ID for r in r1), "Precondition: T6 fires once"
+        r2 = eng.evaluate(_t6_state(context_tokens=90000))
+        assert not any(r.trigger == T6_ID for r in r2), \
+            "T6 must fire only once per session"
+
+    def test_t6_rehydration_no_refire(self, tmp_path):
+        """T6 §4.5: JSONL with a T6 entry → restart → no re-fire."""
+        sl = SessionLog(workspace=tmp_path, agent_user_id=AGENT_USER)
+        sl.append(role="user", sender=AGENT_USER, room=ROOM, event_id=None,
+                  content=_framed(T6_TEXT), source="reminder", trigger=T6_ID)
+        eng = _engine(tmp_path)
+        eng.rehydrate(sl.read(ROOM))
+        res = eng.evaluate(_t6_state(context_tokens=90000))
+        assert not any(r.trigger == T6_ID for r in res), \
+            "T6 must not re-fire after rehydration (fired-state derived from JSONL)"
+
+    def test_t6_umbral_reset_rearms(self, tmp_path):
+        """T6 §4.5: engine.reset() re-arms T6."""
+        eng = _engine(tmp_path)
+        eng.evaluate(_t6_state(context_tokens=90000))  # fires
+        eng.reset()
+        res = eng.evaluate(_t6_state(context_tokens=90000))
+        assert any(r.trigger == T6_ID for r in res), \
+            "T6 must fire again after umbral reset"
+
+    # -- case 6: T5∩T6 staggering --
+
+    def test_t6_t5_stagger_gradual_crossing(self, tmp_path):
+        """T6 §4.6: session crossing both thresholds with neither tool used →
+        T5 at the 50K boundary, T6 at the 75K boundary; never two at once."""
+        eng = _engine(tmp_path)
+        tools = {"advisor", "memory_search", "shell"}
+        r1 = eng.evaluate(_t6_state(context_tokens=50000, enabled_tools=tools))
+        assert any(r.trigger == T5_ID for r in r1), "T5 must fire at the 50K boundary"
+        assert not any(r.trigger == T6_ID for r in r1), \
+            "T6 must not fire below 75K"
+        r2 = eng.evaluate(_t6_state(context_tokens=60000, enabled_tools=tools))
+        assert r2 == [], \
+            f"Between thresholds with T5 already fired, nothing fires; got {r2}"
+        r3 = eng.evaluate(_t6_state(context_tokens=75000, enabled_tools=tools))
+        assert any(r.trigger == T6_ID for r in r3), "T6 must fire at the 75K boundary"
+        assert not any(r.trigger == T5_ID for r in r3), \
+            "T5 fires once per session — must not re-fire at the 75K boundary"
+
+    def test_t6_t5_stagger_jump_never_both_at_one_boundary(self, tmp_path):
+        """T6 §4.6: a single boundary jump past BOTH thresholds (e.g. one huge
+        tool result) → T5 fires, T6 defers to the next boundary. Never both."""
+        eng = _engine(tmp_path)
+        tools = {"advisor", "memory_search", "shell"}
+        r1 = eng.evaluate(_t6_state(context_tokens=80000, enabled_tools=tools))
+        assert any(r.trigger == T5_ID for r in r1), \
+            "T5 (shallower breakpoint) wins the shared boundary"
+        assert not any(r.trigger == T6_ID for r in r1), \
+            "T5 and T6 must NEVER fire at the same boundary — reminders dilute"
+        r2 = eng.evaluate(_t6_state(context_tokens=80000, enabled_tools=tools))
+        assert any(r.trigger == T6_ID for r in r2), \
+            "T6 must fire at the next eligible boundary after deferral"
+        assert not any(r.trigger == T5_ID for r in r2), \
+            "T5 fires once per session — must not re-fire"
+
+    # -- case 7: JSONL entry shape + replay byte-identity (v1 patterns) --
+
+    def test_t6_jsonl_entry_and_replay_identity(self, tmp_path):
+        """T6 §4.7: JSONL entry role/user, source/reminder, trigger id, exact
+        framed content; build_context() replays verbatim (I1 byte-identity)."""
+        sl = SessionLog(workspace=tmp_path, agent_user_id=AGENT_USER)
+        framed = _framed(T6_TEXT)
+        sl.append(role="user", sender=AGENT_USER, room=ROOM, event_id=None,
+                  content=framed, source="reminder", trigger=T6_ID)
+        entries = sl.read(ROOM)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["role"] == "user"
+        assert e["source"] == "reminder"
+        assert e["trigger"] == T6_ID
+        assert e["content"] == framed
+        context = sl.build_context(ROOM)
+        assert len(context) == 1
+        assert context[0]["content"] == framed, \
+            "build_context must replay T6 entries verbatim (byte-identity)"
+        assert Reminder(trigger=T6_ID, text=T6_TEXT).content == framed, \
+            "Live-framed content must equal the persisted bytes (stored == seen)"
+
+    @pytest.mark.asyncio
+    async def test_t6_integration_stagger_order(self, tmp_path):
+        """T6 §4.6/§4.7: live agent loop jumping past BOTH breakpoints in one
+        giant tool result → T5 injected at the first deep boundary, T6 at the
+        next; correct history + notice order; never both at one boundary."""
+        ws = _setup_workspace(tmp_path, tools=("shell", "file_read", "file_write",
+                                               "file_edit", "todo_write",
+                                               "memory_search", "advisor"))
+        config = _cfg(ws, max_iterations=10, truncation_limit=400000)
+        agent = Agent(config)
+        results_iter = iter(["y" * 340_000,   # ≈85K tokens — jumps past 50K AND 75K
+                             "z" * 100_000])  # ≈25K more — stays deep, no T2 (<80%)
+        stream_fn, _ = _make_capturing_stream(tool_iterations=2)
+        mock_exec = AsyncMock(
+            side_effect=lambda **kw: ToolResult(content=next(results_iter),
+                                                is_error=False))
+        notices = []
+
+        async def capture_notice(room_id, body, **kw):
+            notices.append(body)
+
+        with patch("openalph.agent.stream", side_effect=stream_fn), \
+             patch("openalph.agent.execute_tool", mock_exec):
+            await agent.handle_input("work", room_id=ROOM,
+                                     callbacks={"send_notice": capture_notice})
+
+        history = agent.history(ROOM)
+        t5_hist = [i for i, m in enumerate(history)
+                   if "deep into this session" in str(m.get("content", ""))]
+        t6_hist = [i for i, m in enumerate(history)
+                   if "deep into a substantial task" in str(m.get("content", ""))]
+        assert t5_hist, "T5 must fire in the live deep loop"
+        assert t6_hist, "T6 must fire in the live deep loop (advisor enabled, 0 calls)"
+        assert t5_hist[0] < t6_hist[0], \
+            "History order: T5 (50K) must precede T6 (75K) — staggered depth ordering"
+
+        t5_notice = [i for i, n in enumerate(notices)
+                     if f"System reminder ({T5_ID})" in n]
+        t6_notice = [i for i, n in enumerate(notices)
+                     if f"System reminder ({T6_ID})" in n]
+        assert t5_notice, "T5 injection must emit a 🔔 Matrix notice (I2)"
+        assert t6_notice, "T6 injection must emit a 🔔 Matrix notice (I2)"
+        assert t5_notice[0] < t6_notice[0], \
+            "Notice order must match injection order: T5 before T6"
