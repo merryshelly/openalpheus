@@ -107,7 +107,7 @@ Optional, config-aware in-stream guidance that helps agents stay on track during
 
 Anthropic (native SDK) and OpenAI-compatible (OpenRouter, vLLM, llama.cpp, etc). Multiple providers per agent. Switch models at runtime via `/model` or configure aliases in TOML.
 
-Any OpenAI-compatible endpoint works with no core changes, so community shims can bridge other backends — e.g. [codex-sidecar](https://codeberg.org/merryshelly/codex-sidecar) adapts a subscription-backed model into a provider.
+Any OpenAI-compatible endpoint works with no core changes, so community shims can bridge other backends — e.g. [codex-sidecar](https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/codex-sidecar) adapts a subscription-backed model into a provider.
 
 ### Memory
 
