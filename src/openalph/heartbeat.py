@@ -19,9 +19,11 @@ from openalph._timer import RecurringTimerManager
 @dataclass
 class HeartbeatEntry:
     room_id: str
-    interval_seconds: int  # or float for test compatibility
+    interval_seconds: int | None  # or float for test compatibility
     seconds_until_next: int
     directive: str | None = None
+    schedule: str | None = None
+    tz: str | None = None
 
 
 class HeartbeatManager(RecurringTimerManager):
@@ -35,6 +37,7 @@ class HeartbeatManager(RecurringTimerManager):
     _entry_cls = HeartbeatEntry
     _drift_correct = False
     _overlap_guard = False
+    _floor = 300  # heartbeat minimum gap in seconds (§7 of DESIGN.md)
     _loop_name = "Heartbeat"
 
 

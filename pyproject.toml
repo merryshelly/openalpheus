@@ -61,6 +61,11 @@ exclude_lines = [
     "raise NotImplementedError",
 ]
 
+[tool.ruff]
+# Vendored third-party code is excluded from lint (upstream style, pinned-SHA
+# byte-tracked -- see src/openalph/vendor/__init__.py provenance policy).
+extend-exclude = ["src/openalph/vendor"]
+
 [tool.ruff.lint]
 # Default ruff ruleset (E4/E7/E9 + pyflakes F) -- the baseline these findings
 # were triaged against. Whitespace (W), isort (I), and line-length (E501) are

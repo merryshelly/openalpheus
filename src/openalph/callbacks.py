@@ -212,16 +212,32 @@ def build_context_status(agent, room_id, *, room_name=None, session_log=None, he
         hb_entry = next((e for e in hb_entries if e.room_id == room_id), None)
         if hb_entry:
             status_data["heartbeat_active"] = True
-            status_data["heartbeat_interval_minutes"] = round(hb_entry.interval_seconds / 60)
-            status_data["heartbeat_next_minutes"] = round(hb_entry.seconds_until_next / 60)
+            schedule = getattr(hb_entry, 'schedule', None)
+            # Check if schedule is a non-empty string (not just truthy, to avoid MagicMock objects in tests)
+            if isinstance(schedule, str) and schedule:
+                # Schedule mode
+                status_data["heartbeat_schedule"] = schedule
+                status_data["heartbeat_tz"] = getattr(hb_entry, 'tz', None)
+                status_data["heartbeat_next_minutes"] = round(hb_entry.seconds_until_next / 60)
+                status_data["heartbeat_interval_minutes"] = None
+            else:
+                # Interval mode
+                status_data["heartbeat_interval_minutes"] = round(hb_entry.interval_seconds / 60)
+                status_data["heartbeat_next_minutes"] = round(hb_entry.seconds_until_next / 60)
+                status_data["heartbeat_schedule"] = None
+                status_data["heartbeat_tz"] = None
         else:
             status_data["heartbeat_active"] = False
             status_data["heartbeat_interval_minutes"] = None
             status_data["heartbeat_next_minutes"] = None
+            status_data["heartbeat_schedule"] = None
+            status_data["heartbeat_tz"] = None
     else:
         status_data["heartbeat_active"] = False
         status_data["heartbeat_interval_minutes"] = None
         status_data["heartbeat_next_minutes"] = None
+        status_data["heartbeat_schedule"] = None
+        status_data["heartbeat_tz"] = None
 
     # Umbral state (context rotation timer)
     if umbral and umbral.is_active(room_id):
@@ -229,16 +245,32 @@ def build_context_status(agent, room_id, *, room_name=None, session_log=None, he
         um_entry = next((e for e in um_entries if e.room_id == room_id), None)
         if um_entry:
             status_data["umbral_active"] = True
-            status_data["umbral_interval_minutes"] = round(um_entry.interval_seconds / 60)
-            status_data["umbral_next_minutes"] = round(um_entry.seconds_until_next / 60)
+            schedule = getattr(um_entry, 'schedule', None)
+            # Check if schedule is a non-empty string (not just truthy, to avoid MagicMock objects in tests)
+            if isinstance(schedule, str) and schedule:
+                # Schedule mode
+                status_data["umbral_schedule"] = schedule
+                status_data["umbral_tz"] = getattr(um_entry, 'tz', None)
+                status_data["umbral_next_minutes"] = round(um_entry.seconds_until_next / 60)
+                status_data["umbral_interval_minutes"] = None
+            else:
+                # Interval mode
+                status_data["umbral_interval_minutes"] = round(um_entry.interval_seconds / 60)
+                status_data["umbral_next_minutes"] = round(um_entry.seconds_until_next / 60)
+                status_data["umbral_schedule"] = None
+                status_data["umbral_tz"] = None
         else:
             status_data["umbral_active"] = False
             status_data["umbral_interval_minutes"] = None
             status_data["umbral_next_minutes"] = None
+            status_data["umbral_schedule"] = None
+            status_data["umbral_tz"] = None
     else:
         status_data["umbral_active"] = False
         status_data["umbral_interval_minutes"] = None
         status_data["umbral_next_minutes"] = None
+        status_data["umbral_schedule"] = None
+        status_data["umbral_tz"] = None
 
     # Room identity
     status_data["room_id"] = room_id

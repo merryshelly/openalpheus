@@ -188,9 +188,11 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | `/model <provider/model\|list>` | Switch model for this room, or list configured aliases |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | Set reasoning effort level for this room (`xhigh`/`max` require supported models; no argument shows the current level) |
 | `/heartbeat start <interval> [directive]` | Start recurring timer (e.g., `5m`, `1h`); optional trailing directive becomes the turn content on each fire (else a WAKE pointer) |
+| `/heartbeat schedule "<cron>" [directive]` | Start a calendar-scheduled heartbeat (5-field cron in quotes, e.g., `"30 6 * * 1-5"` = 06:30 weekdays; host-local timezone shown in status; min gap 5m); optional trailing directive as above |
 | `/heartbeat stop` | Stop heartbeat |
 | `/heartbeat status` | List active heartbeats across rooms |
 | `/umbral start <interval> [directive]` | Start recurring context rotation (min 30m); optional trailing directive is re-injected as the turn content each cycle |
+| `/umbral schedule "<cron>" [directive]` | Start a calendar-scheduled context rotation (5-field cron in quotes, e.g., `"0 20 * * 0"` = Sundays 20:00; host-local timezone; min gap 30m); directive re-injected each cycle |
 | `/umbral stop` | Stop context rotation |
 | `/umbral status` | List active umbral timers across rooms |
 | `/cache <1h\|5m\|off>` | Anthropic prompt cache TTL (default `1h`; no argument shows current TTL + toolstrip state) |

@@ -12,10 +12,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import shlex
 import tempfile
 import time
 from html import escape as html_escape
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import mistune
 from nio import (
@@ -42,6 +44,7 @@ from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
 from openalph.tools import escape_system_reminder_tags, truncate_result
 from openalph.callbacks import build_callbacks, build_context_status, MatrixSinks
+import openalph.schedule as schedule
 
 # Constants for media handling
 MAX_MEDIA_BYTES = 20_000_000  # 20 MB
@@ -3043,10 +3046,104 @@ class MatrixBot:
 
         if body.startswith("/heartbeat"):
             parts = body.split(None, 3)
-            if len(parts) >= 3 and parts[1] == "start":
+            if len(parts) >= 2 and parts[1] == "schedule":
+                # Parse schedule command: /heartbeat schedule "<spec>" [directive...]
+                rest = body[len("/heartbeat schedule"):].lstrip()
+                try:
+                    tokens = shlex.split(rest)
+                except ValueError as e:
+                    msg = (
+                        f"Usage error: {e}. Format: "
+                        "`/heartbeat schedule \"<5-field cron spec>\" [directive...]`"
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                if not tokens:
+                    msg = (
+                        "Usage: "
+                        "`/heartbeat schedule \"<5-field cron spec>\" [directive...]`"
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                # Check if unquoted cron spec (multiple tokens like cron fields)
+                is_unquoted_cron = (
+                    len(tokens) >= 5 and
+                    all(t and (t[0].isdigit() or t[0] in '*,/-') for t in tokens[:5])
+                )
+                if is_unquoted_cron:
+                    msg = (
+                        "Cron spec must be quoted. Usage: "
+                        "`/heartbeat schedule \"<5-field cron spec>\" [directive...]` "
+                        "(e.g., `/heartbeat schedule \"30 6 * * 1-5\"`)"
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                spec = tokens[0]
+                directive = " ".join(tokens[1:]) if len(tokens) > 1 else None
+
+                # Validate spec
+                try:
+                    schedule.validate_spec(spec)
+                except schedule.ScheduleError:
+                    msg = (
+                        "Invalid cron spec. Use 5-field format: "
+                        "`minute hour day month day-of-week` (e.g., `30 6 * * 1-5`)."
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                # Check minimum gap
+                try:
+                    tz = ZoneInfo(schedule.DEFAULT_TZ)
+                    gap = schedule.min_gap(spec, tz)
+                    if gap < 300:  # heartbeat floor
+                        msg = (
+                            f"Schedule gap too small ({gap}s < 5m minimum). "
+                            "Use a less frequent spec."
+                        )
+                        await self.send(room_id, msg)
+                        return
+                except schedule.ScheduleError:
+                    msg = (
+                        "Invalid cron spec. Use 5-field format: "
+                        "`minute hour day month day-of-week` (e.g., `30 6 * * 1-5`)."
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                # Check mutual exclusion
+                if self.umbral and self.umbral.is_active(room_id):
+                    await self.send(room_id,
+                        "Stop the umbral timer first (`/umbral stop`) — "
+                        "umbral and heartbeat cannot run in the same room.")
+                    return
+
+                # Escape directive through the standard path
+                if directive:
+                    directive = escape_system_reminder_tags(directive)
+
+                # Arm the schedule
+                await self.heartbeat.start_schedule(
+                    room_id, spec, tz=schedule.DEFAULT_TZ, directive=directive
+                )
+                directive_part = (
+                    f" · directive: {_trunc_directive(directive)}"
+                    if directive
+                    else ""
+                )
+                hb_msg = (
+                    f"Heartbeat started: every \"{spec}\" "
+                    f"({schedule.DEFAULT_TZ}){directive_part}."
+                )
+                await self.send(room_id, hb_msg)
+            elif len(parts) >= 3 and parts[1] == "start":
                 interval = parse_interval(parts[2])
                 if interval is None:
-                    await self.send(room_id, "Invalid interval. Use e.g. `15m`, `1h`, `6h`.")
+                    msg = "Invalid interval. Use e.g. `15m`, `1h`, `6h`."
+                    await self.send(room_id, msg)
                 elif interval < 300:
                     await self.send(room_id, "Minimum interval is 5m.")
                 elif self.umbral and self.umbral.is_active(room_id):
@@ -3054,10 +3151,13 @@ class MatrixBot:
                         "Stop the umbral timer first (`/umbral stop`) — "
                         "umbral and heartbeat cannot run in the same room.")
                 else:
-                    directive = parts[3] if len(parts) >= 4 else None
+                    directive = (
+                        parts[3] if len(parts) >= 4 else None
+                    )
                     await self.heartbeat.start(room_id, interval, directive)
                     human = format_interval(interval)
-                    await self.send(room_id, f"Heartbeat started: every {human} in this room.")
+                    msg = f"Heartbeat started: every {human} in this room."
+                    await self.send(room_id, msg)
             elif len(parts) >= 2 and parts[1] == "stop":
                 stopped = await self.heartbeat.stop(room_id)
                 if stopped:
@@ -3073,22 +3173,143 @@ class MatrixBot:
                     for e in entries:
                         # Resolve room name from nio client
                         nio_room = self.client.rooms.get(e.room_id)
-                        name = (getattr(nio_room, 'name', '') or getattr(nio_room, 'display_name', '') or e.room_id) if nio_room else e.room_id
-                        line = f"- **{name}** — every {format_interval(e.interval_seconds)}, next in {format_interval(e.seconds_until_next)}"
+                        if nio_room:
+                            name = (
+                                getattr(nio_room, 'name', '') or
+                                getattr(nio_room, 'display_name', '') or
+                                e.room_id
+                            )
+                        else:
+                            name = e.room_id
+                        if e.schedule:
+                            # Schedule mode
+                            tz_name = e.tz or schedule.DEFAULT_TZ
+                            next_str = format_interval(e.seconds_until_next)
+                            line = (
+                                f"- **{name}** — every \"{e.schedule}\" "
+                                f"({tz_name}), next in {next_str}"
+                            )
+                        else:
+                            # Interval mode
+                            interval_str = format_interval(e.interval_seconds)
+                            next_str = format_interval(e.seconds_until_next)
+                            line = (
+                                f"- **{name}** — every {interval_str}, "
+                                f"next in {next_str}"
+                            )
                         if e.directive:
                             line += f" · directive: {_trunc_directive(e.directive)}"
                         lines.append(line)
                     await self.send(room_id, "\n".join(lines))
             else:
-                await self.send(room_id, "Usage: `/heartbeat start <interval>` | `/heartbeat stop` | `/heartbeat status`")
+                msg = (
+                    "Usage: `/heartbeat schedule \"<cron>\"` | "
+                    "`/heartbeat start <interval>` | `/heartbeat stop` | "
+                    "`/heartbeat status`"
+                )
+                await self.send(room_id, msg)
             return
 
         if body.startswith("/umbral"):
             parts = body.split(None, 3)
-            if len(parts) >= 3 and parts[1] == "start":
+            if len(parts) >= 2 and parts[1] == "schedule":
+                # Parse schedule command: /umbral schedule "<spec>" [directive...]
+                rest = body[len("/umbral schedule"):].lstrip()
+                try:
+                    tokens = shlex.split(rest)
+                except ValueError as e:
+                    msg = (
+                        f"Usage error: {e}. Format: "
+                        "`/umbral schedule \"<5-field cron spec>\" [directive...]`"
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                if not tokens:
+                    msg = (
+                        "Usage: "
+                        "`/umbral schedule \"<5-field cron spec>\" [directive...]`"
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                # Check if unquoted cron spec (multiple tokens like cron fields)
+                is_unquoted_cron = (
+                    len(tokens) >= 5 and
+                    all(t and (t[0].isdigit() or t[0] in '*,/-') for t in tokens[:5])
+                )
+                if is_unquoted_cron:
+                    msg = (
+                        "Cron spec must be quoted. Usage: "
+                        "`/umbral schedule \"<5-field cron spec>\" [directive...]` "
+                        "(e.g., `/umbral schedule \"0 20 * * 0\"`)"
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                spec = tokens[0]
+                directive = " ".join(tokens[1:]) if len(tokens) > 1 else None
+
+                # Validate spec
+                try:
+                    schedule.validate_spec(spec)
+                except schedule.ScheduleError:
+                    msg = (
+                        "Invalid cron spec. Use 5-field format: "
+                        "`minute hour day month day-of-week` (e.g., `0 20 * * 0`)."
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                # Check minimum gap
+                try:
+                    tz = ZoneInfo(schedule.DEFAULT_TZ)
+                    gap = schedule.min_gap(spec, tz)
+                    if gap < 1800:  # umbral floor
+                        msg = (
+                            f"Schedule gap too small ({gap}s < 30m minimum). "
+                            "Use a less frequent spec."
+                        )
+                        await self.send(room_id, msg)
+                        return
+                except schedule.ScheduleError:
+                    msg = (
+                        "Invalid cron spec. Use 5-field format: "
+                        "`minute hour day month day-of-week` (e.g., `0 20 * * 0`)."
+                    )
+                    await self.send(room_id, msg)
+                    return
+
+                # Check mutual exclusion
+                if self.heartbeat and self.heartbeat.is_active(room_id):
+                    await self.send(room_id,
+                        "Stop the heartbeat first (`/heartbeat stop`) — "
+                        "umbral and heartbeat cannot run in the same room.")
+                    return
+
+                # Escape directive through the standard path
+                if directive:
+                    directive = escape_system_reminder_tags(directive)
+
+                # Arm the schedule
+                await self.umbral.start_schedule(
+                    room_id, spec, tz=schedule.DEFAULT_TZ, directive=directive
+                )
+                directive_part = (
+                    f" · directive: {_trunc_directive(directive)}"
+                    if directive
+                    else ""
+                )
+                um_msg = (
+                    f"🌑 Umbral started: every \"{spec}\" "
+                    f"({schedule.DEFAULT_TZ}){directive_part}."
+                )
+                await self.send(room_id, um_msg)
+            elif len(parts) >= 3 and parts[1] == "start":
                 interval = parse_interval(parts[2])
                 if interval is None:
-                    await self.send(room_id, "Invalid interval. Use e.g. `30m`, `6h`.")
+                    msg = "Invalid interval. Use e.g. `30m`, `6h`."
+                    await self.send(room_id, msg)
                 elif interval < 1800:
                     await self.send(room_id, "Minimum interval is 30m.")
                 elif self.heartbeat and self.heartbeat.is_active(room_id):
@@ -3099,7 +3320,8 @@ class MatrixBot:
                     directive = parts[3] if len(parts) >= 4 else None
                     await self.umbral.start(room_id, interval, directive)
                     human = format_interval(interval)
-                    await self.send(room_id, f"🌑 Umbral started: every {human} in this room.")
+                    msg = f"🌑 Umbral started: every {human} in this room."
+                    await self.send(room_id, msg)
             elif len(parts) >= 2 and parts[1] == "stop":
                 stopped = await self.umbral.stop(room_id)
                 if stopped:
@@ -3114,19 +3336,36 @@ class MatrixBot:
                     lines = ["**Active umbral timers:**", ""]
                     for e in entries:
                         nio_room = self.client.rooms.get(e.room_id)
-                        name = (getattr(nio_room, 'name', '') or
+                        if nio_room:
+                            name = (
+                                getattr(nio_room, 'name', '') or
                                 getattr(nio_room, 'display_name', '') or
-                                e.room_id) if nio_room else e.room_id
-                        line = (
-                            f"- **{name}** — every {format_interval(e.interval_seconds)}, "
-                            f"next in {format_interval(e.seconds_until_next)}")
+                                e.room_id
+                            )
+                        else:
+                            name = e.room_id
+                        if e.schedule:
+                            # Schedule mode
+                            tz_name = e.tz or schedule.DEFAULT_TZ
+                            line = (
+                                f"- **{name}** — every \"{e.schedule}\" ({tz_name}), "
+                                f"next in {format_interval(e.seconds_until_next)}")
+                        else:
+                            # Interval mode
+                            line = (
+                                f"- **{name}** — every {format_interval(e.interval_seconds)}, "
+                                f"next in {format_interval(e.seconds_until_next)}")
                         if e.directive:
                             line += f" · directive: {_trunc_directive(e.directive)}"
                         lines.append(line)
                     await self.send(room_id, "\n".join(lines))
             else:
-                await self.send(room_id,
-                    "Usage: `/umbral start <interval>` | `/umbral stop` | `/umbral status`")
+                msg = (
+                    "Usage: `/umbral schedule \"<cron>\"` | "
+                    "`/umbral start <interval>` | `/umbral stop` | "
+                    "`/umbral status`"
+                )
+                await self.send(room_id, msg)
             return
 
         if body.startswith("/steer"):
@@ -3184,8 +3423,22 @@ class MatrixBot:
         logger.info("Initial sync complete in %.0fms (%s rooms joined, lazy wake active)", _sync_ms, joined)
 
         # Resume persisted heartbeats and umbral timers
-        await self.heartbeat.resume()
-        await self.umbral.resume()
+        heartbeat_catchup_rooms = await self.heartbeat.resume()
+        umbral_catchup_rooms = await self.umbral.resume()
+
+        # Post caught-up notices for missed scheduled fires
+        hb_catchup_msg = (
+            "⚠️ heartbeat: caught up a missed scheduled fire for this "
+            "room (process was down across the scheduled instant)"
+        )
+        um_catchup_msg = (
+            "⚠️ umbral: caught up a missed scheduled fire for this "
+            "room (process was down across the scheduled instant)"
+        )
+        for room_id in heartbeat_catchup_rooms:
+            await self.send_notice(room_id, hb_catchup_msg)
+        for room_id in umbral_catchup_rooms:
+            await self.send_notice(room_id, um_catchup_msg)
 
         # Use sync_forever for the main sync loop
         await self.client.sync_forever(timeout=self.config.sync_timeout)

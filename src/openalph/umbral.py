@@ -19,13 +19,16 @@ from openalph._timer import RecurringTimerManager
 @dataclass
 class UmbralEntry:
     room_id: str
-    interval_seconds: int
+    interval_seconds: int | None
     seconds_until_next: int
     directive: str | None = None
+    schedule: str | None = None
+    tz: str | None = None
 
 
 class UmbralManager(RecurringTimerManager):
     _entry_cls = UmbralEntry
     _drift_correct = True
     _overlap_guard = True
+    _floor = 1800  # umbral minimum gap in seconds (§7 of DESIGN.md)
     _loop_name = "Umbral"
