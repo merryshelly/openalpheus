@@ -1,6 +1,6 @@
 """Reminder engine for OpenAlph agents.
 
-Provides state-triggered <system-reminder> guidance injections into the
+Provides state-triggered <system-reminder> reminder injections into the
 message stream.  Pure logic module — no Matrix, provider, or I/O knowledge.
 
 API surface:
