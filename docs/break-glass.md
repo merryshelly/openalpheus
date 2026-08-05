@@ -28,7 +28,8 @@ Agents are now down. Nothing is getting worse. Take a breath.
 ## Step 1: Identify the Last Known Good Version
 
 ARCH-7: `install.sh` pip-installs OpenAlph into `/opt/openalph-venv` from the
-Forgejo repo (tailnet-only — `git+https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus.git@<version>`).
+GitHub mirror (public — `git+https://github.com/merryshelly/openalpheus.git@<version>`). The canonical
+repo is on a self-hosted Forgejo instance (tailnet-only).
 There is **no git checkout, no source tree, and no test suite on disk** — so
 recovery is a pip reinstall of a known-good ref, not a local `git checkout`.
 
@@ -40,7 +41,7 @@ Find the version currently installed:
 ```
 
 Pick the ref to roll back to (a tag or commit that predates the bad change).
-Browse history on the remote — https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus/commits —
+Browse history on the remote — https://github.com/merryshelly/openalpheus/commits —
 or, if you keep a checkout on a workstation, `git log --oneline` there. Note the
 tag (e.g. `v0.1.2`) or commit SHA.
 
@@ -54,7 +55,7 @@ dependencies (add it only if deps are unchanged between the two refs).
 
 ```bash
 sudo /opt/openalph-venv/bin/pip install --force-reinstall \
-    "git+https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus.git@<good-ref>"
+    "git+https://github.com/merryshelly/openalpheus.git@<good-ref>"
 ```
 
 Replace `<good-ref>` with the tag or SHA from Step 1 (e.g. `v0.1.2`).
@@ -85,7 +86,7 @@ sudo /opt/openalph-venv/bin/openalph prompt <name>
 
 If both succeed you're ready to restart. If you want the full test suite, run it
 from a git checkout on a workstation (not on the box):
-`git clone https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus.git && cd openalpheus && pip install -e ".[dev]" && pytest -q`.
+`git clone https://github.com/merryshelly/openalpheus.git && cd openalpheus && pip install -e ".[dev]" && pytest -q`.
 
 ---
 
@@ -125,7 +126,8 @@ journalctl -u openalph@<name> -n 50 --no-pager
 | Service unit | `/etc/systemd/system/openalph@.service` | Template unit for all agents |
 | Agent workspaces | `/home/oa-<name>/workspace/` | Per-agent prompts, tools, memory |
 | Shared data | `/srv/openalph/shared/` | Beads DB, shared docs |
-| Git remote | `forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus` | Full history |
+| Git remote | `github.com/merryshelly/openalpheus` (public mirror) | Full history |
+| Canonical repo | `forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus` (tailnet-only) | Full history |
 
 **Key fact:** The venv at `/opt/openalph-venv` is bind-mounted read-only into the running services via `BindReadOnlyPaths`. A reinstall changes the code on disk, but running services keep the old code until they are **restarted** — so a stopped service cannot make things worse, and your fix does not take effect until Step 4.
 

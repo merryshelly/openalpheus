@@ -25,7 +25,7 @@ set -euo pipefail
 # =============================================================================
 
 readonly OPENALPH_VERSION="${OPENALPH_VERSION:-v0.1.2}"
-readonly OPENALPH_REPO="https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus.git"
+readonly OPENALPH_REPO="https://github.com/merryshelly/openalpheus.git"
 
 readonly REQUIRED_PYTHON_MAJOR=3
 readonly REQUIRED_PYTHON_MINOR=11
@@ -38,7 +38,7 @@ readonly OPENALPH_CONFIG_DIR="/etc/openalph"
 readonly OPENALPH_AGENTS_DIR="/etc/openalph/agents"
 
 readonly DOCKER_INSTALL_DOCS="https://docs.docker.com/engine/install/"
-readonly OPENALPH_DOCS="https://forgejo-proxmox.quetzal-moth.ts.net/merryshelly/openalpheus"
+readonly OPENALPH_DOCS="https://github.com/merryshelly/openalpheus"
 
 readonly PORT_HTTPS=443
 readonly PORT_OPENALPH=4269
