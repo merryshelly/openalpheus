@@ -865,6 +865,74 @@ class TestBuildOpenaiKwargs:
         ))
         assert kw["extra_body"]["reasoning"] == {"effort": "xhigh"}
 
+    # --- Fireworks reasoning_effort (kdsn.271) ---
+    # Fireworks documents TOP-LEVEL reasoning_effort (low/medium/high/xhigh/max,
+    # plus none/adaptive; default medium when omitted). Live-validated
+    # 2026-08-05: all six values accepted (HTTP 200) on the three fleet aliases
+    # kimi-k3 / kimi-k2p6 / glm-5p2, and effort demonstrably modulates
+    # reasoning_content length (none=0 chars). Previously _supports_reasoning_
+    # extra excluded fireworks, so /effort was a silent no-op there.
+
+    def test_fireworks_sends_reasoning_effort_top_level(self):
+        """Fireworks gets top-level reasoning_effort, not OpenRouter's nested format."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="high", provider_key="fireworks",
+        ))
+        assert kw["extra_body"]["reasoning_effort"] == "high"
+        assert "reasoning" not in kw["extra_body"]
+
+    def test_fireworks_off_maps_to_none(self):
+        """OA 'off' maps to Fireworks 'none' (suppresses reasoning). Sent
+        explicitly so the server default (medium) can't silently override
+        operator intent — silent default override was the kdsn.271 bug."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="off", provider_key="fireworks",
+        ))
+        assert kw["extra_body"]["reasoning_effort"] == "none"
+
+    def test_fireworks_all_levels_pass_through_1to1(self):
+        """low/medium/high/xhigh/max map 1:1 onto reasoning_effort."""
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            kw = _build_openai_kwargs(**self._base_args(
+                thinking_level=level, provider_key="fireworks",
+            ))
+            assert kw["extra_body"]["reasoning_effort"] == level
+
+    def test_fireworks_never_sends_anthropic_thinking_param(self):
+        """Fireworks docs: `thinking` and `reasoning_effort` are mutually
+        exclusive (400 if both). OA must never send a `thinking` kwarg on the
+        openai-type path."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="high", provider_key="fireworks",
+        ))
+        assert "thinking" not in kw
+        assert "thinking" not in kw.get("extra_body", {})
+
+    def test_fireworks_reasoning_coexists_with_routing(self):
+        """Fireworks reasoning_effort and a routing dict share extra_body."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="low", provider_key="fireworks",
+            routing={"quantizations": ["fp8"]},
+        ))
+        assert kw["extra_body"]["reasoning_effort"] == "low"
+        assert kw["extra_body"]["provider"] == {"quantizations": ["fp8"]}
+
+    def test_fireworks_branch_does_not_swallow_ds4_none(self):
+        """DSv4-flash (macstudio) still gets reasoning_effort='none' on off —
+        the fireworks branch must not preempt the model-name-gated branch."""
+        kw = _build_openai_kwargs(**self._base_args(
+            api_model="macstudio/deepseek-v4-flash",
+            thinking_level="off", provider_key="macstudio",
+        ))
+        assert kw["extra_body"]["reasoning_effort"] == "none"
+
+    def test_openai_still_omits_reasoning(self):
+        """Direct OpenAI with thinking set: no reasoning keys anywhere (unchanged)."""
+        kw = _build_openai_kwargs(**self._base_args(
+            thinking_level="high", provider_key="openai",
+        ))
+        assert "extra_body" not in kw
+
 
 class TestDSV4FEffortPrefix:
     """DeepSeek-V4-Flash effort support (workspace-im7t.9.13): DSv4's

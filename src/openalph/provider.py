@@ -1356,6 +1356,13 @@ def _build_openai_kwargs(
     extra_body = {}
     if thinking_level != "off" and _supports_reasoning_extra:
         extra_body["reasoning"] = {"effort": thinking_level}
+    elif provider_key == "fireworks":
+        # kdsn.271: Fireworks takes TOP-LEVEL reasoning_effort (not OpenRouter's
+        # nested reasoning.effort). Live-validated 2026-08-05: none/low/medium/
+        # high/xhigh/max all accepted on kimi-k3, kimi-k2p6, glm-5p2 — direct
+        # 1:1 mapping, OA "off" -> "none". Always sent explicitly so the server
+        # default (medium) can never silently override operator intent again.
+        extra_body["reasoning_effort"] = "none" if thinking_level == "off" else thinking_level
     elif thinking_level == "off" and "deepseek-v4-flash" in api_model.lower():
         # DSv4 thinks BY DEFAULT (template enable_thinking=true). llama.cpp
         # disables thinking only on TOP-LEVEL reasoning_effort="none" (verified
