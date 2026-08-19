@@ -323,6 +323,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None]] = [
     ("kimi-k2p6",   262_144, None),
     # Local
     ("deepseek-v4-flash", 1_048_576, None),
+    ("qwen38",      262_144, None),
     ("qwen3.5",     262_144, None),
     ("qwen3p5",     262_144, None),
     ("qwen3.6",     262_144, None),
@@ -414,6 +415,7 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("minimax-m3", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("deepseek-v4-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
+    ("qwen38", SamplingProfile(temperature=1.0, top_p=0.95)),
 ]
 
 
