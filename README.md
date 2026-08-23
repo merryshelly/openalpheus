@@ -85,7 +85,7 @@ Skills are listed by name in the prompt; the agent reads their content on demand
 
 Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
 
-Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `web_fetch_js`\*\*, `grep`, `glob`, `subagent`, `advisor`, `memory_search`, `send_media`, `context_status`, `todo_write`.
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `web_fetch_js`\*\*, `grep`, `glob`, `subagent`, `advisor`, `memory_search`, `send_media`, `view_image`, `context_status`, `todo_write`.
 
 \*`web_search` requires a [Brave Search API key](https://brave.com/search/api/) configured in `workspace/tools/web_search.toml`. Without it, the tool is available but returns an error. `web_fetch` (direct URL fetching) works without any API key.
 
@@ -100,6 +100,8 @@ Vision is a **model-level capability**, not an agent-level one. When someone pos
 3. **fail-closed `false`** with a one-time warning — uncharacterized models never receive image data.
 
 This makes `/model` switches safe in both directions: posting an image to a room running a blind model passes the tag through as plain text, and switching models mid-session is blocked only when the history contains images *and* the target model can't see. Supported image types: JPEG, PNG, GIF, WebP. Images count toward context at roughly 1 token per 750 raw bytes.
+
+Agents can also self-serve images with the `view_image` tool: it validates a workspace image (containment, type, 5 MB default cap, active-model vision gate), then stages it for injection as a framed user message at the next tool-loop boundary — never as a tool-result image block, which only Anthropic accepts. Subagents get their own vision inbox; images land in the sub's context, not the parent's.
 
 ### Guidance injection
 
