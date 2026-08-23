@@ -771,6 +771,22 @@ class Agent:
                                     "content": f"[Operator steering — mid-turn guidance]: {_note}",
                                 })
 
+                    # Drain the vision inbox at the top of every iteration — AFTER the
+                    # steering drain, BEFORE reminder evaluation (kdsn.276). view_image
+                    # deposits [media:] tags during the previous batch's tool execution;
+                    # draining here injects them as ONE user message at the next loop top,
+                    # AFTER ALL tool results of the pending batch (parallel batches
+                    # included) BY CONSTRUCTION — do not move this inside the tool-result
+                    # append loop. The framed tag text is expanded to image blocks via
+                    # _build_user_content, gated on the room's active model's vision.
+                    _vision_drain = (callbacks or {}).get("drain_vision")
+                    if _vision_drain:
+                        _vtext = await _vision_drain()
+                        if _vtext:
+                            history.append({"role": "user", "content": _build_user_content(
+                                _vtext, self.config,
+                                vision=model_supports_vision(self.get_model(room_id), self.config))})
+
                     # Reminder evaluation at tool-loop boundary (after steering, before API call).
                     # Ordering: steering drains first, then reminders (operator outranks harness).
                     # R1-5: mirror turn-start durability gate — when production callbacks
@@ -1043,7 +1059,8 @@ class Agent:
                                 break
 
                         # Thread call_id through for subagent log cross-referencing
-                        tc_callbacks = {**(callbacks or {}), "call_id": tc.id}
+                        tc_callbacks = {**(callbacks or {}), "call_id": tc.id,
+                                        "active_model": self.get_model(room_id)}
                         tool_coros.append(execute_tool(
                             name=tc.name,
                             input=tc.input,

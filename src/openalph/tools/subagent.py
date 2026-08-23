@@ -258,6 +258,14 @@ async def run_subagent(
         except Exception:
             logger.warning("subagent cost: compute_cost failed for model %r; recording $0", model_s)
 
+    # Per-sub vision inbox (kdsn.276): a sub's view_image call lands in the SUB's
+    # own context, never the parent's. A plain list inbox + closures; drained at
+    # the top of each iteration (before complete()).
+    _sub_vision_inbox: list[str] = []
+
+    async def _sub_vision_deposit(tag: str) -> None:
+        _sub_vision_inbox.append(tag)
+
     # Per-sub-agent isolated read registry — prevents sub from using parent's read state
     _sub_read_registry: dict[str, float] = {}
     # Per-sub-agent isolated advisor consult counter — local to this dispatch,
@@ -317,6 +325,36 @@ async def run_subagent(
     try:
         for iteration in range(iteration_limit):
             iter_start = time.time()
+
+            # Drain the per-sub vision inbox at the TOP of the iteration (before
+            # complete()), so a view_image deposit from the previous batch lands as
+            # ONE user message AFTER all tool results of that batch (kdsn.276).
+            if _sub_vision_inbox:
+                from openalph.agent import _build_user_content
+                from openalph.provider import model_supports_vision as _sub_msv
+                from openalph.tools.vision import frame_vision_batch
+                _tags = list(_sub_vision_inbox)
+                _sub_vision_inbox.clear()
+                _framed = frame_vision_batch(_tags)
+                if _framed:
+                    from openalph.agent import MEDIA_TAG_RE as _SUB_MEDIA_RE
+                    _paths = [
+                        (m.group(1) if (m := _SUB_MEDIA_RE.search(t)) else t)
+                        for t in _tags
+                    ]
+                    messages.append({
+                        "role": "user",
+                        "content": _build_user_content(
+                            _framed, config,
+                            vision=_sub_msv(config.default_model, config)),
+                    })
+                    _append_transcript({
+                        "event": "view_image",
+                        "iteration": iteration,
+                        "paths": _paths,
+                        "count": len(_tags),
+                    })
+
             response = await complete(
                 config=config,
                 system=system,
@@ -440,6 +478,10 @@ async def run_subagent(
                         # Unique per inner call so concurrent advisor consults
                         # in one batch don't collide on the bridge key (F6).
                         "call_id": tc.id,
+                        # view_image seam (kdsn.276): deposit into the sub's own
+                        # inbox; the model gate reads the sub's fixed default_model.
+                        "vision_deposit": _sub_vision_deposit,
+                        "active_model": config.default_model,
                     },
                 ))
 

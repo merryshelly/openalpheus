@@ -722,6 +722,37 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         "config": {
             "max_upload_bytes": 20971520
         }
+    },
+    "view_image": {
+        "description": (
+            "View an image that already exists in your workspace by attaching it to "
+            "your own context. The image is staged now and provided to you as a user "
+            "message before the NEXT model call (never inside this tool result). "
+            "Supported types: JPEG, PNG, GIF, WebP. "
+            "WHEN TO USE: you need to actually see a workspace image (a photo, plot, "
+            "screenshot, diagram) to reason about it. "
+            "WHEN NOT TO USE: to SEND an image to the operator use send_media instead; "
+            "for non-image files use shell/file_read; if the image is not on disk yet, "
+            "download it via shell first. "
+            "COST: images consume context — roughly 1 token per 750 bytes — and large "
+            "images may exceed the per-image cap (default 5 MB, max_bytes); downscale "
+            "oversized images via shell first. "
+            "If the active model has no vision capability the tool returns a clear "
+            "error naming the model and the /model escape — switch models and retry."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path to the image (e.g. shots/a.jpg). Absolute paths, '..', and shell/framed-control characters are rejected."
+                },
+            },
+            "required": ["path"]
+        },
+        "config": {
+            "max_bytes": 5_242_880
+        }
     }
 }
 
@@ -1588,6 +1619,14 @@ async def _execute_tool_inner(
             caption=input.get("caption"),
             max_upload_bytes=tool_config.get("max_upload_bytes", 20_971_520),
             upload_callback=callbacks.get("send_media") if callbacks else None,
+        )
+    elif name == "view_image":
+        from .vision import view_image
+        result = await view_image(
+            path=input["path"],
+            tool_config=tool_config,
+            agent_config=agent_config,
+            callbacks=callbacks,
         )
     elif name == "todo_write":
         result = await _execute_todo_write(input, callbacks)
