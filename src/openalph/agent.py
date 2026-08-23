@@ -17,7 +17,7 @@ from pathlib import Path
 
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
-from openalph.provider import complete, stream, ping_cache, ThinkingBlock, compute_cost
+from openalph.provider import complete, stream, ping_cache, ThinkingBlock, compute_cost, model_supports_vision
 from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
 
@@ -37,14 +37,20 @@ _TOOL_CALL_OVERHEAD_CHARS = 80   # {"type":"tool_use","id":"...","name":"...","i
 _TOOL_RESULT_OVERHEAD_CHARS = 80  # {"type":"tool_result","tool_use_id":"...","content":}
 
 
-def _build_user_content(text: str, config: AgentConfig) -> str | list[dict]:
-    """Build user message content, expanding image media tags when vision is enabled.
+def _build_user_content(text: str, config: AgentConfig, *, vision: bool) -> str | list[dict]:
+    """Build user message content, expanding image media tags when the room's
+    active model supports vision.
+
+    The expansion gate is the explicit keyword-only ``vision`` flag — resolved
+    per call from the room's active model via
+    ``openalph.provider.model_supports_vision`` (kdsn.275). There is no
+    agent-level vision config field anymore.
 
     Returns plain text string when no image expansion needed.
     Returns list of content blocks when images are present and vision is enabled.
     """
     # If vision is disabled, return text unchanged
-    if not config.vision:
+    if not vision:
         return text
 
     # Find all media tags
@@ -426,7 +432,7 @@ class Agent:
             any(block.get("type") == "image" for block in msg.get("content", []))
             for msg in history
         )
-        if has_images:
+        if has_images and not model_supports_vision(model_str, self.config):
             return f"Cannot switch to {model_str} — session contains images and model may not support vision."
 
         # Context window guard: check current context vs model limit
@@ -624,8 +630,11 @@ class Agent:
             self._current_tasks[room_id] = asyncio.current_task()
             history = self.history(room_id)
             try:
-                # Build user content (may expand image media tags if vision enabled)
-                content = _build_user_content(text, self.config)
+                # Build user content (may expand image media tags when the
+                # room's active model supports vision, kdsn.275)
+                content = _build_user_content(
+                    text, self.config,
+                    vision=model_supports_vision(self.get_model(room_id), self.config))
 
                 # Check for context overflow before appending user message.
                 # When append_user=False the message is already in history (hydrated

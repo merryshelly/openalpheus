@@ -270,13 +270,15 @@ class TestCapabilitiesTable:
         assert _model_output_cap("anthropic/claude-sonnet-4-20250514") is None
 
     def test_capabilities_table_structure(self):
-        """Every entry in _MODEL_CAPABILITIES is a 3-tuple (str, int|None, int|None)."""
+        """Every entry in _MODEL_CAPABILITIES is a 4-tuple
+        (str, int|None, int|None, vision: bool) — kdsn.275 added the vision element."""
         for entry in _MODEL_CAPABILITIES:
-            assert len(entry) == 3
-            frag, window, cap = entry
+            assert len(entry) == 4
+            frag, window, cap, vision = entry
             assert isinstance(frag, str)
             assert window is None or isinstance(window, int)
             assert cap is None or isinstance(cap, int)
+            assert isinstance(vision, bool)
 
 
 # ---------------------------------------------------------------------------

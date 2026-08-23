@@ -78,7 +78,6 @@ class AgentConfig:
     # loop holds both per-room locks with no socket, no room output and no log
     # above DEBUG, so nothing raises and the room silently looks dead.
     turn_stall_timeout_seconds: float = 900
-    vision: bool = False
     thinking: str = "off"
     temperature: float | None = None
     top_p: float | None = None
@@ -86,6 +85,11 @@ class AgentConfig:
     reminders: bool = True
     injection_defense: bool = True
     model_limits: dict[str, int] = field(default_factory=dict)
+    # kdsn.275: vision capability is a MODEL-LEVEL property — [model_vision]
+    # holds per-model overrides ("provider/api-model" = true|false) consulted
+    # by provider.model_supports_vision BEFORE the curated table. The .25
+    # agent-level `vision: bool` flag was hard-cut (no alias, no tombstone).
+    model_vision: dict[str, bool] = field(default_factory=dict)
     model_aliases: dict[str, str] = field(default_factory=dict)
 
 
@@ -309,11 +313,6 @@ def load_config(path: Path) -> AgentConfig:
     if not isinstance(injection_defense, bool):
         raise ConfigError("injection_defense must be a boolean")
 
-    # vision defaults to False if not specified
-    vision = agent_section.get("vision", False)
-    if not isinstance(vision, bool):
-        raise ConfigError("vision must be a boolean")
-
     # thinking defaults to "off" if not specified
     thinking = agent_section.get("thinking", "off")
     valid_thinking = ("off", "low", "medium", "high", "xhigh", "max")
@@ -489,6 +488,22 @@ def load_config(path: Path) -> AgentConfig:
                 if isinstance(limit, int) and limit > 0:
                     model_limits[model_name] = limit
 
+    # Parse optional [model_vision] section (kdsn.275). DELIBERATE deviation
+    # from [model_limits]' lenient skip: a non-bool value raises ConfigError.
+    # Fail-LOUD here — a silently-dropped `= false` disable override would be
+    # fail-OPEN on a safety knob (images would flow to a model the operator
+    # explicitly marked blind).
+    model_vision = {}
+    if "model_vision" in toml_data:
+        model_vision_section = toml_data["model_vision"]
+        if isinstance(model_vision_section, dict):
+            for model_name, vis in model_vision_section.items():
+                if not isinstance(vis, bool):
+                    raise ConfigError(
+                        f"model_vision[{model_name!r}] must be a boolean, "
+                        f"got {vis!r} ({type(vis).__name__})")
+                model_vision[model_name] = vis
+
     # Parse optional [matrix] section
     matrix = _parse_matrix_config(toml_data)
 
@@ -504,7 +519,6 @@ def load_config(path: Path) -> AgentConfig:
         max_iterations=max_iterations,
         truncation_limit=truncation_limit,
         turn_stall_timeout_seconds=turn_stall_timeout_seconds,
-        vision=vision,
         reminders=reminders,
         injection_defense=injection_defense,
         thinking=thinking,
@@ -512,6 +526,7 @@ def load_config(path: Path) -> AgentConfig:
         top_p=top_p,
         degen_detector=degen_detector,
         model_limits=model_limits,
+        model_vision=model_vision,
         model_aliases=model_aliases,
     )
 

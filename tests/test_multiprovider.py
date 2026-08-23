@@ -328,7 +328,6 @@ class TestLoadMultiProviderConfig:
 name = "merry"
 default_model = "anthropic/claude-opus-4-6"
 max_tokens = 8192
-vision = true
 
 [providers.anthropic]
 type = "anthropic"
@@ -722,7 +721,7 @@ class TestAgentActiveModel:
     def test_switch_model_vision_guard(self, tmp_path):
         """Block model switch when images exist in room history and target is non-vision."""
         (tmp_path / "SAFETY.md").write_text("")
-        config = make_multi_config(workspace=str(tmp_path), vision=True)
+        config = make_multi_config(workspace=str(tmp_path))
         from openalph.agent import Agent
         agent = Agent(config)
 

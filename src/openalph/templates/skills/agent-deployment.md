@@ -218,7 +218,6 @@ name = "<name>"
 default_model = "openrouter/z-ai/glm-5"
 max_tokens = 16384
 model_max_tokens = 131072
-vision = false
 thinking = "high"
 
 [providers.openrouter]

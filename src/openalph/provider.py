@@ -306,39 +306,86 @@ def _thinking_budget(level: str, base_max_tokens: int, model_max_tokens: int) ->
     return budget, max_tokens
 
 
-# (context_window, output_cap)  — output_cap None = no clamp (Fireworks/local tolerate)
-_MODEL_CAPABILITIES: list[tuple[str, int | None, int | None]] = [
+# (fragment, context_window, output_cap, vision)  — output_cap None = no clamp
+# (Fireworks/local tolerate). vision True = model accepts image content blocks
+# (kdsn.275). Kimi k2p6/k3 live-probed 2026-08-22; the Qwen3.8 pair is the
+# MULTIMODAL local build — "qwen3.8"/"qwen3p8" with the dot/p can never
+# substring-collide with "qwen38" (the blind coder build).
+_MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     # Anthropic
-    ("haiku-4-5",  200_000,   64_000),
-    ("sonnet-4-6", 200_000,  128_000),
-    ("sonnet-5",  1_048_576, 128_000),
-    ("opus-4-6",  1_048_576, 128_000),
-    ("opus-4-7",  1_048_576, 128_000),
-    ("opus-4-8",  1_048_576, 128_000),
-    ("opus-5",    1_048_576, 128_000),
-    ("fable",     1_048_576, 128_000),
+    ("haiku-4-5",  200_000,   64_000, True),
+    ("sonnet-4-6", 200_000,  128_000, True),
+    ("sonnet-5",  1_048_576, 128_000, True),
+    ("opus-4-6",  1_048_576, 128_000, True),
+    ("opus-4-7",  1_048_576, 128_000, True),
+    ("opus-4-8",  1_048_576, 128_000, True),
+    ("opus-5",    1_048_576, 128_000, True),
+    ("fable",     1_048_576, 128_000, True),
     # Fireworks / open
-    ("glm-5p2",   1_048_576, None),
-    ("kimi-k3",     1_048_576, None),
-    ("kimi-k2p6",   262_144, None),
+    ("glm-5p2",   1_048_576, None, False),
+    ("kimi-k3",     1_048_576, None, True),
+    ("kimi-k2p6",   262_144, None, True),
     # Local
-    ("deepseek-v4-flash", 1_048_576, None),
-    ("qwen38",      262_144, None),
-    ("qwen3.5",     262_144, None),
-    ("qwen3p5",     262_144, None),
-    ("qwen3.6",     262_144, None),
-    ("qwen3p6",     262_144, None),
+    ("deepseek-v4-flash", 1_048_576, None, False),
+    ("qwen38",      262_144, None, False),
+    ("qwen3.8",     262_144, None, True),
+    ("qwen3p8",     262_144, None, True),
+    ("qwen3.5",     262_144, None, False),
+    ("qwen3p5",     262_144, None, False),
+    ("qwen3.6",     262_144, None, False),
+    ("qwen3p6",     262_144, None, False),
     # Others (window only)
-    ("maverick",  1_048_576, None),
-    ("hermes",      131_072, None),
-    ("gemini",    1_048_576, None),
+    ("maverick",  1_048_576, None, True),
+    ("hermes",      131_072, None, False),
+    ("gemini",    1_048_576, None, True),
 ]
+
+# Models already WARNed about by model_supports_vision's fail-closed branch
+# (one warning per unknown model string per process, never per message).
+_VISION_WARNED: set[str] = set()
+
+
+def model_supports_vision(api_model: str, config) -> bool:
+    """Resolve whether a model accepts image content blocks (kdsn.275).
+
+    Three layers, mirroring Agent._resolve_model_limit_for's structure
+    (including its alias-expansion-first step — the wonmun 2026-08-03
+    bare-alias bug is the precedent):
+      1. config.model_vision override — exact full-string match, POST-alias.
+      2. _MODEL_CAPABILITIES table — substring fragment, first-match-wins.
+      3. Fail-closed False + one-time WARN log: never send base64 image data
+         to an uncharacterized model.
+
+    ``config`` is duck-typed (any object with model_aliases / model_vision
+    attributes); provider.py deliberately does not import openalph.config
+    here. The returned decision is per-call — room model switches and TOML
+    edits take effect without restart.
+    """
+    # Room model strings may be bare aliases (e.g. a persisted `/model deepseek`
+    # override): expand before BOTH the override layer and the table layer,
+    # otherwise both silently miss and the model falls through to the
+    # fail-closed default.
+    if api_model in config.model_aliases:
+        api_model = config.model_aliases[api_model]
+    if api_model in config.model_vision:
+        return config.model_vision[api_model]
+    m = api_model.lower()
+    for frag, _window, _cap, vision in _MODEL_CAPABILITIES:
+        if frag in m:
+            return vision
+    if api_model not in _VISION_WARNED:
+        _VISION_WARNED.add(api_model)
+        logger.warning("Unknown model %r has no curated vision capability; "
+                       "failing closed (images will NOT be sent). Add a "
+                       "[model_vision] override to force-enable it.",
+                       api_model)
+    return False
 
 
 def model_context_window(api_model: str) -> int | None:
     """Curated default context window for a model, or None if unknown."""
     m = api_model.lower()
-    for frag, window, _cap in _MODEL_CAPABILITIES:
+    for frag, window, _cap, _vision in _MODEL_CAPABILITIES:
         if frag in m:
             return window
     return None
@@ -355,7 +402,7 @@ def _model_output_cap(api_model: str) -> int | None:
     Returns the cap in tokens, or None if unknown / no clamp required.
     """
     m = api_model.lower()
-    for frag, _window, cap in _MODEL_CAPABILITIES:
+    for frag, _window, cap, _vision in _MODEL_CAPABILITIES:
         if frag in m:
             return cap
     return None

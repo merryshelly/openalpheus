@@ -162,7 +162,6 @@ max_tokens = 8192
 model_max_tokens = 200000
 max_iterations = 50
 truncation_limit = 50000
-vision = false
 
 [providers.anthropic]
 type = "anthropic"
