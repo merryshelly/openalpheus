@@ -91,6 +91,16 @@ Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `
 
 \*\*`web_fetch_js` renders JavaScript-heavy pages (SPAs, dashboards, infinite-scroll) via [Tabstack](https://tabstack.ai)'s cloud browser — opt-in via `api_key` in `workspace/tools/web_fetch_js.toml` (unconfigured = tool unavailable). Unlike `web_fetch`, the target URL and page content transit a third-party cloud, so treat it as a deliberate exception to "no cloud except the ones you explicitly choose." `web_fetch` nudges toward it at the point of need when a fetch looks unrendered.
 
+### Vision
+
+Vision is a **model-level capability**, not an agent-level one. When someone posts an image to a room, the harness records a `[media: path (mime, size)]` tag; whether that tag expands into base64 image blocks is decided per room, per *active model*, by a three-layer resolver (`model_supports_vision` in `provider.py`):
+
+1. `[model_vision]` TOML override — exact per-model `true`/`false` (operator escape hatch in both directions),
+2. a curated capabilities table in `provider.py` (same fragment convention as context-window resolution),
+3. **fail-closed `false`** with a one-time warning — uncharacterized models never receive image data.
+
+This makes `/model` switches safe in both directions: posting an image to a room running a blind model passes the tag through as plain text, and switching models mid-session is blocked only when the history contains images *and* the target model can't see. Supported image types: JPEG, PNG, GIF, WebP. Images count toward context at roughly 1 token per 750 raw bytes.
+
 ### Guidance injection
 
 Optional, config-aware in-stream guidance that helps agents stay on track during long turns — without touching the system prompt, and fully visible.
