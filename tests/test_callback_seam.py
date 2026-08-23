@@ -81,6 +81,8 @@ def _make_bot(agent=None, **overrides):
 
 # The exact key set the tools layer expects (the wire format contract).
 # Pinning this proves the refactor doesn't change what tools see.
+# 15th key "log_vision_injection" added by kdsn.279 (view_image observability
+# seam — agent-owned inbox; the transport only logs).
 _EXPECTED_CALLBACK_KEYS = frozenset({
     "send_media",
     "on_redaction",
@@ -89,6 +91,7 @@ _EXPECTED_CALLBACK_KEYS = frozenset({
     "context_status",
     "send_notice",
     "log_reminder",
+    "log_vision_injection",
     "turn_source",
     "read_registry",
     "room_id",
@@ -100,7 +103,7 @@ _EXPECTED_CALLBACK_KEYS = frozenset({
 
 _SIDE_EFFECT_KEYS = frozenset({
     "send_media", "on_redaction", "on_keepalive_miss", "on_degenerate",
-    "send_notice", "log_reminder",
+    "send_notice", "log_reminder", "log_vision_injection",
 })
 
 _AGENT_STATE_KEYS = frozenset({
@@ -122,13 +125,13 @@ class TestCallbacksDictKeys:
     """
 
     def test_exact_key_set(self):
-        """The callbacks dict has exactly the expected 14 keys — no more, no less."""
+        """The callbacks dict has exactly the expected 15 keys — no more, no less."""
         bot = _make_bot()
         cb = bot._build_agent_callbacks("!room:server", None)
         assert set(cb.keys()) == set(_EXPECTED_CALLBACK_KEYS)
 
     def test_side_effect_keys_are_callable(self):
-        """All 6 side-effect keys are async callables (closures delegating to sinks)."""
+        """All 7 side-effect keys are async callables (closures delegating to sinks)."""
         bot = _make_bot()
         cb = bot._build_agent_callbacks("!room:server", None)
         for key in _SIDE_EFFECT_KEYS:
@@ -429,6 +432,17 @@ class TestBuildCallbacksHeadless:
         asyncio.run(cb["send_media"]("/path/file.txt", "text/plain", "file.txt"))
         sinks.send_media.assert_awaited_once()
 
+    def test_log_vision_injection_routes_through_sinks(self):
+        """kdsn.279 15th key: log_vision_injection delegates to the sinks method
+        with (room_id, framed) — the transport observes, the agent injects."""
+        from openalph.callbacks import build_callbacks
+        agent = _make_agent()
+        sinks = MagicMock()
+        sinks.log_vision_injection = AsyncMock()
+        cb = build_callbacks(agent, "!room:server", sinks, turn_source=None)
+        asyncio.run(cb["log_vision_injection"]("!room:server", "framed text"))
+        sinks.log_vision_injection.assert_awaited_once_with("!room:server", "framed text")
+
 
 # ---------------------------------------------------------------------------
 # SPEC: CommsSinks protocol + MatrixSinks (RED until callbacks.py exists)
@@ -457,6 +471,7 @@ class TestCommsSinksProtocol:
         expected_methods = {
             "send_notice", "log_reminder", "send_media",
             "on_redaction", "on_keepalive_miss", "on_degenerate",
+            "log_vision_injection",
         }
         for method in expected_methods:
             assert hasattr(MatrixSinks, method), f"MatrixSinks missing {method}"

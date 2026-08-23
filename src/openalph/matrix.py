@@ -398,10 +398,6 @@ class MatrixBot:
         # released before `_session_locks[room_id]` is acquired).
         self._activate_locks: dict[str, asyncio.Lock] = {}
         self._steering_inbox: dict[str, list[str]] = {}
-        # view_image staging (kdsn.276): per-room inbox of [media:] tags deposited
-        # by the view_image tool, drained at the top of the next agent tool-loop
-        # iteration into ONE framed user message.
-        self._vision_inbox: dict[str, list[str]] = {}
         self._active_turns: set[str] = set()
         self._advisor_results: dict[tuple, dict] = {}  # R5: keyed (room_id, call_id)
         self._subagent_results: dict[tuple, dict] = {}  # keyed (room_id, call_id)
@@ -952,54 +948,6 @@ class MatrixBot:
         aliases = getattr(getattr(self.agent, "config", None), "model_aliases", None) or {}
         key = str(mdl)
         return aliases.get(key, key)
-
-    def _make_vision_callbacks(self, room_id: str) -> dict:
-        """Build the per-room view_image deposit/drain closures (kdsn.276).
-
-        ``vision_deposit(tag)`` appends a ``[media:]`` tag to the room's inbox;
-        ``drain_vision()`` pops the room's queued tags, frames them into ONE
-        user message via ``frame_vision_batch``, appends ONE session-log entry
-        (role=user, source="view_image"), and best-effort notifies the room.
-
-        The inbox is lazily (re)initialised via getattr so tests that construct
-        a MatrixBot with ``__new__`` (no ``__init__``) still work.
-        """
-        # Lazy-init: tests build MatrixBot via __new__ and never run __init__.
-        inbox = getattr(self, "_vision_inbox", None)
-        if inbox is None:
-            inbox = {}
-            self._vision_inbox = inbox
-
-        async def _vision_deposit(tag: str) -> None:
-            self._vision_inbox.setdefault(room_id, []).append(tag)
-
-        async def _drain_vision() -> str:
-            tags = self._vision_inbox.pop(room_id, [])
-            if not tags:
-                return ""
-            from openalph.tools.vision import frame_vision_batch
-            framed = frame_vision_batch(tags)
-            _sl = getattr(self, "session_log", None)
-            if _sl is not None:
-                try:
-                    _sl.append(
-                        role="user",
-                        sender=self.config.user_id,
-                        room=room_id,
-                        event_id=None,
-                        content=framed,
-                        source="view_image",
-                    )
-                except Exception:
-                    logger.warning("vision session-log append failed", exc_info=True)
-            try:
-                await self.send_notice(
-                    room_id, f"👁️ view_image: {len(tags)} image(s) attached")
-            except Exception:
-                pass
-            return framed
-
-        return {"vision_deposit": _vision_deposit, "drain_vision": _drain_vision}
 
     def _make_tool_callbacks(self, room_id: str):
         """Create tool-use callback closures bound to a specific room.
@@ -2320,12 +2268,6 @@ class MatrixBot:
                 # when drain_steering= kwarg is None.
                 callbacks['drain_steering'] = _drain_steering
 
-                # Wire the view_image deposit/drain seam for this interactive turn
-                # (kdsn.276). NOT added to _build_agent_callbacks — that builder's
-                # 14-key set is pinned by other tests and shared by heartbeat/CLI
-                # paths, which must keep getting the tool's clean "not wired" error.
-                callbacks.update(self._make_vision_callbacks(room_id))
-
                 # Liveness hook for the tool layer (e.g. the subagent tool pings
                 # this while blocked on a long sub run). Added here rather than in
                 # _build_agent_callbacks so that builder's pinned key set — and the
@@ -2779,9 +2721,11 @@ class MatrixBot:
             if hasattr(self, '_steering_inbox'):
                 self._steering_inbox.pop(room_id, None)
             # Clear any staged view_image tags so a halted room can't leak them
-            # into the next turn.
-            if hasattr(self, '_vision_inbox'):
-                self._vision_inbox.pop(room_id, None)
+            # into the next turn (kdsn.279: the per-room vision inbox lives on
+            # the AGENT now; getattr-guarded for tests with MagicMock agents).
+            _vi = getattr(getattr(self, 'agent', None), '_vision_inbox', None)
+            if _vi is not None:
+                _vi.pop(room_id, None)
             await self._cancel_current(room_id)
             await self.send(room_id, "Stopped. Room halted \u2014 use `/resume` to re-enable.")
             return

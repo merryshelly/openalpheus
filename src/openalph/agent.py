@@ -8,6 +8,7 @@ so the operator can check usage without external tooling.
 import asyncio
 import contextlib
 import base64
+import functools
 import json
 import logging
 import re
@@ -226,7 +227,18 @@ class Agent:
         self._read_registries: dict[str, dict] = {}
         # Per-room advisor consult counters (session cap tracking)
         self._advisor_uses: dict[str, int] = {}
+        # view_image staging (kdsn.279): per-room inbox of [media:] tags deposited
+        # by the view_image tool, drained at the top of the next tool-loop
+        # iteration into ONE framed user message. Agent-owned (moved off
+        # MatrixBot) so heartbeat/umbral/CLI turns stage + inject too.
+        self._vision_inbox: dict[str, list[str]] = {}
 
+    async def _vision_deposit(self, room_id: str, tag: str) -> None:
+        """Append a staged [media:] tag to this room's vision inbox (kdsn.279).
+
+        Wired as the DEFAULT ``vision_deposit`` tool callback at dispatch
+        (setdefault — an explicit callback in the caller's dict wins)."""
+        self._vision_inbox.setdefault(room_id, []).append(tag)
 
     def _engine_for(self, room_id: str) -> ReminderEngine:
         """Lazily create and return a per-room ReminderEngine (R1-4)."""
@@ -257,6 +269,9 @@ class Agent:
         # R1-1: clear this room's read registry
         self._read_registries.pop(room_id, None)
         self._advisor_uses.pop(room_id, None)
+        # kdsn.279: drop staged view_image tags too — a reset room must not
+        # resurrect stale tags into the post-rotation context.
+        self._vision_inbox.pop(room_id, None)
 
     def _usage_for(self, room_id: str) -> dict[str, int]:
         """Lazily init + return the per-room counter record."""
@@ -771,21 +786,35 @@ class Agent:
                                     "content": f"[Operator steering — mid-turn guidance]: {_note}",
                                 })
 
-                    # Drain the vision inbox at the top of every iteration — AFTER the
-                    # steering drain, BEFORE reminder evaluation (kdsn.276). view_image
-                    # deposits [media:] tags during the previous batch's tool execution;
-                    # draining here injects them as ONE user message at the next loop top,
-                    # AFTER ALL tool results of the pending batch (parallel batches
-                    # included) BY CONSTRUCTION — do not move this inside the tool-result
-                    # append loop. The framed tag text is expanded to image blocks via
-                    # _build_user_content, gated on the room's active model's vision.
-                    _vision_drain = (callbacks or {}).get("drain_vision")
-                    if _vision_drain:
-                        _vtext = await _vision_drain()
-                        if _vtext:
-                            history.append({"role": "user", "content": _build_user_content(
-                                _vtext, self.config,
-                                vision=model_supports_vision(self.get_model(room_id), self.config))})
+                    # Drain the AGENT's OWN vision inbox at the top of every iteration —
+                    # AFTER the steering drain, BEFORE reminder evaluation (placement
+                    # unchanged from kdsn.276; state moved onto the Agent in kdsn.279,
+                    # there is NO drain_vision callback key anymore — a stray one in
+                    # callbacks is ignored). view_image deposits [media:] tags during
+                    # the previous batch's tool execution; draining here injects them
+                    # as ONE user message at the next loop top, AFTER ALL tool results
+                    # of the pending batch (parallel batches included) BY CONSTRUCTION
+                    # — do not move this inside the tool-result append loop. The framed
+                    # tag text is expanded to image blocks via _build_user_content,
+                    # gated on the room's active model's vision.
+                    _tags = self._vision_inbox.pop(room_id, [])
+                    if _tags:
+                        from openalph.tools.vision import frame_vision_batch
+                        _framed = frame_vision_batch(_tags)
+                        history.append({"role": "user", "content": _build_user_content(
+                            _framed, self.config,
+                            vision=model_supports_vision(self.get_model(room_id), self.config))})
+                        # Optional observability seam (kdsn.279): the transport logs
+                        # the injection (JSONL source="view_image" + room notice).
+                        # Fail-soft — injection is NEVER gated on logging.
+                        _log_cb = (callbacks or {}).get("log_vision_injection")
+                        if callable(_log_cb):
+                            try:
+                                await _log_cb(room_id, _framed)
+                            except Exception:
+                                logger.warning(
+                                    "log_vision_injection callback failed in %s",
+                                    room_id, exc_info=True)
 
                     # Reminder evaluation at tool-loop boundary (after steering, before API call).
                     # Ordering: steering drains first, then reminders (operator outranks harness).
@@ -1061,6 +1090,14 @@ class Agent:
                         # Thread call_id through for subagent log cross-referencing
                         tc_callbacks = {**(callbacks or {}), "call_id": tc.id,
                                         "active_model": self.get_model(room_id)}
+                        # Default vision_deposit seam (kdsn.279): the agent owns the
+                        # per-room inbox, so it wires the deposit for every turn shape
+                        # (interactive/heartbeat/umbral/CLI). setdefault is load-bearing:
+                        # an explicit vision_deposit in the caller's callbacks WINS
+                        # (test/transport override stays possible).
+                        tc_callbacks.setdefault(
+                            "vision_deposit",
+                            functools.partial(self._vision_deposit, room_id))
                         tool_coros.append(execute_tool(
                             name=tc.name,
                             input=tc.input,

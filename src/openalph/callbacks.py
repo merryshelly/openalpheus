@@ -33,6 +33,7 @@ class CommsSinks(Protocol):
     async def on_redaction(self, tool_name, events) -> None: ...
     async def on_keepalive_miss(self, room_id=None) -> None: ...
     async def on_degenerate(self, model=None, generation_id=None, **kw) -> None: ...
+    async def log_vision_injection(self, room_id, framed) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,22 @@ class HeadlessSinks:
 
     async def on_degenerate(self, model=None, generation_id=None, **kw):
         print(f"⚠️ Degeneration detected — model: {model or 'unknown'}", file=sys.stderr)
+
+    async def log_vision_injection(self, room_id, framed):
+        """Log a view_image injection (kdsn.279): JSONL source='view_image' + a
+        stderr notice. The framed tag text (pre-expansion) is persisted as-is —
+        rehydration degrades it to plain text. No session_log → print only."""
+        if self._sl is not None:
+            self._sl.append(
+                role="user",
+                sender=self._uid,
+                room=room_id,
+                event_id=None,
+                content=framed,
+                source="view_image",
+            )
+        print(f"👁️ view_image: {framed.count('[media:')} image(s) attached",
+              file=sys.stderr, flush=True)
 
 class MatrixSinks:
     """CommsSinks backed by a live MatrixBot + nio client."""
@@ -163,6 +180,34 @@ class MatrixSinks:
                 event="cache_keepalive_miss",
                 detail="ping wrote instead of read",
             )
+
+    async def log_vision_injection(self, room_id, framed):
+        """Log a view_image injection (kdsn.279): ONE JSONL entry
+        (role=user, source='view_image', framed tag text) + a best-effort
+        👁 room notice via the bot's PLAIN send_notice (not self.send_notice —
+        that one wraps the body in reminder-style <details> HTML)."""
+        _sl = getattr(self._bot, 'session_log', None)
+        if _sl is not None:
+            try:
+                _sl.append(
+                    role="user",
+                    sender=self._bot.config.user_id,
+                    room=room_id,
+                    event_id=None,
+                    content=framed,
+                    source="view_image",
+                )
+            except Exception as exc:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning("view_image session-log append failed in %s: %s",
+                               room_id, exc, exc_info=True)
+        try:
+            await self._bot.send_notice(
+                room_id,
+                f"👁️ view_image: {framed.count('[media:')} image(s) attached")
+        except Exception:
+            pass
 
     async def on_degenerate(self, model=None, generation_id=None, **kw):
         """Emit an m.notice when the degen detector flags a response."""
@@ -300,7 +345,7 @@ def build_callbacks(
 
     Agent-state callbacks read directly from *agent*.  Side-effect callbacks
     delegate to *sinks* (a CommsSinks implementation).  Returns a dict with
-    the 14 keys the tools layer expects.
+    the 15 keys the tools layer expects.
     """
 
     async def _context_status_callback(req_room_id=None):
@@ -324,6 +369,9 @@ def build_callbacks(
 
     async def _log_reminder_callback(_room_id, reminder):
         await sinks.log_reminder(_room_id, reminder)
+
+    async def _log_vision_injection_callback(_room_id, framed):
+        await sinks.log_vision_injection(_room_id, framed)
 
     async def _keepalive_miss_callback(_room_id=None):
         await sinks.on_keepalive_miss(_room_id or room_id)
@@ -358,6 +406,7 @@ def build_callbacks(
         "context_status": _context_status_callback,
         "send_notice": _send_notice_callback,
         "log_reminder": _log_reminder_callback,
+        "log_vision_injection": _log_vision_injection_callback,
         "turn_source": turn_source,
         "read_registry": _read_registry,
         "room_id": room_id,

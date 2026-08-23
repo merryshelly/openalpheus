@@ -1,22 +1,35 @@
-"""Tests for the view_image tool (kdsn.276).
+"""Tests for the view_image tool (kdsn.276; Matrix-decoupled in kdsn.279).
 
 Interface contract:
     view_image(path) lets an agent attach a workspace image to its own
     context. The tool validates (containment, existence, image MIME from
     extension, size cap, model vision capability) and deposits a
-    `[media: path (mime, size)]` tag into a per-room inbox via a
-    `vision_deposit` callback. At the top of the NEXT tool-loop iteration a
-    `drain_vision` callback returns ONE framed user message batching all
-    queued tags (framing by openalph.tools.vision.frame_vision_batch);
-    agent.py expands it via the EXISTING _build_user_content and appends it
-    after ALL tool results of the pending batch. Provider-universal: images
-    ride user messages, never tool results (vllm#43203).
+    `[media: path (mime, size)]` tag into the AGENT's per-room inbox
+    (`Agent._vision_inbox`) via a `vision_deposit` callback. The callback is
+    wired BY DEFAULT at agent.py tool dispatch (setdefault — tests/transports
+    may still override); subagent.py wires its own per-sub deposit. At the
+    top of the NEXT tool-loop iteration the agent drains its OWN inbox (there
+    is NO drain callback — kdsn.279 removed MatrixBot's `_vision_inbox` +
+    `_make_vision_callbacks`), frames ALL queued tags into ONE user message
+    (openalph.tools.vision.frame_vision_batch), expands it via the EXISTING
+    _build_user_content, and appends it after ALL tool results of the pending
+    batch. Provider-universal: images ride user messages, never tool results
+    (vllm#43203).
 
-    Callback keys (wired by matrix._make_vision_callbacks for interactive
-    turns; by subagent.py per-sub): "vision_deposit" (async tag->None),
-    "drain_vision" (async -> str), "active_model" (str, set at dispatch).
+    Observability seam: the OPTIONAL `log_vision_injection(room_id, framed)`
+    callback — wired by callbacks.build_callbacks (its 15th key) so
+    interactive AND heartbeat/umbral/CLI turns all log — writes the JSONL
+    `source="view_image"` entry + room notice. Injection is NEVER gated on
+    it (unlike the reminder I1 durability gate): absent or raising, the
+    image still lands in context.
+
+    Callback keys: "vision_deposit" (async tag->None; agent-wired default,
+    overridable), "log_vision_injection" (async (room_id, framed)->None;
+    optional, observability only), "active_model" (str, set at dispatch).
 
 Spec: memory/projects/openalph/vision-model-capability-spec.md sections 2, 4, 5.
+Design rule: architecture-summary.md → Design Principles — no Matrix coupling
+unless the feature IS Matrix (SB directive, 2026-08-22).
 """
 
 import json
@@ -83,25 +96,36 @@ def _deposit_spy(record: list):
     return _deposit
 
 
-def _drain_for(inbox: list):
-    """A drain_vision double over a plain list inbox (frames like prod)."""
-    async def _drain() -> str:
-        tags = list(inbox)
-        inbox.clear()
-        return frame_vision_batch(tags) if tags else ""
-    return _drain
-
-
 def _callbacks(tmp_path, inbox=None, active_model=VISION_MODEL):
-    """Callbacks dict mirroring the production wiring for a room."""
+    """Tool-level callbacks for DIRECT execute_tool calls (validation/success
+    tests): a deposit spy + active_model. Agent-LOOP tests must NOT use this —
+    they rely on the agent's own default wiring (kdsn.279)."""
     if inbox is None:
         inbox = []
     return {
         "room_id": "!test:server",
         "vision_deposit": _deposit_spy(inbox),
-        "drain_vision": _drain_for(inbox),
         "active_model": active_model,
     }
+
+
+def _loop_callbacks(**extra):
+    """Callbacks for handle_input loop tests: NO vision mechanism keys at all
+    (no vision_deposit, no drain_vision) — the heartbeat/umbral/CLI shape
+    (kdsn.279). The agent wires its own deposit default at dispatch and
+    drains its own inbox at the loop top. `extra` may add observability keys
+    (e.g. a log_vision_injection spy)."""
+    cbs = {"room_id": "!test:server"}
+    cbs.update(extra)
+    return cbs
+
+
+def _bare_agent(tmp_path):
+    """A real Agent with prompt assembly stubbed (vision-inbox unit tests)."""
+    (tmp_path / "tools").mkdir(exist_ok=True)
+    config = _make_config(tmp_path)
+    with patch("openalph.agent.assemble_prompt", return_value="system"):
+        return Agent(config)
 
 
 def _stream_tool_then_text(tool_calls_list, final_text="Done"):
@@ -265,8 +289,9 @@ class TestViewImageValidation:
 
     @pytest.mark.asyncio
     async def test_no_deposit_callback_is_clean_error(self, tmp_path):
-        """Unwired runtime context (e.g. heartbeat/CLI in v1) -> honest error,
-        never a silent drop."""
+        """Defensive guard (kdsn.279): the agent loop wires vision_deposit by
+        default now, so this error fires only for DIRECT execute_tool calls
+        outside any wired runtime. It must stay honest, never a silent drop."""
         rel = _make_image(tmp_path)
         config = _make_config(tmp_path)
         cbs = _callbacks(tmp_path)
@@ -403,12 +428,15 @@ class TestViewImageDiscovery:
         assert "jpeg" in desc or "png" in desc
 
 
-# --- Drain integration: agent loop (spec 5.7/5.8/5.10) ---
+# --- Drain integration: agent loop (spec 5.7/5.8/5.10; agent-owned, kdsn.279) ---
 
 
 class TestVisionDrainInAgentLoop:
-    """handle_input: deposit during tool execution -> injected as ONE user
-    message at the next loop top, AFTER all tool results of the batch."""
+    """handle_input: a view_image deposit lands in the AGENT's own per-room
+    inbox (wired by default at dispatch) and the agent drains it at the next
+    loop top — injected as ONE user message AFTER all tool results of the
+    batch. These tests pass NO vision mechanism keys in callbacks (the
+    heartbeat/umbral/CLI shape, kdsn.279): no Matrix wiring anywhere."""
 
     def _agent_with_vision_tool(self, tmp_path):
         (tmp_path / "tools").mkdir(exist_ok=True)
@@ -420,15 +448,13 @@ class TestVisionDrainInAgentLoop:
     async def test_deposit_then_injected_next_iteration(self, tmp_path):
         rel = _make_image(tmp_path)
         config = self._agent_with_vision_tool(tmp_path)
-        inbox = []
-        cbs = _callbacks(tmp_path, inbox=inbox)
 
         tc = ToolCall(id="tc1", name="view_image", input={"path": rel})
         with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system"):
             mock_stream.side_effect = _stream_tool_then_text([tc], "I see it")
             agent = Agent(config)
-            result = await agent.handle_input("look at this", callbacks=cbs)
+            result = await agent.handle_input("look at this", callbacks=_loop_callbacks())
 
         assert result == "I see it"
         history = agent.history("_default")
@@ -446,6 +472,83 @@ class TestVisionDrainInAgentLoop:
         assert img[0]["media_type"] == "image/jpeg"
         import base64 as _b64
         assert _b64.b64decode(img[0]["data"]) == JPEG_BYTES
+        # The agent drained its own inbox
+        assert agent._vision_inbox.get("_default") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_shaped_callbacks_still_inject(self, tmp_path):
+        """REGRESSION PIN (kdsn.279): heartbeat/umbral/CLI turns carry no
+        vision mechanism keys — v1 gave them the "not wired" error. With the
+        agent-owned inbox they must stage + inject anyway. Uses a non-default
+        room to prove deposit + drain follow the LOOP's room_id."""
+        rel = _make_image(tmp_path)
+        config = self._agent_with_vision_tool(tmp_path)
+        cbs = _loop_callbacks()
+        cbs["room_id"] = "!hb:server"
+
+        tc = ToolCall(id="tc1", name="view_image", input={"path": rel})
+        with patch("openalph.agent.stream") as mock_stream, \
+             patch("openalph.agent.assemble_prompt", return_value="system"):
+            mock_stream.side_effect = _stream_tool_then_text([tc], "seen")
+            agent = Agent(config)
+            result = await agent.handle_input("look", room_id="!hb:server", callbacks=cbs)
+
+        assert result == "seen"
+        injected = [m for m in agent.history("!hb:server")
+                    if m["role"] == "user" and isinstance(m["content"], list)]
+        assert len(injected) == 1, "heartbeat-shaped turn must inject the staged image"
+        assert agent._vision_inbox.get("!hb:server") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_stray_drain_vision_callback_ignored(self, tmp_path):
+        """kdsn.279 REMOVED the drain_vision callback key: a stray drain_vision
+        in callbacks (stale wiring) must be ignored — the agent drains only
+        its own inbox, exactly once."""
+        rel = _make_image(tmp_path)
+        config = self._agent_with_vision_tool(tmp_path)
+        drain_spy = AsyncMock(return_value=(
+            "[view_image tool output — 1 image(s): BOGUS]\n"
+            "[media: BOGUS (image/jpeg, 1 B)]"))
+        cbs = _loop_callbacks(drain_vision=drain_spy)
+
+        tc = ToolCall(id="tc1", name="view_image", input={"path": rel})
+        with patch("openalph.agent.stream") as mock_stream, \
+             patch("openalph.agent.assemble_prompt", return_value="system"):
+            mock_stream.side_effect = _stream_tool_then_text([tc], "ok")
+            agent = Agent(config)
+            await agent.handle_input("look", callbacks=cbs)
+
+        drain_spy.assert_not_awaited()
+        injected = [m for m in agent.history("_default")
+                    if m["role"] == "user" and isinstance(m["content"], list)]
+        assert len(injected) == 1, "exactly ONE injected message, from the agent inbox"
+        flat = json.dumps(injected[0]["content"])
+        assert "BOGUS" not in flat
+        assert rel in flat
+
+    @pytest.mark.asyncio
+    async def test_vision_deposit_override_honored(self, tmp_path):
+        """setdefault semantics: an explicit vision_deposit in callbacks WINS
+        over the agent default (test/transport override stays possible). The
+        agent default is then not used — nothing lands in the agent inbox and
+        nothing is injected (the overrider owns its own draining)."""
+        rel = _make_image(tmp_path)
+        config = self._agent_with_vision_tool(tmp_path)
+        spy_inbox = []
+        cbs = _loop_callbacks(vision_deposit=_deposit_spy(spy_inbox))
+
+        tc = ToolCall(id="tc1", name="view_image", input={"path": rel})
+        with patch("openalph.agent.stream") as mock_stream, \
+             patch("openalph.agent.assemble_prompt", return_value="system"):
+            mock_stream.side_effect = _stream_tool_then_text([tc], "ok")
+            agent = Agent(config)
+            await agent.handle_input("look", callbacks=cbs)
+
+        assert len(spy_inbox) == 1 and rel in spy_inbox[0]
+        assert agent._vision_inbox.get("_default") in (None, [])
+        injected = [m for m in agent.history("_default")
+                    if m["role"] == "user" and isinstance(m["content"], list)]
+        assert injected == []
 
     @pytest.mark.asyncio
     async def test_ordering_with_parallel_tool_batch(self, tmp_path):
@@ -453,8 +556,6 @@ class TestVisionDrainInAgentLoop:
         lands after ALL tool results of the batch (spec invariant 1)."""
         rel = _make_image(tmp_path)
         config = self._agent_with_vision_tool(tmp_path)
-        inbox = []
-        cbs = _callbacks(tmp_path, inbox=inbox)
 
         tc_view = ToolCall(id="tc1", name="view_image", input={"path": rel})
         # Second tool is NOT enabled in this workspace -> clean unknown-tool
@@ -464,7 +565,7 @@ class TestVisionDrainInAgentLoop:
              patch("openalph.agent.assemble_prompt", return_value="system"):
             mock_stream.side_effect = _stream_tool_then_text([tc_view, tc_other], "ok")
             agent = Agent(config)
-            await agent.handle_input("batch", callbacks=cbs)
+            await agent.handle_input("batch", callbacks=_loop_callbacks())
 
         history = agent.history("_default")
         roles = [m["role"] for m in history]
@@ -482,8 +583,6 @@ class TestVisionDrainInAgentLoop:
         rel_a = _make_image(tmp_path, name="a.jpg")
         rel_b = _make_image(tmp_path, name="b.jpg")
         config = self._agent_with_vision_tool(tmp_path)
-        inbox = []
-        cbs = _callbacks(tmp_path, inbox=inbox)
 
         calls = [ToolCall(id="tc1", name="view_image", input={"path": rel_a}),
                  ToolCall(id="tc2", name="view_image", input={"path": rel_b})]
@@ -491,7 +590,7 @@ class TestVisionDrainInAgentLoop:
              patch("openalph.agent.assemble_prompt", return_value="system"):
             mock_stream.side_effect = _stream_tool_then_text(calls, "both seen")
             agent = Agent(config)
-            await agent.handle_input("compare", callbacks=cbs)
+            await agent.handle_input("compare", callbacks=_loop_callbacks())
 
         injected = [m for m in agent.history("_default")
                     if m["role"] == "user"
@@ -506,8 +605,6 @@ class TestVisionDrainInAgentLoop:
         deposited or injected (spec 5.6 + 5.12 override/disable behavior)."""
         rel = _make_image(tmp_path)
         config = self._agent_with_vision_tool(tmp_path)
-        inbox = []
-        cbs = _callbacks(tmp_path, inbox=inbox, active_model=BLIND_MODEL)
         # Room actually running the blind model:
         with patch("openalph.agent.stream") as mock_stream, \
              patch("openalph.agent.assemble_prompt", return_value="system"):
@@ -515,9 +612,10 @@ class TestVisionDrainInAgentLoop:
             mock_stream.side_effect = _stream_tool_then_text([tc], "cannot see")
             agent = Agent(config)
             agent.switch_model(BLIND_MODEL)  # no images yet -> allowed
-            await agent.handle_input("look", callbacks=cbs)
+            await agent.handle_input("look", callbacks=_loop_callbacks())
 
-        assert inbox == [], "blind model must refuse before deposit"
+        assert agent._vision_inbox.get("_default") in (None, []), \
+            "blind model must refuse before deposit"
         history = agent.history("_default")
         tool_results = [m for m in history if m["role"] == "tool"]
         assert tool_results and tool_results[0]["is_error"] is True
@@ -526,72 +624,171 @@ class TestVisionDrainInAgentLoop:
         assert [m["role"] for m in history].count("user") == 1
 
 
-# --- Matrix wiring: deposit/drain closures + JSONL (spec 4.1, 4.3.5) ---
+# --- Agent-owned inbox (kdsn.279: state lives on Agent, NOT MatrixBot) ---
 
 
-class TestMatrixVisionCallbacks:
-    """MatrixBot._make_vision_callbacks(room_id) builds the per-room deposit
-    and drain closures; the drain logs ONE JSONL entry (source=view_image)
-    and returns the framed text for the agent loop to expand."""
+class TestAgentVisionInbox:
+    """kdsn.279: the per-room vision inbox is agent-owned
+    (`Agent._vision_inbox`, `Agent._vision_deposit`). MatrixBot no longer
+    carries one — the deposit producer is the agent's own tool loop, so the
+    state lives with the agent (Design Principles, SB directive 2026-08-22)."""
 
-    def _bare_bot(self):
-        from openalph.matrix import MatrixBot
-        bot = MatrixBot.__new__(MatrixBot)
-        bot.config = MagicMock(user_id="@merry:test")
-        bot.session_log = MagicMock()
-        bot.send_notice = AsyncMock()
-        return bot
-
-    def test_callbacks_have_expected_keys(self):
-        bot = self._bare_bot()
-        cbs = bot._make_vision_callbacks("!r:test")
-        assert callable(cbs["vision_deposit"])
-        assert callable(cbs["drain_vision"])
+    def test_agent_starts_with_empty_per_room_inbox(self, tmp_path):
+        agent = _bare_agent(tmp_path)
+        assert isinstance(agent._vision_inbox, dict)
+        assert agent._vision_inbox == {}
 
     @pytest.mark.asyncio
-    async def test_deposit_appends_to_per_room_inbox(self):
-        bot = self._bare_bot()
-        cbs = bot._make_vision_callbacks("!r:test")
-        await cbs["vision_deposit"]("[media: a.jpg (image/jpeg, 1 B)]")
-        await cbs["vision_deposit"]("[media: b.png (image/png, 2 B)]")
-        assert bot._vision_inbox["!r:test"] == [
+    async def test_default_deposit_appends_per_room_and_isolates(self, tmp_path):
+        agent = _bare_agent(tmp_path)
+        await agent._vision_deposit("!r:test", "[media: a.jpg (image/jpeg, 1 B)]")
+        await agent._vision_deposit("!r:test", "[media: b.png (image/png, 2 B)]")
+        assert agent._vision_inbox["!r:test"] == [
             "[media: a.jpg (image/jpeg, 1 B)]",
             "[media: b.png (image/png, 2 B)]",
         ]
         # A different room is isolated
-        assert bot._vision_inbox.get("!other:test") in (None, [])
+        await agent._vision_deposit("!other:test", "[media: c.gif (image/gif, 3 B)]")
+        assert agent._vision_inbox["!other:test"] == ["[media: c.gif (image/gif, 3 B)]"]
+        assert len(agent._vision_inbox["!r:test"]) == 2
+
+    def test_reset_room_clears_inbox(self, tmp_path):
+        """Umbral path: reset_room drops the room's staged tags (closes WS2
+        residual gap #4 — the stale-tag leak across context rotation)."""
+        agent = _bare_agent(tmp_path)
+        agent._vision_inbox["!r:test"] = ["[media: a.jpg (image/jpeg, 1 B)]"]
+        agent._vision_inbox["!other:test"] = ["[media: b.png (image/png, 2 B)]"]
+        agent.reset_room("!r:test")
+        assert agent._vision_inbox.get("!r:test") in (None, [])
+        # Other rooms' staged tags survive
+        assert agent._vision_inbox["!other:test"] == ["[media: b.png (image/png, 2 B)]"]
+
+
+# --- log_vision_injection seam (kdsn.279): observability, never gating ---
+
+
+class TestLogVisionInjection:
+    """The optional `log_vision_injection(room_id, framed)` callback is how
+    the transport layer observes injections (JSONL source="view_image" + room
+    notice). build_callbacks wires it (15th key) so interactive AND
+    heartbeat/umbral/CLI turns all log. Unlike the reminder I1 durability
+    gate, injection is NEVER gated on logging: absent or raising, the image
+    still lands in context. Accepted consequence of a logging failure: live
+    context and JSONL diverge."""
+
+    async def _run_vision_turn(self, tmp_path, cbs, final="seen"):
+        rel = _make_image(tmp_path)
+        (tmp_path / "tools").mkdir(exist_ok=True)
+        (tmp_path / "tools" / "view_image.toml").write_text("")
+        config = _make_config(tmp_path)
+        tc = ToolCall(id="tc1", name="view_image", input={"path": rel})
+        with patch("openalph.agent.stream") as mock_stream, \
+             patch("openalph.agent.assemble_prompt", return_value="system"):
+            mock_stream.side_effect = _stream_tool_then_text([tc], final)
+            agent = Agent(config)
+            result = await agent.handle_input("look", callbacks=cbs)
+        return agent, result, rel
 
     @pytest.mark.asyncio
-    async def test_drain_frames_logs_and_pops(self):
-        bot = self._bare_bot()
-        cbs = bot._make_vision_callbacks("!r:test")
-        tags = ["[media: a.jpg (image/jpeg, 1 B)]", "[media: b.png (image/png, 2 B)]"]
-        for t in tags:
-            await cbs["vision_deposit"](t)
+    async def test_log_callback_receives_room_and_framed(self, tmp_path):
+        spy = AsyncMock()
+        agent, _, rel = await self._run_vision_turn(
+            tmp_path, _loop_callbacks(log_vision_injection=spy))
+        spy.assert_awaited_once()
+        args = spy.await_args.args
+        assert args[0] == "_default"  # the loop room
+        framed = args[1]
+        assert framed.startswith("[view_image tool output — 1 image(s)")
+        assert f"[media: {rel} (image/jpeg," in framed
 
-        framed = await cbs["drain_vision"]()
-        assert framed == frame_vision_batch(tags)
-        assert "[view_image tool output" in framed
-        # ONE JSONL entry, role=user, source=view_image, tag text stored
+    @pytest.mark.asyncio
+    async def test_injection_proceeds_without_log_callback(self, tmp_path):
+        """No log_vision_injection key: injection still happens — the seam is
+        observability-only, never a gate."""
+        agent, result, _ = await self._run_vision_turn(tmp_path, _loop_callbacks())
+        assert result == "seen"
+        injected = [m for m in agent.history("_default")
+                    if m["role"] == "user" and isinstance(m["content"], list)]
+        assert len(injected) == 1
+
+    @pytest.mark.asyncio
+    async def test_raising_log_callback_does_not_break_turn(self, tmp_path):
+        """A failing log_vision_injection must not break the turn or lose the
+        injection (fail-soft, mirroring the old drain's try/except)."""
+        spy = AsyncMock(side_effect=RuntimeError("log backend down"))
+        agent, result, _ = await self._run_vision_turn(
+            tmp_path, _loop_callbacks(log_vision_injection=spy))
+        assert result == "seen"
+        injected = [m for m in agent.history("_default")
+                    if m["role"] == "user" and isinstance(m["content"], list)]
+        assert len(injected) == 1
+
+    @pytest.mark.asyncio
+    async def test_build_callbacks_seam_writes_jsonl_headless(self, tmp_path):
+        """build_callbacks' log_vision_injection (15th key) writes the JSONL
+        entry via HeadlessSinks (the CLI shape): role=user,
+        source="view_image", content == the framed tag text (pre-expansion —
+        rehydration degrades to plain text)."""
+        from openalph.callbacks import build_callbacks, HeadlessSinks
+        from openalph.session import SessionLog
+        sl = SessionLog(workspace=tmp_path, agent_user_id="@agent:x")
+        sinks = HeadlessSinks(session_log=sl, agent_user_id="@agent:x")
+        agent = MagicMock()
+        cb = build_callbacks(agent, "!r:x", sinks, turn_source=None,
+                             session_log=sl)
+        assert callable(cb.get("log_vision_injection"))
+        framed = frame_vision_batch(["[media: a.jpg (image/jpeg, 104 B)]"])
+        await cb["log_vision_injection"]("!r:x", framed)
+        raw = sl.read("!r:x")
+        assert len(raw) == 1
+        assert raw[0]["role"] == "user"
+        assert raw[0]["source"] == "view_image"
+        assert raw[0]["content"] == framed
+
+    @pytest.mark.asyncio
+    async def test_matrix_sinks_seam_writes_jsonl_and_notice(self):
+        """MatrixSinks.log_vision_injection: ONE JSONL entry (role=user,
+        source="view_image", framed tag text, sender=the bot's user_id) plus
+        a best-effort 👁 room notice via the bot's plain send_notice."""
+        from openalph.callbacks import MatrixSinks
+        bot = MagicMock()
+        bot.config.user_id = "@merry:test"
+        bot.session_log = MagicMock()
+        bot.send_notice = AsyncMock()
+        sinks = MatrixSinks(bot, "!r:x")
+        tags = ["[media: a.jpg (image/jpeg, 1 B)]", "[media: b.png (image/png, 2 B)]"]
+        framed = frame_vision_batch(tags)
+        await sinks.log_vision_injection("!r:x", framed)
+        # ONE JSONL entry with the v1 field contract
         assert bot.session_log.append.call_count == 1
         _, kwargs = bot.session_log.append.call_args
         assert kwargs.get("role") == "user"
+        assert kwargs.get("sender") == "@merry:test"
+        assert kwargs.get("room") == "!r:x"
         assert kwargs.get("source") == "view_image"
         assert kwargs.get("content") == framed
-        # Inbox drained; second drain is empty and logs nothing
-        assert bot._vision_inbox.get("!r:test") in (None, [])
-        assert await cbs["drain_vision"]() == ""
-        assert bot.session_log.append.call_count == 1
+        # Room notice fired (mentions view_image + the image count)
+        bot.send_notice.assert_awaited_once()
+        notice_args = bot.send_notice.await_args.args
+        assert notice_args[0] == "!r:x"
+        assert "view_image" in notice_args[1]
+        assert "2" in notice_args[1]
 
     @pytest.mark.asyncio
-    async def test_drain_without_session_log_still_frames(self):
-        """No session_log handle (tests/CLI) -> drain still returns the frame."""
-        bot = self._bare_bot()
+    async def test_matrix_sinks_seam_tolerates_missing_session_log(self):
+        """No session_log handle -> no crash, notice still attempted."""
+        from openalph.callbacks import MatrixSinks
+        bot = MagicMock()
+        bot.config.user_id = "@merry:test"
         bot.session_log = None
-        cbs = bot._make_vision_callbacks("!r:test")
-        await cbs["vision_deposit"]("[media: a.jpg (image/jpeg, 1 B)]")
-        framed = await cbs["drain_vision"]()
-        assert "[media: a.jpg" in framed
+        bot.send_notice = AsyncMock()
+        sinks = MatrixSinks(bot, "!r:x")
+        framed = frame_vision_batch(["[media: a.jpg (image/jpeg, 1 B)]"])
+        await sinks.log_vision_injection("!r:x", framed)  # must not raise
+        bot.send_notice.assert_awaited_once()
+
+
+# --- JSONL persistence (spec 4.3.5) ---
 
 
 class TestViewImageJSONL:
@@ -653,12 +850,13 @@ class TestInjectedMessageWireFormat:
         assert "data:image/jpeg;base64,AAAA" in flat
 
 
-# --- Subagent drain (spec 4.4, 5.11) ---
+# --- Subagent drain (spec 4.4, 5.11 — UNCHANGED by kdsn.279) ---
 
 
 class TestSubagentVisionDrain:
-    """Subagents get a per-sub vision inbox in v1: a sub's view_image call
-    lands in the SUB's context (never the parent's)."""
+    """Subagents get a per-sub vision inbox: a sub's view_image call lands in
+    the SUB's context (never the parent's). Already Matrix-free — this is the
+    pattern kdsn.279 ported to the main agent loop."""
 
     def _tools(self):
         return [ToolDef(

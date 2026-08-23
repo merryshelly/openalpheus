@@ -154,10 +154,11 @@ class TestHeadlessSinks:
         assert HeadlessSinks is not None
 
     def test_satisfies_comms_sinks_protocol(self):
-        """HeadlessSinks has all 6 CommsSinks methods."""
+        """HeadlessSinks has all 7 CommsSinks methods (7th: log_vision_injection, kdsn.279)."""
         from openalph.callbacks import HeadlessSinks, CommsSinks
         expected = {"send_notice", "log_reminder", "send_media",
-                    "on_redaction", "on_keepalive_miss", "on_degenerate"}
+                    "on_redaction", "on_keepalive_miss", "on_degenerate",
+                    "log_vision_injection"}
         for method in expected:
             assert hasattr(HeadlessSinks, method), f"HeadlessSinks missing {method}"
 
@@ -206,6 +207,33 @@ class TestHeadlessSinks:
         await sinks.log_reminder("!room:server", reminder)
         captured = capsys.readouterr()
         assert "reminder text" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_log_vision_injection_writes_to_session_log(self, tmp_path, capsys):
+        """kdsn.279: log_vision_injection appends source='view_image' with the
+        framed tag text (pre-expansion) + prints a notice to stderr."""
+        from openalph.callbacks import HeadlessSinks
+        sl = SessionLog(tmp_path, "@bot:server")
+        sinks = HeadlessSinks(session_log=sl, agent_user_id="@bot:server")
+        framed = ("[view_image tool output — 1 image(s): a.jpg]\n"
+                  "[media: a.jpg (image/jpeg, 104 B)]")
+        await sinks.log_vision_injection("!room:server", framed)
+        entries = sl.read("!room:server")
+        assert len(entries) == 1
+        assert entries[0]["role"] == "user"
+        assert entries[0]["source"] == "view_image"
+        assert entries[0]["content"] == framed
+        captured = capsys.readouterr()
+        assert "view_image" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_log_vision_injection_no_session_log_does_not_crash(self, capsys):
+        """log_vision_injection without a session_log just prints (no crash)."""
+        from openalph.callbacks import HeadlessSinks
+        sinks = HeadlessSinks()
+        await sinks.log_vision_injection("_cli", "[view_image tool output — 1 image(s): a.jpg]")
+        captured = capsys.readouterr()
+        assert "view_image" in captured.err
 
     @pytest.mark.asyncio
     async def test_on_redaction_prints_to_stderr(self, capsys):

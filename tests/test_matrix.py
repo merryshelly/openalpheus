@@ -254,6 +254,34 @@ class TestCommands:
         agent.handle_input.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_stop_command_clears_agent_vision_inbox(self):
+        """kdsn.279: /stop pops the room's AGENT-side vision inbox (the bot no
+        longer owns one) so staged [media:] tags can't leak into the next turn."""
+        config = make_matrix_config(user_id="@merry:matrix.local")
+        agent = MagicMock()
+        agent.cancel = MagicMock()
+        agent._vision_inbox = {
+            "!test:matrix.local": ["[media: a.jpg (image/jpeg, 1 B)]"],
+            "!other:matrix.local": ["[media: b.png (image/png, 2 B)]"],
+        }
+
+        bot = make_bot(agent, config, _cancel_current=AsyncMock())
+
+        event = make_room_message("@sb:matrix.local", "/stop")
+        room = MagicMock()
+        room.room_id = "!test:matrix.local"
+
+        await bot._handle_room_message(room, event)
+        # Drain background tasks fired by handler
+        if hasattr(bot, "_background_tasks"):
+            await asyncio.gather(*bot._background_tasks)
+
+        bot._cancel_current.assert_awaited_once()
+        # The halted room's staged tags are gone; other rooms are untouched.
+        assert agent._vision_inbox.get("!test:matrix.local") in (None, [])
+        assert agent._vision_inbox["!other:matrix.local"] == ["[media: b.png (image/png, 2 B)]"]
+
+    @pytest.mark.asyncio
     async def test_status_command_posts_status(self):
         """/status posts agent status without going through agent loop."""
         config = make_matrix_config(user_id="@merry:matrix.local")

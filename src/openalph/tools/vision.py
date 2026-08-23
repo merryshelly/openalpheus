@@ -4,12 +4,17 @@ injection (workspace-kdsn.276).
 ``view_image(path)`` lets an agent attach a workspace image to its own
 context. The tool validates (containment, existence, image MIME from
 extension, size cap, model vision capability) and deposits a
-``[media: path (mime, size)]`` tag into a per-room inbox via a
-``vision_deposit`` callback. At the top of the NEXT tool-loop iteration a
-``drain_vision`` callback returns ONE framed user message batching all queued
-tags (framing by :func:`frame_vision_batch`); agent.py expands it via the
-EXISTING ``_build_user_content`` and appends it after ALL tool results of the
-pending batch.
+``[media: path (mime, size)]`` tag into the AGENT's per-room inbox
+(``Agent._vision_inbox``) via a ``vision_deposit`` callback — wired by default
+at agent.py tool dispatch (setdefault; callers may override), with
+tools/subagent.py wiring its own per-sub deposit. At the top of the NEXT
+tool-loop iteration the agent drains its OWN inbox (there is no drain
+callback — kdsn.279 removed MatrixBot's ``_vision_inbox`` +
+``_make_vision_callbacks``), frames ALL queued tags into ONE user message
+(:func:`frame_vision_batch`), expands it via the EXISTING
+``_build_user_content``, and appends it after ALL tool results of the pending
+batch. The optional ``log_vision_injection(room_id, framed)`` callback is an
+observability seam only (JSONL + notice) — injection is never gated on it.
 
 Provider-universal by design: images ride user messages, never tool results
 (vllm#43203). The image bytes NEVER appear in the tool result — the result is
@@ -76,8 +81,9 @@ async def view_image(
     if not callable(deposit):
         return _err(
             "view_image is not available in this runtime context: no "
-            "vision_deposit callback is wired (interactive Matrix turns and "
-            "sub-agent runs only in v1). The image cannot be staged."
+            "vision_deposit callback is wired (the agent tool loop wires one "
+            "by default since kdsn.279; this error means the tool was invoked "
+            "outside a wired runtime). The image cannot be staged."
         )
 
     # 2. Path safety — reject absolute paths, traversal, framing chars, and
