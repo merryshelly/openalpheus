@@ -196,6 +196,88 @@ class TestSyntheticEffortMapping:
         assert "reasoning_effort" not in kw["extra_body"]
 
 
+class TestSyntheticQwenEffortOverride:
+    """Per-model effort override for hf:qwen/qwen3.8 (kdsn.281 refinement,
+    2026-08-24). The Qwen3.8 model card's native reasoning_effort vocabulary
+    is xhigh/medium/low (no off/high/max), and probe7 measured ALL six OA
+    levels accepted at the wire on hf:Qwen/Qwen3.8-27B — including xhigh
+    (distinguished, heavier reasoning than high) and max (200 here, unlike
+    the GLM backend's 400). So the default synthetic collapse xhigh/max->high
+    discards real intent on this model. Override map: off->none, low/medium/
+    high 1:1, xhigh->xhigh 1:1 (card-native, measured), max->xhigh + warn-once
+    (max is not card-native; map to the model's ceiling)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_synthetic_warned(self):
+        provider_module._SYNTHETIC_EFFORT_WARNED.clear()
+        yield
+        provider_module._SYNTHETIC_EFFORT_WARNED.clear()
+
+    def _args(self, level):
+        return dict(
+            api_model="hf:Qwen/Qwen3.8-27B",
+            system="sys",
+            provider_messages=[{"role": "user", "content": "hi"}],
+            provider_tools=None,
+            max_tokens=1024,
+            thinking_level=level,
+            quirks=[],
+            provider_key="synthetic",
+        )
+
+    def _effort(self, kw):
+        return kw.get("extra_body", {}).get("reasoning_effort")
+
+    def test_off_maps_to_none(self):
+        assert self._effort(_build_openai_kwargs(**self._args("off"))) == "none"
+
+    @pytest.mark.parametrize("level", ["low", "medium", "high"])
+    def test_low_medium_high_passthrough(self, level):
+        assert self._effort(_build_openai_kwargs(**self._args(level))) == level
+
+    def test_xhigh_passthrough_no_warning(self, caplog):
+        """The distinguishing case: xhigh survives 1:1 for qwen3.8 (it would
+        remap+warn under the default synthetic map)."""
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(**self._args("xhigh"))
+        assert self._effort(kw) == "xhigh"
+        warns = [r for r in caplog.records if "reasoning_effort" in r.message]
+        assert warns == [], f"unexpected remap warning: {[r.message for r in warns]}"
+
+    def test_max_maps_to_xhigh_with_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(**self._args("max"))
+        assert self._effort(kw) == "xhigh"
+        assert any(
+            "max" in r.message and "reasoning_effort" in r.message
+            for r in caplog.records
+        ), f"expected remap warning, got: {[r.message for r in caplog.records]}"
+
+    def test_max_remap_warns_once(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                _build_openai_kwargs(**self._args("max"))
+        warns = [r for r in caplog.records
+                 if "reasoning_effort" in r.message and r.levelno >= logging.WARNING]
+        assert len(warns) == 1
+
+    def test_fragment_is_case_insensitive(self):
+        """Live ID is 'hf:Qwen/Qwen3.8-27B' — fragment matching lowercases."""
+        kw = _build_openai_kwargs(**{**self._args("xhigh"),
+                                     "api_model": "hf:qwen/qwen3.8-27b"})
+        assert self._effort(kw) == "xhigh"
+
+    def test_other_synthetic_models_still_use_default_map(self, caplog):
+        """Regression guard: kimi-k3 on synthetic keeps the default collapse."""
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(
+                **{**self._args("xhigh"),
+                   "api_model": "hf:moonshotai/Kimi-K3"})
+        assert self._effort(kw) == "high"
+        assert any("xhigh" in r.message and "reasoning_effort" in r.message
+                   for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # C3 — capabilities + sampling fragments for hf:-namespaced Synthetic IDs
 # ---------------------------------------------------------------------------

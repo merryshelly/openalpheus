@@ -361,11 +361,37 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
 # (one warning per unknown model string per process, never per message).
 _VISION_WARNED: set[str] = set()
 
-# Synthetic thinking levels already WARNed about for the xhigh/max -> high
-# reasoning_effort remap (one warning per remapped level per process, never
-# per message). House convention mirrors _VISION_WARNED /
-# _warned_unpriced_anthropic.
-_SYNTHETIC_EFFORT_WARNED: set[str] = set()
+# Synthetic reasoning_effort remaps already WARNed about (one warning per
+# (override-fragment, level) pair per process, never per message — the
+# fragment slot is None for the default map, so qwen3.8's max -> xhigh and
+# the default max -> high are DISTINCT warnings). House convention mirrors
+# _VISION_WARNED / _warned_unpriced_anthropic. Tests only clear this set and
+# assert via caplog; its key shape is internal.
+_SYNTHETIC_EFFORT_WARNED: set[tuple[str | None, str]] = set()
+
+# Per-model reasoning_effort overrides for the Synthetic provider (kdsn.281
+# refinement, 2026-08-24). Fragment-keyed, case-insensitive substring match
+# on api_model, first-match-wins — house convention per _MODEL_CAPABILITIES /
+# _SAMPLING_PROFILES. When a fragment matches, its map REPLACES the default
+# synthetic map for that call.
+#
+# hf:qwen/qwen3.8 (synthetic-probe7, 2026-08-24): ALL SIX levels return 200
+# at the wire on hf:Qwen/Qwen3.8-27B — xhigh is distinguished (measurably
+# heavier reasoning than high) and max is accepted here (unlike the GLM
+# backend's 400). The model card's native vocabulary is xhigh/medium/low, so
+# the default xhigh/max -> high collapse discards real intent on this model:
+# xhigh passes through 1:1 (card-native, measured), and max — NOT card-native
+# — ceiling-maps to xhigh with a warn-once.
+_SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
+    ("hf:qwen/qwen3.8", {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "xhigh",
+    }),
+]
 
 
 def model_supports_vision(api_model: str, config) -> bool:
@@ -1450,19 +1476,46 @@ def _build_openai_kwargs(
         # class). So ALWAYS send it explicitly: OA "off" -> "none",
         # low/medium/high 1:1, and the unsupported xhigh/max collapse to "high"
         # with a warn-once (operator intent is lossy, so surface it).
-        _syn_effort = {
-            "off": "none",
-            "low": "low",
-            "medium": "medium",
-            "high": "high",
-            "xhigh": "high",
-            "max": "high",
-        }.get(thinking_level, "high")
-        if thinking_level in ("xhigh", "max") and thinking_level not in _SYNTHETIC_EFFORT_WARNED:
-            _SYNTHETIC_EFFORT_WARNED.add(thinking_level)
+        #
+        # Per-model overrides (kdsn.281 refinement, synthetic-probe7
+        # 2026-08-24): qwen3.8 accepts ALL SIX levels at the wire with xhigh
+        # distinguished (heavier reasoning than high), so a matching fragment's
+        # map replaces the default. max is not card-native there -> ceiling-map
+        # to xhigh. Lookup stays INSIDE this branch — other providers never
+        # see it.
+        _syn_map = None
+        _syn_frag = None
+        _model_lc = api_model.lower()
+        for _frag, _map in _SYNTHETIC_EFFORT_OVERRIDES:
+            if _frag in _model_lc:
+                _syn_map, _syn_frag = _map, _frag
+                break
+        if _syn_map is None:
+            _syn_map = {
+                "off": "none",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "high",
+                "max": "high",
+            }
+        _syn_effort = _syn_map.get(thinking_level, "high")
+        # Warn-once per (map, level) when a level is remapped DOWNWARD in tier
+        # (xhigh->high, max->high, max->xhigh). 1:1 mappings never warn —
+        # including override xhigh->xhigh — and off->none is a disable-alias,
+        # not a tier drop. The (fragment, level) key keeps default and override
+        # remaps of the same level from swallowing each other's warning.
+        # _TIER spans both OA levels and wire values (max is an OA level that
+        # Fireworks passes through 1:1, ranked above xhigh; "off" normalizes
+        # to the wire value "none").
+        _TIER = {"none": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
+        _req_tier = _TIER.get("none" if thinking_level == "off" else thinking_level)
+        if (_req_tier is not None and _TIER.get(_syn_effort, -1) < _req_tier
+                and (_syn_frag, thinking_level) not in _SYNTHETIC_EFFORT_WARNED):
+            _SYNTHETIC_EFFORT_WARNED.add((_syn_frag, thinking_level))
             logger.warning(
                 "Synthetic does not support reasoning_effort=%r; remapping to "
-                "'high' (operator intent is lossy).", thinking_level,
+                "%r (operator intent is lossy).", thinking_level, _syn_effort,
             )
         extra_body["reasoning_effort"] = _syn_effort
     elif thinking_level == "off" and "deepseek-v4-flash" in api_model.lower():
