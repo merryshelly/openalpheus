@@ -1696,11 +1696,13 @@ async def stream(
             cache_ttl=cache_ttl,
         )
         
+        _stream_count = 0
         try:
             async with client.messages.stream(**api_kwargs) as stream:
                 accumulated_text = ""
                 
                 async for event in stream:
+                    _stream_count += 1
                     event_type = getattr(event, "type", None)
                     
                     if event_type == "text":
@@ -1757,6 +1759,21 @@ async def stream(
             raise ProviderError("Provider request timed out") from e
         except anthropic.APIConnectionError as e:
             raise ProviderError("Provider unreachable — connection failed") from e
+        except httpx.TimeoutException as e:
+            if _stream_count == 0:
+                raise ProviderError("Provider timed out before streaming any data") from e
+            raise ProviderError(
+                f"Provider timed out mid-stream after {_stream_count} chunk(s)"
+            ) from e
+        except httpx.HTTPError as e:
+            _exc_name = type(e).__name__
+            if _stream_count == 0:
+                raise ProviderError(
+                    f"Provider transport error ({_exc_name}) before streaming any data"
+                ) from e
+            raise ProviderError(
+                f"Provider transport error mid-stream after {_stream_count} chunk(s) ({_exc_name})"
+            ) from e
     
     elif provider_cfg.type == "openai":
         client = _get_client(provider_cfg)
@@ -1798,6 +1815,7 @@ async def stream(
             api_kwargs["user"] = affinity
             api_kwargs["extra_headers"] = {"x-session-affinity": affinity}
 
+        _stream_count = 0
         try:
             response = await client.chat.completions.create(**api_kwargs)
             
@@ -1811,6 +1829,7 @@ async def stream(
             tool_call_accumulators: dict[int, dict] = {}
             
             async for chunk in response:
+                _stream_count += 1
                 # Capture generation ID from first chunk
                 if not generation_id and getattr(chunk, "id", None):
                     generation_id = chunk.id
@@ -1969,6 +1988,21 @@ async def stream(
             raise ProviderError("Provider request timed out") from e
         except openai.APIConnectionError as e:
             raise ProviderError("Provider unreachable — connection failed") from e
+        except httpx.TimeoutException as e:
+            if _stream_count == 0:
+                raise ProviderError("Provider timed out before streaming any data") from e
+            raise ProviderError(
+                f"Provider timed out mid-stream after {_stream_count} chunk(s)"
+            ) from e
+        except httpx.HTTPError as e:
+            _exc_name = type(e).__name__
+            if _stream_count == 0:
+                raise ProviderError(
+                    f"Provider transport error ({_exc_name}) before streaming any data"
+                ) from e
+            raise ProviderError(
+                f"Provider transport error mid-stream after {_stream_count} chunk(s) ({_exc_name})"
+            ) from e
     
     else:
         raise ValueError(f"Unsupported provider type: {provider_cfg.type}")

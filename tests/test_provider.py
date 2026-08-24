@@ -10,11 +10,14 @@ Response: content (str), model (str), usage (Usage), stop_reason (str)
 Usage: input_tokens, output_tokens, cache_read_tokens (optional), cache_creation_tokens (optional)
 """
 
+import asyncio
+
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.provider import complete, stream, Response, Usage, ThinkingBlock, StreamEvent, _convert_messages_for_anthropic, _build_openai_kwargs
+from openalph.provider import ProviderError, complete, stream, Response, Usage, ThinkingBlock, _convert_messages_for_anthropic, _build_openai_kwargs
 
 
 def make_provider(key="anthropic", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
@@ -1134,3 +1137,195 @@ class TestOpenAICacheNormalization:
         assert response.usage.cache_read_tokens == 120
         assert response.usage.cache_creation_tokens == 0
         assert response.usage.output_tokens == 60
+
+
+# --- Mid-stream transport errors (kdsn.287) ---
+
+
+class _RaisingOpenAIStream:
+    """Mock openai stream that yields `chunks` then raises `exc` mid-iteration.
+
+    The openai SDK translates httpx exceptions only in the request phase
+    (_base_client.py); during stream iteration (_streaming.py) raw httpx
+    exceptions escape unwrapped.
+    """
+
+    def __init__(self, chunks, exc):
+        self._chunks = chunks
+        self._exc = exc
+
+    def __aiter__(self):
+        return self._impl()
+
+    async def _impl(self):
+        for chunk in self._chunks:
+            yield chunk
+        raise self._exc
+
+
+class _RaisingAnthropicStream:
+    """Mock anthropic AsyncMessageStream that yields `events` then raises `exc`."""
+
+    def __init__(self, events, exc):
+        self._events = events
+        self._exc = exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def __aiter__(self):
+        return self._impl()
+
+    async def _impl(self):
+        for event in self._events:
+            yield event
+        raise self._exc
+
+    async def get_final_message(self):  # pragma: no cover - unreachable after raise
+        return _anthropic_final_message("unreachable")
+
+
+class TestMidStreamTransportErrors:
+    """kdsn.287: raw httpx exceptions raised during stream iteration must be
+    wrapped as ProviderError, distinguishing zero-data stall from mid-stream
+    interruption. Spec: memory/projects/openalph/specs/kdsn.287-midstream-transport-errors-spec.md
+    """
+
+    def _openai_config(self):
+        return make_config(
+            providers={
+                "synthetic": make_provider(
+                    key="synthetic", type="openai", api_key="sk-test",
+                    base_url="https://api.synthetic.new/openai/v1",
+                )
+            },
+            default_model="synthetic/hf:moonshotai/Kimi-K3",
+        )
+
+    def _anthropic_config(self):
+        return make_config(
+            providers={"anthropic": make_provider(key="anthropic", type="anthropic", api_key="sk-test")},
+            default_model="anthropic/claude-sonnet-4-20250514",
+        )
+
+    @pytest.mark.asyncio
+    async def test_openai_readtimeout_zero_chunks(self):
+        config = self._openai_config()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=_RaisingOpenAIStream([], httpx.ReadTimeout("simulated stall"))
+            )
+            with pytest.raises(ProviderError, match="timed out before streaming any data"):
+                await complete(config=config, system="Test",
+                               messages=[{"role": "user", "content": "Hi"}])
+
+    @pytest.mark.asyncio
+    async def test_openai_readtimeout_after_chunks(self):
+        config = self._openai_config()
+        chunks = mock_openai_stream_chunks("partial")[:1]  # text chunk only, no usage chunk
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=_RaisingOpenAIStream(chunks, httpx.ReadTimeout("simulated stall"))
+            )
+            events = []
+            with pytest.raises(ProviderError, match=r"timed out mid-stream after 1 chunk\(s\)"):
+                async for event in stream(config=config, system="Test",
+                                          messages=[{"role": "user", "content": "Hi"}]):
+                    events.append(event)
+            # Partial output reaches the caller; no synthetic done event on failure.
+            assert [e.type for e in events] == ["text"]
+
+    @pytest.mark.asyncio
+    async def test_openai_remote_protocol_error_zero_chunks(self):
+        config = self._openai_config()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=_RaisingOpenAIStream(
+                    [], httpx.RemoteProtocolError("peer closed connection"))
+            )
+            with pytest.raises(
+                ProviderError,
+                match=r"transport error \(RemoteProtocolError\) before streaming any data",
+            ):
+                await complete(config=config, system="Test",
+                               messages=[{"role": "user", "content": "Hi"}])
+
+    @pytest.mark.asyncio
+    async def test_anthropic_readtimeout_after_event(self):
+        config = self._anthropic_config()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.messages.stream.return_value = _RaisingAnthropicStream(
+                [_anthropic_text("partial")], httpx.ReadTimeout("simulated stall"))
+            with pytest.raises(ProviderError, match=r"timed out mid-stream after 1 chunk\(s\)"):
+                await complete(config=config, system="Test",
+                               messages=[{"role": "user", "content": "Hi"}])
+
+    @pytest.mark.asyncio
+    async def test_anthropic_remote_protocol_error_zero_events(self):
+        config = self._anthropic_config()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.messages.stream.return_value = _RaisingAnthropicStream(
+                [], httpx.RemoteProtocolError("peer closed connection"))
+            with pytest.raises(
+                ProviderError,
+                match=r"transport error \(RemoteProtocolError\) before streaming any data",
+            ):
+                await complete(config=config, system="Test",
+                               messages=[{"role": "user", "content": "Hi"}])
+
+    # --- Guards (green pre- and post-fix) ---
+
+    @pytest.mark.asyncio
+    async def test_openai_request_phase_timeout_still_mapped(self):
+        """SDK-wrapped request-phase errors keep their existing mapping."""
+        import openai as openai_sdk
+        config = self._openai_config()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                side_effect=openai_sdk.APITimeoutError(
+                    httpx.Request("POST", "https://api.synthetic.new/openai/v1/chat/completions"))
+            )
+            with pytest.raises(ProviderError, match="Provider request timed out"):
+                await complete(config=config, system="Test",
+                               messages=[{"role": "user", "content": "Hi"}])
+
+    @pytest.mark.asyncio
+    async def test_openai_cancelled_error_not_swallowed(self):
+        """Cancellation must propagate untouched — never wrapped as ProviderError
+        (the stall watchdog and /stop depend on it)."""
+        config = self._openai_config()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.chat.completions.create = AsyncMock(
+                return_value=_RaisingOpenAIStream([], asyncio.CancelledError()))
+            with pytest.raises(asyncio.CancelledError):
+                await complete(config=config, system="Test",
+                               messages=[{"role": "user", "content": "Hi"}])
+
+    @pytest.mark.asyncio
+    async def test_anthropic_cancelled_error_not_swallowed(self):
+        config = self._anthropic_config()
+        with patch("openalph.provider._get_client") as mock_gc:
+            client = MagicMock()
+            mock_gc.return_value = client
+            client.messages.stream.return_value = _RaisingAnthropicStream(
+                [], asyncio.CancelledError())
+            with pytest.raises(asyncio.CancelledError):
+                await complete(config=config, system="Test",
+                               messages=[{"role": "user", "content": "Hi"}])
