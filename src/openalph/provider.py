@@ -131,10 +131,17 @@ def _get_client(provider: ProviderConfig):
     """Get or create a cached provider client."""
     timeout = getattr(provider, "timeout", 600.0)
     if provider.type == "anthropic":
-        key = ("anthropic", provider.api_key, None, timeout)
+        # Honor base_url for anthropic-type providers so Anthropic-compatible
+        # gateways (e.g. api.synthetic.new/anthropic) are reachable; otherwise
+        # the SDK always dials api.anthropic.com. Keying the cache on base_url
+        # keeps a gateway client distinct from the default-endpoint client.
+        # The key-redirect consideration is accepted because agent configs are
+        # root-owned. None stays the effective default (SDK default endpoint).
+        key = ("anthropic", provider.api_key, provider.base_url, timeout)
         if key not in _client_cache:
             _client_cache[key] = anthropic.AsyncAnthropic(
                 api_key=provider.api_key,
+                base_url=provider.base_url,
                 timeout=httpx.Timeout(timeout, connect=10.0),
                 max_retries=_MAX_SDK_RETRIES,
             )
@@ -321,6 +328,16 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("opus-4-8",  1_048_576, 128_000, True),
     ("opus-5",    1_048_576, 128_000, True),
     ("fable",     1_048_576, 128_000, True),
+    # Synthetic (kdsn.281) — hf:-namespaced open-weight IDs. Windows are from
+    # Synthetic's live GET /openai/v1/models (2026-08-23) and are SMALLER than
+    # Fireworks for the same weights (Kimi-K3: 512K vs 1M). These rows must sit
+    # BEFORE the generic rows below: first-match-wins, and "hf:moonshotai/
+    # kimi-k3" contains the generic fragment "kimi-k3".
+    ("hf:moonshotai/kimi-k3",            524288, None, True),
+    ("hf:zai-org/glm-5.2",               524288, None, False),
+    ("hf:zai-org/glm-4.7-flash",         196608, None, False),
+    ("hf:openai/gpt-oss",                131072, None, False),
+    ("hf:nvidia/nvidia-nemotron-3-super", 262144, None, False),
     # Fireworks / open
     ("glm-5p2",   1_048_576, None, False),
     ("kimi-k3",     1_048_576, None, True),
@@ -343,6 +360,12 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
 # Models already WARNed about by model_supports_vision's fail-closed branch
 # (one warning per unknown model string per process, never per message).
 _VISION_WARNED: set[str] = set()
+
+# Synthetic thinking levels already WARNed about for the xhigh/max -> high
+# reasoning_effort remap (one warning per remapped level per process, never
+# per message). House convention mirrors _VISION_WARNED /
+# _warned_unpriced_anthropic.
+_SYNTHETIC_EFFORT_WARNED: set[str] = set()
 
 
 def model_supports_vision(api_model: str, config) -> bool:
@@ -457,6 +480,12 @@ _DEFAULT_SAMPLING_PROFILE = SamplingProfile()
 # !pySmWhiuIGZElv1Wul): temp 0.80 without a repeat penalty is a known
 # mode-collapse setup for long structured/reasoning transcripts.
 _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
+    # Synthetic hf:-namespaced pins (kdsn.281). "hf:zai-org/glm-5.2" does NOT
+    # substring-match the Fireworks "glm-5p2" fragment (dot vs p), so synthetic
+    # IDs need their own explicit pins — the kdsn.241.3 no-penalty invariant
+    # must not depend on default-profile accident.
+    ("hf:moonshotai/kimi-k3", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    ("hf:zai-org/glm-5.2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k3",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
@@ -1412,6 +1441,30 @@ def _build_openai_kwargs(
         # 1:1 mapping, OA "off" -> "none". Always sent explicitly so the server
         # default (medium) can never silently override operator intent again.
         extra_body["reasoning_effort"] = "none" if thinking_level == "off" else thinking_level
+    elif provider_key == "synthetic":
+        # kdsn.281: Synthetic takes TOP-LEVEL reasoning_effort (like Fireworks),
+        # never OpenRouter's nested reasoning.effort. Probed 2026-08-23
+        # (synthetic-probe4/5/6): none/low/medium/high -> 200; "max" -> 400
+        # from the inference backend; literal "off" -> 400 from the gateway;
+        # an omitted param silently defaults to reasoning-ON (kdsn.271 bug
+        # class). So ALWAYS send it explicitly: OA "off" -> "none",
+        # low/medium/high 1:1, and the unsupported xhigh/max collapse to "high"
+        # with a warn-once (operator intent is lossy, so surface it).
+        _syn_effort = {
+            "off": "none",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high",
+            "max": "high",
+        }.get(thinking_level, "high")
+        if thinking_level in ("xhigh", "max") and thinking_level not in _SYNTHETIC_EFFORT_WARNED:
+            _SYNTHETIC_EFFORT_WARNED.add(thinking_level)
+            logger.warning(
+                "Synthetic does not support reasoning_effort=%r; remapping to "
+                "'high' (operator intent is lossy).", thinking_level,
+            )
+        extra_body["reasoning_effort"] = _syn_effort
     elif thinking_level == "off" and "deepseek-v4-flash" in api_model.lower():
         # DSv4 thinks BY DEFAULT (template enable_thinking=true). llama.cpp
         # disables thinking only on TOP-LEVEL reasoning_effort="none" (verified
