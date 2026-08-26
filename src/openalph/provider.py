@@ -344,6 +344,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("kimi-k2p6",   262_144, None, True),
     # Local
     ("deepseek-v4-flash", 1_048_576, None, False),
+    ("qwen38-27b-fp8", 262_144, None, True),   # blackwell SGLang replicas (vision verified 2026-08-26); MUST precede generic "qwen38"
     ("qwen38",      262_144, None, False),
     ("qwen3.8",     262_144, None, True),
     ("qwen3p8",     262_144, None, True),
