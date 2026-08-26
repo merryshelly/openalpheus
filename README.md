@@ -85,7 +85,7 @@ Skills are listed by name in the prompt; the agent reads their content on demand
 
 Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
 
-Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `web_fetch_js`\*\*, `grep`, `glob`, `subagent`, `advisor`, `memory_search`, `send_media`, `view_image`, `context_status`, `todo_write`.
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `web_fetch_js`\*\*, `grep`, `glob`, `subagent`, `advisor`, `memory_search`, `send_media`, `view_image`, `context_status`, `todo_write`, `heartbeat`.
 
 \*`web_search` requires a [Brave Search API key](https://brave.com/search/api/) configured in `workspace/tools/web_search.toml`. Without it, the tool is available but returns an error. `web_fetch` (direct URL fetching) works without any API key.
 

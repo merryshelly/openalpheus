@@ -698,6 +698,48 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         },
         "config": {}
     },
+    "heartbeat": {
+        "description": (
+            "Start, check, or stop this session's per-room heartbeat — an "
+            "automated wake-up timer that fires a turn in this room on an "
+            "interval. Use it to supervise long-running background work "
+            "(builds, deploys, watch-loops) instead of sleep hacks: start a "
+            "heartbeat, keep working or let the room idle, then act on the "
+            "next fire. "
+            "IMPORTANT: Heartbeats persist across process restarts and burn "
+            "tokens on every fire — ALWAYS stop the heartbeat when the "
+            "supervised job completes. Minimum interval is 5 minutes. "
+            "Re-issuing start replaces the existing timer for this room. "
+            "Cannot start while an umbral timer is active in the room. "
+            "IMPORTANT: interval mode only (\"15m\", \"1h\", or seconds as an "
+            "integer) — cron schedules remain operator slash-command territory "
+            "(/heartbeat schedule), as do recurring standing routines. "
+            "NEVER use this for umbrals (context rotation) — that timer is "
+            "operator-only by design. Not available to sub-agents or on the "
+            "headless CLI. "
+            "status reports this room's current entry (interval, next fire, "
+            "directive). stop is idempotent-cheap but errors when nothing is "
+            "active."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action: \"start\", \"stop\", or \"status\""
+                },
+                "interval": {
+                    "description": "Interval for start: a string like \"15m\"/\"1h\"/\"300s\" (case-insensitive) or a positive integer (seconds directly). Minimum 5 minutes."
+                },
+                "directive": {
+                    "type": "string",
+                    "description": "Optional free-text directive (start only), passed verbatim."
+                }
+            },
+            "required": ["action"]
+        },
+        "config": {}
+    },
     "send_media": {
         "description": (
             "Upload and send a file to the current Matrix room. "
@@ -1070,6 +1112,353 @@ async def _execute_todo_write(input: dict, callbacks: dict | None) -> "ToolResul
     result_text = f"Todo list updated ({summary}):\n{list_text}"
 
     return ToolResult(content=result_text, is_error=False)
+
+
+async def _execute_heartbeat_tool(input: dict, callbacks: dict | None) -> "ToolResult":
+    """Execute the built-in heartbeat tool (kdsn.290).
+
+    Lets an agent session manage its own per-room heartbeat timer (start /
+    stop / status). Room scoping ALWAYS comes from ``callbacks["room_id"]``
+    — never from any input key (there is no cross-room surface in v1).
+
+    Guards (all return ``ToolResult(is_error=True)`` without mutating state,
+    never raising):
+      - missing callbacks / None heartbeat manager → transport-unavailable
+        steering (headless/CLI has no timer manager).
+      - sub-agent sentinel room ("__sub__") → refused (no timer semantics).
+      - bad input shapes (non-str action, non-str/non-int interval, non-str
+        directive) → steering.
+      - manager exceptions → caught and sanitized (type name only).
+
+    Reuses ``openalph.heartbeat.parse_interval`` (returns None, never raises)
+    and ``HeartbeatManager._floor`` (300) rather than re-hardcoding literals.
+    Room scoping reads ``callbacks["room_id"]`` via .get() — a missing key
+    yields steering, never a KeyError (R4).
+    """
+    from openalph.heartbeat import (
+        HeartbeatManager,
+        format_interval,
+        parse_interval,
+    )
+
+    # --- Transport / scope guards -----------------------------------------
+    # R4: never bare-subscript the room id. A malformed caller (or a future
+    # callback wiring that omits the key) must get steering, not a KeyError
+    # escaping the tool and killing the turn.
+    room_id = callbacks.get("room_id") if callbacks else None
+    if room_id is None:
+        return ToolResult(
+            content=(
+                "Heartbeat tool unavailable: no room-scoped session context "
+                "(callbacks carry no \"room_id\"); heartbeat timers are "
+                "per-room and cannot be managed without a room context."
+            ),
+            is_error=True,
+        )
+
+    # R3: the sub-agent sentinel refusal is checked BEFORE the transport
+    # guard. Sub-agent tool-call callbacks carry no "heartbeat" key, so under
+    # the previous order they hit the generic transport-unavailable message
+    # instead of the sub-specific refusal the spec pins.
+    if room_id == "__sub__":
+        return ToolResult(
+            content=(
+                "Sub-agents cannot manage heartbeats — heartbeat timers are "
+                "per-room and only the owning session may start/stop them."
+            ),
+            is_error=True,
+        )
+
+    # Headless/CLI wires "heartbeat"=None (and possibly callbacks=None) — all
+    # actions fail clean with steering toward the /heartbeat slash command.
+    hb = callbacks.get("heartbeat") if callbacks else None
+    if hb is None:
+        return ToolResult(
+            content=(
+                "Heartbeats are managed in Matrix rooms via the "
+                "`/heartbeat` slash command — the heartbeat tool is "
+                "unavailable interface (no timer manager wired)."
+            ),
+            is_error=True,
+        )
+
+    # --- Action normalization ---------------------------------------------
+    action_raw = input.get("action")
+    # Lenient: strip + lowercase a STRING action. Non-str (incl. bool) is a
+    # bad shape → reject without coercion (never raise).
+    if not isinstance(action_raw, str):
+        return ToolResult(
+            content=(
+                "Invalid action: action must be a string. "
+                "Valid actions: start, stop, status."
+            ),
+            is_error=True,
+        )
+    action = action_raw.strip().lower()
+
+    um = callbacks.get("umbral")
+    send_notice = callbacks.get("send_notice")
+
+    # =====================================================================
+    # start
+    # =====================================================================
+    if action == "start":
+        # R1 (tool policy): start issued from within the room's OWN fired
+        # heartbeat turn is refused. Re-issue=start replaces the timer, and
+        # replacement cancels the current loop task — the ancestor of the
+        # gather child this call runs in — recreating the cyclic-cancel the
+        # manager-side R1 fix prevents for stop. A deferred-replacement
+        # mechanism ("apply at end of the turn") is out of scope for v1, so
+        # the contract is: interval changes must come from a LATER turn.
+        # The refusal keys on in_own_loop ALONE (re-audit F5): a same-batch
+        # [stop, start] pair inside one fired turn runs as parallel gather
+        # siblings, and the stop sibling removes the room's entry BEFORE
+        # this probe can read it — any additional "entry exists" AND-term
+        # would silently skip the refusal and arm a NEW timer mid-turn,
+        # violating the steering's "the current timer keeps running"
+        # promise. Keying exclusively on the contextvar closes the race:
+        # the mark survives the sibling's bookkeeping removal for the
+        # whole turn.
+        # Checked early, before interval validation: fired turns only enter
+        # here with a complete tool-call input (action is required by the
+        # schema), and a fixed refusal beats a confusing per-field error
+        # sample for a call that could never have succeeded.
+        _in_own_turn = False
+        # getattr defends against contract drift (a mock or partial manager
+        # lacking the helper); a REAL manager always exposes both. Any error
+        # reading state here MUST NOT crash the turn (never-raise rule) —
+        # fall through to the ordinary start path, which has its own
+        # exception hygiene around hb.start.
+        try:
+            _has = getattr(hb, "in_own_loop", None)
+            if _has is not None:
+                _in_own_turn = bool(_has(room_id))
+        except Exception:
+            logger.warning(
+                "in_own_loop probe failed for %s; treating as not-own-turn",
+                room_id,
+                exc_info=True,
+            )
+        if _in_own_turn:
+            return ToolResult(
+                content=(
+                    "Heartbeat is running its own turn right now — interval "
+                    "changes take effect only if issued from a later turn; "
+                    "the current timer keeps running."
+                ),
+                is_error=True,
+            )
+
+        # interval required for start.
+        interval_raw = input.get("interval")
+        if interval_raw is None:
+            return ToolResult(
+                content=(
+                    "Missing required parameter 'interval' for start. "
+                    "Use a string like \"15m\", \"1h\", or \"300s\" "
+                    "(case-insensitive), or a positive integer (seconds)."
+                ),
+                is_error=True,
+            )
+
+        # Resolve interval to seconds:
+        #  - str → parse_interval (returns None on invalid, never raises)
+        #  - positive JSON integer → seconds directly (bool is an int subclass
+        #    and MUST be rejected; floats/dicts/etc. are bad shapes)
+        #  - never re-parse a parsed value.
+        if isinstance(interval_raw, bool):
+            return ToolResult(
+                content=(
+                    "Invalid interval: a boolean is not a valid interval. "
+                    "Use a string like \"15m\" or a positive integer (seconds)."
+                ),
+                is_error=True,
+            )
+        if isinstance(interval_raw, int):
+            seconds = interval_raw
+        elif isinstance(interval_raw, str):
+            seconds = parse_interval(interval_raw)
+            if seconds is None:
+                return ToolResult(
+                    content=(
+                        f"Invalid interval: {interval_raw!r}. "
+                        "Use e.g. `15m`, `1h`, `6h`, or a positive integer."
+                    ),
+                    is_error=True,
+                )
+        else:
+            # float, dict, list, etc. — bad shape.
+            return ToolResult(
+                content=(
+                    "Invalid interval: must be a string (e.g. \"15m\") or a "
+                    "positive integer (seconds)."
+                ),
+                is_error=True,
+            )
+
+        # Floor (canonical 5-minute floor, slash-parity wording).
+        if seconds < HeartbeatManager._floor:
+            return ToolResult(
+                content="Minimum interval is 5m.",
+                is_error=True,
+            )
+
+        # directive (optional, start only) — must be a string if present.
+        directive = input.get("directive")
+        if directive is not None and not isinstance(directive, str):
+            return ToolResult(
+                content=(
+                    "Invalid directive: must be a string. Omit it if you have "
+                    "no directive to attach."
+                ),
+                is_error=True,
+            )
+
+        # Umbral mutual exclusion — checked BEFORE start is called.
+        # R5 fail-closed: if umbral state can't be VERIFIED (is_active
+        # raises), refuse the start and name the failure — starting with an
+        # unknown umbral state could violate the exclusion, which is worse
+        # than a spurious refusal.
+        if um is not None:
+            try:
+                um_active = bool(um.is_active(room_id))
+            except Exception as e:
+                logger.warning(
+                    "um.is_active raised for %s; failing closed", room_id,
+                    exc_info=True,
+                )
+                return ToolResult(
+                    content=(
+                        "Cannot verify umbral state "
+                        f"({type(e).__name__}) — refusing start; "
+                        "check /umbral status and retry."
+                    ),
+                    is_error=True,
+                )
+            if um_active:
+                return ToolResult(
+                    content=(
+                        "Stop the umbral timer first (`/umbral stop`) — "
+                        "umbral and heartbeat cannot run in the same room."
+                    ),
+                    is_error=True,
+                )
+
+        # Delegate to the manager (replace is the tested manager contract —
+        # no refusal, no special message for an already-active timer).
+        try:
+            await hb.start(room_id, seconds, directive)
+        except Exception as e:
+            return ToolResult(
+                content=f"Heartbeat start failed: {type(e).__name__}.",
+                is_error=True,
+            )
+
+        human = format_interval(seconds)
+        # Notice (one, room-scoped) — only if a sink is wired.
+        if send_notice is not None:
+            try:
+                await send_notice(room_id, f"💓 Heartbeat started — every {human}")
+            except Exception:
+                logger.warning("heartbeat start notice failed in %s", room_id)
+
+        return ToolResult(
+            content=(
+                f"Heartbeat started: every {human} in this room.\n"
+                "Persists across process restarts; auto-stops on context "
+                "overflow. Stop with action=\"stop\" when done."
+            ),
+            is_error=False,
+        )
+
+    # =====================================================================
+    # stop
+    # =====================================================================
+    if action == "stop":
+        # Read the entry BEFORE stopping so we can surface schedule-mode
+        # provenance in the result (the tool is interval-only but may stop an
+        # operator-started schedule entry). Mirrors the slash handler's
+        # read-before-mutate ordering.
+        try:
+            entries = hb.status()
+        except Exception:
+            entries = []
+        entry = next((e for e in entries if e.room_id == room_id), None)
+
+        try:
+            stopped = await hb.stop(room_id)
+        except Exception as e:
+            return ToolResult(
+                content=f"Heartbeat stop failed: {type(e).__name__}.",
+                is_error=True,
+            )
+        if not stopped:
+            return ToolResult(
+                content="No heartbeat active in this room.",
+                is_error=True,
+            )
+
+        suffix = ""
+        if entry is not None and getattr(entry, "schedule", None):
+            suffix = f' (was schedule "{entry.schedule}")'
+
+        if send_notice is not None:
+            try:
+                await send_notice(room_id, "💓 Heartbeat stopped")
+            except Exception:
+                logger.warning("heartbeat stop notice failed in %s", room_id)
+
+        return ToolResult(
+            content=f"Heartbeat stopped.{suffix}",
+            is_error=False,
+        )
+
+    # =====================================================================
+    # status (a read — fires NO notice, absence is information not an error)
+    # =====================================================================
+    if action == "status":
+        try:
+            active = hb.is_active(room_id)
+            entries = hb.status() if active else []
+        except Exception as e:
+            return ToolResult(
+                content=f"Heartbeat status failed: {type(e).__name__}.",
+                is_error=True,
+            )
+        entry = next((e for e in entries if e.room_id == room_id), None)
+        if entry is None:
+            return ToolResult(
+                content="No heartbeat active in this room.",
+                is_error=False,
+            )
+
+        # Format the entry — mirror the slash status line shape, this room only.
+        next_str = format_interval(int(entry.seconds_until_next))
+        schedule = getattr(entry, "schedule", None)
+        if schedule:
+            tz_name = getattr(entry, "tz", None) or "UTC"
+            line = (
+                f'every "{schedule}" ({tz_name}), next in {next_str}'
+            )
+        else:
+            interval_str = format_interval(int(entry.interval_seconds))
+            line = f"every {interval_str}, next in {next_str}"
+
+        directive = getattr(entry, "directive", None)
+        if directive:
+            one_line = " ".join(directive.split())
+            trunc = one_line if len(one_line) <= 120 else one_line[:119] + "…"
+            line += f" · directive: {trunc}"
+
+        return ToolResult(content=line, is_error=False)
+
+    # Unknown action — steer the caller toward the valid actions.
+    return ToolResult(
+        content=(
+            f"Unknown action: {action!r}. Valid actions: start, stop, status."
+        ),
+        is_error=True,
+    )
 
 
 def _update_read_registry(resolved_path: str | None, callbacks: dict | None) -> None:
@@ -1630,6 +2019,8 @@ async def _execute_tool_inner(
         )
     elif name == "todo_write":
         result = await _execute_todo_write(input, callbacks)
+    elif name == "heartbeat":
+        result = await _execute_heartbeat_tool(input, callbacks)
     else:
         return ToolResult(
             content=f"Unknown tool: {name}",

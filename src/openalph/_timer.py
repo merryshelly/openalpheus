@@ -24,6 +24,7 @@ Communicates via an async callback and has no Matrix-specific knowledge.
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -43,6 +44,25 @@ logger = logging.getLogger(__name__)
 # within grace of now; older misses are logged and skipped. grace=0 disables
 # catch-up entirely. Read via module attribute for test monkeypatching.
 MISSED_FIRE_GRACE_SECONDS = 1800
+
+# R1 loop-context detection: marks code executing INSIDE a timer's fired
+# turn with (manager, room_id) — the STRONG manager reference itself, not
+# an id() (re-audit F1: id()-keying was theoretically fragile to GC reuse
+# of a freed manager's address by a new manager; identity matching on the
+# object eliminates that class entirely). The contextvar holding a strong
+# ref is acceptable and intended: it keeps the manager alive across its own
+# fired turn (the bound callback already does the same), and the strict-
+# finally reset clears the ref when the turn completes. Contextvars
+# propagate INTO child tasks created by asyncio.gather (which is how
+# Agent.handle_input runs tool calls), but NOT into unrelated tasks like
+# operator slash-command handling — so an external stop still cancels an
+# in-flight turn while a tool-driven self-stop through a gather child is
+# detected and skips the fatal cancel+await of its own ancestor (cyclic
+# cancellation → cascade of Task.cancel recursion frames / RecursionError,
+# kdsn.290 audit R1).
+_TIMER_LOOP_CTX: contextvars.ContextVar = contextvars.ContextVar(
+    "openalph_timer_loop", default=None
+)
 
 
 @dataclass
@@ -197,7 +217,16 @@ class RecurringTimerManager:
             return False
 
         task = self._tasks[room_id]
-        self_stop = asyncio.current_task() is task
+        # Self-stop = direct (same task: pre-tool-era slash self-stop) OR
+        # tool-driven: the tool runs in a gather CHILD task, which is never
+        # the timer task, but contextvars DO propagate into it — so the
+        # loop-context mark set around the callback matches here even though
+        # the task identity check no longer does. Only this manager's own
+        # fired turn for this room matches (it holds a strict superset of
+        # that turn's context); an external stop has no mark.
+        self_stop = (asyncio.current_task() is task) or (
+            _TIMER_LOOP_CTX.get() == (self, room_id)
+        )
 
         if not self_stop:
             task.cancel()
@@ -263,6 +292,23 @@ class RecurringTimerManager:
 
     def is_active(self, room_id: str) -> bool:
         return room_id in self._tasks and not self._tasks[room_id].done()
+
+    def in_own_loop(self, room_id: str) -> bool:
+        """True iff the current context is THIS manager's fired turn for
+        ``room_id`` — including any gather child tasks spawned inside it
+        (contextvars propagate into them). Unrelated tasks (e.g. an
+        operator slash-command handler) return False even while a fire for
+        the room is in flight.
+
+        Exposed publicly so the heartbeat tool can refuse start-from-own-
+        turn instead of letting tools import the contextvar directly."""
+        # Identity match on the manager OBJECT (m is self) plus room id —
+        # not id() — so a freed-and-reused address can never alias a
+        # different manager's mark (F1).
+        _ctx = _TIMER_LOOP_CTX.get()
+        return (
+            _ctx is not None and _ctx[0] is self and _ctx[1] == room_id
+        )
 
     async def resume(self) -> list[str]:
         """Read config from disk and start timers for all persisted entries.
@@ -514,11 +560,18 @@ class RecurringTimerManager:
                     self._last_fired[room_id] = time.time()
                     await self._persist()
 
+                # Mark the fired turn (and any tasks spawned inside it —
+                # contextvars propagate into gather children) as executing
+                # inside this manager's loop for this room. stop()/start()
+                # consult the mark to detect a self-stop (R1); it is reset
+                # when the turn completes, whether cleanly or via exception.
+                _ctx_token = _TIMER_LOOP_CTX.set((self, room_id))
                 try:
                     await self.callback(room_id)
                 except Exception:
                     logger.exception("%s callback error for %s", self._loop_name, room_id)
                 finally:
+                    _TIMER_LOOP_CTX.reset(_ctx_token)
                     if self._overlap_guard:
                         self._processing[room_id] = False
 

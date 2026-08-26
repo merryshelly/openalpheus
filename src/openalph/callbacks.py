@@ -345,7 +345,7 @@ def build_callbacks(
 
     Agent-state callbacks read directly from *agent*.  Side-effect callbacks
     delegate to *sinks* (a CommsSinks implementation).  Returns a dict with
-    the 15 keys the tools layer expects.
+    the 17 keys the tools layer expects.
     """
 
     async def _context_status_callback(req_room_id=None):
@@ -414,4 +414,9 @@ def build_callbacks(
         "advisor_uses": _advisor_uses,
         "advisor_results": {} if advisor_results is None else advisor_results,
         "subagent_results": {} if subagent_results is None else subagent_results,
+        # kdsn.290: raw timer managers (or None on transports that don't wire
+        # them — e.g. headless CLI). Forwarded so the heartbeat tool can reach
+        # them via callbacks["heartbeat"] / callbacks["umbral"].
+        "heartbeat": heartbeat,
+        "umbral": umbral,
     }

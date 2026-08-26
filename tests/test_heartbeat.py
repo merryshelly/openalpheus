@@ -20,7 +20,6 @@ Interval helpers:
 import pytest
 import asyncio
 import json
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
@@ -518,3 +517,149 @@ class TestTimerResumeRobustness:
         live = [t for t in m._tasks.values() if not t.done()]
         assert len(live) == 1
         await m.shutdown()
+
+
+# ===========================================================================
+# R1 (kdsn.290 audit) — loop-context detection. Manager-level pins for the
+# contextvar machinery in RecurringTimerManager (src/openalph/_timer.py):
+# contextvar set/reset around the callback, self-stop through a gather
+# child, and the UNCHANGED external-stop contract.
+# ===========================================================================
+
+
+class TestTimerLoopContext:
+    @pytest.mark.asyncio
+    async def test_contextvar_set_during_callback_and_reset_after(self, tmp_path):
+        """R1/F1: during the fired callback the loop-context contextvar
+        holds (manager, room_id) — the STRONG manager reference, matched by
+        identity (re-audit F1 replaced id()-keying) — and is reset (None)
+        once the turn completes. The reset is a strict-finally pin:
+        observable for both clean and raising callbacks at manager
+        level."""
+        import openalph._timer as timer_mod
+        seen = []
+
+        async def cb(room_id):
+            seen.append(timer_mod._TIMER_LOOP_CTX.get())
+
+        m = HeartbeatManager(tmp_path / "heartbeats.json", cb)
+        await m.start("!room:x", 0.05, _initial_delay=0.01)
+        await asyncio.sleep(0.12)
+        await m.shutdown()
+        # The 0.05s interval fires 2-3 times inside the 0.12s observation
+        # window; assert no fire count (just ≥1) and that EVERY fired turn
+        # saw the mark.
+        assert seen, "no fires observed"
+        mks = set(seen)
+        assert len(mks) == 1
+        (mk,) = mks
+        assert mk[0] is m and mk[1] == "!room:x"  # identity, not id(m) (F1)
+        assert timer_mod._TIMER_LOOP_CTX.get() is None  # reset after the turn
+
+        # Second manager (raising callback): subprocess-level reset too.
+        seen2 = []
+
+        async def cb_boom(room_id):
+            seen2.append(timer_mod._TIMER_LOOP_CTX.get())
+            raise RuntimeError("boom")
+
+        m2 = HeartbeatManager(tmp_path / "heartbeats2.json", cb_boom)
+        await m2.start("!room:y", 0.05, _initial_delay=0.01)
+        await asyncio.sleep(0.12)
+        await m2.shutdown()
+        assert seen2, "no fires observed (raising callback)"
+        mks2 = set(seen2)
+        assert len(mks2) == 1
+        (mk2,) = mks2
+        assert mk2[0] is m2 and mk2[1] == "!room:y"  # identity, not id() (F1)
+        assert timer_mod._TIMER_LOOP_CTX.get() is None  # reset even on raise
+
+    @pytest.mark.asyncio
+    async def test_in_own_loop_false_outside_false_for_other_rooms(self, tmp_path):
+        """R1: the public helper only reports the manager's OWN turn for
+        THIS room — the outer (non-fire) task reads False even while a fire
+        is in flight, and the helper pins room scoping (another room's turn
+        does not match)."""
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", AsyncMock())
+        fired = asyncio.Event()
+
+        async def slow_cb(room_id):
+            fired.set()
+            await asyncio.sleep(5)
+
+        hb.callback = slow_cb
+        await hb.start("!room:x", 0.05, _initial_delay=0.01)
+        await asyncio.wait_for(fired.wait(), timeout=5)
+        # The fire is IN progress … but this task is not the fire.
+        assert hb.in_own_loop("!room:x") is False
+        assert hb.in_own_loop("!room:other") is False
+        await hb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_self_stop_through_gather_child_stops_cleanly(self, tmp_path):
+        """R1 manager-level pin: stop() invoked from a gather CHILD inside
+        the fired turn (the production handle_input wiring) must behave as a
+        self-stop — no CancelledError reaching the harness task, one fire,
+        no refire, loop task exits (no entry left to track)."""
+        fired = []
+
+        async def cb(room_id):
+            fired.append(room_id)
+            [stopped] = await asyncio.gather(hb.stop(room_id))
+            assert stopped is True
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", cb)
+        await hb.start("!room:x", 0.05, _initial_delay=0.01)
+        # If stop() had cancelled the timer task itself (pre-fix external
+        # treatment of the gather child), the CancelledError would surface
+        # here and fail the test.
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:  # pragma: no cover - regression path
+            pytest.fail(
+                "self-stop through a gather child cancelled the timer task (R1)"
+            )
+        assert fired == ["!room:x"], f"one fire, no refire: {fired}"
+        assert hb.is_active("!room:x") is False
+        assert "!room:x" not in hb._tasks  # loop exited; bookkeeping cleaned
+        await hb.shutdown()  # must not raise/hang
+
+    @pytest.mark.asyncio
+    async def test_external_stop_during_fire_still_cancels(self, tmp_path):
+        """R1 contract pin (external stop semantics UNCHANGED): an external
+        stop() — from a task that does NOT inherit the fired turn's context
+        — while a fire is in flight still cancels the in-flight turn and
+        returns after the loop task is done. The fired turn then sees the
+        fire as cancelled, exactly like before the R1 fix. The fresh
+        create_task mirrors operator slash handling: operator code runs in
+        its own task tree whose contextvar is NOT the fired turn's mark.
+        (Inline awaiting stop() would resolve un-marked as well — the
+        outer test task carries no mark either; the fresh task keeps the
+        "different task tree" fidelity explicit and immune to the test
+        itself ever running inside a marked context.)"""
+        fired = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def slow_cb(room_id):
+            fired.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", slow_cb)
+        await hb.start("!room:x", 0.05, _initial_delay=0.01)
+        await asyncio.wait_for(fired.wait(), timeout=5)
+
+        # Fresh task: does NOT inherit the fired turn's mark (contextvars
+        # are copied from the CURRENT task, which is the outer test task —
+        # unmarked). This mirrors operator /heartbeat stop.
+        stopped = await asyncio.create_task(hb.stop("!room:x"))
+        assert stopped is True
+        await asyncio.wait_for(cancelled.wait(), timeout=5)  # fire WAS cancelled
+
+        task = hb._tasks.get("!room:x")
+        assert task is None or task.done()  # stop returned after the loop died
+        assert not hb.is_active("!room:x")
+        await hb.shutdown()

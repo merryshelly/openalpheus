@@ -83,6 +83,9 @@ def _make_bot(agent=None, **overrides):
 # Pinning this proves the refactor doesn't change what tools see.
 # 15th key "log_vision_injection" added by kdsn.279 (view_image observability
 # seam — agent-owned inbox; the transport only logs).
+# 16th/17th keys "heartbeat"/"umbral" added by kdsn.290 (heartbeat
+# self-control tool): the raw timer managers, forwarded so the heartbeat
+# tool can reach them via callbacks["heartbeat"] / callbacks["umbral"].
 _EXPECTED_CALLBACK_KEYS = frozenset({
     "send_media",
     "on_redaction",
@@ -99,6 +102,8 @@ _EXPECTED_CALLBACK_KEYS = frozenset({
     "advisor_uses",
     "advisor_results",
     "subagent_results",
+    "heartbeat",
+    "umbral",
 })
 
 _SIDE_EFFECT_KEYS = frozenset({
@@ -110,6 +115,9 @@ _AGENT_STATE_KEYS = frozenset({
     "context_status", "turn_source", "read_registry", "room_id",
     "get_transcript", "advisor_uses", "advisor_results", "subagent_results",
 })
+
+# kdsn.290: raw timer managers (or None on transports that don't wire them).
+_MANAGER_KEYS = frozenset({"heartbeat", "umbral"})
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +133,27 @@ class TestCallbacksDictKeys:
     """
 
     def test_exact_key_set(self):
-        """The callbacks dict has exactly the expected 15 keys — no more, no less."""
+        """The callbacks dict has exactly the expected 17 keys — no more, no less."""
         bot = _make_bot()
         cb = bot._build_agent_callbacks("!room:server", None)
         assert set(cb.keys()) == set(_EXPECTED_CALLBACK_KEYS)
+
+    def test_exact_key_count_is_17(self):
+        """kdsn.290: wire format grew 15 → 17 with the raw timer managers."""
+        bot = _make_bot()
+        cb = bot._build_agent_callbacks("!room:server", None)
+        assert len(cb) == 17
+
+    def test_manager_keys_carry_bot_managers(self):
+        """kdsn.290: callbacks["heartbeat"]/["umbral"] forward bot.heartbeat /
+        bot.umbral verbatim (None on this bot fixture, so identity pins both
+        presence of the key and the pass-through value)."""
+        hb = MagicMock()
+        um = MagicMock()
+        bot = _make_bot(heartbeat=hb, umbral=um)
+        cb = bot._build_agent_callbacks("!room:server", None)
+        assert cb["heartbeat"] is hb
+        assert cb["umbral"] is um
 
     def test_side_effect_keys_are_callable(self):
         """All 7 side-effect keys are async callables (closures delegating to sinks)."""
@@ -348,6 +373,32 @@ class TestBuildCallbacksHeadless:
         sinks = MagicMock()  # duck-typed — any object with the sink methods
         cb = build_callbacks(agent, "!room:server", sinks, turn_source=None)
         assert set(cb.keys()) == set(_EXPECTED_CALLBACK_KEYS)
+
+    def test_manager_keys_default_to_none(self):
+        """kdsn.290: heartbeat/umbral keys are present even when no managers
+        are passed (headless/CLI wires None; the heartbeat tool fails clean)."""
+        from openalph.callbacks import build_callbacks
+        agent = _make_agent()
+        sinks = MagicMock()
+        cb = build_callbacks(agent, "!room:server", sinks, turn_source=None)
+        for key in _MANAGER_KEYS:
+            assert key in cb, f"manager key {key!r} must be present in the callbacks dict"
+            assert cb[key] is None, f"{key!r} must default to None when not passed"
+
+    def test_manager_keys_carry_passed_managers(self):
+        """kdsn.290: the heartbeat/umbral kwargs flow through to the dict
+        verbatim — the heartbeat tool reads its manager from these keys."""
+        from openalph.callbacks import build_callbacks
+        agent = _make_agent()
+        sinks = MagicMock()
+        hb = MagicMock()
+        um = MagicMock()
+        cb = build_callbacks(
+            agent, "!room:server", sinks, turn_source=None,
+            heartbeat=hb, umbral=um,
+        )
+        assert cb["heartbeat"] is hb
+        assert cb["umbral"] is um
 
     def test_turn_source_passes_through(self):
         from openalph.callbacks import build_callbacks
