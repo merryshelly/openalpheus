@@ -919,3 +919,131 @@ class TestWebFetchMaxCharsGuard:
         out = _fetch(f"<html><body>{src}</body></html>", 100)
         assert "truncated" in out.content
         assert len(out.content) < len(src)
+
+
+class TestWebFetchJsOffset:
+    """kdsn.291: char-windowing offset for web_fetch_js markdown mode.
+    Schema mode + offset -> is_error (silently-ignored would mislead);
+    schema mode + max_chars stays ignored (existing documented behavior)."""
+
+    @pytest.mark.asyncio
+    async def test_markdown_window(self):
+        text = "M" * 1000
+        mock_resp = mock_post_response(json_data={"content": text})
+        client = make_post_client(mock_resp)
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await web_fetch_js(
+                url="https://example.com", api_key="fake-key", base_url=BASE,
+                offset=400, max_chars=200,
+            )
+        assert result.is_error is False
+        assert result.content.startswith(
+            "[web_fetch_js window: chars 400-599 of 1000 | 400 before | 400 after — continue with offset=600]"
+        )
+        assert result.content.endswith("M" * 200)
+
+    @pytest.mark.asyncio
+    async def test_schema_mode_offset_errors_without_request(self):
+        mock_resp = mock_post_response(json_data={"content": "x"})
+        client = make_post_client(mock_resp)
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await web_fetch_js(
+                url="https://example.com", api_key="fake-key", base_url=BASE,
+                schema={"type": "object", "properties": {}}, offset=10,
+            )
+        assert result.is_error is True
+        assert "markdown-mode only" in result.content
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_schema_mode_max_chars_still_ignored(self):
+        long_json = {"a": "x" * 5000}
+        mock_resp = mock_post_response(json_data=long_json)
+        client = make_post_client(mock_resp)
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await web_fetch_js(
+                url="https://example.com", api_key="fake-key", base_url=BASE,
+                schema={"type": "object", "properties": {}}, max_chars=10,
+            )
+        assert result.is_error is False
+        assert "x" * 5000 in result.content  # no truncation in schema mode
+
+    @pytest.mark.asyncio
+    async def test_markdown_offset_beyond_end(self):
+        mock_resp = mock_post_response(json_data={"content": "M" * 1000})
+        client = make_post_client(mock_resp)
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await web_fetch_js(
+                url="https://example.com", api_key="fake-key", base_url=BASE,
+                offset=5000,
+            )
+        assert result.is_error is True
+        assert "1000" in result.content
+
+
+class TestWebFetchJsOffsetReview:
+    """kdsn.291 review fixes for web_fetch_js: invalid offsets rejected
+    pre-request, offset flows through the real dispatch seam, huge markdown
+    full text carries the head-anchored navigation note."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["x", True, -5])
+    async def test_markdown_invalid_offset_errors_without_request(self, bad):
+        client = make_post_client(mock_post_response(json_data={"content": "M" * 1000}))
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await web_fetch_js(
+                url="https://example.com", api_key="fake-key", base_url=BASE,
+                offset=bad,
+            )
+        assert result.is_error is True
+        assert "offset must be a non-negative integer" in result.content
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_execute_tool_windows_markdown(self):
+        from openalph.config import AgentConfig, ProviderConfig
+
+        cfg = AgentConfig(
+            name="test-agent",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            providers={
+                "anthropic": ProviderConfig(
+                    key="anthropic", type="anthropic", api_key="sk-test",
+                    base_url=None, quirks=[],
+                )
+            },
+            workspace="/tmp",
+            max_iterations=25,
+            truncation_limit=50000,
+        )
+        client = make_post_client(mock_post_response(json_data={"content": "M" * 1000}))
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await execute_tool(
+                name="web_fetch_js",
+                input={"url": "https://example.com", "offset": 400, "max_chars": 200},
+                tool_config={"api_key": "fake-key", "base_url": BASE},
+                agent_config=cfg,
+            )
+        assert result.is_error is False
+        assert result.content.startswith("[web_fetch_js window: chars 400-599 of 1000")
+
+    @pytest.mark.asyncio
+    async def test_huge_markdown_full_text_note(self):
+        client = make_post_client(
+            mock_post_response(json_data={"content": "M" * 60_000})
+        )
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await web_fetch_js(
+                url="https://example.com", api_key="fake-key", base_url=BASE,
+            )
+        assert result.is_error is False
+        assert result.content.startswith("[web_fetch_js note: full markdown is 60000 chars")
+        assert "offset=30000 for the middle" in result.content

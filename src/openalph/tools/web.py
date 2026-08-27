@@ -2,10 +2,10 @@
 
 Interface contract:
     web_search(query, count=5, api_key="", endpoint="") -> ToolResult
-    web_fetch(url, max_chars=None, tool_config=None) -> ToolResult
+    web_fetch(url, max_chars=None, tool_config=None, offset=None) -> ToolResult
     web_fetch_js(url, schema=None, effort="max", max_chars=None, nocache=False,
                  api_key="", base_url="https://api.tabstack.ai/v1",
-                 timeout=90) -> ToolResult
+                 timeout=90, offset=None) -> ToolResult
 
 Search uses the Brave Search API. Fetch uses httpx with HTML stripping.
 web_fetch_js wraps Tabstack's cloud-browser extraction API (POST
@@ -27,6 +27,13 @@ BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 REQUEST_TIMEOUT = 15.0
 USER_AGENT = "OpenAlph/0.1 (https://codeberg.org/merryshelly/openalph)"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2MB cap to prevent OOM on large responses
+
+# kdsn.291: default window size for offset windowing. Just UNDER the
+# fleet-default truncation_limit (50_000 chars): the navigation marker
+# (<=~120 chars) rides ahead of the window, so marker+window must fit inside
+# the downstream framework head/tail truncation or the window's own middle
+# gets shaved. 49_000 + marker < 50_000 -> default windows arrive intact.
+DEFAULT_WINDOW_CHARS = 49_000
 
 TABSTACK_BASE_URL = "https://api.tabstack.ai/v1"
 TABSTACK_TIMEOUT = 90.0  # Tabstack's max-effort render runs 15-60s; 15s (web_fetch's
@@ -100,6 +107,47 @@ def _looks_like_unrendered_spa(raw_html: str, stripped_text: str) -> bool:
     return any(marker in lowered for marker in _JS_SHELL_MARKERS)
 
 
+# --- kdsn.291: offset windowing helpers ---
+
+
+def _is_pos_int(v) -> bool:
+    """Genuine positive int (bool excluded — it is an int subclass)."""
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _validate_offset(offset, tool: str):
+    """kdsn.291: validate an optional 0-based char offset.
+
+    Returns None when valid (absent or a non-negative int), else an error
+    message string. bool is explicitly rejected (isinstance(True, int) is
+    True). Validation happens BEFORE any network request.
+    """
+    if offset is None:
+        return None
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return (
+            f"{tool} error: offset must be a non-negative integer "
+            f"(got {type(offset).__name__})"
+        )
+    return None
+
+
+def _window_text(text: str, offset: int, window: int, tool: str) -> str:
+    """kdsn.291: navigation marker + text[offset:offset+window] (clamped to
+    end of text). The marker is PREFIXED so it survives the downstream
+    framework head/tail truncation, which keeps the head."""
+    total = len(text)
+    end = min(offset + window, total)
+    parts = [f"chars {offset}-{end - 1} of {total}"]
+    if offset > 0:
+        parts.append(f"{offset} before")
+    if end < total:
+        parts.append(f"{total - end} after — continue with offset={end}")
+    else:
+        parts.append("end of text")
+    return f"[{tool} window: " + " | ".join(parts) + "]\n" + text[offset:end]
+
+
 # --- Public API ---
 
 
@@ -161,13 +209,22 @@ async def web_search(
 
 
 async def web_fetch(
-    url: str, max_chars: int | None = None, tool_config: dict | None = None
+    url: str,
+    max_chars: int | None = None,
+    tool_config: dict | None = None,
+    offset: int | None = None,
 ) -> ToolResult:
     """Fetch URL and extract readable content.
 
     Args:
         url: URL to fetch
-        max_chars: Maximum characters to return (default None = no limit)
+        max_chars: Without offset: head+tail truncation cap (default None =
+            no limit). With offset: window size — chars to read starting at
+            offset (default DEFAULT_WINDOW_CHARS).
+        offset: 0-based char offset into the extracted text (kdsn.291).
+            Enables window mode: read a specific region of a large page
+            (e.g. the middle, which head/tail truncation makes unreachable).
+            None (default) = legacy behavior, byte-identical.
         tool_config: web_fetch's own tool config (optional). Only used to read
             "js_fallback_tool" (workspace-kdsn.202.1): when set, a successful
             fetch that looks like an unrendered JS-SPA shell gets a steering
@@ -177,6 +234,10 @@ async def web_fetch(
     Returns:
         ToolResult with readable text extracted from HTML, or error.
     """
+    offset_error = _validate_offset(offset, "web_fetch")
+    if offset_error:
+        return ToolResult(content=offset_error, is_error=True)
+
     try:
         async with httpx.AsyncClient(
             timeout=REQUEST_TIMEOUT,
@@ -218,26 +279,56 @@ async def web_fetch(
                 f"for full browser rendering.]"
             )
 
-        # Apply max_chars limit (to the extracted text only; the note is
-        # appended AFTER truncation so it's never cut into by the head/tail
-        # split below).
-        # BUG-4: with max_chars<=0, len(text) > max_chars was true, tail_budget
-        # was 0 and text[-0:] returned the WHOLE string, so "truncation"
-        # produced the full page plus a marker (a negative value duplicated
-        # content). Use the same guard web_fetch_js already had: only truncate
-        # for a genuine positive int (and not a bool, which is an int subclass).
-        if (
-            isinstance(max_chars, int)
-            and not isinstance(max_chars, bool)
-            and max_chars > 0
-            and len(text) > max_chars
-        ):
+        # kdsn.291: window mode (offset) takes precedence over the legacy
+        # head/tail cap. The note is appended AFTER either so it's never cut
+        # into. Legacy path: BUG-4 guard preserved — only truncate for a
+        # genuine positive int (bool is an int subclass; max_chars<=0 used to
+        # make text[-0:] return the WHOLE string).
+        if offset is not None:
+            total = len(text)
+            if total == 0:
+                return ToolResult(
+                    content=(
+                        "web_fetch error: extracted text is empty (0 chars) — "
+                        "nothing to window"
+                    ),
+                    is_error=True,
+                )
+            if offset >= total:
+                return ToolResult(
+                    content=(
+                        f"web_fetch error: offset {offset} is beyond the end of "
+                        f"the extracted text ({total} chars) — use offset < {total}"
+                    ),
+                    is_error=True,
+                )
+            window = max_chars if _is_pos_int(max_chars) else DEFAULT_WINDOW_CHARS
+            text = _window_text(text, offset, window, "web_fetch")
+        elif _is_pos_int(max_chars) and len(text) > max_chars:
             head_budget = max_chars // 2
             tail_budget = max_chars - head_budget
+            total = len(text)
             text = (
                 text[:head_budget]
-                + f"\n[truncated: {len(text) - max_chars} chars removed]\n"
+                + f"\n[truncated: {total - max_chars} chars removed — text is "
+                  f"{total} chars total; re-fetch with offset={total // 2} "
+                  f"to read a specific region]\n"
                 + text[-tail_budget:]
+            )
+        elif len(text) > DEFAULT_WINDOW_CHARS:
+            # kdsn.291: full text larger than the typical framework cap will be
+            # head/tail-truncated downstream with only a generic marker. The
+            # note is PREPENDED so it survives that truncation (the head is
+            # kept) and carries the total size + windowing steer at the point
+            # of need. Only the no-window/no-cap path gets it — window mode
+            # and the legacy cap already carry their own navigation.
+            total = len(text)
+            text = (
+                f"[web_fetch note: full text is {total} chars — larger than the "
+                f"typical 50,000-char tool-result window, so you are seeing "
+                f"head+tail only. Re-fetch with offset (0-based char position) "
+                f"and max_chars (window size) to read a specific region, e.g. "
+                f"offset={total // 2} for the middle.]\n" + text
             )
 
         text += js_note
@@ -259,6 +350,7 @@ async def web_fetch_js(
     api_key: str = "",
     base_url: str = TABSTACK_BASE_URL,
     timeout: float = TABSTACK_TIMEOUT,
+    offset: int | None = None,
 ) -> ToolResult:
     """Fetch a JavaScript-rendered page via Tabstack's cloud browser.
 
@@ -274,8 +366,15 @@ async def web_fetch_js(
             instead of markdown.
         effort: "min" | "standard" | "max" (default "max"). Any other value
             is coerced to "max" rather than erroring.
-        max_chars: Truncate returned markdown to this many chars (head+tail).
-            Ignored in schema mode.
+        max_chars: Without offset: truncate returned markdown to this many
+            chars (head+tail). With offset: window size (chars to read
+            starting at offset, default DEFAULT_WINDOW_CHARS). Ignored in
+            schema mode.
+        offset: 0-based char offset into the rendered markdown (kdsn.291).
+            Window mode: read a specific region of long rendered pages.
+            Markdown mode ONLY — errors when a schema is given (schema mode
+            returns structured JSON, which windowing does not apply to).
+            None (default) = legacy behavior, byte-identical.
         nocache: Bypass Tabstack's cache for real-time data. Default False.
             Only a real bool is honored; any other type is coerced to False.
         api_key: Tabstack API key (Bearer auth). Empty -> fail-safe is_error.
@@ -339,6 +438,21 @@ async def web_fetch_js(
                 "embedded credentials"
             ),
         )
+
+    # kdsn.291: offset is markdown-mode only. A window request in schema mode
+    # would be silently ignored (schema output is structured JSON) — an
+    # explicit misdirected call, so it errors before any request.
+    if offset is not None and schema is not None:
+        return ToolResult(
+            is_error=True,
+            content=(
+                "web_fetch_js error: offset is markdown-mode only — omit schema "
+                "(or drop offset) to window the rendered markdown"
+            ),
+        )
+    offset_error = _validate_offset(offset, "web_fetch_js")
+    if offset_error:
+        return ToolResult(content=offset_error, is_error=True)
 
     if schema is not None:
         if isinstance(schema, str):
@@ -428,13 +542,36 @@ async def web_fetch_js(
                     content="web_fetch_js: malformed response (expected markdown content)",
                 )
             text = data["content"]
+            # kdsn.291: window mode (offset) takes precedence; legacy
+            # head/tail truncation only when no offset was given.
+            if offset is not None:
+                total = len(text)
+                if total == 0:
+                    return ToolResult(
+                        is_error=True,
+                        content=(
+                            "web_fetch_js error: rendered markdown is empty "
+                            "(0 chars) — nothing to window"
+                        ),
+                    )
+                if offset >= total:
+                    return ToolResult(
+                        is_error=True,
+                        content=(
+                            f"web_fetch_js error: offset {offset} is beyond the "
+                            f"end of the markdown ({total} chars) — use "
+                            f"offset < {total}"
+                        ),
+                    )
+                window = max_chars if _is_pos_int(max_chars) else DEFAULT_WINDOW_CHARS
+                text = _window_text(text, offset, window, "web_fetch_js")
             # M2: only truncate for a real, positive int max_chars. A bad
             # optional value (0, negative, non-int, or a bool -- True/False
             # are technically int in Python but never a sane char count)
             # must never error, and must never be used to compute a
             # negative tail slice that produces MORE output than the
             # untruncated source (the old text[-0:] / text[-negative:] bug).
-            if (
+            elif (
                 isinstance(max_chars, int)
                 and not isinstance(max_chars, bool)
                 and max_chars > 0
@@ -446,6 +583,19 @@ async def web_fetch_js(
                     text[:head_budget]
                     + f"\n[truncated: {len(text) - max_chars} chars removed]\n"
                     + text[-tail_budget:]
+                )
+            elif len(text) > DEFAULT_WINDOW_CHARS:
+                # kdsn.291: as in web_fetch — full rendered markdown beyond the
+                # typical framework cap gets a head-anchored navigation note.
+                # LAST in the chain: window mode and the legacy cap take
+                # precedence (they carry their own navigation).
+                total = len(text)
+                text = (
+                    f"[web_fetch_js note: full markdown is {total} chars — larger "
+                    f"than the typical 50,000-char tool-result window, so you are "
+                    f"seeing head+tail only. Re-fetch with offset (0-based char "
+                    f"position) and max_chars (window size) to read a specific "
+                    f"region, e.g. offset={total // 2} for the middle.]\n" + text
                 )
 
         return ToolResult(content=text, is_error=False)

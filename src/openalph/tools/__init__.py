@@ -436,9 +436,11 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
     "web_fetch": {
         "description": (
             "Fetch a URL and return its readable text content (HTML converted to plain text). "
-            "Use max_chars to limit response size for large pages; if content is truncated, "
-            "increase max_chars or fetch a more specific anchor URL. "
-            "NOT for local files — use file_read instead."
+            "For large pages: without offset, max_chars is a head+tail cap — the middle is "
+            "unreachable. To read a specific region (e.g. the middle), pass offset (0-based "
+            "char position) with max_chars as the window size; the result carries a "
+            "navigation marker (total size, continue offset). Or fetch a more specific "
+            "anchor URL. NOT for local files — use file_read instead."
         ),
         "parameters": {
             "type": "object",
@@ -449,7 +451,19 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum characters to return (optional; reduce for large pages, increase if content is cut off)"
+                    "description": (
+                        "Without offset: head+tail truncation cap. With offset: window "
+                        "size (chars to read starting at offset; default 50000)."
+                    )
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": (
+                        "0-based character offset into the extracted text (window mode). "
+                        "Reads a specific region of a large page, e.g. the middle. The "
+                        "result carries a navigation marker with total size and the "
+                        "continue offset."
+                    )
                 }
             },
             "required": ["url"]
@@ -471,6 +485,8 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "NEVER send credentials, cookies, or authenticated URLs through this tool — Tabstack "
             "fetches the page from its own cloud and cannot use your session. For logged-in "
             "flows, use local Playwright (see browser-automation skill). "
+            "For rendered markdown longer than the context window: pass offset (0-based char "
+            "position) with max_chars as the window size — markdown mode only. "
             "When NOT to use: static/simple pages web_fetch already handles; multi-step "
             "interaction (clicking, form flows) or multi-page research — those stay in the "
             "browser-automation skill via the tabstack CLI (/automate, /research)."
@@ -501,8 +517,16 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 "max_chars": {
                     "type": "integer",
                     "description": (
-                        "Truncate returned markdown to this many chars (head+tail), like "
-                        "web_fetch. Ignored in schema mode."
+                        "Without offset: truncate returned markdown to this many chars "
+                        "(head+tail), like web_fetch. With offset: window size (default "
+                        "50000). Ignored in schema mode."
+                    )
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": (
+                        "0-based char offset into the rendered markdown (window mode). "
+                        "Markdown mode only — errors when a schema is given."
                     )
                 },
                 "nocache": {
@@ -1902,6 +1926,7 @@ async def _execute_tool_inner(
         result = await web_fetch(
             url=input["url"],
             max_chars=input.get("max_chars"),
+            offset=input.get("offset"),
             tool_config=tool_config,
         )
     elif name == "web_fetch_js":
@@ -1921,6 +1946,7 @@ async def _execute_tool_inner(
             schema=input.get("schema"),
             effort=input.get("effort") or tool_config.get("default_effort", "max"),
             max_chars=input.get("max_chars"),
+            offset=input.get("offset"),
             # L3: pass the raw value through -- do NOT force bool() here.
             # bool("false") is True, so a force-bool() at the dispatch seam
             # would turn a stringly-typed "false" into True before the

@@ -8,7 +8,7 @@ import json
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 from openalph.tools.web import web_search, web_fetch, _strip_html_tags, MAX_RESPONSE_BYTES
-from openalph.tools import ToolResult
+from openalph.tools import ToolResult, execute_tool
 
 
 def mock_httpx_response(status_code=200, json_data=None, text="", content=None):
@@ -246,9 +246,15 @@ class TestWebFetch:
             )
             result = await web_fetch("https://test.com", max_chars=200)
 
-        assert "[truncated" in result.content
-        # Result should be roughly max_chars + marker length
-        assert len(result.content) < 300
+        assert result.is_error is False
+        # kdsn.291: head+tail body preserved, steering marker carries total + midpoint
+        assert result.content.startswith("A" * 100)
+        assert result.content.endswith("A" * 100)
+        assert (
+            "[truncated: 800 chars removed — text is 1000 chars total; "
+            "re-fetch with offset=500 to read a specific region]"
+            in result.content
+        )
 
     @pytest.mark.asyncio
     async def test_max_chars_none_returns_full(self):
@@ -315,9 +321,12 @@ class TestWebFetch:
             result = await web_fetch("https://test.com/huge")
 
         assert result.is_error is False
-        # Must be capped — overflow bytes must not appear
+        # kdsn.291: full huge text carries a head-anchored navigation note;
+        # the 2MB cap applies to the fetched body, not the annotation.
         assert "Y" not in result.content
-        assert len(result.content.encode("utf-8")) <= MAX_RESPONSE_BYTES
+        assert result.content.startswith("[web_fetch note: full text is")
+        body = result.content.split("\n", 1)[1]
+        assert len(body.encode("utf-8")) == MAX_RESPONSE_BYTES
 
     @pytest.mark.asyncio
     async def test_web_fetch_partial_last_chunk_trimmed(self):
@@ -346,9 +355,11 @@ class TestWebFetch:
             result = await web_fetch("https://test.com/partial")
 
         assert result.is_error is False
-        assert len(result.content.encode("utf-8")) <= MAX_RESPONSE_BYTES
+        # kdsn.291: body is exactly the 2MB cap (navigation note rides ahead)
+        body = result.content.split("\n", 1)[1]
+        assert len(body.encode("utf-8")) == MAX_RESPONSE_BYTES
         # First chunk's characters must all be present
-        assert "A" in result.content
+        assert "A" in body
 
     @pytest.mark.asyncio
     async def test_web_fetch_normal_response_unchanged(self):
@@ -383,3 +394,218 @@ class TestHtmlStripping:
     def test_whitespace_collapsed(self):
         result = _strip_html_tags("  lots   of    spaces  ")
         assert result == "lots of spaces"
+
+
+# ---------------------------------------------------------------------------
+# kdsn.291: char-windowing offset (window mode) + legacy-mode steering marker
+# Spec: memory/projects/openalph/specs/kdsn.291-web-fetch-offset-windowing-spec.md
+# ---------------------------------------------------------------------------
+
+
+class TestWebFetchOffset:
+    """kdsn.291: offset (0-based char position) turns max_chars from a head/tail
+    cap into a window size. No offset -> legacy behavior byte-identical, with
+    the legacy marker now carrying total size + midpoint steering."""
+
+    @staticmethod
+    async def _fetch(text, **kwargs):
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = _make_fetch_client(
+                mock_streaming_response(content=text.encode())
+            )
+            result = await web_fetch("https://test.com", **kwargs)
+        return result, MockClient
+
+    @pytest.mark.asyncio
+    async def test_window_exact(self):
+        """T1: offset=400 max_chars=200 on 1000 chars -> text[400:600] + nav marker."""
+        text = "z" * 1000
+        result, _ = await self._fetch(text, offset=400, max_chars=200)
+        assert result.is_error is False
+        assert result.content.startswith(
+            "[web_fetch window: chars 400-599 of 1000 | 400 before | 400 after — continue with offset=600]"
+        )
+        assert result.content.endswith("z" * 200)
+
+    @pytest.mark.asyncio
+    async def test_window_clamps_to_end(self):
+        """T2: window reaching the end clamps; 'end of text', no continue clause."""
+        text = "z" * 1000
+        result, _ = await self._fetch(text, offset=900, max_chars=200)
+        assert result.is_error is False
+        assert result.content.startswith(
+            "[web_fetch window: chars 900-999 of 1000 | 900 before | end of text]"
+        )
+        assert result.content.endswith("z" * 100)
+
+    @pytest.mark.asyncio
+    async def test_window_default_max_chars(self):
+        """T3: offset without max_chars -> 50k default window (clamped here)."""
+        text = "z" * 1000
+        result, _ = await self._fetch(text, offset=400)
+        assert result.is_error is False
+        assert result.content.startswith(
+            "[web_fetch window: chars 400-999 of 1000 | 400 before | end of text]"
+        )
+        assert result.content.endswith("z" * 600)
+
+    @pytest.mark.asyncio
+    async def test_offset_zero_is_window_not_truncation(self):
+        """T4: explicit offset=0 is window mode (not head/tail); 'before' omitted at 0."""
+        text = "z" * 1000
+        result, _ = await self._fetch(text, offset=0, max_chars=200)
+        assert result.is_error is False
+        assert result.content.startswith(
+            "[web_fetch window: chars 0-199 of 1000 | 800 after — continue with offset=200]"
+        )
+        assert result.content.endswith("z" * 200)
+        assert "before" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_offset_beyond_end_errors_with_total(self):
+        """T5: offset past end of text -> is_error naming the total length."""
+        text = "z" * 1000
+        result, _ = await self._fetch(text, offset=5000, max_chars=200)
+        assert result.is_error is True
+        assert "5000" in result.content
+        assert "1000" in result.content
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [-1, "400", True])
+    async def test_offset_invalid_types_error_without_network(self, bad):
+        """T6: invalid offset -> is_error BEFORE any network request."""
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            result = await web_fetch("https://test.com", offset=bad, max_chars=200)
+        assert result.is_error is True
+        assert "offset must be a non-negative integer" in result.content
+        MockClient.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_offset_legacy_full(self):
+        """T7: no offset, no max_chars -> full text, no marker (regression)."""
+        text = "z" * 500
+        result, _ = await self._fetch(text)
+        assert result.is_error is False
+        assert result.content == text
+
+    @pytest.mark.asyncio
+    async def test_no_offset_max_chars_legacy_marker_steers(self):
+        """T8: legacy head/tail truncation marker carries total + midpoint steer."""
+        text = "G" * 1000
+        result, _ = await self._fetch(text, max_chars=200)
+        assert result.is_error is False
+        assert result.content.startswith("G" * 100)
+        assert result.content.endswith("G" * 100)
+        assert (
+            "[truncated: 800 chars removed — text is 1000 chars total; "
+            "re-fetch with offset=500 to read a specific region]"
+            in result.content
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_execute_tool_windows(self):
+        """T9: offset flows through the real dispatch seam (schema wiring)."""
+        from openalph.config import AgentConfig, ProviderConfig
+
+        cfg = AgentConfig(
+            name="test-agent",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=8192,
+            providers={
+                "anthropic": ProviderConfig(
+                    key="anthropic", type="anthropic", api_key="sk-test",
+                    base_url=None, quirks=[],
+                )
+            },
+            workspace="/tmp",
+            max_iterations=25,
+            truncation_limit=50000,
+        )
+        text = "z" * 1000
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = _make_fetch_client(
+                mock_streaming_response(content=text.encode())
+            )
+            result = await execute_tool(
+                name="web_fetch",
+                input={"url": "https://test.com", "offset": 400, "max_chars": 200},
+                tool_config={},
+                agent_config=cfg,
+            )
+        assert result.is_error is False
+        assert result.content.startswith("[web_fetch window: chars 400-599 of 1000")
+
+    @pytest.mark.asyncio
+    async def test_window_into_2mb_capped_text(self):
+        """T10: windowing works on a 2MB-capped extraction."""
+        text = "X" * MAX_RESPONSE_BYTES
+        result, _ = await self._fetch(text, offset=1_500_000, max_chars=1000)
+        assert result.is_error is False
+        total = MAX_RESPONSE_BYTES
+        assert (
+            f"chars 1500000-1500999 of {total} | 1500000 before | "
+            f"{total - 1500999 - 1} after — continue with offset=1501000"
+            in result.content
+        )
+        assert result.content.endswith("X" * 1000)
+
+
+class TestWebFetchPipeline:
+    """kdsn.291 review fixes: windows must survive the framework truncation
+    pipeline (truncate_result), and huge uncapped full text must carry a
+    head-anchored navigation note that survives the head/tail cut."""
+
+    @staticmethod
+    async def _fetch(text, **kwargs):
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = _make_fetch_client(
+                mock_streaming_response(content=text.encode())
+            )
+            result = await web_fetch("https://test.com", **kwargs)
+        return result
+
+    @pytest.mark.asyncio
+    async def test_default_window_survives_framework_truncation(self):
+        """P1: marker + 49k default window < 50k limit -> byte-identical
+        through the real truncate_result pipeline (no double-truncation)."""
+        from openalph.tools import truncate_result
+
+        result = await self._fetch("z" * 200_000, offset=0)
+        assert result.is_error is False
+        assert result.content.startswith("[web_fetch window: chars 0-48999 of 200000")
+        truncated = truncate_result(result.content, 50_000)
+        assert truncated == result.content  # intact — no framework marker
+
+    @pytest.mark.asyncio
+    async def test_window_larger_than_lower_limit_shaves_visibly(self):
+        """P2: with a configured lower truncation_limit the window IS shaved —
+        the framework marker appears (visible + self-correcting, never silent)."""
+        from openalph.tools import truncate_result
+
+        result = await self._fetch("z" * 200_000, offset=0)
+        truncated = truncate_result(result.content, 20_000)
+        assert "[truncated:" in truncated
+        assert truncated != result.content
+
+    @pytest.mark.asyncio
+    async def test_huge_full_text_note_survives_truncation(self):
+        """P3: uncapped huge full text -> head-anchored note with total size
+        + midpoint offset; the note survives the framework head/tail cut."""
+        from openalph.tools import truncate_result
+
+        result = await self._fetch("z" * 200_000)
+        assert result.is_error is False
+        assert result.content.startswith("[web_fetch note: full text is 200000 chars")
+        assert "offset=100000 for the middle" in result.content
+        truncated = truncate_result(result.content, 50_000)
+        assert truncated.startswith("[web_fetch note: full text is 200000 chars")
+        assert "offset=100000" in truncated
+
+    @pytest.mark.asyncio
+    async def test_note_absent_when_legacy_cap_applies(self):
+        """P4: max_chars head/tail truncation already carries navigation —
+        the full-text note must not also appear (no double steering)."""
+        result = await self._fetch("z" * 200_000, max_chars=2000)
+        assert result.is_error is False
+        assert "[web_fetch note:" not in result.content
+        assert "re-fetch with offset=100000 to read a specific region" in result.content
