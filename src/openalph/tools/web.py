@@ -325,10 +325,11 @@ async def web_fetch(
             total = len(text)
             text = (
                 f"[web_fetch note: full text is {total} chars — larger than the "
-                f"typical 50,000-char tool-result window, so you are seeing "
-                f"head+tail only. Re-fetch with offset (0-based char position) "
-                f"and max_chars (window size) to read a specific region, e.g. "
-                f"offset={total // 2} for the middle.]\n" + text
+                f"typical 50,000-char tool-result limit, so expect head+tail "
+                f"truncation if a [truncated:] marker appears. To read a specific "
+                f"region, re-fetch with offset (0-based char position) and "
+                f"max_chars (window size), e.g. offset={total // 2} for the "
+                f"middle.]\n" + text
             )
 
         text += js_note
@@ -579,9 +580,15 @@ async def web_fetch_js(
             ):
                 head_budget = max_chars // 2
                 tail_budget = max_chars - head_budget
+                # kdsn.291 (review 2): same total + midpoint steering as
+                # web_fetch's legacy marker — an agent paginating rendered
+                # markdown gets the offset steer at the point of need.
+                total = len(text)
                 text = (
                     text[:head_budget]
-                    + f"\n[truncated: {len(text) - max_chars} chars removed]\n"
+                    + f"\n[truncated: {total - max_chars} chars removed — text is "
+                      f"{total} chars total; re-fetch with offset={total // 2} "
+                      f"to read a specific region]\n"
                     + text[-tail_budget:]
                 )
             elif len(text) > DEFAULT_WINDOW_CHARS:
@@ -592,10 +599,11 @@ async def web_fetch_js(
                 total = len(text)
                 text = (
                     f"[web_fetch_js note: full markdown is {total} chars — larger "
-                    f"than the typical 50,000-char tool-result window, so you are "
-                    f"seeing head+tail only. Re-fetch with offset (0-based char "
-                    f"position) and max_chars (window size) to read a specific "
-                    f"region, e.g. offset={total // 2} for the middle.]\n" + text
+                    f"than the typical 50,000-char tool-result limit, so expect "
+                    f"head+tail truncation if a [truncated:] marker appears. To "
+                    f"read a specific region, re-fetch with offset (0-based char "
+                    f"position) and max_chars (window size), e.g. "
+                    f"offset={total // 2} for the middle.]\n" + text
                 )
 
         return ToolResult(content=text, is_error=False)

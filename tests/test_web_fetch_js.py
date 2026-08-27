@@ -256,8 +256,14 @@ class TestWebFetchJsSuccessPaths:
             )
 
         assert result.is_error is False
-        assert "[truncated" in result.content
-        assert len(result.content) < 300
+        # kdsn.291 review 2: marker aligned with web_fetch's (total + midpoint)
+        assert result.content.startswith("A" * 100)
+        assert result.content.endswith("A" * 100)
+        assert (
+            "[truncated: 800 chars removed — text is 1000 chars total; "
+            "re-fetch with offset=500 to read a specific region]"
+            in result.content
+        )
 
     @pytest.mark.asyncio
     async def test_11_nocache_passed_through(self):
@@ -1047,3 +1053,23 @@ class TestWebFetchJsOffsetReview:
         assert result.is_error is False
         assert result.content.startswith("[web_fetch_js note: full markdown is 60000 chars")
         assert "offset=30000 for the middle" in result.content
+
+    @pytest.mark.asyncio
+    async def test_markdown_legacy_marker_carries_offset_steer(self):
+        """kdsn.291 review 2: js legacy head/tail marker carries total +
+        midpoint offset steer, aligned with web_fetch (no asymmetry)."""
+        client = make_post_client(mock_post_response(json_data={"content": "M" * 1000}))
+        with patch("openalph.tools.web.httpx.AsyncClient") as MockClient:
+            MockClient.return_value = client
+            result = await web_fetch_js(
+                url="https://example.com", api_key="fake-key", base_url=BASE,
+                max_chars=200,
+            )
+        assert result.is_error is False
+        assert result.content.startswith("M" * 100)
+        assert result.content.endswith("M" * 100)
+        assert (
+            "[truncated: 800 chars removed — text is 1000 chars total; "
+            "re-fetch with offset=500 to read a specific region]"
+            in result.content
+        )
