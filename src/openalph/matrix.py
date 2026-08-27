@@ -36,7 +36,7 @@ from nio import (
 )
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
-from openalph.provider import ProviderError
+from openalph.provider import ProviderError, ProviderUnavailableError, resolve_model_checked
 from openalph.config import MatrixConfig
 from openalph.session import SessionLog, persist_assistant_turn
 from openalph.mention import mentions_me, is_gated, strip_mention
@@ -401,6 +401,56 @@ class MatrixBot:
         self._active_turns: set[str] = set()
         self._advisor_results: dict[tuple, dict] = {}  # R5: keyed (room_id, call_id)
         self._subagent_results: dict[tuple, dict] = {}  # keyed (room_id, call_id)
+
+    async def _emit_provider_notice(self, room_id: str, error) -> None:
+        """Send the ⚠️ Provider error notice with the kdsn.292 warn-once latch.
+
+        ProviderUnavailableError (degraded-start / skipped provider): keyed by
+        (room_id, provider_key) — the FIRST occurrence per pair posts the
+        notice (naming provider + startup skip reason); repeats are log-only,
+        so a degraded default hit by a 5m heartbeat or umbral turn doesn't
+        spam the room forever. Plain ProviderError (transient API failure):
+        always posted — those are per-incident, not per-startup-state.
+        """
+        if isinstance(error, ProviderUnavailableError):
+            if not hasattr(self, "_unavailable_noticed"):
+                self._unavailable_noticed = set()
+            key = (room_id, error.provider_key or "")
+            if key in self._unavailable_noticed:
+                logger.info(
+                    "Provider unavailable notice suppressed (already sent) in %s: %s",
+                    room_id, error,
+                )
+                return
+            self._unavailable_noticed.add(key)
+            await self.send(room_id, f"⚠️ **Provider error:** {error}")
+            return
+        await self.send(room_id, f"⚠️ **Provider error:** {error}")
+
+    async def _broadcast_degraded_start(self) -> None:
+        """One m.notice per joined room when the process came up degraded
+        (kdsn.292 §3c). Once per process, right after initial sync; FAIL-SOFT —
+        a per-room send failure warns and continues, never crashes startup.
+        """
+        skipped = getattr(self.agent.config, "skipped_providers", None)
+        if not skipped:
+            return
+        from openalph.notify import degraded_summary
+        body = degraded_summary(self.agent.config)
+        # Review M2 (accepted tradeoff, comment-only): these rooms are
+        # awaited INLINE inside sync_forever, so a down-Matrix startup delays
+        # the send attempts serially (each send_notice retries/blocks per
+        # room). Accepted — the rooms list only exists after the initial sync
+        # succeeds anyway, and in the failure mode that matters (Matrix down)
+        # this loop runs at most once with the per-room try/except above
+        # bounding any individual failure.
+        for room_id in list(getattr(self.client, "rooms", {}) or {}):
+            try:
+                await self.send_notice(room_id, f"🚨 **Agent started degraded**\n{body}")
+            except Exception:
+                logger.warning(
+                    "degraded-start broadcast failed for %s", room_id, exc_info=True,
+                )
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for text.
@@ -1376,8 +1426,7 @@ class MatrixBot:
                     return
                 # Check if the provider has cache_bust_notices enabled
                 try:
-                    from openalph.config import resolve_model
-                    provider_cfg, _ = resolve_model(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases)
+                    provider_cfg, _ = resolve_model_checked(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases, skipped_providers=getattr(self.agent.config, "skipped_providers", {}))
                     if not provider_cfg.cache_bust_notices:
                         return
                 except Exception:
@@ -1516,7 +1565,9 @@ class MatrixBot:
         except ProviderError as e:
             code = f" ({e.status_code})" if e.status_code else ""
             logger.warning("Heartbeat provider error%s in %s: %s", code, room_id, e)
-            await self.send(room_id, f"⚠️ **Provider error** (heartbeat): {e}")
+            # kdsn.292: warn-once latch lives in _emit_provider_notice —
+            # a degraded default must not spam the room every heartbeat.
+            await self._emit_provider_notice(room_id, e)
         except Exception:
             logger.exception("Heartbeat processing error in %s", room_id)
             await self.send(room_id, "⚠️ Heartbeat error — check agent logs for details.")
@@ -1549,7 +1600,8 @@ class MatrixBot:
         except ProviderError as e:
             code = f" ({e.status_code})" if e.status_code else ""
             logger.warning("Umbral provider error%s in %s: %s", code, room_id, e)
-            await self.send(room_id, f"⚠️ **Provider error** during umbral turn: {e}")
+            # kdsn.292: warn-once latch lives in _emit_provider_notice.
+            await self._emit_provider_notice(room_id, e)
         except Exception:
             logger.exception("Umbral turn processing error in %s", room_id)
             await self.send(room_id, "⚠️ Umbral turn error — check agent logs. Archiving context.")
@@ -2198,8 +2250,7 @@ class MatrixBot:
                         return
                     # Check if the provider has cache_bust_notices enabled
                     try:
-                        from openalph.config import resolve_model
-                        provider_cfg, _ = resolve_model(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases)
+                        provider_cfg, _ = resolve_model_checked(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases, skipped_providers=getattr(self.agent.config, "skipped_providers", {}))
                         if not provider_cfg.cache_bust_notices:
                             return
                     except Exception:
@@ -2432,7 +2483,8 @@ class MatrixBot:
             except ProviderError as e:
                 code = f" ({e.status_code})" if e.status_code else ""
                 logger.warning("Provider error%s in %s: %s", code, room_id, e)
-                await self.send(room_id, f"⚠️ **Provider error:** {e}")
+                # kdsn.292: warn-once latch lives in _emit_provider_notice.
+                await self._emit_provider_notice(room_id, e)
             except Exception:
                 # Agent error: send generic message to avoid leaking exception details
                 logger.exception("Agent error processing message in %s", room_id)
@@ -2993,9 +3045,8 @@ class MatrixBot:
                 return
             # Check if current model uses Anthropic provider
             try:
-                from openalph.config import resolve_model
                 model_str = self.agent.get_model(room_id)
-                provider_cfg, _ = resolve_model(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases)
+                provider_cfg, _ = resolve_model_checked(model_str, self.agent.config.providers, aliases=self.agent.config.model_aliases, skipped_providers=getattr(self.agent.config, "skipped_providers", {}))
                 if provider_cfg.type != "anthropic":
                     await self.send(room_id,
                         f"⚠️ Cache TTL only applies to Anthropic providers. "
@@ -3427,6 +3478,10 @@ class MatrixBot:
         self._synced = True
         joined = len(self.client.rooms) if hasattr(self.client, 'rooms') else '?'
         logger.info("Initial sync complete in %.0fms (%s rooms joined, lazy wake active)", _sync_ms, joined)
+
+        # kdsn.292 §3c: if startup was degraded, announce it once per joined
+        # room (fail-soft — never blocks the sync loop).
+        await self._broadcast_degraded_start()
 
         # Resume persisted heartbeats and umbral timers
         heartbeat_catchup_rooms = await self.heartbeat.resume()

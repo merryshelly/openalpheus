@@ -120,7 +120,9 @@ path = "/tmp/test-workspace"
         assert config.providers["anthropic"].cache_bust_notices is False
 
     def test_toml_rejects_non_boolean(self, tmp_path):
-        """cache_bust_notices = "yes" in TOML raises ConfigError."""
+        """cache_bust_notices = "yes" in TOML — kdsn.292 flip: the provider is
+        SKIPPED with the same validation text as its skip reason (any
+        per-provider authoring error degrades instead of raising)."""
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
@@ -134,8 +136,10 @@ cache_bust_notices = "yes"
 [workspace]
 path = "/tmp/test-workspace"
 """)
-        with pytest.raises(ConfigError, match="cache_bust_notices must be a boolean"):
-            load_config(tmp_path / "agent.toml")
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "anthropic" in config.skipped_providers
+        assert "cache_bust_notices must be a boolean" in config.skipped_providers["anthropic"]
 
 
 # ===========================================================================

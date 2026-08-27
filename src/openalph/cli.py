@@ -195,6 +195,16 @@ def cmd_run(args):
         print("Error: No [matrix] section in config", file=sys.stderr)
         sys.exit(1)
 
+    # kdsn.292: best-effort ntfy alert when the DEFAULT provider is degraded.
+    # Runs before Matrix connect (alerts even if the homeserver is down) and
+    # is DEFENSIVELY wrapped — a startup alert must never take the agent down;
+    # maybe_notify_default_degraded is itself fail-soft, this is belt+braces.
+    try:
+        from openalph.notify import maybe_notify_default_degraded
+        maybe_notify_default_degraded(config)
+    except Exception:
+        logger.exception("degraded-start ntfy alert path failed (ignored)")
+
     agent = Agent(config)
     bot = MatrixBot(agent, config.matrix)
 

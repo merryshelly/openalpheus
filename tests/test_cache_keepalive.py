@@ -259,8 +259,12 @@ subagent_cache_keepalive = "yes"
 [workspace]
 path = "/tmp/test-workspace"
 """)
-        with pytest.raises(ConfigError, match="subagent_cache_keepalive must be a boolean"):
-            load_config(tmp_path / "agent.toml")
+        # kdsn.292 flip: any per-provider authoring error SKIPS the provider
+        # with the validation text as its reason, never ConfigError.
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "anthropic" in config.skipped_providers
+        assert "subagent_cache_keepalive must be a boolean" in config.skipped_providers["anthropic"]
 
 
 # ===========================================================================

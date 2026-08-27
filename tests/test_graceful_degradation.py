@@ -108,8 +108,10 @@ path = "{tmp_path / 'workspace'}"
         assert "anthropic" in config.providers
         assert "nokey" not in config.providers
 
-    def test_default_model_provider_failure_is_fatal(self, tmp_path):
-        """If the default_model's provider fails to load, config load MUST raise."""
+    def test_default_model_provider_failure_is_degraded(self, tmp_path):
+        """kdsn.292 flip: default_model's provider failing to load is now a
+        DEGRADED start (skip recorded with reason), NOT fatal — see SB ruling
+        2026-08-26. (Was: test_default_model_provider_failure_is_fatal.)"""
         config_path = _write_config(tmp_path, f"""
 [agent]
 name = "test"
@@ -127,11 +129,16 @@ api_key = "sk-good-key"
 [workspace]
 path = "{tmp_path / 'workspace'}"
 """)
-        with pytest.raises(ConfigError, match="default_model.*broken"):
-            load_config(config_path)
+        config = load_config(config_path)  # must NOT raise (kdsn.292)
+        assert config.default_model == "broken/some-model"
+        assert "broken" not in config.providers
+        assert "broken" in config.skipped_providers
+        assert "exit code" in config.skipped_providers["broken"]
+        assert "anthropic" in config.providers  # healthy half still usable
 
-    def test_default_model_alias_to_skipped_provider_is_fatal(self, tmp_path):
-        """If default_model is an alias that resolves to a skipped provider, it's fatal."""
+    def test_default_model_alias_to_skipped_provider_is_degraded(self, tmp_path):
+        """kdsn.292 flip: default_model aliasing a skipped provider is now a
+        DEGRADED start, NOT fatal. (Was: ..._is_fatal.)"""
         config_path = _write_config(tmp_path, f"""
 [agent]
 name = "test"
@@ -152,11 +159,14 @@ myalias = "broken/some-model"
 [workspace]
 path = "{tmp_path / 'workspace'}"
 """)
-        with pytest.raises(ConfigError, match="default_model.*broken"):
-            load_config(config_path)
+        config = load_config(config_path)  # must NOT raise (kdsn.292)
+        assert "broken" not in config.providers
+        assert "broken" in config.skipped_providers
+        assert "exit code" in config.skipped_providers["broken"]
 
-    def test_all_providers_fail_is_fatal(self, tmp_path):
-        """If ALL providers fail, config load MUST raise (can't run without any)."""
+    def test_all_providers_fail_is_degraded(self, tmp_path):
+        """kdsn.292 flip: ALL providers failing is a DEGRADED start with
+        empty providers dict, NOT ConfigError. (Was: ..._is_fatal.)"""
         config_path = _write_config(tmp_path, f"""
 [agent]
 name = "test"
@@ -174,8 +184,10 @@ api_key_cmd = "echo ''"
 [workspace]
 path = "{tmp_path / 'workspace'}"
 """)
-        with pytest.raises(ConfigError, match="[Nn]o providers"):
-            load_config(config_path)
+        config = load_config(config_path)  # must NOT raise (kdsn.292)
+        assert config.providers == {}
+        assert set(config.skipped_providers) == {"broken", "also_broken"}
+        assert all(config.skipped_providers.values())  # every skip has a reason
 
     def test_warning_logged_for_skipped_provider(self, tmp_path, caplog):
         """Skipped provider emits a WARNING log identifying which provider and why."""
@@ -255,9 +267,11 @@ path = "{tmp_path / 'workspace'}"
         with pytest.raises(ValueError, match="Unknown provider.*broken"):
             resolve_model("broken/some-model", config.providers)
 
-    def test_non_api_key_errors_still_fatal(self, tmp_path):
-        """Errors that aren't api_key failures (e.g., invalid provider type)
-        should still be fatal — graceful degradation only covers api_key resolution."""
+    def test_non_api_key_errors_skip_with_reason(self, tmp_path):
+        """kdsn.292 flip: errors that aren't api_key failures (e.g. invalid
+        provider type) SKIP THE PROVIDER WITH REASON — the SB ruling widened
+        tolerance to ANY per-provider authoring problem (a mass-applied TOML
+        slip must never crash-loop an agent). (Was: ..._still_fatal.)"""
         config_path = _write_config(tmp_path, f"""
 [agent]
 name = "test"
@@ -274,6 +288,10 @@ api_key = "sk-some-key"
 [workspace]
 path = "{tmp_path / 'workspace'}"
 """)
-        # Invalid provider type should still crash — it's a config error, not a transient failure
-        with pytest.raises(ConfigError, match="[Ii]nvalid provider type"):
-            load_config(config_path)
+        # kdsn.292: invalid provider type skips the provider (reason names
+        # the type problem); the healthy provider still loads.
+        config = load_config(config_path)
+        assert "weird" not in config.providers
+        assert "weird" in config.skipped_providers
+        assert "type" in config.skipped_providers["weird"].lower()
+        assert "anthropic" in config.providers

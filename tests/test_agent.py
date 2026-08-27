@@ -315,7 +315,7 @@ class TestPerRoomModelOverride:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.config.resolve_model"):
+        with patch("openalph.provider.resolve_model_checked"):
             result = agent.switch_model("other/model-x", "room_a")
 
         assert result is None
@@ -325,7 +325,7 @@ class TestPerRoomModelOverride:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.config.resolve_model"):
+        with patch("openalph.provider.resolve_model_checked"):
             agent.switch_model("other/model-a", "room_a")
             agent.switch_model("other/model-b", "room_b")
 
@@ -337,7 +337,7 @@ class TestPerRoomModelOverride:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.config.resolve_model"):
+        with patch("openalph.provider.resolve_model_checked"):
             agent.switch_model("other/room-model", "room_a")
 
         status_a = agent.status("room_a")
@@ -351,7 +351,7 @@ class TestPerRoomModelOverride:
         config = make_config(tmp_path)
         agent = Agent(config)
 
-        with patch("openalph.config.resolve_model"):
+        with patch("openalph.provider.resolve_model_checked"):
             agent.switch_model("persistent/model", "test_room")
 
         with patch("openalph.agent.stream") as mock:
@@ -369,7 +369,7 @@ class TestPerRoomModelOverride:
         config = make_config(tmp_path, default_model="original/default")
 
         agent1 = Agent(config)
-        with patch("openalph.config.resolve_model"):
+        with patch("openalph.provider.resolve_model_checked"):
             agent1.switch_model("override/model", "room_a")
         assert agent1.get_model("room_a") == "override/model"
 
@@ -392,7 +392,7 @@ class TestPerRoomModelOverride:
             {"role": "user", "content": "just text"},
         ]
 
-        with patch("openalph.config.resolve_model"):
+        with patch("openalph.provider.resolve_model_checked"):
             result_a = agent.switch_model("other/model", "room_a")
             result_b = agent.switch_model("other/model", "room_b")
 

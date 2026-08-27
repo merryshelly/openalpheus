@@ -241,8 +241,12 @@ path = "/tmp/test"
         # ARCH-2 consolidated api_key/password/access_token resolution into one
         # `_resolve_secret` helper — the "no source configured" message now
         # names the actual field consistently ("api_key", not "API key").
-        with pytest.raises(ConfigError, match="api_key"):
-            load_config(tmp_path / "agent.toml")
+        # kdsn.292 flip: this is now a SKIP-WITH-REASON (degraded start), not
+        # a fatal ConfigError — one stray provider block must never crash-loop.
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "anthropic" in config.skipped_providers
+        assert "api_key" in config.skipped_providers["anthropic"]
 
     def test_invalid_provider_type(self, tmp_path):
         (tmp_path / "agent.toml").write_text("""
@@ -257,8 +261,11 @@ api_key = "sk-test"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="provider"):
-            load_config(tmp_path / "agent.toml")
+        # kdsn.292 flip: invalid type provider is skipped with reason.
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "google" in config.skipped_providers
+        assert "type" in config.skipped_providers["google"].lower()
 
     def test_openai_missing_base_url(self, tmp_path):
         """OpenAI-compatible provider requires base_url."""
@@ -274,8 +281,11 @@ api_key = "sk-test"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="base_url"):
-            load_config(tmp_path / "agent.toml")
+        # kdsn.292 flip: missing base_url provider is skipped with reason.
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "openrouter" in config.skipped_providers
+        assert "base_url" in config.skipped_providers["openrouter"]
 
     def test_env_var_not_set(self, tmp_path, monkeypatch):
         monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
@@ -291,8 +301,11 @@ api_key_env = "NONEXISTENT_VAR"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="NONEXISTENT_VAR"):
-            load_config(tmp_path / "agent.toml")
+        # kdsn.292 flip: unset env var skips the provider; reason names the var.
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "anthropic" in config.skipped_providers
+        assert "NONEXISTENT_VAR" in config.skipped_providers["anthropic"]
 
     def test_command_fails(self, tmp_path):
         (tmp_path / "agent.toml").write_text("""
@@ -307,8 +320,12 @@ api_key_cmd = "false"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="api_key_cmd"):
-            load_config(tmp_path / "agent.toml")
+        # kdsn.292 flip: failing api_key_cmd skips the provider (single
+        # attempt, no retry — the acceptance suite pins the attempt count).
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "anthropic" in config.skipped_providers
+        assert "api_key_cmd" in config.skipped_providers["anthropic"]
 
     def test_nonexistent_file(self, tmp_path):
         with pytest.raises(ConfigError):
@@ -345,7 +362,9 @@ path = "/nonexistent/path/here"
             load_config(tmp_path / "agent.toml")
 
     def test_default_model_unknown_provider(self, tmp_path):
-        """default_model referencing unconfigured provider raises ConfigError."""
+        """kdsn.292 flip: default_model referencing a provider that was never
+        configured is a DEGRADED start — skip reason "not configured" —
+        NOT ConfigError. (Was: raised ConfigError.)"""
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
@@ -358,8 +377,10 @@ api_key = "sk-test"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="banana.*not configured"):
-            load_config(tmp_path / "agent.toml")
+        config = load_config(tmp_path / "agent.toml")
+        assert "banana" in config.skipped_providers
+        assert "not configured" in config.skipped_providers["banana"]
+        assert "anthropic" in config.providers
 
 
 # --- Dataclass ---
@@ -446,8 +467,10 @@ class TestAgentConfig:
 
 class TestSubprocessTimeout:
 
-    def test_api_key_cmd_timeout_raises_config_error(self, tmp_path):
-        """When api_key_cmd hangs, ConfigError is raised."""
+    def test_api_key_cmd_timeout_skips_provider(self, tmp_path):
+        """When api_key_cmd hangs, the provider is SKIPPED with the "timed
+        out" reason (kdsn.292 flip: single attempt, degraded start; was a
+        fatal ConfigError). The _resolve_secret reason text is unchanged."""
         from unittest.mock import patch as _patch
         (tmp_path / "agent.toml").write_text("""
 [agent]
@@ -463,11 +486,19 @@ path = "/tmp/test"
 """)
         with _patch("openalph.config.subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired(cmd="sleep 999", timeout=10)
-            with pytest.raises(ConfigError, match="timed out"):
-                load_config(tmp_path / "agent.toml")
+            config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "anthropic" in config.skipped_providers
+        assert "timed out" in config.skipped_providers["anthropic"].lower()
+        assert mock_run.call_count == 1  # kdsn.292: exactly ONE attempt, never re-hammered
 
     def test_password_cmd_timeout_raises_config_error(self, tmp_path):
-        """When matrix.password_cmd hangs, ConfigError is raised."""
+        """When matrix.password_cmd hangs, ConfigError is raised. The [matrix]
+        section is NOT a provider block, so matrix credentials stay
+        structural-FATAL: the kdsn.292 skip-with-reason flip applies only to
+        [providers.*] and must not degrade the Matrix layer (verified against
+        config.py: _parse_matrix_config calls _resolve_secret directly — its
+        ConfigError on timeout is never caught by the provider-skip loop)."""
         from unittest.mock import patch as _patch
         (tmp_path / "agent.toml").write_text("""
 [agent]

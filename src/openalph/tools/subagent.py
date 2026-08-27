@@ -216,9 +216,10 @@ async def run_subagent(
     # run's tokens are tallied unpriced rather than mispriced or crashing.
     _sub_api_model = config.default_model  # fallback if a response omits .model
     try:
-        from openalph.config import resolve_model
-        _sub_pcfg, _sub_api_model = resolve_model(config.default_model, config.providers,
-                                                  aliases=config.model_aliases)
+        from openalph.provider import resolve_model_checked
+        _sub_pcfg, _sub_api_model = resolve_model_checked(config.default_model, config.providers,
+                                                  aliases=config.model_aliases,
+                                                  skipped_providers=getattr(config, "skipped_providers", {}))
         _sub_provider_key = getattr(_sub_pcfg, "key", None)
         _sub_provider_type = getattr(_sub_pcfg, "type", None)
     except Exception:

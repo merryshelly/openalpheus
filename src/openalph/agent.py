@@ -298,6 +298,9 @@ class Agent:
                                     aliases=self.config.model_aliases)
             return getattr(pcfg, "key", None), getattr(pcfg, "type", None)
         except Exception:
+            # kdsn.292: keep this blanket catch — it is INTENTIONAL. Pricing
+            # gating must never crash a turn; on ANY resolution failure the
+            # call is tallied unpriced (None, None) instead of mispriced or fatal.
             return None, None
 
     def _record_turn_usage(self, room_id: str, usage, model: str, cache_ttl: str | None,
@@ -432,11 +435,21 @@ class Agent:
 
     def switch_model(self, model_str: str, room_id: str = "_default") -> str | None:
         """Switch active model. Returns error string on failure, None on success."""
-        from openalph.config import resolve_model
+        from openalph.provider import ProviderUnavailableError, resolve_model_checked
 
-        # Validate the model can be resolved
+        # Validate the model can be resolved. kdsn.292: an explicit /model at a
+        # dead provider must be LOUD — ProviderUnavailableError's message names
+        # the provider AND the startup skip reason; the room model is left
+        # UNCHANGED (the assignment below is never reached). Alias-typo
+        # ValueErrors keep their original listing message.
         try:
-            resolve_model(model_str, self.config.providers, aliases=self.config.model_aliases)
+            resolve_model_checked(
+                model_str, self.config.providers,
+                aliases=self.config.model_aliases,
+                skipped_providers=getattr(self.config, "skipped_providers", {}),
+            )
+        except ProviderUnavailableError as e:
+            return str(e)
         except ValueError as e:
             return str(e)
 
@@ -516,10 +529,11 @@ class Agent:
         if not any(getattr(tc, "name", None) == "subagent" for tc in active_tool_calls):
             return None, None
         try:
-            from openalph.config import resolve_model
-            provider_cfg, _ = resolve_model(
+            from openalph.provider import resolve_model_checked
+            provider_cfg, _ = resolve_model_checked(
                 self.get_model(room_id), self.config.providers,
                 aliases=self.config.model_aliases,
+                skipped_providers=getattr(self.config, "skipped_providers", {}),
             )
         except Exception:
             return None, None

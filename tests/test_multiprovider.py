@@ -405,7 +405,10 @@ path = "/tmp/test"
         config = load_config(tmp_path / "agent.toml")
         assert config.providers["anthropic"].api_key == "sk-from-cmd"
 
-    def test_load_multi_provider_missing_api_key_raises(self, tmp_path):
+    def test_load_multi_provider_missing_api_key_is_degraded(self, tmp_path):
+        """kdsn.292 flip: a provider missing every api_key source is skipped
+        with reason; the (default's!) missing provider degrades the start
+        rather than raising. (Was: ..._raises.)"""
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
@@ -418,13 +421,18 @@ type = "anthropic"
 path = "/tmp/test"
 """)
         # ARCH-2: unified secret resolver names the field literally ("api_key")
-        # rather than the old ad hoc "API key" phrasing; the graceful-degradation
-        # wrapper (ARCH-5, kdsn.155) then re-surfaces it via "No providers loaded
-        # successfully. Skipped: ...".
-        with pytest.raises(ConfigError, match="api_key"):
-            load_config(tmp_path / "agent.toml")
+        # rather than the old ad hoc "API key" phrasing. kdsn.292: the
+        # graceful-degradation path now SURVIVES the zero-provider load —
+        # the reason lands in skipped_providers instead of a fatal
+        # "No providers loaded" ConfigError.
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "anthropic" in config.skipped_providers
+        assert "api_key" in config.skipped_providers["anthropic"]
 
-    def test_load_multi_provider_openai_missing_base_url_raises(self, tmp_path):
+    def test_load_multi_provider_openai_missing_base_url_is_skipped(self, tmp_path):
+        """kdsn.292 flip: openai provider without base_url is skipped with
+        reason (default then degrades), not fatal. (Was: ..._raises.)"""
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
@@ -437,10 +445,14 @@ api_key = "sk-test"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="base_url"):
-            load_config(tmp_path / "agent.toml")
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "openrouter" in config.skipped_providers
+        assert "base_url" in config.skipped_providers["openrouter"]
 
-    def test_load_multi_provider_invalid_type_raises(self, tmp_path):
+    def test_load_multi_provider_invalid_type_is_skipped(self, tmp_path):
+        """kdsn.292 flip: invalid provider type skips the provider with
+        reason (default then degrades), not fatal. (Was: ..._raises.)"""
         (tmp_path / "agent.toml").write_text("""
 [agent]
 name = "test"
@@ -453,8 +465,10 @@ api_key = "sk-test"
 [workspace]
 path = "/tmp/test"
 """)
-        with pytest.raises(ConfigError, match="[Ii]nvalid provider type"):
-            load_config(tmp_path / "agent.toml")
+        config = load_config(tmp_path / "agent.toml")
+        assert config.providers == {}
+        assert "cohere" in config.skipped_providers
+        assert "type" in config.skipped_providers["cohere"].lower()
 
     def test_load_multi_provider_with_ollama_placeholder_key(self, tmp_path):
         (tmp_path / "agent.toml").write_text("""
@@ -609,16 +623,20 @@ class TestCompleteMultiProvider:
 
     @pytest.mark.asyncio
     async def test_complete_unknown_provider_raises(self):
-        """complete() with model prefix not in providers raises ValueError."""
+        """complete() with model prefix not in providers raises
+        ProviderUnavailableError — a ProviderError subtype carrying the
+        provider key and startup-skip reason (kdsn.292 typed path; the error
+        no longer surfaces as a raw ValueError)."""
         config = make_config()  # only has "anthropic" provider
-        from openalph.provider import complete
-        with pytest.raises(ValueError, match="[Uu]nknown provider"):
+        from openalph.provider import complete, ProviderUnavailableError
+        with pytest.raises(ProviderUnavailableError) as exc_info:
             await complete(
                 config=config,
                 system="test",
                 messages=[{"role": "user", "content": "hi"}],
                 model="openrouter/moonshotai/kimi-k2.5",
             )
+        assert exc_info.value.provider_key == "openrouter"
 
 
 # ===========================================================================

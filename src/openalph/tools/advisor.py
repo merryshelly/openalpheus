@@ -282,10 +282,16 @@ async def run_advisor(
             )
 
         try:
-            provider_cfg, _api_model = resolve_model(
+            # kdsn.292: resolve_model_checked surfaces a skipped/never-loaded
+            # provider as ProviderUnavailableError (a ProviderError, NOT a
+            # ValueError) — catch it into the same soft-ToolResult seam so the
+            # turn survives and the model sees the skip reason.
+            from openalph.provider import ProviderError, resolve_model_checked
+            provider_cfg, _api_model = resolve_model_checked(
                 model_str, config.providers, aliases=config.model_aliases,
+                skipped_providers=getattr(config, "skipped_providers", {}),
             )
-        except ValueError as e:
+        except (ValueError, ProviderError) as e:
             return ToolResult(
                 content=f"Advisor model not usable \u2014 {e}",
                 is_error=True,

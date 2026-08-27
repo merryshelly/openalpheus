@@ -14,6 +14,13 @@
 Description=OpenAlph Agent - %i
 After=network-online.target
 Wants=network-online.target
+# kdsn.292 anti-flap (SB ruling 2026-08-26): bound restart cycling so a
+# crash-looping agent can never hammer external secret-resolution services
+# fleet-wide. At most 5 starts per 10 minutes; past the burst the unit stays
+# failed-but-stopped until an operator acts. One directive per key — the test
+# suite parses this file with configparser strict=True (rejects duplicates).
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -25,7 +32,9 @@ WorkingDirectory=/home/oa-%i
 # restart-loops forever.
 ExecStart=/usr/local/bin/openalph run %i
 Restart=on-failure
-RestartSec=5
+# kdsn.292 anti-flap: 30s between restarts (was 5) — worst case ~6 start
+# cycles per StartLimitIntervalSec instead of ~120.
+RestartSec=30
 # Both assignments on ONE Environment= directive. systemd accepts repeated
 # Environment= lines, but the test suite parses this file with configparser in
 # strict mode, where a repeated key is a DuplicateOptionError -- the installed

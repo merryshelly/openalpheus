@@ -60,6 +60,19 @@ class ProviderConfig:
 
 
 @dataclass
+class NotificationsConfig:
+    """Optional ntfy alerting configuration (kdsn.292, [notifications] section).
+
+    The alerting path must never recreate the bug it reports: ntfy_token is
+    fail-soft at config load (a token-cmd failure logs a warning and leaves
+    token None; notifications then fire unauthenticated), and the send path
+    (openalph.notify) swallows every network error.
+    """
+    ntfy_url: str
+    ntfy_token: str | None = None
+
+
+@dataclass
 class AgentConfig:
     """Configuration for an OpenAlph agent."""
     name: str
@@ -91,6 +104,12 @@ class AgentConfig:
     # agent-level `vision: bool` flag was hard-cut (no alias, no tombstone).
     model_vision: dict[str, bool] = field(default_factory=dict)
     model_aliases: dict[str, str] = field(default_factory=dict)
+    # kdsn.292: providers that failed startup validation/key resolution are
+    # held here (provider_key -> human-readable reason) instead of killing
+    # the load. Empty == fully healthy start. Do NOT rename — several
+    # call sites poke it defensively via getattr(config, "skipped_providers", {}).
+    skipped_providers: dict[str, str] = field(default_factory=dict)
+    notifications: NotificationsConfig | None = None
 
 
 def resolve_model(
@@ -368,31 +387,44 @@ def load_config(path: Path) -> AgentConfig:
     except KeyError:
         raise ConfigError("Missing required field: agent.default_model")
     
-    skipped_providers = []
-    skipped_errors = {}
+    # kdsn.292 (SB ruling 2026-08-26): ANY per-provider problem — authoring
+    # error (bad type/base_url/timeout/flags) or secret-resolution failure —
+    # skips that provider WITH REASON into skipped_map. A stray config must
+    # NEVER be ConfigError at load: exit 1 under Restart=on-failure crash-loops
+    # and any `*_cmd` source re-hammers 1Password fleet-wide every cycle.
+    # Resolution reasons carry _resolve_secret text verbatim (per spec §2);
+    # authoring reasons constructed here name the field ("type", "base_url", …).
+    skipped_map: dict[str, str] = {}
+
+    def _skip_provider(provider_key: str, reason: str) -> None:
+        logger.warning("Skipping provider '%s': %s", provider_key, reason)
+        skipped_map[provider_key] = reason
+
     for section_name, section_data in providers_sections.items():
         provider_key = section_name.split(".", 1)[1]
         
         provider_type = section_data.get("type")
         if not provider_type:
-            raise ConfigError(f"Missing required field: {section_name}.type")
+            _skip_provider(provider_key, f"missing required field: {section_name}.type")
+            continue
         if provider_type not in ("anthropic", "openai"):
-            raise ConfigError(f"Invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
-        
+            _skip_provider(provider_key, f"invalid provider type: {provider_type}. Must be 'anthropic' or 'openai'")
+            continue
+
         try:
             api_key = _resolve_api_key(section_data)
         except ConfigError as e:
-            logger.warning("Skipping provider '%s': %s", provider_key, e)
-            skipped_providers.append(provider_key)
-            skipped_errors[provider_key] = str(e)
+            _skip_provider(provider_key, str(e))
             continue
-        
+
         base_url = section_data.get("base_url")
         if provider_type == "openai":
             if base_url is None:
-                raise ConfigError(f"base_url is required for {section_name} provider")
+                _skip_provider(provider_key, f"base_url is required for {section_name} (openai-compatible) provider")
+                continue
             if not isinstance(base_url, str) or not base_url:
-                raise ConfigError("base_url must be a non-empty string")
+                _skip_provider(provider_key, "base_url must be a non-empty string")
+                continue
         
         quirks = section_data.get("quirks", [])
         if not isinstance(quirks, list):
@@ -400,25 +432,30 @@ def load_config(path: Path) -> AgentConfig:
         
         timeout = section_data.get("timeout", 600.0)
         if not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ConfigError(f"timeout must be a positive number, got: {timeout!r}")
+            _skip_provider(provider_key, f"timeout must be a positive number, got: {timeout!r}")
+            continue
         timeout = float(timeout)
-        
+
         cache_bust_notices = section_data.get("cache_bust_notices", False)
         if not isinstance(cache_bust_notices, bool):
-            raise ConfigError("cache_bust_notices must be a boolean")
+            _skip_provider(provider_key, "cache_bust_notices must be a boolean")
+            continue
 
         subagent_cache_keepalive = section_data.get("subagent_cache_keepalive", False)
         if not isinstance(subagent_cache_keepalive, bool):
-            raise ConfigError("subagent_cache_keepalive must be a boolean")
-        
+            _skip_provider(provider_key, "subagent_cache_keepalive must be a boolean")
+            continue
+
         routing = section_data.get("routing")
         if routing is not None and not isinstance(routing, dict):
-            raise ConfigError(f"routing must be a table/dict, got: {type(routing).__name__}")
+            _skip_provider(provider_key, f"routing must be a table/dict, got: {type(routing).__name__}")
+            continue
 
         provider_degen = section_data.get("degen_detector")
         if provider_degen is not None:
             if provider_degen not in ("off", "warn", "abort"):
-                raise ConfigError(f"degen_detector must be one of ('off', 'warn', 'abort'), got: {provider_degen!r}")
+                _skip_provider(provider_key, f"degen_detector must be one of ('off', 'warn', 'abort'), got: {provider_degen!r}")
+                continue
 
         providers[provider_key] = ProviderConfig(
             key=provider_key,
@@ -433,19 +470,19 @@ def load_config(path: Path) -> AgentConfig:
             degen_detector=provider_degen,
         )
 
-    # Check if any providers loaded at all
-    if not providers:
-        skipped_msg = ", ".join(
-            f"{k} ({skipped_errors[k]})" for k in skipped_providers
-        ) if skipped_providers else "none configured"
-        raise ConfigError(
-            f"No providers loaded successfully. Skipped: {skipped_msg}"
+    # kdsn.292: zero providers is DEGRADED, not fatal — slash commands, the
+    # Matrix sync loop and local tools all function; every LLM invocation
+    # fails loudly via provider.ProviderUnavailableError (pre-network).
+    if not providers and skipped_map:
+        logger.error(
+            "DEGRADED START: no providers loaded — agent will start degraded; skipped: %s",
+            ", ".join(f"{k} ({v})" for k, v in skipped_map.items()),
         )
 
     # Log provider status
     active = ", ".join(sorted(providers.keys()))
-    if skipped_providers:
-        skipped = ", ".join(skipped_providers)
+    if skipped_map:
+        skipped = ", ".join(skipped_map.keys())
         logger.info("Providers loaded: %s (skipped: %s)", active, skipped)
     else:
         logger.info("Providers loaded: %s", active)
@@ -468,15 +505,14 @@ def load_config(path: Path) -> AgentConfig:
     if "/" in resolved_default:
         provider_prefix = resolved_default.split("/", 1)[0]
         if provider_prefix not in providers:
-            available = ", ".join(sorted(providers.keys()))
-            if provider_prefix in skipped_providers:
-                raise ConfigError(
-                    f"default_model '{default_model}' requires provider '{provider_prefix}' "
-                    f"which failed to load. Available providers: {available}"
-                )
-            raise ConfigError(
-                f"default_model '{default_model}' references provider '{provider_prefix}' "
-                f"which is not configured. Available providers: {available}"
+            # kdsn.292: degraded, loud, never fatal (see SB ruling). If the
+            # prefix was never even declared in [providers.*], record the
+            # authoring-vs-resolution distinguishing reason.
+            if provider_prefix not in skipped_map:
+                skipped_map[provider_prefix] = "not configured in [providers.*]"
+            logger.error(
+                "DEGRADED START: default_model '%s' provider '%s' unavailable (%s)",
+                default_model, provider_prefix, skipped_map[provider_prefix],
             )
 
     # Parse optional [model_limits] section
@@ -507,6 +543,9 @@ def load_config(path: Path) -> AgentConfig:
     # Parse optional [matrix] section
     matrix = _parse_matrix_config(toml_data)
 
+    # Parse optional [notifications] section (kdsn.292: ntfy degraded-start alert)
+    notifications = _parse_notifications_config(toml_data)
+
     # Return resolved configuration
     return AgentConfig(
         name=name,
@@ -528,6 +567,8 @@ def load_config(path: Path) -> AgentConfig:
         model_limits=model_limits,
         model_vision=model_vision,
         model_aliases=model_aliases,
+        skipped_providers=skipped_map,
+        notifications=notifications,
     )
 
 
@@ -548,6 +589,36 @@ def load_agent_config(name: str) -> AgentConfig:
     """
     config_path = CONFIG_DIR / f"{name}.toml"
     return load_config(config_path)
+
+
+def _parse_notifications_config(toml_data: dict) -> NotificationsConfig | None:
+    """Parse the optional [notifications] section (kdsn.292).
+
+    ntfy_url is the section's only mandatory field: invalid → ConfigError
+    (structural authoring error, never fires secret resolution).
+    ntfy_token resolution is FAIL-SOFT: a token-cmd failure can never be
+    allowed to crash an agent that is otherwise alive — the alerting path
+    must never recreate the bug it reports — so it warns and fires
+    unauthenticated instead of raising.
+    """
+    if "notifications" not in toml_data:
+        return None
+
+    section = toml_data["notifications"]
+    if not isinstance(section, dict):
+        raise ConfigError("[notifications] section must be a table")
+
+    ntfy_url = section.get("ntfy_url")
+    if not isinstance(ntfy_url, str) or not ntfy_url:
+        raise ConfigError("notifications.ntfy_url must be a non-empty string")
+
+    try:
+        ntfy_token = _resolve_secret(section, "ntfy_token", "ntfy_token", required=False)
+    except ConfigError as e:
+        logger.warning("ntfy_token resolution failed (fail-soft): %s", e)
+        ntfy_token = None
+
+    return NotificationsConfig(ntfy_url=ntfy_url, ntfy_token=ntfy_token)
 
 
 def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:

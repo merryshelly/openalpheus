@@ -33,6 +33,81 @@ class ProviderError(Exception):
         self.status_code = status_code
 
 
+class ProviderUnavailableError(ProviderError):
+    """Raised (pre-network) when a model resolves to a provider that was not
+    loaded at startup — it was skipped-with-reason during config load, or was
+    never configured at all (kdsn.292 degraded-start).
+
+    Carries the structured skip reason so in-room notices, the warn-once
+    latch, and operator alerts can name BOTH the provider and why it died,
+    without re-parsing the message string.
+    """
+    def __init__(self, message: str, provider_key: str | None = None,
+                 reason: str = ""):
+        super().__init__(message)
+        self.provider_key = provider_key
+        self.reason = reason
+
+
+def resolve_model_checked(
+    model_str: str,
+    providers: dict[str, ProviderConfig],
+    aliases: dict[str, str] | None = None,
+    skipped_providers: dict[str, str] | None = None,
+) -> tuple[ProviderConfig, str]:
+    """resolve_model() with degraded-start awareness (kdsn.292).
+
+    Healthy models pass through byte-identical to config.resolve_model.
+    A provider missing from `providers` converts the unknown-provider
+    ValueError into ProviderUnavailableError, carrying the startup skip
+    reason from `skipped_providers` (or the "never configured" fallback).
+    UNKNOWN-ALIAS ValueErrors pass through UNCHANGED — a misspelled alias is
+    an operator typo, not dead infrastructure, and the existing error message
+    already names the available aliases.
+    """
+    # Triage must look at the RESOLVED string, not the raw argument (review
+    # F1, kdsn.292): an EXISTING alias whose target provider is skipped or
+    # never configured expanded fine but then failed unknown-provider on the
+    # UNEXPANDED bare name, which the `"/" not in model_str` guard re-raised
+    # as raw ValueError — bypassing the typed path (warn-once latch, in-room
+    # reason, ntfy alert). Expand existing aliases exactly as resolve_model
+    # does so the provider prefix is checked on the qualified string below.
+    # This CANNOT weaken typo UX: resolve_model already succeeded for
+    # healthy resolutions, so reaching the except on a bare name means the
+    # alias was either expanded (target provider missing → typed path, this
+    # case) or UNKNOWN — and unknown aliases have "/" nowhere, so the
+    # bare-name guard below still re-raises the plain ValueError that lists
+    # available aliases (pinned by test_unknown_alias_stays_valueerror).
+    resolved_str = model_str
+    if (
+        "/" not in model_str
+        and aliases
+        and model_str in aliases
+    ):
+        resolved_str = aliases[model_str]
+    try:
+        return resolve_model(model_str, providers, aliases=aliases)
+    except ValueError as e:
+        # Re-raise anything that isn't a fully-qualified unknown-provider
+        # reference. Alias-expansion and bare-name errors must remain
+        # ValueError so typo-UX (and callers catching ValueError) are
+        # preserved.
+        if "/" not in resolved_str:
+            raise
+        prefix = resolved_str.partition("/")[0]
+        if prefix in providers:
+            raise
+        reason = None
+        if skipped_providers:
+            reason = skipped_providers.get(prefix)
+        if not reason:
+            reason = "provider not loaded at startup (skipped or never configured)"
+        raise ProviderUnavailableError(
+            f"provider '{prefix}' unavailable: {reason}",
+            provider_key=prefix, reason=reason,
+        ) from e
+
+
 _API_KEY_PATTERN = re.compile(r'\b(sk-[a-zA-Z0-9_-]{10,})\b')
 
 # ---------------------------------------------------------------------------
@@ -1588,8 +1663,9 @@ async def ping_cache(
     to the caller's retry/error-counting logic.
     """
     model_str = model or config.default_model
-    provider_cfg, api_model = resolve_model(
+    provider_cfg, api_model = resolve_model_checked(
         model_str, config.providers, aliases=config.model_aliases,
+        skipped_providers=getattr(config, "skipped_providers", {}),
     )
     if provider_cfg.type != "anthropic":
         return None
@@ -1663,8 +1739,9 @@ async def stream(
     """
     # Resolve model string to provider and API model name
     model_str = model or config.default_model
-    provider_cfg, api_model = resolve_model(
+    provider_cfg, api_model = resolve_model_checked(
         model_str, config.providers, aliases=config.model_aliases,
+        skipped_providers=getattr(config, "skipped_providers", {}),
     )
     
     # Convert messages to provider-native format
