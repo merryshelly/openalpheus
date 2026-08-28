@@ -269,16 +269,109 @@ class TestTruncateResult:
         assert result.endswith("TAIL_CONTENT_")
 
     def test_marker_includes_char_count(self):
-        """Truncation marker indicates how many characters were removed."""
+        """Truncation marker reports the fixed-point omitted-character count."""
         text = "x" * 10000
         result = truncate_result(text, 1000)
-        # Marker should contain a number (the removed char count)
         import re
 
-        numbers = re.findall(r"\d+", result)
-        assert len(numbers) > 0
-        # At least one number should be in the thousands (chars removed)
-        assert any(int(n) > 1000 for n in numbers)
+        match = re.search(r"\[truncated: (\d+) chars removed", result)
+        assert match is not None
+        # N = len(text) - max_chars + len(marker(N)); with the required Fix C
+        # marker, N=9106 and len(marker)=106, so 9000 + 106 is stable.
+        assert int(match.group(1)) == 9106
+
+    def test_marker_counts_actual_gap(self):
+        """R1: the marker count equals the real omitted gap at the 50k seam."""
+        import re
+
+        text = "w" * 50_087
+        result = truncate_result(text, 50_000)
+        match = re.search(r"\[truncated: (\d+) chars removed[^]]*\]", result)
+        assert match is not None
+        head = result[:match.start()]
+        tail = result[match.end():]
+        omitted = len(text) - len(head) - len(tail)
+        assert int(match.group(1)) == omitted
+        assert len(result) == 50_000
+
+    def test_marker_digit_boundary(self):
+        """R2: N0=999 crosses to a four-digit fixed point and stays exact."""
+        import re
+
+        text = "w" * 1_999
+        result = truncate_result(text, 1_000)
+        match = re.search(r"\[truncated: (\d+) chars removed[^]]*\]", result)
+        assert match is not None
+        head = result[:match.start()]
+        tail = result[match.end():]
+        omitted = len(text) - len(head) - len(tail)
+        # N0 = 1999 - 1000 = 999 (three digits). With the exact Fix C marker,
+        # marker(999) is 105 chars, producing N1=1104 (four digits); rebuilding
+        # gives a 106-char marker and the stable fixed point N2=N3=1105. The
+        # required ten-iteration cap therefore has ample margin (two updates).
+        n0 = len(text) - 1_000
+        n1 = n0 + len(
+            f"[truncated: {n0} chars removed — re-run with a smaller limit or "
+            "a narrower query/command to retrieve more]"
+        )
+        n2 = n0 + len(
+            f"[truncated: {n1} chars removed — re-run with a smaller limit or "
+            "a narrower query/command to retrieve more]"
+        )
+        n3 = n0 + len(
+            f"[truncated: {n2} chars removed — re-run with a smaller limit or "
+            "a narrower query/command to retrieve more]"
+        )
+        assert (n0, n1, n2, n3) == (999, 1_104, 1_105, 1_105)
+        assert int(match.group(1)) == n2
+        assert int(match.group(1)) == omitted
+        assert len(result) == 1_000
+
+    def test_under_limit_unchanged_fixed_point_regression(self):
+        """R3: fixed-point accounting never changes an under-budget value."""
+        text = "unchanged-window"
+        assert truncate_result(text, len(text)) == text
+        assert truncate_result(text, len(text) + 1) == text
+
+    def test_marker_exceeds_budget_fallback(self):
+        """R4: when the marker exceeds the budget, return marker(N_converged)[:limit].
+
+        The fallback path (content_budget < 0) returns the *converged*-N marker
+        sliced to the limit, not the legacy N0 marker. N is the documented
+        fixed point: N = overflow + len(marker(N)), iterated up to 10 times.
+        Pinned honestly across limits that span the pre-number, in-number, and
+        near-full marker regions — never loosened (the N value is meaningless
+        here by design, but the prefix the model receives is exact).
+        """
+        text = "w" * 200
+
+        def _converged_marker(txt, limit):
+            overflow = len(txt) - limit
+            removed = overflow
+            for _ in range(10):
+                marker = (
+                    f"[truncated: {removed} chars removed — re-run with a "
+                    "smaller limit or a narrower query/command to retrieve "
+                    "more]"
+                )
+                nxt = overflow + len(marker)
+                if nxt == removed:
+                    break
+                removed = nxt
+            marker = (
+                f"[truncated: {removed} chars removed — re-run with a "
+                "smaller limit or a narrower query/command to retrieve "
+                "more]"
+            )
+            return marker
+
+        for limit in (10, 16, 50, 102):
+            marker = _converged_marker(text, limit)
+            assert len(marker) > limit, (
+                f"marker ({len(marker)} chars) must exceed limit {limit} to "
+                "exercise the fallback path"
+            )
+            assert truncate_result(text, limit) == marker[:limit]
 
     def test_zero_length_text(self):
         """Empty string is unchanged."""

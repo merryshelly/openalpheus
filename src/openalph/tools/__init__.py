@@ -965,15 +965,29 @@ def truncate_result(text: str, max_chars: int) -> str:
     """
     if len(text) <= max_chars:
         return text
-    
-    # Calculate removal
-    removed_count = len(text) - max_chars
-    
-    # Budget for head and tail (leave room for marker)
-    # Marker includes continuation steering so the agent knows how to recover.
-    marker = f"[truncated: {removed_count} chars removed — re-run with offset/limit or a narrower command to retrieve more]"
+
+    # N must count the actual gap between the retained head and tail, not
+    # merely the amount by which the original value exceeded max_chars. The
+    # marker itself consumes part of the budget, and its digit width can in
+    # turn change its own length, so solve the small fixed point explicitly.
+    overflow = len(text) - max_chars
+    removed_count = overflow
+    for _ in range(10):
+        marker = (
+            f"[truncated: {removed_count} chars removed — re-run with a smaller "
+            "limit or a narrower query/command to retrieve more]"
+        )
+        next_removed_count = overflow + len(marker)
+        if next_removed_count == removed_count:
+            break
+        removed_count = next_removed_count
+
+    marker = (
+        f"[truncated: {removed_count} chars removed — re-run with a smaller "
+        "limit or a narrower query/command to retrieve more]"
+    )
     marker_len = len(marker)
-    
+
     # Available space for content after accounting for marker
     content_budget = max_chars - marker_len
     
@@ -1928,6 +1942,7 @@ async def _execute_tool_inner(
             max_chars=input.get("max_chars"),
             offset=input.get("offset"),
             tool_config=tool_config,
+            result_limit=getattr(agent_config, "truncation_limit", None),
         )
     elif name == "web_fetch_js":
         from .web import web_fetch_js
@@ -1956,6 +1971,7 @@ async def _execute_tool_inner(
             api_key=api_key,
             base_url=tool_config.get("base_url", "https://api.tabstack.ai/v1"),
             timeout=tool_config.get("timeout", 90),
+            result_limit=getattr(agent_config, "truncation_limit", None),
         )
     elif name == "subagent":
         from .subagent import run_subagent

@@ -931,10 +931,13 @@ class TestDescriptionsD:
         long_text = "x" * 200000
         result = truncate_result(long_text, 1000)
         assert "[truncated:" in result, "Truncation marker must be present"
-        assert "re-run" in result.lower() or "offset" in result.lower() \
-               or "limit" in result.lower() or "narrower" in result.lower(), \
-            f"Truncation marker must include continuation steering; got marker: " \
-            f"{[s for s in result.split('[') if 'truncated' in s]}"
+        assert (
+            "re-run with a smaller limit or a narrower query/command to retrieve more"
+            in result
+        ), (
+            f"Truncation marker must include the tool-neutral continuation steering; "
+            f"got marker: {[s for s in result.split('[') if 'truncated' in s]}"
+        )
 
     @pytest.mark.asyncio
     async def test_D27_file_edit_no_match_steering(self, tmp_path):

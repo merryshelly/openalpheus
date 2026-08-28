@@ -132,20 +132,209 @@ def _validate_offset(offset, tool: str):
     return None
 
 
+FLOOR_WINDOW_CHARS = 1_000
+
+
+def _window_header(
+    offset: int,
+    end: int,
+    total: int,
+    tool: str,
+    result_limit: int | None = None,
+    *,
+    trimmed: bool = False,
+) -> str:
+    """Render a window navigation header for an already-selected end offset.
+
+    ``trimmed`` is explicit because a result limit alone does not establish
+    that a delivered window was shortened. Only the budgeted-window path may
+    set it, and only for an end below the requested end.
+    """
+    parts = [f"chars {offset}-{end - 1} of {total}"]
+    if offset > 0:
+        parts.append(f"{offset} before")
+    if trimmed:
+        if result_limit is None:
+            raise ValueError("a trimmed window header requires result_limit")
+        parts.append(
+            f"window trimmed to fit the {result_limit}-char result budget"
+        )
+    if end < total:
+        parts.append(f"{total - end} after — continue with offset={end}")
+    else:
+        parts.append("end of text")
+    return f"[{tool} window: " + " | ".join(parts) + "]\n"
+
+
+def _trimmed_header_intervals(
+    lower: int,
+    upper: int,
+    total: int,
+) -> list[tuple[int, int]]:
+    """Return bounded end intervals with stable trimmed-header digit widths.
+
+    Within an interval, only ``end - 1``, ``end``, and ``total - end`` can
+    affect a trimmed header's length. Their decimal widths change only at
+    powers of ten (plus the one-character ``end - 1`` transition immediately
+    after a power), so these endpoints cover every realized header length
+    without walking the requested window.
+    """
+    starts = {lower, upper + 1}
+    for exponent in range(1, len(str(total)) + 1):
+        power = 10 ** exponent
+        for start in (power, power + 1, total - power + 1):
+            if lower < start <= upper:
+                starts.add(start)
+    if lower < total <= upper:
+        starts.add(total)
+
+    points = sorted(starts)
+    return [
+        (start, next_start - 1)
+        for start, next_start in zip(points, points[1:])
+    ]
+
+
 def _window_text(text: str, offset: int, window: int, tool: str) -> str:
     """kdsn.291: navigation marker + text[offset:offset+window] (clamped to
     end of text). The marker is PREFIXED so it survives the downstream
     framework head/tail truncation, which keeps the head."""
     total = len(text)
     end = min(offset + window, total)
-    parts = [f"chars {offset}-{end - 1} of {total}"]
-    if offset > 0:
-        parts.append(f"{offset} before")
-    if end < total:
-        parts.append(f"{total - end} after — continue with offset={end}")
+    return _window_header(offset, end, total, tool) + text[offset:end]
+
+
+def _budgeted_window_text(
+    text: str,
+    offset: int,
+    window: int,
+    tool: str,
+    result_limit: int,
+    suffix: str = "",
+    preserve_legacy_untrimmed: bool = False,
+) -> str | None:
+    """Return the maximal fitting window, or ``None`` below the 1k floor.
+
+    An untrimmed window that already fits is returned byte-for-byte unchanged
+    (for explicit windows, only with the redaction headroom still reserved).
+    Otherwise, evaluate the finite set of decimal-width header intervals and
+    select the largest real end that fits; this avoids a shrink/re-render loop
+    whose endpoint can be stale at a digit boundary.
+    """
+    total = len(text)
+    requested_end = min(offset + window, total)
+    untrimmed_header = _window_header(offset, requested_end, total, tool)
+
+    # Redaction occurs after this handler. Reserve its realistic expansion.
+    # The byte-identical shortcut for already-fitting windows must keep the
+    # headroom reserved for EXPLICITLY supplied max_chars values, or a
+    # near-limit window (e.g. a clamped short page) could expand past the
+    # limit post-redaction and be middle-cut. The default 49k window
+    # (max_chars omitted — callers pass preserve_legacy_untrimmed=True only
+    # for a true None) is exempt from the shortcut's headroom requirement,
+    # to keep kdsn.291 byte identity; its ~900-char margin at the 50k cap
+    # is a documented marked-cut residual. At the 1k floor the reserve
+    # clamps to the surplus, matching the trimmed path below. The trimmed
+    # path ALWAYS reserves the full (floor-clamped) headroom, for default
+    # and explicit windows alike.
+    REDACTION_HEADROOM = min(1_000, result_limit // 10)
+    if preserve_legacy_untrimmed:
+        shortcut_headroom = 0
     else:
-        parts.append("end of text")
-    return f"[{tool} window: " + " | ".join(parts) + "]\n" + text[offset:end]
+        untrimmed_body_budget = (
+            result_limit - len(untrimmed_header) - len(suffix)
+        )
+        shortcut_headroom = min(
+            REDACTION_HEADROOM, max(0, untrimmed_body_budget - FLOOR_WINDOW_CHARS)
+        )
+
+    # Preserve byte identity for all already-fitting windows.
+    if (
+        len(untrimmed_header)
+        + (requested_end - offset)
+        + len(suffix)
+        + shortcut_headroom
+        <= result_limit
+    ):
+        return untrimmed_header + text[offset:requested_end] + suffix
+
+    # Every rendered trimmed candidate must actually be shorter than the
+    # requested window. A shorter request that cannot fit needs no artificial
+    # sub-1k result: fail loud instead.
+    lower = offset + FLOOR_WINDOW_CHARS
+    upper = requested_end - 1
+    if lower > upper:
+        return None
+
+    # The reserve above applies to BODY capacity only, and is never a
+    # pre-redaction here: execute_tool is the single choke point that also
+    # emits operator redaction notices. At the 1k floor the reserve is
+    # clamped to the surplus so a known feasible floor window is not
+    # rejected solely by the reserve.
+
+    best_end: int | None = None
+    best_content: str | None = None
+    for interval_start, interval_end in _trimmed_header_intervals(lower, upper, total):
+        # This header length is realized throughout the interval. The raw
+        # candidate is exactly offset + result_limit - h - len(suffix); then
+        # reserve headroom from its body budget before choosing the endpoint.
+        interval_header = _window_header(
+            offset,
+            interval_start,
+            total,
+            tool,
+            result_limit,
+            trimmed=True,
+        )
+        header_length = len(interval_header)
+        raw_candidate_end = offset + result_limit - header_length - len(suffix)
+        raw_body_budget = raw_candidate_end - offset
+        if raw_body_budget < FLOOR_WINDOW_CHARS:
+            continue
+        reserved_headroom = min(
+            REDACTION_HEADROOM,
+            raw_body_budget - FLOOR_WINDOW_CHARS,
+        )
+        candidate_end = min(interval_end, raw_candidate_end - reserved_headroom)
+        if candidate_end < interval_start:
+            continue
+
+        # Render the candidate's real header, rather than trusting an assumed
+        # digit width, before accepting it. This is a bounded enumeration of
+        # the realized header-length range, not a monotone shrink loop.
+        header = _window_header(
+            offset,
+            candidate_end,
+            total,
+            tool,
+            result_limit,
+            trimmed=True,
+        )
+        body_length = candidate_end - offset
+        actual_body_budget = result_limit - len(header) - len(suffix)
+        actual_reserved_headroom = min(
+            REDACTION_HEADROOM,
+            max(0, actual_body_budget - FLOOR_WINDOW_CHARS),
+        )
+        if (
+            body_length < FLOOR_WINDOW_CHARS
+            or body_length + actual_reserved_headroom > actual_body_budget
+        ):
+            continue
+
+        if best_end is None or candidate_end > best_end:
+            best_end = candidate_end
+            best_content = header + text[offset:candidate_end] + suffix
+
+    return best_content
+
+
+def _window_budget_error(tool: str, result_limit: int) -> str:
+    """Compact post-fetch floor error; tiny configured caps may still cut it."""
+    return (
+        f"{tool} error: {result_limit}-char result budget cannot fit the header "
+        "plus a 1,000-char window; raise truncation_limit."
+    )
 
 
 # --- Public API ---
@@ -213,6 +402,7 @@ async def web_fetch(
     max_chars: int | None = None,
     tool_config: dict | None = None,
     offset: int | None = None,
+    result_limit: int | None = None,
 ) -> ToolResult:
     """Fetch URL and extract readable content.
 
@@ -280,10 +470,9 @@ async def web_fetch(
             )
 
         # kdsn.291: window mode (offset) takes precedence over the legacy
-        # head/tail cap. The note is appended AFTER either so it's never cut
-        # into. Legacy path: BUG-4 guard preserved — only truncate for a
-        # genuine positive int (bool is an int subclass; max_chars<=0 used to
-        # make text[-0:] return the WHOLE string).
+        # head/tail cap. Legacy path: BUG-4 guard preserved — only truncate
+        # for a genuine positive int (bool is an int subclass; max_chars<=0
+        # used to make text[-0:] return the WHOLE string).
         if offset is not None:
             total = len(text)
             if total == 0:
@@ -303,6 +492,17 @@ async def web_fetch(
                     is_error=True,
                 )
             window = max_chars if _is_pos_int(max_chars) else DEFAULT_WINDOW_CHARS
+            if _is_pos_int(result_limit):
+                budgeted = _budgeted_window_text(
+                    text, offset, window, "web_fetch", result_limit, js_note,
+                    preserve_legacy_untrimmed=max_chars is None,
+                )
+                if budgeted is None:
+                    return ToolResult(
+                        content=_window_budget_error("web_fetch", result_limit),
+                        is_error=True,
+                    )
+                return ToolResult(content=budgeted, is_error=False)
             text = _window_text(text, offset, window, "web_fetch")
         elif _is_pos_int(max_chars) and len(text) > max_chars:
             head_budget = max_chars // 2
@@ -352,6 +552,7 @@ async def web_fetch_js(
     base_url: str = TABSTACK_BASE_URL,
     timeout: float = TABSTACK_TIMEOUT,
     offset: int | None = None,
+    result_limit: int | None = None,
 ) -> ToolResult:
     """Fetch a JavaScript-rendered page via Tabstack's cloud browser.
 
@@ -565,6 +766,17 @@ async def web_fetch_js(
                         ),
                     )
                 window = max_chars if _is_pos_int(max_chars) else DEFAULT_WINDOW_CHARS
+                if _is_pos_int(result_limit):
+                    budgeted = _budgeted_window_text(
+                        text, offset, window, "web_fetch_js", result_limit,
+                        preserve_legacy_untrimmed=max_chars is None,
+                    )
+                    if budgeted is None:
+                        return ToolResult(
+                            content=_window_budget_error("web_fetch_js", result_limit),
+                            is_error=True,
+                        )
+                    return ToolResult(content=budgeted, is_error=False)
                 text = _window_text(text, offset, window, "web_fetch_js")
             # M2: only truncate for a real, positive int max_chars. A bad
             # optional value (0, negative, non-int, or a bool -- True/False
