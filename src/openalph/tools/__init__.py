@@ -626,7 +626,10 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
     "memory_search": {
         "description": (
             "Search workspace memory files using hybrid semantic + keyword search. "
-            "Returns ranked snippets with file paths and line numbers. "
+            "Returns ranked results with file paths and line numbers. "
+            "Results for memory atoms (files whose parent directory is named 'atoms') "
+            "return complete content inline; other files return short truncated snippets "
+            "to expand with file_read. "
             "IMPORTANT: search BEFORE asserting anything about prior work, decisions, dates, "
             "people, preferences, or todos — do not rely on recall alone. "
             "Run multiple targeted queries rather than one broad search. "
@@ -659,6 +662,7 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "mmr_lambda": 0.7,
             "temporal_decay_enabled": True,
             "temporal_decay_half_life_days": 30,
+            "atom_full_max_chars": 2500,
             "extra_paths": []
         }
     },

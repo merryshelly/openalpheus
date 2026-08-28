@@ -51,6 +51,97 @@ _DEGRADED_NOTICE = (
     "  and place the model file at the path above. Keyword search still works.\n"
 )
 
+# kdsn.299: at most this many distinct atom files get full-content emission
+# per call. Atoms are brief (~2.1K max measured); without a cap a 30-result
+# all-atom call could blow the 50K tool-result truncation limit.
+MAX_FULL_ATOMS = 10
+
+# kdsn.299: truncation marker appended to atoms cut at atom_full_max_chars,
+# steering the caller to read the whole file via file_read.
+_ATOM_TRUNCATED_MARKER = (
+    "\n[atom truncated at {cap} chars — file_read the path above for the full atom]"
+)
+
+
+def _is_atom_path(path: str) -> bool:
+    """An indexed path is a memory atom iff its parent directory name is
+    exactly "atoms" (case-sensitive)."""
+    return Path(path).parent.name == "atoms"
+
+
+def _read_atom_full(path: str, workspace) -> "str | None":
+    """Read an atom file from disk for inline emission.
+
+    Returns the file content, or None when full-read is unsafe/impossible
+    (caller falls back to the legacy snippet): the candidate resolves outside
+    the workspace (incl. symlink escape), is missing, unreadable, or is a
+    directory. Never raises.
+    """
+    try:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = Path(workspace) / candidate
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(Path(workspace).resolve()):
+            return None
+        if not resolved.is_file():
+            return None
+        return resolved.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _format_results(query: str, results: list, workspace, atom_full_max_chars) -> str:
+    """Format search results for display.
+
+    Atom results (parent directory named exactly "atoms") are emitted with the
+    complete file content inline (deduped by resolved path, budget-capped,
+    char-capped); everything else keeps the legacy 200-char flattened snippet.
+    Returns everything except the degraded-embedder notice prefix, which
+    run_memory_search prepends.
+    """
+    if not results:
+        return f"No results found for \"{query}\"."
+
+    full_ok = (
+        isinstance(atom_full_max_chars, int)
+        and not isinstance(atom_full_max_chars, bool)
+        and atom_full_max_chars >= 1
+    )
+    seen_full_paths: set = set()
+
+    lines = [f"Found {len(results)} results for \"{query}\":\n"]
+    for i, r in enumerate(results, 1):
+        snippet = r.snippet[:200].replace("\n", " ").strip()
+        lines.append(f"[{i}] {r.path}:{r.start_line}-{r.end_line} (score: {r.score:.2f})")
+
+        content = None
+        resolved = None
+        if full_ok and _is_atom_path(r.path):
+            candidate = Path(r.path)
+            if not candidate.is_absolute():
+                candidate = Path(workspace) / candidate
+            try:
+                resolved = candidate.resolve()
+            except (OSError, ValueError):
+                resolved = None
+            if (resolved is not None
+                    and resolved not in seen_full_paths
+                    and len(seen_full_paths) < MAX_FULL_ATOMS):
+                content = _read_atom_full(r.path, workspace)
+
+        if content is not None:
+            seen_full_paths.add(resolved)
+            if len(content) > atom_full_max_chars:
+                content = (content[:atom_full_max_chars]
+                           + _ATOM_TRUNCATED_MARKER.format(cap=atom_full_max_chars))
+            # Audit M1: indent full content so a poisoned atom cannot forge
+            # a "[N] path (score: ...)" header line at column 0.
+            lines.append("  " + content.replace("\n", "\n  ") + "\n")
+        else:
+            lines.append(f"  {snippet}\n")
+    return "\n".join(lines)
+
 
 def _get_index_lock(workspace_key: str) -> asyncio.Lock:
     lock = _index_locks.get(workspace_key)
@@ -255,10 +346,8 @@ async def _index_and_search(indexer, workspace, query, config, max_results, min_
             content=notice + f"No results found for \"{query}\".", is_error=False
         )
 
-    lines = [f"Found {len(results)} results for \"{query}\":\n"]
-    for i, r in enumerate(results, 1):
-        snippet = r.snippet[:200].replace("\n", " ").strip()
-        lines.append(f"[{i}] {r.path}:{r.start_line}-{r.end_line} (score: {r.score:.2f})")
-        lines.append(f"  {snippet}\n")
-
-    return ToolResult(content=notice + "\n".join(lines), is_error=False)
+    atom_full_max_chars = config.get("atom_full_max_chars", 2500)
+    return ToolResult(
+        content=notice + _format_results(query, results, workspace, atom_full_max_chars),
+        is_error=False,
+    )
