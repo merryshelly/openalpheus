@@ -469,6 +469,33 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
     }),
 ]
 
+# Reasoning-effort tier ranks shared by every warn-once remap site in this
+# module: spans both OA levels and wire values ("off" normalizes to the wire
+# value "none" at the lookup; max is an OA level ranked above xhigh).
+_TIER = {"none": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
+
+# Blackwell (local SGLang rig) reasoning_effort remap (kdsn.301, wire-probed
+# 2026-08-28 vs router http://10.0.20.111:8000, SGLang 0.5.18, served model
+# qwen38-27b-fp8, same prompt per level): none/low/medium/xhigh all -> 200
+# and genuinely distinguished (xhigh=2733 vs medium=258 reasoning tokens;
+# none yields reasoning_tokens=0), while high/max/garbage -> 400 LOUD reject.
+# So high collapses DOWN to medium and max ceiling-maps to xhigh, each with a
+# warn-once (operator intent is lossy, so surface it). ALWAYS send the param
+# explicitly: an omitted effort falls back to the server's low/medium-like
+# default (silent override, kdsn.271 bug class).
+_BLACKWELL_EFFORT_MAP: dict[str, str] = {
+    "off": "none",
+    "low": "low",
+    "medium": "medium",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+}
+
+# Blackwell reasoning_effort remaps already WARNed about (one warning per OA
+# level per process, never per message; keyed by the OA level, e.g. "high",
+# "max"). House convention mirrors _SYNTHETIC_EFFORT_WARNED / _VISION_WARNED.
+_BLACKWELL_EFFORT_WARNED: set[str] = set()
+
 
 def model_supports_vision(api_model: str, config) -> bool:
     """Resolve whether a model accepts image content blocks (kdsn.275).
@@ -1581,10 +1608,6 @@ def _build_openai_kwargs(
         # including override xhigh->xhigh — and off->none is a disable-alias,
         # not a tier drop. The (fragment, level) key keeps default and override
         # remaps of the same level from swallowing each other's warning.
-        # _TIER spans both OA levels and wire values (max is an OA level that
-        # Fireworks passes through 1:1, ranked above xhigh; "off" normalizes
-        # to the wire value "none").
-        _TIER = {"none": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
         _req_tier = _TIER.get("none" if thinking_level == "off" else thinking_level)
         if (_req_tier is not None and _TIER.get(_syn_effort, -1) < _req_tier
                 and (_syn_frag, thinking_level) not in _SYNTHETIC_EFFORT_WARNED):
@@ -1594,6 +1617,33 @@ def _build_openai_kwargs(
                 "%r (operator intent is lossy).", thinking_level, _syn_effort,
             )
         extra_body["reasoning_effort"] = _syn_effort
+    elif provider_key == "blackwell":
+        # kdsn.301: Blackwell (local SGLang rig) takes TOP-LEVEL
+        # reasoning_effort (like Fireworks/Synthetic), never OpenRouter's
+        # nested reasoning.effort. Wire-probed 2026-08-28: none/low/medium/
+        # xhigh -> 200 and genuinely distinguished (xhigh=2733 vs medium=258
+        # reasoning tokens on the same prompt); high/max/garbage -> 400 LOUD
+        # reject. So ALWAYS send it explicitly (an omitted param silently
+        # defaults to reasoning-ON, kdsn.271 bug class): off -> "none",
+        # low/medium/xhigh pass 1:1 (xhigh is card-native and wire-verified,
+        # UNLIKE the synthetic default map's collapse), and the unsupported
+        # high/max collapse with a warn-once - high DOWN to "medium" (never
+        # up to xhigh, which would silently ~10x the reasoning burn) and max
+        # ceiling to "xhigh", mirroring the synthetic qwen3.8 override.
+        _bw_effort = _BLACKWELL_EFFORT_MAP.get(thinking_level, "medium")
+        # Warn-once per OA level, ONLY on a downward tier-drop (high->medium,
+        # max->xhigh). 1:1 mappings never warn - including the xhigh
+        # passthrough - and off->none is a disable-alias, not a tier drop
+        # ("off" normalizes to the wire value "none", tier 0).
+        _req_tier = _TIER.get("none" if thinking_level == "off" else thinking_level)
+        if (_req_tier is not None and _TIER.get(_bw_effort, -1) < _req_tier
+                and thinking_level not in _BLACKWELL_EFFORT_WARNED):
+            _BLACKWELL_EFFORT_WARNED.add(thinking_level)
+            logger.warning(
+                "Blackwell does not support reasoning_effort=%r; remapping to "
+                "%r (operator intent is lossy).", thinking_level, _bw_effort,
+            )
+        extra_body["reasoning_effort"] = _bw_effort
     elif thinking_level == "off" and "deepseek-v4-flash" in api_model.lower():
         # DSv4 thinks BY DEFAULT (template enable_thinking=true). llama.cpp
         # disables thinking only on TOP-LEVEL reasoning_effort="none" (verified
