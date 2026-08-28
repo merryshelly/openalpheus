@@ -327,18 +327,19 @@ class TestGatedDedup:
         assert len(captured) >= 1, "stream() was never called"
         messages = captured[-1]
 
-        # Count trailing user messages
-        trailing_users = []
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                trailing_users.append(msg)
-            else:
-                break
-
-        assert len(trailing_users) == 1, (
-            f"DM: expected 1 trailing user entry, got {len(trailing_users)}"
+        # Invariant: the live user message appears on the wire exactly once —
+        # the gated/dedup regression this test guards was a DOUBLE-APPEND of
+        # the same text, not merely a second trailing user-role entry. Since
+        # kdsn.298 (session-orient), a harness turn-start reminder legitimately
+        # follows the live user message as another trailing user-role entry, so
+        # count occurrences of the live TEXT, not the trailing role-run.
+        live_occs = [
+            m for m in messages if m.get("content") == "Hello in DM"
+        ]
+        assert len(live_occs) == 1, (
+            f"DM: live user message must appear exactly once on the wire, "
+            f"got {len(live_occs)}"
         )
-        assert messages[-1].get("content") == "Hello in DM"
 
 
 # ── Unit Test: provider._dedup_trailing_user ──────────────────────────────────

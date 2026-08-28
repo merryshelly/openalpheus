@@ -35,6 +35,12 @@ class ReminderState:
     tool_calls_session: dict        # {tool_name: count}
     todo_list: list                 # list of todo item dicts
     enabled_tools: set              # set of tool name strings
+    # kdsn.298 session-orient: turn-start site only populates these; the
+    # tool-loop-boundary site (and the __sub__ sentinel room) flows defaults —
+    # model_resolved == "" == _oriented_model keeps the predicate silent there.
+    model_resolved: str = ""        # post-room-override, post-alias-expansion
+    model_vision: bool = False
+    orient_ts: str = ""             # pre-rendered host-local timestamp string
 
 
 @dataclass
@@ -42,6 +48,10 @@ class Reminder:
     """A single reminder to inject into the message stream."""
     trigger: str
     text: str
+    # kdsn.298: generic JSONL plumbing (session-orient carries the resolved
+    # model here so rehydrate can restore _oriented_model without parsing the
+    # framed text). Sinks pass it through only when not None.
+    detail: str | None = None
 
     @property
     def content(self) -> str:
@@ -66,6 +76,10 @@ class ReminderEngine:
         self._t6_fired: bool = False        # T6: once per session
         # Per-turn state
         self._t4_fired_this_turn: bool = False  # T4: once per turn
+        # kdsn.298: model-keyed orientation flag (spec MED-1 — also cleared in
+        # reset(); rehydrate() calls reset() first, so a stale value surviving
+        # reset would wrongly suppress a deserved fire).
+        self._oriented_model: str | None = None
 
     def evaluate(self, state: ReminderState) -> list[Reminder]:
         """Evaluate all trigger predicates against current state.
@@ -77,6 +91,33 @@ class ReminderEngine:
             return []
 
         results: list[Reminder] = []
+
+        # session-orient (kdsn.298) — turn_start only. Model-keyed keyed flag
+        # IS the per-epoch cap: same-model re-evaluations are suppressed,
+        # model switches re-fire (each switch keys once).
+        # Suppression forms (test t19 pins both sides):
+        #  - fresh engine, unpopulated state (__sub__ sentinel room, or any
+        #    construction site flowing defaults): "" vs None → suppressed.
+        #  - oriented engine, unpopulated state: "" re-arms (winds the keyed
+        #    state back toward un-armed) so the NEXT populated evaluation
+        #    still fires — covers restart/history-clear without rehydrate.
+        #  - populated state equal to the oriented model: suppressed.
+        if (state.evaluation_point == "turn_start"
+                and state.model_resolved != self._oriented_model
+                and (state.model_resolved or self._oriented_model is not None)):
+            self._oriented_model = state.model_resolved
+            results.append(Reminder(
+                trigger="session-orient",
+                detail=state.model_resolved,
+                text=(
+                    "Session orientation (injected automatically at "
+                    "context-epoch start):\n"
+                    f"- Session began: {state.orient_ts}\n"
+                    f"- Active model: {state.model_resolved}\n"
+                    f"- Context window: {state.context_limit:,} tokens\n"
+                    f"- Vision: {'yes' if state.model_vision else 'no'}"
+                ),
+            ))
 
         # T1: todo-nudge — boundary, iteration==5, todo_write enabled,
         # no todo_write call this turn, no in_progress item; ≤2/session
@@ -221,6 +262,12 @@ class ReminderEngine:
                 self._t5_fired = True
             elif trigger == "advisor-salience":
                 self._t6_fired = True
+            elif trigger == "session-orient" and entry.get("detail") is not None:
+                # kdsn.298: restore the model-keyed orientation flag from the
+                # persisted detail. Last-wins in JSONL order (the final entry
+                # is the epoch's last orientation — spec §4.4). Guarded: an
+                # entry lacking detail preserves any known-good earlier one.
+                self._oriented_model = entry["detail"]
             # T4 is per-turn — not rehydrated across sessions
 
     def reset(self) -> None:
@@ -231,6 +278,7 @@ class ReminderEngine:
         self._t5_fired = False
         self._t6_fired = False
         self._t4_fired_this_turn = False
+        self._oriented_model = None
 
     def reset_turn(self) -> None:
         """Clear per-turn fired state (new turn boundary)."""

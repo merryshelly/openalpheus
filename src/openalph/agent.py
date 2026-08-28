@@ -246,6 +246,38 @@ class Agent:
             self._reminder_engines[room_id] = ReminderEngine(self.config)
         return self._reminder_engines[room_id]
 
+    def _orient_inputs(self, room_id: str) -> dict:
+        """session-orient ReminderState inputs for the turn-start site (kdsn.298).
+
+        Fail-soft everywhere: a stale persisted /model override pointing at an
+        unconfigured provider raises in resolve_model — caught, and the RAW
+        get_model string is used (review LOW-2: under fail-soft the compared
+        keyed form flips to raw; self-healing). Must never raise into a turn.
+        model_resolved uses the RESOLVED provider's key (audit reconciliation
+        HIGH-1, kimi3+qwen38): reconstructing the prefix from the input string
+        mis-keyed bare aliases ("/model deepseek" → "deepseek/deepseek-v4-flash"
+        instead of "macstudio/deepseek-v4-flash"), making the model-keyed cap
+        spelling-sensitive and the nudge's model line wrong.
+        """
+        model = self.get_model(room_id)
+        try:
+            from openalph.config import resolve_model
+            provider_cfg, api_name = resolve_model(
+                model, self.config.providers,
+                aliases=self.config.model_aliases)
+            model_resolved = f"{provider_cfg.key}/{api_name}"
+        except Exception as exc:
+            logger.warning("session-orient: model resolution failed for %r "
+                           "in %s — using raw string (%s: %s)",
+                           model, room_id, type(exc).__name__, exc)
+            model_resolved = model
+        return {
+            "model_resolved": model_resolved,
+            "model_vision": model_supports_vision(model, self.config),
+            "orient_ts": datetime.now(timezone.utc).astimezone().strftime(
+                "%A, %B %d, %Y — %H:%M %Z"),
+        }
+
     def rehydrate_reminders(self, room_id: str, entries: list[dict]) -> None:
         """Rehydrate reminder fired-state for a room from JSONL entries (R1-4)."""
         self._engine_for(room_id).rehydrate(entries)
@@ -748,6 +780,12 @@ class Agent:
                         tool_calls_session=dict(self._room_tool_counts.get(room_id, {})),
                         todo_list=list(_TODO_STATE.get(room_id, [])),  # R1-3
                         enabled_tools=_enabled_tools,
+                        # kdsn.298: orientation inputs — turn-start site ONLY;
+                        # the boundary site flows the dataclass defaults.
+                        # The __sub__ sentinel room is never orientable
+                        # (decision 7): empty strings == the engine's
+                        # default/un-oriented key suppress the predicate there.
+                        **self._orient_inputs(room_id) if room_id != "__sub__" else {},
                     )
                     _turn_start_reminders = self._engine_for(room_id).evaluate(_turn_start_state)
                 for _rem in _turn_start_reminders:

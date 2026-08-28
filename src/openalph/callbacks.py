@@ -13,6 +13,8 @@ import sys
 
 import mistune
 
+from openalph.reminders import Reminder
+
 
 # ---------------------------------------------------------------------------
 # CommsSinks protocol (structural typing)
@@ -65,6 +67,14 @@ class HeadlessSinks:
                 content=reminder.content,
                 source="reminder",
                 trigger=reminder.trigger,
+                # kdsn.298: conditional pass-through — plain T1–T6 reminders
+                # must NOT gain a detail key in the JSONL (review LOW-13).
+                # isinstance (not attr probing): duck-typed/mocked reminders
+                # (e.g. MagicMock in legacy sink tests) auto-fabricate a
+                # truthy .detail that would corrupt the JSONL.
+                **({"detail": reminder.detail}
+                   if isinstance(reminder, Reminder)
+                   and reminder.detail is not None else {}),
             )
         print(reminder.content, file=sys.stderr, flush=True)
 
@@ -132,6 +142,14 @@ class MatrixSinks:
                 content=reminder.content,
                 source="reminder",
                 trigger=reminder.trigger,
+                # kdsn.298: conditional pass-through — plain T1–T6 reminders
+                # must NOT gain a detail key in the JSONL (review LOW-13).
+                # isinstance (not attr probing): duck-typed/mocked reminders
+                # (e.g. MagicMock in legacy sink tests) auto-fabricate a
+                # truthy .detail that would corrupt the JSONL.
+                **({"detail": reminder.detail}
+                   if isinstance(reminder, Reminder)
+                   and reminder.detail is not None else {}),
             )
 
     async def send_media(self, file_path, content_type, filename, caption=None):
