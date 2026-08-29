@@ -77,7 +77,7 @@ Every subagent task prompt must include:
 
 ```
 ---
-Begin your response by briefly restating the task you were given, then summarize your findings. The receiving session may have lost context.
+Begin your response by briefly restating the task you were given, then summarize your findings.
 ```
 
 ---
@@ -173,5 +173,5 @@ You are a subagent tasked with analyzing API response formats.
 ```
 
 ---
-Begin your response by briefly restating the task you were given, then summarize your findings. The receiving session may have lost context.
+Begin your response by briefly restating the task you were given, then summarize your findings.
 ```

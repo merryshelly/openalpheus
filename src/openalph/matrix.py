@@ -130,6 +130,12 @@ _FURL_RESULT_RAW_CAP = 12000      # full result content, pre-escape
 _FURL_INPUT_ESC_CAP = 4000        # post-escape ceiling for the input fold
 _FURL_RESULT_ESC_CAP = 16000      # post-escape ceiling for the result fold
 
+# kdsn.247.2: the furl reader is the OPERATOR, who cannot re-run anything —
+# the default agent-facing re-run steering marker would be misaddressed here.
+_FURL_TRUNCATION_MARKER_TEMPLATE = (
+    "[{n} chars elided from this notice — full content in session JSONL]"
+)
+
 
 def _unwrap_tool_result(text: str) -> str:
     """Strip the ``<tool_result tool="..." id="...">\\n … \\n</tool_result>``
@@ -153,7 +159,9 @@ def _escape_capped(text: str, raw_cap: int, esc_cap: int) -> str:
     escaped result to `esc_cap` (entity-safe: never cuts inside an `&…;`).
     Both bounds matter — raw_cap keeps the common case readable, esc_cap keeps
     the PDU size bounded regardless of how far escaping expands the content."""
-    esc = html_escape(truncate_result(str(text), raw_cap))
+    esc = html_escape(truncate_result(
+        str(text), raw_cap,
+        marker_template=_FURL_TRUNCATION_MARKER_TEMPLATE))
     if len(esc) <= esc_cap:
         return esc
     cut = esc[:esc_cap]

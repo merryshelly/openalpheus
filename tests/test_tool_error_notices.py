@@ -254,8 +254,17 @@ class TestErrorNoticeDetail:
 
         c = _notice_contents(bot)[0]
         fb = c.get("formatted_body", "")
-        assert "[truncated:" in fb, \
-            "over-long detail must carry the head+tail truncate_result marker"
+        # kdsn.247.2: the marker is head+tail elision via truncate_result, but
+        # operator-addressed (this render path's reader cannot re-run anything).
+        assert "[truncated:" not in fb, \
+            "agent-facing re-run marker must not appear in operator notices"
+        assert "chars elided from this notice" in fb, \
+            "over-long detail must carry the operator-facing elision marker"
+        assert "full content in session JSONL" in fb
+        # Head+tail, not hard-cut: material from BOTH ends survives, and the
+        # middle elision means fewer than the full 40000 chars pass through.
+        assert fb.count("Z") < 40000, \
+            "elided notice must not carry the entire 40000-char detail"
         # Shows MORE than the old 2000 hard cap...
         assert fb.count("Z") > 2000, \
             "furled detail must surface more than the old 2000-char hard cut"
@@ -390,3 +399,42 @@ class TestSubAgentNoticeScope:
         cb = captured["callbacks"] or {}
         assert "on_tool_call" not in cb, \
             "sub-agent internal tool calls must have NO on_tool_call → no notices (§8b scope)"
+
+
+class TestFurledTruncationMarkerAudience:
+    """kdsn.247.2 — an elided furl block must address its actual reader: the
+    operator, who cannot 're-run' anything. The agent-facing steering marker
+    ('[truncated: N chars removed — re-run with a smaller limit …]') is the
+    right instruction inside a <tool_result> but wrong in a Matrix notice
+    render, where it reads like the operator should go retry something.
+    Surfaced when a 13.1K template read confused the operator into thinking
+    the file itself was truncated; the session JSONL was complete."""
+
+    @pytest.mark.asyncio
+    async def test_elided_furled_result_uses_operator_facing_marker(self, tmp_path):
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        _tool_notice, _ = bot._make_tool_callbacks(ROOM)
+
+        big = "x" * 13000  # > _FURL_RESULT_RAW_CAP (12000) → head+tail elision
+        await _tool_notice("tc1", "file_read", {"path": "/x/big.md"}, big, False)
+
+        fb = _notice_contents(bot)[0].get("formatted_body", "")
+        assert "chars elided from this notice" in fb, (
+            "elided furl block must speak to the operator, not the agent")
+        assert "full content in session JSONL" in fb
+        assert "re-run with a smaller" not in fb, (
+            "agent-facing re-run instruction must not appear in "
+            "operator-facing Matrix notices")
+
+    @pytest.mark.asyncio
+    async def test_under_cap_result_notice_has_no_marker(self, tmp_path):
+        """Results under the raw cap render whole — no elision marker at all."""
+        bot, agent = _make_bot_with_real_agent(tmp_path)
+        _tool_notice, _ = bot._make_tool_callbacks(ROOM)
+
+        await _tool_notice("tc1", "file_read", {"path": "/x/small.md"},
+                           "tiny", False)
+
+        fb = _notice_contents(bot)[0].get("formatted_body", "")
+        assert "elided from this notice" not in fb
+        assert "re-run with a smaller" not in fb

@@ -383,3 +383,40 @@ class TestTruncateResult:
         result = truncate_result(text, 10)
         # Should produce something, even if mostly marker
         assert isinstance(result, str)
+
+    def test_custom_marker_template_audience_text(self):
+        """kdsn.247.2: marker_template swaps the agent-facing steering text."""
+        text = "A" * 10000
+        template = ("[{n} chars elided from this notice — "
+                    "full content in session JSONL]")
+        result = truncate_result(text, 1000, marker_template=template)
+        assert "elided from this notice" in result
+        assert "full content in session JSONL" in result
+        assert "re-run with a smaller" not in result
+        assert len(result) == 1000
+
+    def test_custom_marker_template_counts_actual_gap(self):
+        """kdsn.247.2: fixed-point budget math holds with a custom template —
+        the count N still equals the real omitted gap."""
+        import re
+
+        text = "w" * 20000
+        template = ("[{n} chars elided from this notice — "
+                    "full content in session JSONL]")
+        result = truncate_result(text, 5000, marker_template=template)
+        match = re.search(
+            r"\[(\d+) chars elided from this notice — "
+            r"full content in session JSONL\]", result)
+        assert match is not None
+        head = result[:match.start()]
+        tail = result[match.end():]
+        omitted = len(text) - len(head) - len(tail)
+        assert int(match.group(1)) == omitted
+        assert result.startswith("w")
+        assert result.endswith("w")
+
+    def test_default_marker_template_unchanged(self):
+        """kdsn.247.2: no marker_template → the agent-facing default persists."""
+        result = truncate_result("A" * 10000, 1000)
+        assert ("re-run with a smaller limit or a narrower query/command"
+                in result)

@@ -954,7 +954,14 @@ def wrap_tool_result(content: str, tool_name: str, tool_call_id: str) -> str:
     )
 
 
-def truncate_result(text: str, max_chars: int) -> str:
+DEFAULT_TRUNCATION_MARKER_TEMPLATE = (
+    "[truncated: {n} chars removed — re-run with a smaller "
+    "limit or a narrower query/command to retrieve more]"
+)
+
+
+def truncate_result(text: str, max_chars: int,
+                    *, marker_template: str | None = None) -> str:
     """Truncate text to max_chars with head+tail and marker.
     
     If len(text) > max_chars: return head + '[truncated: N chars removed]' + tail.
@@ -963,7 +970,11 @@ def truncate_result(text: str, max_chars: int) -> str:
     Args:
         text: Text to potentially truncate
         max_chars: Maximum characters allowed
-        
+        marker_template: Optional override for the elision marker; must
+            contain ``{n}``, replaced with the omitted-character count.
+            Defaults to the agent-facing steering string; operator-facing
+            renders (e.g. Matrix notices) pass their own (kdsn.247.2).
+
     Returns:
         Original text if under limit, or truncated text with marker
     """
@@ -975,21 +986,16 @@ def truncate_result(text: str, max_chars: int) -> str:
     # marker itself consumes part of the budget, and its digit width can in
     # turn change its own length, so solve the small fixed point explicitly.
     overflow = len(text) - max_chars
+    template = marker_template or DEFAULT_TRUNCATION_MARKER_TEMPLATE
     removed_count = overflow
     for _ in range(10):
-        marker = (
-            f"[truncated: {removed_count} chars removed — re-run with a smaller "
-            "limit or a narrower query/command to retrieve more]"
-        )
+        marker = template.format(n=removed_count)
         next_removed_count = overflow + len(marker)
         if next_removed_count == removed_count:
             break
         removed_count = next_removed_count
 
-    marker = (
-        f"[truncated: {removed_count} chars removed — re-run with a smaller "
-        "limit or a narrower query/command to retrieve more]"
-    )
+    marker = template.format(n=removed_count)
     marker_len = len(marker)
 
     # Available space for content after accounting for marker
