@@ -409,6 +409,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     # BEFORE the generic rows below: first-match-wins, and "hf:moonshotai/
     # kimi-k3" contains the generic fragment "kimi-k3".
     ("hf:moonshotai/kimi-k3",            524288, None, True),
+    ("hf:zai-org/glm-5.3-flash",         524288, None, True),
     ("hf:zai-org/glm-5.2",               524288, None, False),
     ("hf:zai-org/glm-4.7-flash",         196608, None, False),
     ("hf:openai/gpt-oss",                131072, None, False),
@@ -466,6 +467,26 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
         "high": "high",
         "xhigh": "xhigh",
         "max": "xhigh",
+    }),
+    # hf:zai-org/glm-5.3-flash (workspace-lh3c.11, wire-probed 2026-08-29):
+    # ALL SIX levels return 200 — "none" yields reasoning_tokens=0 (genuine
+    # off, even though the z.ai-native card says thinking cannot be disabled),
+    # and the gateway handles xhigh/max (card-native vocab is low/high/max;
+    # probe: 0/0/25/74/100/47 reasoning tokens on a trivial prompt for
+    # none/low/medium/high/xhigh/max — non-monotonic at that scale, tier
+    # differentiation beyond on/off UNCHARACTERIZED). Card-native vocab is
+    # low/high/max; the template coerces unknown values to max, so at the
+    # model level xhigh~max — pass 1:1 (harmless, honors "very heavy"
+    # intent) but do not cite xhigh as a distinct tier. Probe quirk: "none"
+    # responses leak a stray </thinking> tag into content (served-template
+    # artifact, not a blocker).
+    ("hf:zai-org/glm-5.3-flash", {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
     }),
 ]
 
@@ -614,6 +635,7 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     # IDs need their own explicit pins — the kdsn.241.3 no-penalty invariant
     # must not depend on default-profile accident.
     ("hf:moonshotai/kimi-k3", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    ("hf:zai-org/glm-5.3-flash", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("hf:zai-org/glm-5.2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k3",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
