@@ -185,7 +185,10 @@ def _sanitize_error(message: str) -> str:
     return _API_KEY_PATTERN.sub('[REDACTED]', message)
 
 # Client cache: reuse HTTP clients for connection pooling.
-# Keyed by (provider, api_key, base_url) so different configs get different clients.
+# Keyed by (type, api_key, base_url, timeout) so different configs get
+# different clients; the trailing hardened flag (kdsn.304) splits
+# key-bearing-call clients onto their own hardened transport so a per-call
+# flag can never poison or un-harden the pooled client.
 _client_cache: dict[tuple, object] = {}
 
 # SDK-level automatic retry budget for transient failures (408/409/429/5xx incl
@@ -201,9 +204,39 @@ _client_cache: dict[tuple, object] = {}
 # unchanged since the assistant turn is appended only after the stream completes.
 _MAX_SDK_RETRIES = 20
 
+# Bounded-response read cap for hardened (key-bearing) calls (kdsn.304). A
+# hardened stream whose accumulated body exceeds this aborts with
+# ProviderError instead of silently buffering an unbounded (and potentially
+# adversarial) response. Mirrors the Stigmergy critic client's 10 MiB body
+# cap (critic_client.py:73).
+_HARDENED_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
-def _get_client(provider: ProviderConfig):
-    """Get or create a cached provider client."""
+
+def _hardened_http_client(timeout: float) -> httpx.AsyncClient:
+    """Build the hardened transport client for key-bearing calls (kdsn.304).
+
+    ``follow_redirects=False``: a 3xx must never re-send the Authorization
+    header to a redirect target. ``trust_env=False``: inherited
+    HTTP(S)_PROXY must not be able to reroute a key-bearing call. The same
+    timeout budget as the pooled client is honored (connect capped at 10s).
+    """
+    return httpx.AsyncClient(
+        follow_redirects=False,
+        trust_env=False,
+        timeout=httpx.Timeout(timeout, connect=10.0),
+    )
+
+
+def _get_client(provider: ProviderConfig, hardened: bool = False):
+    """Get or create a cached provider client.
+
+    ``hardened`` (kdsn.304) is part of the cache key: hardened (key-bearing)
+    calls get their OWN cached client built on a hardened httpx transport
+    (no redirect following, no proxy-env inheritance), so a per-call
+    hardening flag can never poison — or silently un-harden — the pooled
+    client other callers share. The default ``hardened=False`` reproduces
+    today's client construction byte-for-byte (same kwargs, no http_client).
+    """
     timeout = getattr(provider, "timeout", 600.0)
     if provider.type == "anthropic":
         # Honor base_url for anthropic-type providers so Anthropic-compatible
@@ -212,24 +245,47 @@ def _get_client(provider: ProviderConfig):
         # keeps a gateway client distinct from the default-endpoint client.
         # The key-redirect consideration is accepted because agent configs are
         # root-owned. None stays the effective default (SDK default endpoint).
-        key = ("anthropic", provider.api_key, provider.base_url, timeout)
+        # The hardened flag is a cache-key component (kdsn.304 split): a
+        # hardened call's client is distinct from its unhardened twin.
+        key = ("anthropic", provider.api_key, provider.base_url, timeout, hardened)
         if key not in _client_cache:
-            _client_cache[key] = anthropic.AsyncAnthropic(
-                api_key=provider.api_key,
-                base_url=provider.base_url,
-                timeout=httpx.Timeout(timeout, connect=10.0),
-                max_retries=_MAX_SDK_RETRIES,
-            )
+            if hardened:
+                # Hardened transport: the Authorization header must never
+                # follow a redirect, and ambient proxy env must not reroute a
+                # key-bearing call.
+                _client_cache[key] = anthropic.AsyncAnthropic(
+                    api_key=provider.api_key,
+                    base_url=provider.base_url,
+                    timeout=httpx.Timeout(timeout, connect=10.0),
+                    max_retries=_MAX_SDK_RETRIES,
+                    http_client=_hardened_http_client(timeout),
+                )
+            else:
+                _client_cache[key] = anthropic.AsyncAnthropic(
+                    api_key=provider.api_key,
+                    base_url=provider.base_url,
+                    timeout=httpx.Timeout(timeout, connect=10.0),
+                    max_retries=_MAX_SDK_RETRIES,
+                )
         return _client_cache[key]
     elif provider.type == "openai":
-        key = ("openai", provider.api_key, provider.base_url, timeout)
+        key = ("openai", provider.api_key, provider.base_url, timeout, hardened)
         if key not in _client_cache:
-            _client_cache[key] = openai.AsyncOpenAI(
-                api_key=provider.api_key,
-                base_url=provider.base_url,
-                timeout=httpx.Timeout(timeout, connect=10.0),
-                max_retries=_MAX_SDK_RETRIES,
-            )
+            if hardened:
+                _client_cache[key] = openai.AsyncOpenAI(
+                    api_key=provider.api_key,
+                    base_url=provider.base_url,
+                    timeout=httpx.Timeout(timeout, connect=10.0),
+                    max_retries=_MAX_SDK_RETRIES,
+                    http_client=_hardened_http_client(timeout),
+                )
+            else:
+                _client_cache[key] = openai.AsyncOpenAI(
+                    api_key=provider.api_key,
+                    base_url=provider.base_url,
+                    timeout=httpx.Timeout(timeout, connect=10.0),
+                    max_retries=_MAX_SDK_RETRIES,
+                )
         return _client_cache[key]
     else:
         raise ValueError(f"Unsupported provider: {provider.type}")
@@ -884,11 +940,26 @@ def compute_cost(model: str, usage: Usage, *, cache_ttl_fallback: str = "1h",
     return CostResult(cost_usd=cost, unpriced_tokens=0, priced=True)
 
 
-def _convert_tools_for_provider(tools: list | None, provider_type: str) -> list[dict] | None:
+def _convert_tools_for_provider(
+    tools: list | None,
+    provider_type: str,
+    strict: bool = False,
+) -> list[dict] | None:
     """Convert ToolDef list to provider-native format.
     
     Anthropic: [{"name": ..., "description": ..., "input_schema": ...}]
     OpenAI: [{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}]
+
+    ``strict`` (kdsn.304) serializes every tool for strict structured output
+    on this call: each Anthropic tool dict gains a top-level ``"strict": True``
+    (sibling of name/description/input_schema — the schema itself is untouched,
+    a caller wanting additionalProperties:false passes it inside the schema,
+    the portable house convention), and each OpenAI ``function`` object gains
+    ``"strict": True`` PLUS ``additionalProperties: False`` injected into
+    ``parameters`` only when the caller didn't already set it (OpenAI
+    structured-outputs requirement; idempotent, non-mutating). With the
+    default ``strict=False`` the output is byte-identical to the pre-kdsn.304
+    shapes (parity-pinned in tests/test_forced_tool.py::TestParity).
     """
     if tools is None:
         return None
@@ -896,19 +967,32 @@ def _convert_tools_for_provider(tools: list | None, provider_type: str) -> list[
     result = []
     for tool in tools:
         if provider_type == "anthropic":
-            result.append({
+            converted = {
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.parameters,
-            })
+            }
+            if strict:
+                converted["strict"] = True
+            result.append(converted)
         elif provider_type == "openai":
+            parameters = tool.parameters
+            if strict:
+                # Inject additionalProperties:false at the schema root only
+                # when absent — never override a caller-set value, never
+                # mutate the caller's dict.
+                if "additionalProperties" not in parameters:
+                    parameters = {**parameters, "additionalProperties": False}
+            function = {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": parameters,
+            }
+            if strict:
+                function["strict"] = True
             result.append({
                 "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                },
+                "function": function,
             })
     return result
 
@@ -1375,6 +1459,7 @@ def _build_anthropic_kwargs(
     temperature: float | None = None,
     top_p: float | None = None,
     cache_ttl: str | None = None,
+    tool_choice: str | None = None,
 ) -> dict:
     """Build kwargs for Anthropic messages API."""
     _cc = {"type": "ephemeral", "ttl": cache_ttl or "1h"}
@@ -1386,6 +1471,15 @@ def _build_anthropic_kwargs(
     }
     if provider_tools:
         api_kwargs["tools"] = provider_tools
+    # Forced tool call (kdsn.304): name-forced tool_choice in the Anthropic
+    # wire form. Emission is gated — a forced choice requires the tool to be
+    # actually advertised, so a forced choice with no tools is a caller bug:
+    # raise early (before any network call) rather than emit a server-side
+    # 400. Omitted (None) adds nothing (parity-pinned).
+    if tool_choice is not None:
+        if not provider_tools:
+            raise ValueError("tool_choice requires tools")
+        api_kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
     
     # Add prompt caching to last user message.
     # Deep copy the target message to avoid mutating the caller's history
@@ -1512,6 +1606,7 @@ def _build_openai_kwargs(
     top_p: float | None = None,
     routing: dict | None = None,
     provider_key: str = "",
+    tool_choice: str | None = None,
 ) -> dict:
     """Build kwargs for OpenAI chat completions API."""
     # Provider capability flags — OpenRouter proxies handle unknown params gracefully,
@@ -1566,6 +1661,19 @@ def _build_openai_kwargs(
             api_kwargs["presence_penalty"] = _profile.presence_penalty
     if provider_tools:
         api_kwargs["tools"] = provider_tools
+    # Forced tool call (kdsn.304): name-forced tool_choice in the OpenAI
+    # structured-outputs form, identical across every openai-type provider
+    # (openai, blackwell SGLang, synthetic). Gated emission — a forced
+    # choice requires the tool to be advertised, so a forced choice with no
+    # tools is a caller bug: raise early (before any network call) rather
+    # than emit a server-side 400. Omitted (None) adds nothing (parity-pinned).
+    if tool_choice is not None:
+        if not provider_tools:
+            raise ValueError("tool_choice requires tools")
+        api_kwargs["tool_choice"] = {
+            "type": "function",
+            "function": {"name": tool_choice},
+        }
     
     # Add sampling parameters. Profile temperature/top_p (kdsn.241.3.1) win
     # over the caller-supplied per-agent override — a profile entry is a
@@ -1802,6 +1910,9 @@ async def stream(
     thinking: str | None = None,
     cache_ttl: str | None = None,
     room_id: str | None = None,
+    tool_choice: str | None = None,
+    strict: bool = False,
+    hardened: bool = False,
 ) -> AsyncGenerator[StreamEvent, None]:
     """
     Stream completion events from Anthropic or OpenAI SDK based on config.providers.
@@ -1821,8 +1932,13 @@ async def stream(
         messages, provider_cfg.type, quirks=provider_cfg.quirks,
     )
     
-    # Convert tools to provider-native format
-    provider_tools = _convert_tools_for_provider(tools, provider_cfg.type)
+    # Convert tools to provider-native format. ``strict`` (kdsn.304) threads
+    # through to the serializer — default False reproduces the pre-kdsn.304
+    # tool shapes byte-for-byte (the keepalive ping path at its own call site
+    # intentionally passes nothing new).
+    provider_tools = _convert_tools_for_provider(
+        tools, provider_cfg.type, strict=strict,
+    )
     
     # Use config.max_tokens if max_tokens is not provided
     tokens = max_tokens if max_tokens is not None else config.max_tokens
@@ -1831,7 +1947,10 @@ async def stream(
     thinking_level = thinking if thinking is not None else getattr(config, "thinking", "off")
 
     if provider_cfg.type == "anthropic":
-        client = _get_client(provider_cfg)
+        # ``hardened`` (kdsn.304) is a cache-key component: hardened
+        # (key-bearing) calls get their own cached client on a hardened
+        # transport (no redirects, no proxy env, bounded read).
+        client = _get_client(provider_cfg, hardened=hardened)
         
         api_kwargs = _build_anthropic_kwargs(
             api_model=api_model,
@@ -1844,14 +1963,27 @@ async def stream(
             temperature=getattr(config, "temperature", None),
             top_p=getattr(config, "top_p", None),
             cache_ttl=cache_ttl,
+            tool_choice=tool_choice,
         )
         
         _stream_count = 0
+        # Bounded body read for hardened calls (kdsn.304): accumulate the
+        # size of every consumed stream item and fail loud past the cap, so a
+        # key-bearing call can never buffer an unbounded response.
+        _hardened_bytes = 0
         try:
             async with client.messages.stream(**api_kwargs) as stream:
                 accumulated_text = ""
                 
                 async for event in stream:
+                    if hardened:
+                        # Measure the event's serialized wire size — SDK
+                        # stream objects are pydantic models (no __len__).
+                        _hardened_bytes += len(event.model_dump_json().encode("utf-8"))
+                        if _hardened_bytes > _HARDENED_MAX_RESPONSE_BYTES:
+                            raise ProviderError(
+                                "hardened call: response body exceeded byte cap"
+                            )
                     _stream_count += 1
                     event_type = getattr(event, "type", None)
                     
@@ -1926,7 +2058,10 @@ async def stream(
             ) from e
     
     elif provider_cfg.type == "openai":
-        client = _get_client(provider_cfg)
+        # ``hardened`` (kdsn.304) is a cache-key component: hardened
+        # (key-bearing) calls get their own cached client on a hardened
+        # transport (no redirects, no proxy env, bounded read).
+        client = _get_client(provider_cfg, hardened=hardened)
 
         # Streaming degeneration monitor (kdsn.241.4) — OpenAI-compatible path only,
         # where the open-weight (GLM/Kimi) repetition collapse this targets occurs.
@@ -1948,6 +2083,7 @@ async def stream(
             top_p=getattr(config, "top_p", None),
             routing=provider_cfg.routing,
             provider_key=provider_cfg.key,
+            tool_choice=tool_choice,
         )
         
         # Add streaming-specific kwargs
@@ -1966,6 +2102,10 @@ async def stream(
             api_kwargs["extra_headers"] = {"x-session-affinity": affinity}
 
         _stream_count = 0
+        # Bounded body read for hardened calls (kdsn.304): accumulate the
+        # size of every consumed stream chunk and fail loud past the cap, so a
+        # key-bearing call can never buffer an unbounded response.
+        _hardened_bytes = 0
         try:
             response = await client.chat.completions.create(**api_kwargs)
             
@@ -1980,6 +2120,14 @@ async def stream(
             
             async for chunk in response:
                 _stream_count += 1
+                if hardened:
+                    # Measure the chunk's serialized wire size — SDK stream
+                    # objects are pydantic models (no __len__).
+                    _hardened_bytes += len(chunk.model_dump_json().encode("utf-8"))
+                    if _hardened_bytes > _HARDENED_MAX_RESPONSE_BYTES:
+                        raise ProviderError(
+                            "hardened call: response body exceeded byte cap"
+                        )
                 # Capture generation ID from first chunk
                 if not generation_id and getattr(chunk, "id", None):
                     generation_id = chunk.id
@@ -2168,6 +2316,9 @@ async def complete(
     thinking: str | None = None,
     cache_ttl: str | None = None,
     room_id: str | None = None,
+    tool_choice: str | None = None,
+    strict: bool = False,
+    hardened: bool = False,
 ) -> Response:
     """
     Route to Anthropic or OpenAI SDK based on config.providers.
@@ -2191,6 +2342,9 @@ async def complete(
         thinking=thinking,
         cache_ttl=cache_ttl,
         room_id=room_id,
+        tool_choice=tool_choice,
+        strict=strict,
+        hardened=hardened,
     ):
         if event.type == "done":
             response = event.response
