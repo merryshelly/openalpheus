@@ -379,7 +379,10 @@ class TestR1_4_PerRoomEngines:
         state_high = ReminderState(
             evaluation_point="tool_loop_boundary",
             iteration=1, max_iterations=10,
-            context_tokens=170000, context_limit=200000,
+            # Ladder contract (migrated T2 pin): 91% of the usable runway —
+            # fires tier 4 on a fresh engine (available_tokens = limit here).
+            context_tokens=182000, context_limit=200000,
+            available_tokens=200000,
             completed_turns=1, turn_source=None,
             tool_calls_this_turn={}, tool_calls_session={},
             todo_list=[], enabled_tools=set(BUILTIN_TOOLS.keys()),
@@ -407,7 +410,10 @@ class TestR1_4_PerRoomEngines:
         state_high = ReminderState(
             evaluation_point="tool_loop_boundary",
             iteration=1, max_iterations=10,
-            context_tokens=170000, context_limit=200000,
+            # Ladder contract (migrated T2 pin): 91% of the usable runway —
+            # fires tier 4 on a fresh engine (available_tokens = limit here).
+            context_tokens=182000, context_limit=200000,
+            available_tokens=200000,
             completed_turns=1, turn_source=None,
             tool_calls_this_turn={}, tool_calls_session={},
             todo_list=[], enabled_tools=set(BUILTIN_TOOLS.keys()),
@@ -434,6 +440,7 @@ class TestR1_4_PerRoomEngines:
 
         entries = [
             {"role": "user", "source": "reminder", "trigger": "context-pressure",
+             "detail": "tier=4",
              "content": "<system-reminder>\nContext at 85%\n</system-reminder>"},
         ]
         agent.rehydrate_reminders(ROOM_A, entries)
@@ -443,20 +450,23 @@ class TestR1_4_PerRoomEngines:
         state_high = ReminderState(
             evaluation_point="tool_loop_boundary",
             iteration=1, max_iterations=10,
-            context_tokens=170000, context_limit=200000,
+            # Ladder contract (migrated T2 pin): 91% of the usable runway —
+            # fires tier 4 on a fresh engine (available_tokens = limit here).
+            context_tokens=182000, context_limit=200000,
+            available_tokens=200000,
             completed_turns=1, turn_source=None,
             tool_calls_this_turn={}, tool_calls_session={},
             todo_list=[], enabled_tools=set(BUILTIN_TOOLS.keys()),
         )
         result_a = engine_a.evaluate(state_high)
         assert not any(r.trigger == "context-pressure" for r in result_a), \
-            "T2 in room A must be suppressed after rehydration"
+            "ladder in room A must be suppressed after rehydration (latch=4)"
 
-        # Room B: T2 should still fire (not rehydrated)
+        # Room B: ladder should still fire (not rehydrated)
         engine_b = agent._engine_for(ROOM_B)
         result_b = engine_b.evaluate(state_high)
         assert any(r.trigger == "context-pressure" for r in result_b), \
-            "T2 in room B must still fire (not rehydrated)"
+            "ladder in room B must still fire (not rehydrated)"
 
 
 class TestR1_5_BoundaryDurabilityGate:
@@ -597,16 +607,21 @@ class TestR1_6_EnabledTools:
 
 
 class TestR1_7_T2EvaluationPointGuard:
-    """R1-7: T2 fires only at tool_loop_boundary, not at turn_start."""
+    """R1-7 (migrated): the wave-1 boundary-only guard is superseded — the
+    ladder fires at BOTH evaluation points (workspace-im7t.46 spec §3, D6).
+    The migrated pins assert the new contract: turn_start fires too, and the
+    monotonic latch dedupes the same turn's boundary."""
 
     @pytest.mark.asyncio
     async def test_r1_7_t2_not_at_turn_start(self, tmp_path):
-        """R1-7: T2 with evaluation_point='turn_start' and ≥80% → does NOT fire."""
+        """Migrated: turn_start at ≥80% of usable runway FIRES (the old
+        boundary-only suppression is gone) — same-turn boundary dedupes."""
         engine = ReminderEngine(_cfg(tmp_path))
         state = ReminderState(
             evaluation_point="turn_start",
             iteration=0, max_iterations=100,
             context_tokens=170000, context_limit=200000,
+            available_tokens=200000,  # 85% of runway → tier 3
             completed_turns=1, turn_source=None,
             tool_calls_this_turn={}, tool_calls_session={},
             todo_list=[],
@@ -614,16 +629,30 @@ class TestR1_7_T2EvaluationPointGuard:
         )
         results = engine.evaluate(state)
         t2 = [r for r in results if r.trigger == "context-pressure"]
-        assert not t2, "T2 must NOT fire at turn_start (R1-7)"
+        assert t2, "ladder must fire at turn_start (R1-7 superseded — both points)"
+        # Same turn's boundary: no re-fire (monotonic latch, spec §3).
+        boundary = ReminderState(
+            evaluation_point="tool_loop_boundary",
+            iteration=1, max_iterations=100,
+            context_tokens=170000, context_limit=200000,
+            available_tokens=200000,
+            completed_turns=1, turn_source=None,
+            tool_calls_this_turn={}, tool_calls_session={},
+            todo_list=[],
+            enabled_tools=set(BUILTIN_TOOLS.keys()),
+        )
+        t2b = [r for r in engine.evaluate(boundary) if r.trigger == "context-pressure"]
+        assert not t2b, "same-turn boundary must not re-fire (latch)"
 
     @pytest.mark.asyncio
     async def test_r1_7_t2_fires_at_boundary(self, tmp_path):
-        """R1-7: T2 with evaluation_point='tool_loop_boundary' and ≥80% → fires once."""
+        """Migrated: tool_loop_boundary at ≥80% of usable runway fires once."""
         engine = ReminderEngine(_cfg(tmp_path))
         state = ReminderState(
             evaluation_point="tool_loop_boundary",
             iteration=1, max_iterations=100,
             context_tokens=170000, context_limit=200000,
+            available_tokens=200000,  # 85% of runway → tier 3
             completed_turns=1, turn_source=None,
             tool_calls_this_turn={}, tool_calls_session={},
             todo_list=[],
@@ -631,7 +660,7 @@ class TestR1_7_T2EvaluationPointGuard:
         )
         results = engine.evaluate(state)
         t2 = [r for r in results if r.trigger == "context-pressure"]
-        assert t2, "T2 must fire at tool_loop_boundary when ≥80% (R1-7)"
+        assert t2, "ladder must fire at tool_loop_boundary when ≥80% (R1-7 migrated)"
 
 
 class TestR1_8_RehydrateIdempotency:
@@ -653,7 +682,8 @@ class TestR1_8_RehydrateIdempotency:
 
     @pytest.mark.asyncio
     async def test_r1_8_booleans_unaffected(self, tmp_path):
-        """R1-8: T2/T3 booleans correct after double rehydrate."""
+        """R1-8 (migrated): ladder latch + T3 boolean correct after double
+        rehydrate — legacy detail-less context-pressure entry latches tier 3."""
         engine = ReminderEngine(_cfg(tmp_path))
         entries = [
             {"role": "user", "source": "reminder", "trigger": "context-pressure",
@@ -664,7 +694,8 @@ class TestR1_8_RehydrateIdempotency:
         engine.rehydrate(entries)
         engine.rehydrate(entries)
 
-        assert engine._t2_fired is True, "T2 must be fired after rehydrate"
+        assert engine._ladder_fired >= 3, \
+            "legacy context-pressure entry must latch ≥ tier 3 after rehydrate"
         assert engine._t3_fired is True, "T3 must be fired after rehydrate"
 
 

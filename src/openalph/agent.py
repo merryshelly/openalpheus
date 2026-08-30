@@ -465,6 +465,16 @@ class Agent:
         """
         return self._resolve_model_limit_for(self.get_model(room_id))
 
+    def _effective_available(self, limit: int) -> int:
+        """Usable context runway: window limit minus the output reserve.
+
+        The single expression the ContextOverflowError guards AND both
+        ReminderState constructions use (context-nudge-ladder D9:
+        single-source `available` — when the guard's formula changes
+        (im7t.47 / kdsn.258), the reminder ladder follows automatically).
+        """
+        return limit - self.config.max_tokens
+
     def switch_model(self, model_str: str, room_id: str = "_default") -> str | None:
         """Switch active model. Returns error string on failure, None on success."""
         from openalph.provider import ProviderUnavailableError, resolve_model_checked
@@ -705,7 +715,7 @@ class Agent:
                     content_tokens if append_user else 0
                 )
                 limit = self._resolve_model_limit(room_id)
-                available = limit - self.config.max_tokens
+                available = self._effective_available(limit)
                 if context_tokens > available:
                     raise ContextOverflowError(context_tokens, limit)
 
@@ -772,8 +782,13 @@ class Agent:
                         evaluation_point="turn_start",
                         iteration=0,
                         max_iterations=self.config.max_iterations,
-                        context_tokens=self._estimate_context_tokens(room_id),
-                        context_limit=self._resolve_model_limit(room_id),
+                        # D12: the guard's already-computed inclusive estimate
+                        # (context + content_tokens when append_user) — a large
+                        # paste on a no-tool-call turn must not skip a tier.
+                        context_tokens=context_tokens,
+                        context_limit=limit,
+                        # D9: same expression as the overflow guard above.
+                        available_tokens=available,
                         completed_turns=_completed_turns,
                         turn_source=_turn_source,
                         tool_calls_this_turn=_tool_calls_this_turn,
@@ -889,8 +904,12 @@ class Agent:
                             evaluation_point="tool_loop_boundary",
                             iteration=iteration,
                             max_iterations=self.config.max_iterations,
+                            # Post-tool-results, pre-call estimate — the same
+                            # surface the pre-call overflow guard uses.
                             context_tokens=context_tokens,
                             context_limit=limit,
+                            # D9: same expression as the overflow guard below.
+                            available_tokens=self._effective_available(limit),
                             completed_turns=_completed_turns,
                             turn_source=_turn_source,
                             tool_calls_this_turn=dict(_tool_calls_this_turn),
@@ -926,7 +945,7 @@ class Agent:
                     # Check for context overflow before calling the API (tool results may push over)
                     context_tokens = self._estimate_context_tokens(room_id)
                     limit = self._resolve_model_limit(room_id)
-                    available = limit - self.config.max_tokens
+                    available = self._effective_available(limit)
                     if context_tokens > available:
                         raise ContextOverflowError(context_tokens, limit)
 

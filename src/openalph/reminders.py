@@ -17,6 +17,40 @@ import math
 from dataclasses import dataclass
 
 
+# Context nudge ladder (workspace-im7t.46 spec): pct of USABLE runway
+# (available_tokens = limit − max_tokens, D8) at which each tier escalates.
+# Module constants by spec — no per-tier config.
+CONTEXT_LADDER_TIERS = (60, 70, 80, 90)
+
+# Escalating guidance per tier (D2: each tier's text subsumes the previous
+# tier's).  Spec §5, verbatim — interactive rooms only (D5: sub-agent variant
+# descoped; sub-agent loops never touch this engine).
+_LADDER_TEXT = {
+    1: (
+        "Context has passed 60% of usable runway (~{remaining:,} tokens remain). "
+        "No action needed yet — keep convergence in mind as you plan the rest "
+        "of this session."
+    ),
+    2: (
+        "Context is at 70% of usable runway (~{remaining:,} tokens remain). "
+        "Wind down: checkpoint working state to files and avoid opening large "
+        "new threads of work."
+    ),
+    3: (
+        "Context is at 80% of usable runway (~{remaining:,} tokens remain). "
+        "Converge now: checkpoint working state to files, finish or hand off "
+        "current work, promote unfinished todos to your durable tracker, and "
+        "prepare a session handoff."
+    ),
+    4: (
+        "Context is at 90% of usable runway (~{remaining:,} tokens remain) — "
+        "final warning before context overflow. Stop starting new work or "
+        "large context writes: summarize state, execute the handoff, and keep "
+        "responses minimal."
+    ),
+}
+
+
 @dataclass
 class ReminderState:
     """Snapshot of agent state for trigger evaluation.
@@ -41,6 +75,14 @@ class ReminderState:
     model_resolved: str = ""        # post-room-override, post-alias-expansion
     model_vision: bool = False
     orient_ts: str = ""             # pre-rendered host-local timestamp string
+    # Context nudge ladder (D9): the overflow guard's `available` =
+    # limit − max_tokens, injected by BOTH agent.py sites from the same helper
+    # expression the guard uses. The engine NEVER reads config.max_tokens
+    # itself (the guard's formula may change — im7t.47 / kdsn.258 — and the
+    # ladder follows automatically). Default 0 = unknown → the ladder silently
+    # skips (fail-safe direction: fewer nudges, never false urgency; also keeps
+    # existing ReminderState constructions valid).
+    available_tokens: int = 0
 
 
 @dataclass
@@ -70,10 +112,18 @@ class ReminderEngine:
         self._config = config
         # Session-level state
         self._t1_session_fires: int = 0     # T1: ≤2 per session
-        self._t2_fired: bool = False        # T2: once per session
         self._t3_fired: bool = False        # T3: once per session
         self._t5_fired: bool = False        # T5: once per session
         self._t6_fired: bool = False        # T6: once per session
+        # Context nudge ladder (replaces the single-shot T2 _t2_fired bool):
+        # _ladder_fired — monotonic highest tier fired this session+model
+        # (D1: single latch, never fire a tier ≤ one already fired; D3: no
+        # re-fire above 90%); D11: re-armed on model switch, cleared on
+        # reset().  _ladder_model — the resolved model the latch was armed
+        # under (None = un-armed/rehydrated, awaiting the first populated
+        # turn-start evaluation).
+        self._ladder_fired: int = 0
+        self._ladder_model: str | None = None
         # Per-turn state
         self._t4_fired_this_turn: bool = False  # T4: once per turn
         # kdsn.298: model-keyed orientation flag (spec MED-1 — also cleared in
@@ -138,22 +188,56 @@ class ReminderEngine:
                 ),
             ))
 
-        # T2: context-pressure — ≥80% of resolved limit; once/session
-        # R1-7: T2 fires only at tool_loop_boundary (spec §3/§4)
-        if (state.evaluation_point == "tool_loop_boundary"
-                and state.context_limit > 0
-                and state.context_tokens / state.context_limit >= 0.80
-                and not self._t2_fired):
-            self._t2_fired = True
-            pct = round(state.context_tokens / state.context_limit * 100)
-            results.append(Reminder(
-                trigger="context-pressure",
-                text=(
-                    f"Context is at {pct}% of the window. Converge: finish or "
-                    "hand off current work, promote unfinished todos to your "
-                    "durable tracker, and prepare a session handoff."
-                ),
-            ))
+        # Context-pressure ladder (workspace-im7t.46; supersedes the wave-1
+        # single-shot T2).  Fires at BOTH evaluation points (turn_start and
+        # tool_loop_boundary — D6: no turn-source gating).  Predicate (spec §3):
+        #   1. available_tokens > 0 and context_limit > 0 (D9: the engine reads
+        #      ONLY state.available_tokens — default 0 = unknown → silent
+        #      skip; degenerate limit → silent skip);
+        #   2. D10 integer cross-multiplication, inclusive:
+        #      context_tokens * 100 >= tier_pct * available_tokens — no float
+        #      thresholds (0.7 is inexact in binary; float comparisons flake
+        #      off-by-one at every tier);
+        #   3. tier > _ladder_fired (D1: monotonic highest-tier latch — a
+        #      multi-tier jump fires ONLY the highest crossed tier; D3: no
+        #      re-fire, no above-90% churn).
+        if (state.available_tokens > 0
+                and state.context_limit > 0):
+            # D11: model-switch re-arm — /model changes what `available` IS,
+            # but the latch is one-way; a latch=4 armed under a 262K window
+            # would silently suppress ALL nudges after switching to a larger
+            # model. Rule: when state.model_resolved is non-empty and differs
+            # from the model the latch was armed under, re-arm to the highest
+            # tier CURRENTLY exceeded (0 if none) and record the new model.
+            # model_resolved == "" (the boundary site, kdsn.298) NEVER re-arms
+            # — only turn-start re-arms, which is correct because /model
+            # applies between turns.  _ladder_model is None after rehydrate()
+            # → the first populated turn-start evaluation re-arms to current
+            # reality (accepted gray zone: a room already past 60% at restart
+            # may see one early-tier duplicate).
+            if (state.model_resolved
+                    and state.model_resolved != self._ladder_model):
+                self._ladder_fired = 0
+                for _tier, _pct in enumerate(CONTEXT_LADDER_TIERS, start=1):
+                    if (state.context_tokens * 100
+                            >= _pct * state.available_tokens):
+                        self._ladder_fired = _tier
+                self._ladder_model = state.model_resolved
+            fired_tier = 0
+            for tier, tier_pct in enumerate(CONTEXT_LADDER_TIERS, start=1):
+                if (state.context_tokens * 100
+                        >= tier_pct * state.available_tokens
+                        and tier > self._ladder_fired):
+                    fired_tier = tier
+            if fired_tier:
+                self._ladder_fired = fired_tier
+                remaining = max(
+                    0, state.available_tokens - state.context_tokens)
+                results.append(Reminder(
+                    trigger="context-pressure",
+                    detail=f"tier={fired_tier}",
+                    text=_LADDER_TEXT[fired_tier].format(remaining=remaining),
+                ))
 
         # T3: memory-salience — turn_start, user-sourced, completed≥2,
         # memory_search enabled, zero memory_search calls; once/session
@@ -255,7 +339,24 @@ class ReminderEngine:
             if trigger == "todo-nudge":
                 self._t1_session_fires += 1
             elif trigger == "context-pressure":
-                self._t2_fired = True
+                # Ladder (replaces the old _t2_fired = True):
+                #   - new writes carry detail="tier=<n>" → latch that tier;
+                #   - legacy wave-1 entries have no detail — the old T2 fired
+                #     at ≥80% of the FULL window ≈ late in usable-runway
+                #     terms, so latch tier 3: do not re-ping tiers 1–2, tier 4
+                #     stays available (spec §3 state migration);
+                #   - max-wins across entries, never last-wins (monotonic by
+                #     construction, D1).
+                detail = entry.get("detail")
+                if isinstance(detail, str) and detail.startswith("tier="):
+                    try:
+                        tier = int(detail[5:])
+                    except ValueError:
+                        tier = 0
+                    tier = min(max(tier, 0), len(CONTEXT_LADDER_TIERS))
+                else:
+                    tier = 3
+                self._ladder_fired = max(self._ladder_fired, tier)
             elif trigger == "memory-salience":
                 self._t3_fired = True
             elif trigger == "memory-salience-deep":
@@ -269,17 +370,26 @@ class ReminderEngine:
                 # entry lacking detail preserves any known-good earlier one.
                 self._oriented_model = entry["detail"]
             # T4 is per-turn — not rehydrated across sessions
+        # D11: the latch is armed under UNKNOWN model identity — the first
+        # populated turn-start evaluation re-arms to current reality.
+        self._ladder_model = None
 
     def reset(self) -> None:
         """Clear all fired-state (umbral wipe = new session)."""
         self._t1_session_fires = 0
-        self._t2_fired = False
         self._t3_fired = False
         self._t5_fired = False
         self._t6_fired = False
         self._t4_fired_this_turn = False
+        # Ladder re-arm (D7): umbral = new session, all tiers re-arm.
+        self._ladder_fired = 0
+        self._ladder_model = None
         self._oriented_model = None
 
     def reset_turn(self) -> None:
-        """Clear per-turn fired state (new turn boundary)."""
+        """Clear per-turn fired state (new turn boundary).
+
+        The ladder latch is session-scoped (D4: one-way for the session) —
+        reset_turn() deliberately does NOT touch it.
+        """
         self._t4_fired_this_turn = False

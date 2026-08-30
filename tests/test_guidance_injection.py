@@ -383,24 +383,29 @@ class TestSubstrateA:
                   source="reminder", trigger=T2_ID)
         eng = _engine(tmp_path)
         eng.rehydrate(sl.read(ROOM))
-        st = _state(context_tokens=170000, context_limit=200000)  # 85%
+        # Ladder contract (migrated from wave-1 T2): the legacy detail-less
+        # entry latches at tier 3, so an 85%-of-runway re-evaluation must not
+        # re-ping; the text above is the legacy wave-1 T2 text.
+        st = _state(context_tokens=170000, context_limit=200000,
+                    available_tokens=200000)  # 85% of usable runway
         results = eng.evaluate(st)
         t2 = [r for r in results if r.trigger == T2_ID]
-        assert not t2, "T2 must not re-fire after rehydration (already fired in JSONL)"
+        assert not t2, "ladder must not re-fire after rehydration (latch >= 3)"
 
     def test_A08_umbral_reset_clears_fired_state(self, tmp_path):
         """§10.A case 8: engine.reset() re-arms all triggers."""
         assert ReminderEngine is not None, "reminders module not implemented"
         eng = _engine(tmp_path)
-        # Fire T2 once
-        st = _state(context_tokens=170000, context_limit=200000)
+        # Fire the ladder once (91% of usable runway → tier 4)
+        st = _state(context_tokens=182000, context_limit=200000,
+                    available_tokens=200000)
         eng.evaluate(st)
-        # Reset (umbral)
+        # Reset (umbral) — D7 re-arm
         eng.reset()
-        # T2 should fire again
+        # The ladder must fire again after the umbral wipe
         results = eng.evaluate(st)
         t2 = [r for r in results if r.trigger == T2_ID]
-        assert t2, "T2 must fire again after umbral reset"
+        assert t2, "ladder must fire again after umbral reset (migrated T2 pin)"
 
     def test_A09_config_killswitch(self, tmp_path):
         """§10.A case 9: reminders=false → evaluate returns empty list."""
@@ -549,34 +554,72 @@ class TestTriggersB:
     # -- T2 context-pressure --
 
     def test_B14_t2_fires_at_80_pct(self, tmp_path):
-        """§10.B case 14: T2 fires at ≥80% context usage."""
+        """§10.B case 14 (migrated): the ladder fires at 80%-of-window context.
+
+        Under the ladder contract (workspace-im7t.46) the 80%-of-full-window
+        context equals the tier-1 boundary of the usable runway when
+        available_tokens == context_limit (no output reserve in this pin) —
+        120000/200000 runway is 60%… so this pin now drives the ladder's
+        first fire at 80%-of-window = 80000*? — see assertion below.
+        """
         eng = _engine(tmp_path)
-        res = eng.evaluate(_state(context_tokens=160000, context_limit=200000))  # 80%
-        assert any(r.trigger == T2_ID for r in res), "T2 must fire at exactly 80%"
+        # 80% of the full window (160000/200000) with the same runnable
+        # denominator: 160000*100 >= 80*200000 → tier 3 boundary, so tier 3
+        # fires (higher tiers not crossed). Fires regardless — the migrated
+        # contract is "context-pressure fires at ≥80% context usage", now
+        # evaluated on the usable-runway denominator.
+        res = eng.evaluate(_state(context_tokens=160000, context_limit=200000,
+                                  available_tokens=200000))  # 80% of runway
+        assert any(r.trigger == T2_ID for r in res), \
+            "ladder must fire at 80% context usage (migrated T2 pin)"
 
     def test_B14_t2_not_at_79_pct(self, tmp_path):
-        """§10.B case 14: T2 does NOT fire at 79%."""
+        """§10.B case 14 (migrated): nothing fires below the tier-1 threshold.
+
+        The old pin asserted no fire at 79%-of-window. On the ladder
+        contract the silent zone is below 60% of usable runway; with the
+        blackwell-style 64K output reserve (runway 134512 under a 200000
+        window) the old 79%-of-window point (158000) is actually PAST tier 1,
+        so the migrated pin uses 119999 — one token below the 60% boundary
+        of a 200000 runway.
+        """
         eng = _engine(tmp_path)
-        # 79%: 158000/200000 = 0.79
-        res = eng.evaluate(_state(context_tokens=158000, context_limit=200000))
-        assert not any(r.trigger == T2_ID for r in res), "T2 must not fire at 79%"
+        # One token below tier 1: 119999*100 < 60*200000
+        res = eng.evaluate(_state(context_tokens=119999, context_limit=200000,
+                                  available_tokens=200000))
+        assert not any(r.trigger == T2_ID for r in res), \
+            "ladder must not fire below the tier-1 threshold (migrated T2 pin)"
 
     def test_B14_t2_once_per_session(self, tmp_path):
-        """§10.B case 14: T2 fires at most once per session."""
+        """§10.B case 14 (migrated): a fired tier never re-fires in-session.
+
+        D1/D3: the monotonic highest-tier latch — the same state re-evaluated
+        produces no duplicate context-pressure reminder.
+        """
         eng = _engine(tmp_path)
-        st = _state(context_tokens=170000, context_limit=200000)
-        eng.evaluate(st)  # first fire
+        st = _state(context_tokens=182000, context_limit=200000,
+                    available_tokens=200000)  # 91% of runway → tier 4
+        first = eng.evaluate(st)  # first fire
+        assert any(r.trigger == T2_ID for r in first), "setup: tier must fire"
         res2 = eng.evaluate(st)  # second evaluation
         t2 = [r for r in res2 if r.trigger == T2_ID]
-        assert not t2, "T2 must fire only once per session"
+        assert not t2, "a fired tier must not re-fire per session (migrated T2 pin)"
 
     def test_B14_t2_interpolates_pct(self, tmp_path):
-        """§10.B case 14: T2 text interpolates the percentage."""
+        """§10.B case 14 (migrated): ladder text interpolates pct + remaining.
+
+        Spec §5 texts name the tier pct and the ~remaining-tokens figure;
+        the tier-3 text at 82.5%-of-runway reads "Context is at 80% of usable
+        runway (~35,000 tokens remain).".
+        """
         eng = _engine(tmp_path)
-        res = eng.evaluate(_state(context_tokens=170000, context_limit=200000))  # 85%
+        res = eng.evaluate(_state(context_tokens=165000, context_limit=200000,
+                                  available_tokens=200000))  # 82.5% of runway
         t2 = [r for r in res if r.trigger == T2_ID]
-        assert t2, "T2 should fire at 85%"
-        assert "85" in t2[0].text, f"T2 text must interpolate pct; got: {t2[0].text}"
+        assert t2 and t2[0].detail == "tier=3", "tier 3 should fire at 82.5%"
+        assert "80" in t2[0].text, f"tier-3 text must name its tier pct; got: {t2[0].text}"
+        assert "35,000" in t2[0].text, \
+            f"tier-3 text must interpolate the remaining figure; got: {t2[0].text}"
 
     # -- T3 memory-salience --
 
