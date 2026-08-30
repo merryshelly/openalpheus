@@ -242,6 +242,23 @@ def render_transcript(
     return header
 
 
+def render_entries(messages: list[dict]) -> str:
+    """Render history entries (no system-prompt header) as a plain string.
+
+    Thin public wrapper over the per-entry renderer: joins
+    _render_entry(message) for every message with a blank-line separator.
+    Same determinism and append-only byte-prefix property as
+    render_transcript (A3) — extending the history extends the render as a
+    byte prefix.
+
+    Used by the Spotter's subsequent (non-initial) delta renders
+    (spotter-v1-design.md §5): later deltas carry only NEW entries, with no
+    system prompt header, so they can be framed and appended without
+    re-rendering the watched session's full history.
+    """
+    return "\n\n".join(_render_entry(m) for m in messages)
+
+
 # ---------------------------------------------------------------------------
 # Component C -- request assembly + provider call (design Section 5)
 # Component D -- counter/cap (design Section 6)

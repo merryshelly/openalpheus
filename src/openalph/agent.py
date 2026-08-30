@@ -21,6 +21,7 @@ from openalph.prompt import assemble_prompt
 from openalph.provider import complete, stream, ping_cache, ThinkingBlock, compute_cost, model_supports_vision
 from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
+from openalph.spotter import SpotterManager
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,17 @@ class Agent:
         # iteration into ONE framed user message. Agent-owned (moved off
         # MatrixBot) so heartbeat/umbral/CLI turns stage + inject too.
         self._vision_inbox: dict[str, list[str]] = {}
+        # Spotter v1 (design §2): an independent monitor that watches this
+        # session turn by turn. Agent-owned — NOT transport-owned (kdsn.276
+        # lesson: the transport must never own harness state) — so every real
+        # Agent carries a SpotterManager and the /spotter operator API, the
+        # turn-completion fire seam, and the loop-top drain all work from the
+        # agent side on every seam (matrix, heartbeat, umbral, CLI). The
+        # defensive getattr guards at the agent seams cover mock /
+        # spotter-less agents (the _spotter / _spotter_inbox attributes may be
+        # absent or deleted).
+        self._spotter = SpotterManager(self.config, self)
+        self._spotter_inbox: dict[str, list] = {}
 
     async def _vision_deposit(self, room_id: str, tag: str) -> None:
         """Append a staged [media:] tag to this room's vision inbox (kdsn.279).
@@ -304,6 +316,21 @@ class Agent:
         # kdsn.279: drop staged view_image tags too — a reset room must not
         # resurrect stale tags into the post-rotation context.
         self._vision_inbox.pop(room_id, None)
+        # Spotter v1 (design §8): a reset room starts a FRESH watch — cancel the
+        # in-flight watch task, drop state + inbox, archive+truncate the
+        # spotters transcript/ledger. Defensive: agents without a wired
+        # SpotterManager skip this (the inbox may still be present as a
+        # transport-wired empty dict).
+        _spotter = getattr(self, "_spotter", None)
+        if _spotter is not None:
+            try:
+                _spotter.reset_room(room_id)
+            except Exception:
+                logger.warning("spotter: reset_room failed in %s (fail-soft)",
+                               room_id, exc_info=True)
+        _spotter_inbox = getattr(self, "_spotter_inbox", None)
+        if isinstance(_spotter_inbox, dict):
+            _spotter_inbox.pop(room_id, None)
 
     def _usage_for(self, room_id: str) -> dict[str, int]:
         """Lazily init + return the per-room counter record."""
@@ -431,6 +458,27 @@ class Agent:
     def get_model(self, room_id: str = "_default") -> str:
         """Return the active model for a room, falling back to config default."""
         return self._room_models.get(room_id, self.config.default_model)
+
+    def _fire_spotter_turn_completion(self, room_id: str, history: list[dict],
+                                      turn_source: str | None,
+                                      callbacks: dict | None) -> None:
+        """Spotter v1 turn-completion seam (design §3): fire a watch pass over
+        the room's newly completed turn.
+
+        Defensive + fail-soft: agents without a wired SpotterManager (mock /
+        spotter-less agents — a deleted or absent _spotter attribute) make
+        this a silent no-op. The manager's
+        maybe_fire is SYNC, never raises, and never mutates history (RC1
+        invariant: it snapshots indices and schedules the watch task only),
+        so a spotter failure can never break or delay the main turn."""
+        _spotter = getattr(self, "_spotter", None)
+        if _spotter is None:
+            return
+        try:
+            _spotter.maybe_fire(room_id, history, turn_source, callbacks)
+        except Exception:
+            logger.warning("spotter: maybe_fire failed in %s (fail-soft)",
+                           room_id, exc_info=True)
 
     def _resolve_model_limit_for(self, model_str: str) -> int:
         """3-layer window resolution for an explicit model string (config override
@@ -883,6 +931,30 @@ class Agent:
                                     "log_vision_injection callback failed in %s",
                                     room_id, exc_info=True)
 
+                    # Drain the SPOTTER's flag inbox at the top of every iteration —
+                    # AFTER the steering + vision drains, BEFORE reminder evaluation
+                    # (operator outranks harness outranks monitor; design §9/§12).
+                    # A delivered flag enters history as ONE framed user message
+                    # (advisory framing — a third-party claim to verify, never an
+                    # operator instruction). Defensive: agents without a wired
+                    # SpotterManager make this a no-op. The JSONL log callback is
+                    # best-effort: injection is NEVER gated on logging (vision
+                    # precedent), a failing log_spotter_flag only warns.
+                    _spotter = getattr(self, "_spotter", None)
+                    if _spotter is not None:
+                        for _flag_framed, _flag_raw, _flag_class, _flag_sev in _spotter.drain_flags(room_id):
+                            history.append({"role": "user", "content": _flag_framed})
+                            _log_flag_cb = (callbacks or {}).get("log_spotter_flag")
+                            if callable(_log_flag_cb):
+                                try:
+                                    await _log_flag_cb(room_id, _flag_raw,
+                                                      flag_class=_flag_class,
+                                                      flag_severity=_flag_sev)
+                                except Exception:
+                                    logger.warning(
+                                        "log_spotter_flag callback failed in %s",
+                                        room_id, exc_info=True)
+
                     # Reminder evaluation at tool-loop boundary (after steering, before API call).
                     # Ordering: steering drains first, then reminders (operator outranks harness).
                     # R1-5: mirror turn-start durability gate — when production callbacks
@@ -1116,6 +1188,11 @@ class Agent:
                         # INVARIANT (RC1): assistant_msg must be history[-1] when matrix persists this turn after return.
                         history.append(assistant_msg)
                         self._last_stop_reason[room_id] = response.stop_reason
+                        # Spotter v1 (design §3): the turn is complete — the monitor
+                        # watches the entries that just landed. maybe_fire is sync,
+                        # never raises, and does not mutate history (RC1 holds).
+                        self._fire_spotter_turn_completion(
+                            room_id, history, _turn_source, callbacks)
                         return final_text
 
                     # Use tool_calls from stream or from response
@@ -1321,6 +1398,11 @@ class Agent:
 
                 history.append({"role": "assistant", "content": final_text})
                 self._last_stop_reason[room_id] = summary_response.stop_reason if summary_response else "max_iterations"
+                # Spotter v1 (design §3): the turn is complete — fire the monitor
+                # over the max-iterations summary turn (same sync, fail-soft,
+                # history-non-mutating maybe_fire as the text-return path).
+                self._fire_spotter_turn_completion(
+                    room_id, history, _turn_source, callbacks)
                 return final_text
             except asyncio.CancelledError:
                 # /stop or process shutdown cancelled us mid-tool-loop.

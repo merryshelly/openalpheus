@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openalph.provider import ToolCall
+from openalph.spotter import frame_spotter_flag
 from openalph.tools import escape_system_reminder_tags
 
 logger = logging.getLogger(__name__)
@@ -343,6 +344,13 @@ class SessionLog:
                 # Mirrors the timesense precedent: framing is context-only, not stored.
                 if _source == "steer":
                     _user_content = f"[Operator steering — mid-turn guidance]: {_user_content}"
+                elif _source == "spotter":
+                    # Spotter advisories (design §9): JSONL stores the RAW FLAG
+                    # block (audit fidelity); the advisory frame is context-only.
+                    # frame_spotter_flag escapes the model-origin payload
+                    # internally, so live (agent.py loop-top drain) and rebuilt
+                    # (this branch) advisory bytes are identical.
+                    _user_content = frame_spotter_flag(_user_content)
                 elif _source not in ("reminder", "steer"):
                     # R2-A: Escape user-origin &lt;system-reminder&gt; tags in context
                     # to prevent spoofing.  Reminder entries (source="reminder")

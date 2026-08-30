@@ -110,6 +110,18 @@ class AgentConfig:
     # call sites poke it defensively via getattr(config, "skipped_providers", {}).
     skipped_providers: dict[str, str] = field(default_factory=dict)
     notifications: NotificationsConfig | None = None
+    # Spotter v1 (spotter-v1-design.md §1): an independent monitor that
+    # watches this agent's live session, turn by turn. Optional [spotter]
+    # TOML section; absent section → all defaults (enabled=True per D6
+    # single knob). This is a CONFIDENTIALITY knob — [spotter] parsing
+    # fails LOUD (ConfigError on bad type/value), the same discipline as
+    # [model_vision]: a silently-dropped setting would be fail-open on a
+    # setting that controls what leaves the process.
+    spotter_enabled: bool = True
+    spotter_model: str = "synglm53"
+    spotter_thinking: str = "off"
+    spotter_max_iterations: int = 8
+    spotter_disabled_rooms: list[str] = field(default_factory=list)
 
 
 def resolve_model(
@@ -540,6 +552,62 @@ def load_config(path: Path) -> AgentConfig:
                         f"got {vis!r} ({type(vis).__name__})")
                 model_vision[model_name] = vis
 
+    # Parse optional [spotter] section (Spotter v1, spotter-v1-design.md §1).
+    # DELIBERATE deviation from [model_limits]' lenient skip: every bad type
+    # or value RAISES ConfigError. Fail-LOUD — the spotter settings control
+    # what leaves the process (an external model reads this agent's full
+    # transcript), so a silently-dropped `enabled = false` or a mistyped
+    # `disabled_rooms` would be fail-open on a confidentiality knob.
+    # Absent section → all defaults (spotter_enabled=True per D6 single knob).
+    spotter_enabled = True
+    spotter_model = "synglm53"
+    spotter_thinking = "off"
+    spotter_max_iterations = 8
+    spotter_disabled_rooms: list[str] = []
+    if "spotter" in toml_data:
+        spotter_section = toml_data["spotter"]
+        if not isinstance(spotter_section, dict):
+            raise ConfigError("[spotter] section must be a table")
+        if "enabled" in spotter_section:
+            if not isinstance(spotter_section["enabled"], bool):
+                raise ConfigError(
+                    f"[spotter] enabled must be a boolean, "
+                    f"got {spotter_section['enabled']!r} "
+                    f"({type(spotter_section['enabled']).__name__})")
+            spotter_enabled = spotter_section["enabled"]
+        if "model" in spotter_section:
+            m = spotter_section["model"]
+            if not isinstance(m, str) or not m:
+                raise ConfigError(
+                    f"[spotter] model must be a non-empty string, got {m!r}")
+            spotter_model = m
+        if "thinking" in spotter_section:
+            th = spotter_section["thinking"]
+            valid_spotter_thinking = ("off", "low", "medium", "high")
+            # xhigh/max are NOT valid for the spotter (D1: qwen38/synthetic
+            # mapping surprises — a future lever, not a v1 knob).
+            if not isinstance(th, str) or th not in valid_spotter_thinking:
+                raise ConfigError(
+                    f"[spotter] thinking must be one of {valid_spotter_thinking}, "
+                    f"got {th!r}")
+            spotter_thinking = th
+        if "max_iterations" in spotter_section:
+            mi = spotter_section["max_iterations"]
+            # bool is an int subclass in Python — reject it explicitly.
+            if isinstance(mi, bool) or not isinstance(mi, int) or mi <= 0:
+                raise ConfigError(
+                    f"[spotter] max_iterations must be a positive integer, "
+                    f"got {mi!r}")
+            spotter_max_iterations = mi
+        if "disabled_rooms" in spotter_section:
+            dr = spotter_section["disabled_rooms"]
+            if not isinstance(dr, list) or not all(
+                    isinstance(r, str) and r for r in dr):
+                raise ConfigError(
+                    "[spotter] disabled_rooms must be a list of non-empty "
+                    f"strings, got {dr!r}")
+            spotter_disabled_rooms = list(dr)
+
     # Parse optional [matrix] section
     matrix = _parse_matrix_config(toml_data)
 
@@ -569,6 +637,11 @@ def load_config(path: Path) -> AgentConfig:
         model_aliases=model_aliases,
         skipped_providers=skipped_map,
         notifications=notifications,
+        spotter_enabled=spotter_enabled,
+        spotter_model=spotter_model,
+        spotter_thinking=spotter_thinking,
+        spotter_max_iterations=spotter_max_iterations,
+        spotter_disabled_rooms=spotter_disabled_rooms,
     )
 
 

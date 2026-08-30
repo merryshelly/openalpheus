@@ -36,6 +36,7 @@ class CommsSinks(Protocol):
     async def on_keepalive_miss(self, room_id=None) -> None: ...
     async def on_degenerate(self, model=None, generation_id=None, **kw) -> None: ...
     async def log_vision_injection(self, room_id, framed) -> None: ...
+    async def log_spotter_flag(self, room_id, raw_payload, *, flag_class=None, flag_severity=None) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,32 @@ class HeadlessSinks:
                 source="view_image",
             )
         print(f"👁️ view_image: {framed.count('[media:')} image(s) attached",
+              file=sys.stderr, flush=True)
+
+    async def log_spotter_flag(self, room_id, raw_payload, *, flag_class=None, flag_severity=None):
+        """Log a delivered Spotter flag (design §9): JSONL source='spotter' + a
+        stderr line. The RAW FLAG block (pre-framing) is persisted — the
+        advisory frame is context-only (build_context re-frames on rebuild).
+        Fail-soft: a session-log write failure must never break the turn. No
+        session_log → print only."""
+        if self._sl is not None:
+            try:
+                self._sl.append(
+                    role="user",
+                    sender=self._uid,
+                    room=room_id,
+                    event_id=None,
+                    content=raw_payload,
+                    source="spotter",
+                    flag_class=flag_class,
+                    flag_severity=flag_severity,
+                )
+            except Exception:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning("spotter session-log append failed in %s",
+                               room_id, exc_info=True)
+        print(f"🔍 spotter flag ({flag_severity}, {flag_class})",
               file=sys.stderr, flush=True)
 
 class MatrixSinks:
@@ -226,6 +253,31 @@ class MatrixSinks:
                 f"👁️ view_image: {framed.count('[media:')} image(s) attached")
         except Exception:
             pass
+
+    async def log_spotter_flag(self, room_id, raw_payload, *, flag_class=None, flag_severity=None):
+        """Log a delivered Spotter flag (design §9): ONE JSONL entry
+        (role=user, source='spotter', RAW FLAG block + class/severity).
+        The advisory frame is context-only — build_context re-frames it on
+        rebuild, so live and rebuilt advisory bytes are identical.
+        Fail-soft: a session-log write failure must never break the turn."""
+        _sl = getattr(self._bot, 'session_log', None)
+        if _sl is not None:
+            try:
+                _sl.append(
+                    role="user",
+                    sender=self._bot.config.user_id,
+                    room=room_id,
+                    event_id=None,
+                    content=raw_payload,
+                    source="spotter",
+                    flag_class=flag_class,
+                    flag_severity=flag_severity,
+                )
+            except Exception as exc:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning("spotter session-log append failed in %s: %s",
+                               room_id, exc, exc_info=True)
 
     async def on_degenerate(self, model=None, generation_id=None, **kw):
         """Emit an m.notice when the degen detector flags a response."""
@@ -363,7 +415,10 @@ def build_callbacks(
 
     Agent-state callbacks read directly from *agent*.  Side-effect callbacks
     delegate to *sinks* (a CommsSinks implementation).  Returns a dict with
-    the 17 keys the tools layer expects.
+    the 17 keys the tools layer expects — plus an 18th, `log_spotter_flag`,
+    when the owning agent carries a real SpotterManager (Spotter v1, design
+    §9: the delivery-time I1 JSONL seam). Agents without a wired spotter
+    (pre-Spotter / transport-less) keep the historical 17-key wire format.
     """
 
     async def _context_status_callback(req_room_id=None):
@@ -391,6 +446,12 @@ def build_callbacks(
     async def _log_vision_injection_callback(_room_id, framed):
         await sinks.log_vision_injection(_room_id, framed)
 
+    async def _log_spotter_flag_callback(_room_id, raw_payload,
+                                         flag_class=None, flag_severity=None):
+        await sinks.log_spotter_flag(_room_id, raw_payload,
+                                     flag_class=flag_class,
+                                     flag_severity=flag_severity)
+
     async def _keepalive_miss_callback(_room_id=None):
         await sinks.on_keepalive_miss(_room_id or room_id)
 
@@ -416,7 +477,7 @@ def build_callbacks(
         except AttributeError:
             pass
 
-    return {
+    _callbacks = {
         "send_media": _send_media_callback,
         "on_redaction": _redaction_callback,
         "on_keepalive_miss": _keepalive_miss_callback,
@@ -438,3 +499,14 @@ def build_callbacks(
         "heartbeat": heartbeat,
         "umbral": umbral,
     }
+
+    # 18th key — Spotter v1 delivery-time JSONL seam (design §9). Conditional
+    # on the owning agent carrying a REAL SpotterManager so that pre-Spotter
+    # and mock agents keep the historical 17-key wire format (the type-NAME
+    # check is load-bearing: a MagicMock agent auto-fabricates a truthy
+    # `_spotter` attribute that must not count, and callbacks.py must not
+    # import spotter.py to ask properly — design §0 import graph).
+    _spotter = getattr(agent, "_spotter", None)
+    if type(_spotter).__name__ == "SpotterManager":
+        _callbacks["log_spotter_flag"] = _log_spotter_flag_callback
+    return _callbacks

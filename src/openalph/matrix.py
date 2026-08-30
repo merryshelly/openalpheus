@@ -3448,6 +3448,33 @@ class MatrixBot:
             await self.send_notice(room_id, "🧭 Steering note queued")
             return
 
+        if body.startswith("/spotter"):
+            # Spotter v1 operator API (design §10). Operator-namespace command:
+            # a getattr-guard (a MagicMock / pre-Spotter agent has no
+            # _spotter) reports unavailability rather than erroring. Sits
+            # BEFORE the halted-room drop so it still answers while a room is
+            # /stop-halted.
+            _spotter = getattr(self.agent, "_spotter", None)
+            if _spotter is None:
+                await self.send_notice(room_id, "Spotter not available on this agent.")
+                return
+            parts = body.split()
+            sub = parts[1] if len(parts) > 1 else "status"
+            if sub == "status":
+                out = _spotter.op_status(room_id)
+            elif sub == "start":
+                out = _spotter.op_start(room_id)
+            elif sub == "stop":
+                out = _spotter.op_stop(room_id)
+            elif sub == "model" and len(parts) > 2:
+                out = _spotter.op_set_model(room_id, parts[2])
+            elif sub == "model":
+                out = "Usage: /spotter model <alias>"
+            else:
+                out = "Usage: /spotter status|start|stop|model <alias>"
+            await self.send_notice(room_id, out)
+            return
+
         # If room is halted via /stop, drop regular messages but allow slash
         # commands through (they already returned above).  This prevents a
         # deadlock where /resume is blocked by the very halt it needs to clear.
