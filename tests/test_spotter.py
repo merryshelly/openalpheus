@@ -107,12 +107,16 @@ THINK_CLOSE = "</" + "think>"
 RE_ANCHOR_LINE = "Respond with exactly SILENT or the FLAG block — nothing else."
 
 # v1.1 §B — canonical session storage: parse_error verdicts never enter
-# state.messages raw; this fixed placeholder does instead. It must never
-# itself parse as a verdict (no standalone SILENT/FLAG line).
+# state.messages raw; this fixed placeholder does instead. v1.1b: it ends
+# with a standalone SILENT line so that VERBATIM IMITATION parses as silent
+# and stores canonical "SILENT" — the imitation lineage self-extinguishes
+# (2026-08-30 wonmun o9RB: qwen38 echoed the original placeholder verbatim,
+# because any fixed stored string is an imitable few-shot pattern).
 UNPARSED_VERDICT_TEXT = (
     "[SPOTTER SYSTEM: the previous verdict could not be parsed. The output "
     "contract is exactly SILENT, or the FLAG block (claim/class/severity/"
     "evidence) — nothing else.]"
+    "\n\nSILENT"
 )
 
 
@@ -466,6 +470,35 @@ class TestParseVerdict:
         raw = THINK_CLOSE + "SILENT"
         assert parse_verdict(raw) == ("silent", None)
 
+    def test_v1_1_fused_prose_close_tag_token_parses(self):
+        # v1.1b (wonmun o9RB passes 0-3, live specimen): prose + stray close
+        # tag + token ALL ON ONE LINE. Tag-strip must substitute a newline
+        # (not the empty string) so the token lands on its own line for the
+        # trailing-SILENT fallback.
+        raw = ("My independent read: the turn is procedural and accurate, "
+               "no checkable false claim. SILENT." + THINK_CLOSE + "SILENT")
+        assert parse_verdict(raw) == ("silent", None)
+
+    def test_v1_1_fused_block_token_parses(self):
+        # Complete think block fused inline between prose and token.
+        raw = ("analysis concludes nothing material" + THINK_OPEN + "reasoning"
+               + THINK_CLOSE + "SILENT")
+        assert parse_verdict(raw) == ("silent", None)
+
+    def test_v1_1_stray_tag_before_flag_header_parses(self):
+        # Same fusion hazard on the FLAG side: a stray tag fused to the
+        # header must not swallow the block.
+        raw = ("the evidence is checkable" + THINK_CLOSE + "FLAG\n"
+               "claim: c\nclass: safety\nseverity: high\nevidence: e")
+        status, flag = parse_verdict(raw)
+        assert status == "flag"
+        assert flag is not None
+
+    def test_v1_1_unparsed_placeholder_parses_as_silent(self):
+        # v1.1b pin: the stored placeholder must itself parse as silent, so
+        # a model that echoes it re-enters the contract (self-extinguishing).
+        assert parse_verdict(UNPARSED_VERDICT_TEXT) == ("silent", None)
+
     def test_v1_1_prose_then_trailing_silent_parses(self):
         raw = ("The main session's claims are verifiable in the transcript. "
                "No specific falsifiable problems.\n\nSILENT")
@@ -595,6 +628,14 @@ class TestClassifyWrapper:
         wtype, chars = classify_wrapper(THINK_OPEN + "SILENT")
         assert wtype == "tag-artifact"
         assert chars > 0
+
+    def test_v1_1b_fused_close_tag_token_is_tag_artifact_with_chars(self):
+        # Live specimen (o9RB pass 1): tag present but token now PARSES, so
+        # wrapper_chars is a real count, not None.
+        raw = ("prose read. SILENT." + THINK_CLOSE + "SILENT")
+        wtype, chars = classify_wrapper(raw)
+        assert wtype == "tag-artifact"
+        assert chars is not None and chars > 0
 
     def test_prose_wrap(self):
         wtype, chars = classify_wrapper("Some analysis prose.\n\nSILENT")
@@ -1370,6 +1411,48 @@ class TestV11SessionStorage:
         verdicts = [e for e in read_jsonl(transcript_path(agent.config.workspace))
                     if e.get("event") == "verdict"]
         assert verdicts and verdicts[0]["content"] == raw
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_placeholder_echo_parses_and_self_extinguishes(self):
+        """v1.1b: pass 1 parse_error stores the placeholder; pass 2's model
+        ECHOES it verbatim (the observed qwen38 failure) — the echo must
+        parse as silent and store canonical "SILENT", so the imitation
+        lineage dies within one generation."""
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        garbage = "I think the session is fine but I am not sure how to format this."
+        payloads = []
+        calls = {"n": 0}
+
+        async def scripted_complete(*args, **kwargs):
+            payloads.append(list(kwargs["messages"]))
+            calls["n"] += 1
+            content = {1: garbage, 2: UNPARSED_VERDICT_TEXT, 3: "SILENT"}[calls["n"]]
+            return Response(content=content, model="qwen38blackwell",
+                            usage=Usage(input_tokens=10, output_tokens=5),
+                            stop_reason="end_turn")
+
+        history = base_history()
+        with patch("openalph.spotter.complete", side_effect=scripted_complete):
+            for i in range(3):
+                grown = history + [{"role": "user", "content": f"entry {j}"}
+                                   for j in range(i + 1)]
+                mgr.maybe_fire(ROOM, grown, None, {})
+                assert await wait_until(lambda: len(payloads) >= i + 1)
+                for _ in range(20):
+                    await asyncio.sleep(0)
+
+        # pass 3's payload = session after pass 2 stored its verdict
+        session = payloads[2]
+        assert session[1]["content"] == UNPARSED_VERDICT_TEXT, (
+            "pass 1 parse_error stores the placeholder")
+        assert session[3]["content"] == "SILENT", (
+            "the echoed placeholder parses as silent and stores CANONICAL "
+            "SILENT — imitation self-extinguishes")
+        passes = [e for e in read_jsonl(ledger_path(agent.config.workspace))
+                  if e.get("event") == "pass"]
+        assert passes[1]["status"] == "silent", (
+            "the echo pass itself is a clean silent, not a parse_error")
         await settle_pending()
 
     @pytest.mark.asyncio

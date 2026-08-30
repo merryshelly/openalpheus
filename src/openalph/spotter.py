@@ -141,6 +141,12 @@ _UNPARSED_VERDICT_TEXT = (
     "[SPOTTER SYSTEM: the previous verdict could not be parsed. The output "
     "contract is exactly SILENT, or the FLAG block (claim/class/severity/"
     "evidence) — nothing else.]"
+    # v1.1b: the placeholder ends with a standalone SILENT line. Any fixed
+    # string stored in the session is an imitable few-shot pattern (o9RB
+    # passes 5-6: the model echoed the original placeholder verbatim); a
+    # verbatim echo of THIS text parses as silent and stores canonical
+    # "SILENT" — the imitation lineage self-extinguishes in one generation.
+    "\n\nSILENT"
 )
 
 # v1.1 §A3 — literal think tags, built via split literals (transport-proof:
@@ -454,9 +460,17 @@ def parse_verdict(text: str, stop_reason: str | None = None) -> tuple[str, Flag 
 # ---------------------------------------------------------------------------
 
 def _strip_think_tags(text: str) -> str:
-    """Remove complete think-wrapped blocks and stray think tags (v1.1 §A3)."""
-    text = _THINK_BLOCK_RE.sub("", text)
-    return _THINK_ANY_TAG_RE.sub("", text)
+    """Remove complete think-wrapped blocks and stray think tags (v1.1 §A3).
+
+    v1.1b: tags substitute a NEWLINE, not the empty string — substitution
+    with "" fuses the verdict token onto the preceding prose line
+    ("prose. SILENT.<tag>SILENT" -> "prose. SILENT.SILENT"), defeating the
+    line-based trailing-SILENT fallback (wonmun o9RB passes 0-3, live
+    specimens). With a newline the token always lands on its own line; the
+    same protects a FLAG header fused to a stray tag.
+    """
+    text = _THINK_BLOCK_RE.sub("\n", text)
+    return _THINK_ANY_TAG_RE.sub("\n", text)
 
 
 def format_flag_block(flag: Flag) -> str:
