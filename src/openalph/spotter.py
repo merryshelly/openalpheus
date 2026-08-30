@@ -128,6 +128,28 @@ _ADVISORY_PREFIX = (
 
 _DELTA_END_MARKER = "[end of delta]"
 
+# v1.1 §C — per-delta contract re-anchor line, appended to EVERY delta frame
+# (design §5 amendment): a per-turn counter against register-mirroring;
+# deterministic and cache-friendly (identical bytes every delta).
+_RE_ANCHOR_LINE = "Respond with exactly SILENT or the FLAG block — nothing else."
+
+# v1.1 §B — canonical session storage: parse_error verdicts never enter
+# state.messages raw (raw wrapped output would persist as a few-shot example
+# of non-compliance); this fixed placeholder does instead. It never itself
+# parses as a verdict (no standalone SILENT/FLAG line).
+_UNPARSED_VERDICT_TEXT = (
+    "[SPOTTER SYSTEM: the previous verdict could not be parsed. The output "
+    "contract is exactly SILENT, or the FLAG block (claim/class/severity/"
+    "evidence) — nothing else.]"
+)
+
+# v1.1 §A3 — literal think tags, built via split literals (transport-proof:
+# the 2026-08-30 draft had literal tags mangled into tab chars in transit).
+_THINK_OPEN = "<" + "think>"
+_THINK_CLOSE = "</" + "think>"
+_THINK_BLOCK_RE = re.compile(_THINK_OPEN + r".*?" + _THINK_CLOSE, re.DOTALL)
+_THINK_ANY_TAG_RE = re.compile(_THINK_OPEN + "|" + _THINK_CLOSE)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -208,7 +230,9 @@ are being measured on not anchoring to the main session's confidence.
 
 ## Output contract (exact)
 
-Your entire final response must be exactly ONE of these two forms:
+Your entire final response must be exactly ONE of these two forms. Your
+final response must begin immediately with SILENT or the FLAG block — no
+preamble, no analysis prose.
 
 Form 1 — nothing worth flagging in this turn:
 
@@ -323,16 +347,26 @@ def parse_verdict(text: str, stop_reason: str | None = None) -> tuple[str, Flag 
 
     Returns ("silent", None) | ("flag", Flag) | ("parse_error", None).
 
-    Rules (byte-exact, case-sensitive):
+    Rules (byte-exact, case-sensitive; v1.1 — design §4a):
       - stop_reason in {"max_tokens", "length"} is always parse_error — a
         truncated FLAG is not a flag.
       - text.strip() == "SILENT" (case-sensitive) is "silent".
-      - A flag must be exactly: first line "FLAG", then in order
+      - Wrapper tolerance: complete think-wrapped blocks and stray think
+        tags are stripped before verdict location; text before the LAST
+        standalone "FLAG" line is tolerated wrapper.
+      - FLAG-block validity is checked BEFORE the trailing-SILENT fallback
+        (reversing the order would swallow a valid flag hedged with
+        "…SILENT"). A flag is: the "FLAG" line, then in order
         "claim: <non-empty>", "class: <one of _VALID_FLAG_CLASSES>",
         "severity: <low|med|high>", "evidence: <non-empty; may span the
-        remaining lines, joined with newlines>".  Any deviation — text before
-        FLAG, missing/unknown/mis-ordered fields, empty values, bad
-        class/severity, or trailing non-empty junk — is parse_error.
+        remaining lines, joined with newlines>".  A bare "FLAG"/"SILENT"
+        line inside the field loop is junk, never an evidence continuation;
+        any deviation — missing/unknown/mis-ordered/duplicated fields, empty
+        values, bad class/severity, or junk after the block — is parse_error.
+      - Trailing-SILENT fallback (only when no FLAG line exists): the token
+        must be the LAST non-empty line. Consciously accepted false-accept
+        risk (SILENT-default posture: a missed flag costs nothing, a wrong
+        flag costs trust).
 
     parse_error is delivered as SILENT (no flag) but ledgered with the raw
     text (design §4, precision tuning / stability measurement).
@@ -344,17 +378,39 @@ def parse_verdict(text: str, stop_reason: str | None = None) -> tuple[str, Flag 
     if text.strip() == "SILENT":
         return ("silent", None)
 
-    lines = text.split("\n")
-    if not lines or lines[0].strip() != "FLAG":
+    # v1.1: tolerate wrapper material — complete think-wrapped blocks and
+    # stray think tags are stripped before verdict location (design §4a).
+    body = _strip_think_tags(text)
+    lines = body.split("\n")
+
+    # v1.1: locate the LAST standalone FLAG line; text before it is
+    # tolerated wrapper.
+    flag_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == "FLAG":
+            flag_idx = i
+
+    if flag_idx is None:
+        # v1.1 trailing-SILENT fallback (only when no FLAG line exists):
+        # the token must be the LAST non-empty line.
+        nonempty = [line for line in lines if line.strip()]
+        if nonempty and nonempty[-1].strip() == "SILENT":
+            return ("silent", None)
         return ("parse_error", None)
+
+    lines = lines[flag_idx + 1:]
 
     fields: dict[str, list[str]] = {}
     order: list[str] = []
-    for line in lines[1:]:
+    for line in lines:
         if line.strip() == "":
             # WHITESPACE-ONLY line: a trailing blank — ignored (the block
             # still parses; the final value strip removes any gap).
             continue
+        if line.strip() in ("FLAG", "SILENT"):
+            # v1.1 guard: a bare verdict token inside the field loop is junk
+            # — never an evidence continuation (design §4a).
+            return ("parse_error", None)
         key, sep, value = line.partition(":")
         if sep and key.strip() in _KNOWN_FLAG_FIELD_KEYS:
             if key.strip() in fields:
@@ -394,6 +450,96 @@ def parse_verdict(text: str, stop_reason: str | None = None) -> tuple[str, Flag 
 
 
 # ---------------------------------------------------------------------------
+# §4a v1.1 helpers — tag stripping, canonical reconstruction, telemetry
+# ---------------------------------------------------------------------------
+
+def _strip_think_tags(text: str) -> str:
+    """Remove complete think-wrapped blocks and stray think tags (v1.1 §A3)."""
+    text = _THINK_BLOCK_RE.sub("", text)
+    return _THINK_ANY_TAG_RE.sub("", text)
+
+
+def format_flag_block(flag: Flag) -> str:
+    """Canonical FLAG-block reconstruction (v1.1 §F, design §4a).
+
+    Values verbatim except that think-tag artifacts are stripped — a
+    sanitizer, not a byte-faithful serializer (live-path Flag values are
+    already tag-free by construction; this is defense in depth). Used for
+    BOTH canonical session storage (§B) and delivery.
+    """
+    def _clean(value: str) -> str:
+        return _strip_think_tags(value).strip()
+
+    return (
+        "FLAG\n"
+        f"claim: {_clean(flag.claim)}\n"
+        f"class: {_clean(flag.klass)}\n"
+        f"severity: {_clean(flag.severity)}\n"
+        f"evidence: {_clean(flag.evidence)}"
+    )
+
+
+def classify_wrapper(text: str) -> tuple[str, int | None]:
+    """Wrapper telemetry for the ledger (v1.1 §E — the N9-class measurement
+    instrument; measures both wrapper classes per model).
+
+    wrapper_type: "clean" (raw stripped text IS the canonical verdict) |
+    "think-wrap" (complete think block present) | "tag-artifact" (stray
+    tags only) | "prose-wrap" (prose before the verdict, no tags).
+    wrapper_chars: len(raw) − len(canonical verdict text); 0 for clean;
+    None when no verdict was extracted (parse_error).
+    """
+    text = text or ""
+    status, flag = parse_verdict(text)
+    if status == "flag" and flag is not None:
+        canonical = format_flag_block(flag)
+    elif status == "silent":
+        canonical = "SILENT"
+    else:
+        canonical = None
+
+    if canonical is not None and text.strip() == canonical:
+        return ("clean", 0)
+
+    if _THINK_BLOCK_RE.search(text):
+        wtype = "think-wrap"
+    elif _THINK_ANY_TAG_RE.search(_THINK_BLOCK_RE.sub("", text)):
+        wtype = "tag-artifact"
+    else:
+        wtype = "prose-wrap"
+
+    if canonical is None:
+        return (wtype, None)
+    return (wtype, max(0, len(text) - len(canonical)))
+
+
+def _canonical_verdict_for_rebuild(ev: dict) -> str:
+    """v1.1 §B across restarts: the transcript keeps RAW verdict content
+    (audit fidelity), but the REBUILT session stores the canonical form —
+    a rebuild-time transformation; transcript files are never rewritten.
+    Status-mirrored: the recorded status reflects what was actually
+    delivered at the time. Missing status (partial/legacy shapes) → fresh
+    parse; anything unparseable → the fixed placeholder, never raw model
+    text."""
+    status = ev.get("status")
+    content = ev.get("content", "") or ""
+    if status == "silent":
+        return "SILENT"
+    if status == "flag":
+        _s, flag = parse_verdict(content)
+        if flag is not None:
+            return format_flag_block(flag)
+        return _UNPARSED_VERDICT_TEXT
+    if status is None:
+        fresh_status, fresh_flag = parse_verdict(content)
+        if fresh_status == "silent":
+            return "SILENT"
+        if fresh_status == "flag" and fresh_flag is not None:
+            return format_flag_block(fresh_flag)
+    return _UNPARSED_VERDICT_TEXT
+
+
+# ---------------------------------------------------------------------------
 # §9 Advisory framing / §5 delta framing
 # ---------------------------------------------------------------------------
 
@@ -430,7 +576,10 @@ def render_delta_frame(rendered: str, *, initial: bool, n_entries: int) -> str:
             f"[TRANSCRIPT DELTA — {n_entries} new entries from the watched "
             "session]"
         )
-    return f"{header}\n{rendered}\n{_DELTA_END_MARKER}"
+    # v1.1 §C: every delta frame ends with the contract re-anchor line —
+    # a per-turn counter against register-mirroring (deterministic,
+    # cache-friendly: identical bytes on every delta).
+    return f"{header}\n{rendered}\n{_DELTA_END_MARKER}\n{_RE_ANCHOR_LINE}"
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +786,8 @@ class SpotterManager:
                 if pending_delta_len is not None:
                     last_kept_delta_len = pending_delta_len
                     pending_delta_len = None
-                rebuilt.append({"role": "assistant", "content": ev.get("content", "")})
+                rebuilt.append({"role": "assistant",
+                                "content": _canonical_verdict_for_rebuild(ev)})
         # Trailing orphan delta (no verdict) → crash mid-pass → drop it; the
         # index then stays at the PRIOR (confirmed) delta's history_len, so
         # the orphaned entries are re-watched (design §8).
@@ -1154,12 +1304,28 @@ class SpotterManager:
         # mid-pass tool traffic follows it. Keep everything through this
         # pass's delta, drop the tool traffic, append the verdict.
         state.messages = state.messages[:2 * state.passes + 1]
-        state.messages.append({"role": "assistant", "content": final_text})
         status, flag = parse_verdict(final_text, final_stop)
+        # v1.1 §B: the session stores the CANONICAL verdict — exact "SILENT"
+        # or format_flag_block(flag), never raw model text — so the Spotter's
+        # own few-shot examples always demonstrate the contract (and
+        # /spotter model switches inherit only clean examples). Raw output
+        # is kept in the transcript JSONL for audit fidelity.
+        if status == "flag" and flag is not None:
+            canonical = format_flag_block(flag)
+        elif status == "silent":
+            canonical = "SILENT"
+        else:
+            canonical = _UNPARSED_VERDICT_TEXT
+        state.messages.append({"role": "assistant", "content": canonical})
+
+        # v1.1 §E: wrapper telemetry, recorded on both ledger event kinds.
+        wrapper_type, wrapper_chars = classify_wrapper(final_text)
 
         # --- delivery (flag) / bookkeeping (silent|parse_error) ---
         if status == "flag" and flag is not None:
-            raw = final_text.strip()
+            # v1.1 §F: delivery carries the canonical block
+            # (format_flag_block), not the raw wrapped text.
+            raw = canonical
             framed_flag = frame_spotter_flag(raw)
             inbox = getattr(self.agent, "_spotter_inbox", None)
             if isinstance(inbox, dict):
@@ -1178,6 +1344,8 @@ class SpotterManager:
                 "model": model_str,
                 "pass_index": state.passes,
                 "delivered": True,
+                "wrapper_type": wrapper_type,
+                "wrapper_chars": wrapper_chars,
             })
             notice = (
                 f"🔍 Spotter flag ({flag.severity}, {flag.klass}): "
@@ -1203,6 +1371,8 @@ class SpotterManager:
                 "output_tokens": out_tok,
                 "elapsed_ms": int((time.monotonic() - pass_t0) * 1000),
                 "error": None,
+                "wrapper_type": wrapper_type,
+                "wrapper_chars": wrapper_chars,
             })
 
         _append_jsonl(self._transcript(room_id), {

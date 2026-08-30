@@ -44,9 +44,12 @@ import pytest
 from openalph.config import AgentConfig, ConfigError, ProviderConfig, load_config
 from openalph.provider import Response, ToolCall, Usage
 from openalph.spotter import (
+    SPOTTER_SYSTEM_PROMPT,
     SPOTTER_TOOL_ALLOWLIST,
     Flag,
+    classify_wrapper,
     estimate_tokens,
+    format_flag_block,
     frame_spotter_flag,
     parse_verdict,
     render_delta_frame,
@@ -93,6 +96,24 @@ DELTA_NONINITIAL_LINE_TEMPLATE = (
     "[TRANSCRIPT DELTA — {n} new entries from the watched session]"
 )
 DELTA_END_MARKER = "[end of delta]"
+
+# v1.1 (2026-08-30): literal think tags are built via split literals — the
+# original draft's literal tags were mangled into tab characters in
+# transport; split literals are mangling-proof and byte-identical at runtime.
+THINK_OPEN = "<" + "think>"
+THINK_CLOSE = "</" + "think>"
+
+# v1.1 §C — per-delta contract re-anchor line (design §5 amendment).
+RE_ANCHOR_LINE = "Respond with exactly SILENT or the FLAG block — nothing else."
+
+# v1.1 §B — canonical session storage: parse_error verdicts never enter
+# state.messages raw; this fixed placeholder does instead. It must never
+# itself parse as a verdict (no standalone SILENT/FLAG line).
+UNPARSED_VERDICT_TEXT = (
+    "[SPOTTER SYSTEM: the previous verdict could not be parsed. The output "
+    "contract is exactly SILENT, or the FLAG block (claim/class/severity/"
+    "evidence) — nothing else.]"
+)
 
 
 def make_provider(key="anthropic", type="anthropic", api_key="sk-test",
@@ -405,13 +426,116 @@ class TestParseVerdict:
         raw = ("FLAG\nclaim: c\nseverity: high\nclass: safety\nevidence: e")
         assert parse_verdict(raw) == ("parse_error", None)
 
-    def test_text_before_flag_header(self):
-        raw = "Let me think.\n" + flag_block()
+    def test_wrapped_invalid_block_still_parse_error(self):
+        # v1.1 amendment (2026-08-30): prose before FLAG is a tolerated
+        # wrapper (supersedes the v1.0 strict no-prefix rule pinned here),
+        # but wrapper tolerance does NOT rescue an invalid block.
+        raw = "Let me think.\n" + flag_block(evidence="")
         assert parse_verdict(raw) == ("parse_error", None)
 
     def test_missing_flag_header(self):
         raw = "claim: c\nclass: safety\nseverity: high\nevidence: e"
         assert parse_verdict(raw) == ("parse_error", None)
+
+    # --- v1.1 live-model amendment (2026-08-30 wonmun smoke) -------------------
+    # Hybrid-thinking models emit chain-of-thought IN-BAND before the verdict
+    # token: think-wrapped blocks, stray tags, or bare analysis prose. The
+    # parser tolerates wrappers BEFORE the verdict; tail junk stays junk.
+    # (2026-08-30 v1.1 session: fixtures rebuilt with THINK_OPEN/THINK_CLOSE —
+    # the original draft's literal tags were mangled into tab characters in
+    # transport, which made several of these tests vacuously pass.)
+
+    def test_v1_1_think_wrapped_reasoning_then_silent_parses(self):
+        raw = (THINK_OPEN + "The delta shows no material problem worth flagging."
+               + THINK_CLOSE + "\nSILENT")
+        assert parse_verdict(raw) == ("silent", None)
+
+    def test_v1_1_think_block_alone_no_verdict_token_is_parse_error(self):
+        # v1.1 contract pin: a think block with no verdict token outside it is
+        # NOT a silent — SILENT-default governs choosing not to flag; it does
+        # not license inventing verdicts from unparseable output.
+        raw = (THINK_OPEN + "The delta shows no material problem worth flagging."
+               + THINK_CLOSE)
+        assert parse_verdict(raw) == ("parse_error", None)
+
+    def test_v1_1_stray_opening_tag_only_silent_parses(self):
+        raw = THINK_OPEN + "SILENT"
+        assert parse_verdict(raw) == ("silent", None)
+
+    def test_v1_1_stray_closing_tag_only_silent_parses(self):
+        raw = THINK_CLOSE + "SILENT"
+        assert parse_verdict(raw) == ("silent", None)
+
+    def test_v1_1_prose_then_trailing_silent_parses(self):
+        raw = ("The main session's claims are verifiable in the transcript. "
+               "No specific falsifiable problems.\n\nSILENT")
+        assert parse_verdict(raw) == ("silent", None)
+
+    def test_v1_1_prose_then_flag_block_parses(self):
+        raw = ("Analysis: the tool output contradicts the assertion.\n\n"
+               + flag_block())
+        status, flag = parse_verdict(raw)
+        assert status == "flag"
+        assert flag is not None
+        assert flag.claim.startswith("the agent asserted")
+
+    def test_v1_1_think_wrapped_then_flag_block_parses(self):
+        raw = (THINK_OPEN + "evidence is thin but the claim is checkable."
+               + THINK_CLOSE + "\n\n" + flag_block())
+        status, flag = parse_verdict(raw)
+        assert status == "flag"
+        assert flag is not None
+
+    def test_v1_1_last_standalone_flag_line_wins(self):
+        # Wrapper tolerance locates the LAST standalone FLAG line; earlier
+        # FLAG-shaped lines in the tolerated wrapper are ignored.
+        raw = ("pre-analysis\nFLAG\nprose that is not a block\n\n" + flag_block())
+        status, flag = parse_verdict(raw)
+        assert status == "flag"
+        assert flag is not None
+        assert flag.claim.startswith("the agent asserted")
+
+    def test_v1_1_silent_mid_prose_is_not_verdict(self):
+        # The token must be the LAST line; prose after a mid-text SILENT
+        # is not a verdict.
+        raw = "SILENT\nsome afterthought sentence"
+        assert parse_verdict(raw) == ("parse_error", None)
+
+    def test_v1_1_preamble_does_not_leak_into_fields(self):
+        raw = ("analysis preamble that mentions claim: nothing here\n"
+               + flag_block())
+        status, flag = parse_verdict(raw)
+        assert status == "flag"
+        assert flag is not None
+        assert flag.claim == "the agent asserted the deploy succeeded but the log shows failure"
+
+    def test_v1_1_bare_silent_line_in_field_loop_is_junk(self):
+        # v1.1 guard: inside the field loop a bare FLAG/SILENT line is junk,
+        # never an evidence continuation.
+        raw = ("FLAG\nclaim: c\nclass: safety\nseverity: high\n"
+               "evidence: e1\nSILENT\nmore evidence")
+        assert parse_verdict(raw) == ("parse_error", None)
+
+    def test_v1_1_bare_flag_line_in_field_loop_is_junk(self):
+        # A trailing bare FLAG line becomes the LAST standalone FLAG header;
+        # the field loop from there finds no fields → parse_error.
+        raw = flag_block() + "\nFLAG"
+        assert parse_verdict(raw) == ("parse_error", None)
+
+    def test_v1_1_format_flag_block_canonical_roundtrip(self):
+        flag = Flag(claim="c is checkable", klass="safety",
+                    severity="high", evidence="tool_result id=tc_1: failed")
+        block = format_flag_block(flag)
+        assert parse_verdict(block) == ("flag", flag)
+
+    def test_v1_1_format_flag_block_strips_think_artifacts(self):
+        # format_flag_block is a sanitizer, not a byte-faithful serializer
+        # (live-path Flag values are already tag-free; this is defense in depth).
+        flag = Flag(claim="claim with " + THINK_OPEN + " stray tag",
+                    klass="guidance", severity="low",
+                    evidence="evidence " + THINK_CLOSE + " fragment")
+        block = format_flag_block(flag)
+        assert "think>" not in block
 
     def test_trailing_junk_after_evidence(self):
         # Junk that is DETECTABLE as junk: an unknown `key:`-shaped line after
@@ -446,6 +570,41 @@ class TestParseVerdict:
 # ---------------------------------------------------------------------------
 # §9 frame_spotter_flag — advisory frame (exact strings)
 # ---------------------------------------------------------------------------
+
+class TestClassifyWrapper:
+    """v1.1 §E — wrapper telemetry taxonomy: clean | think-wrap | prose-wrap |
+    tag-artifact. wrapper_chars = len(raw) − len(canonical verdict text);
+    None when no verdict was extracted (parse_error)."""
+
+    def test_clean_silent(self):
+        assert classify_wrapper("SILENT") == ("clean", 0)
+
+    def test_clean_silent_with_whitespace_dressing(self):
+        assert classify_wrapper("  SILENT\n") == ("clean", 0)
+
+    def test_clean_flag_block(self):
+        assert classify_wrapper(flag_block()) == ("clean", 0)
+
+    def test_think_wrap_block_then_silent(self):
+        wtype, chars = classify_wrapper(
+            THINK_OPEN + "reasoning" + THINK_CLOSE + "\nSILENT")
+        assert wtype == "think-wrap"
+        assert chars > 0
+
+    def test_tag_artifact_stray_tag_only(self):
+        wtype, chars = classify_wrapper(THINK_OPEN + "SILENT")
+        assert wtype == "tag-artifact"
+        assert chars > 0
+
+    def test_prose_wrap(self):
+        wtype, chars = classify_wrapper("Some analysis prose.\n\nSILENT")
+        assert wtype == "prose-wrap"
+        assert chars > 0
+
+    def test_parse_error_wrapper_chars_none(self):
+        wtype, _chars = classify_wrapper("complete garbage, no verdict at all")
+        assert _chars is None
+
 
 class TestFrameSpotterFlag:
 
@@ -497,6 +656,7 @@ class TestRenderDeltaFrame:
         expected = (
             DELTA_INITIAL_LINE_TEMPLATE.format(n=4)
             + "\nRENDERED BODY\n" + DELTA_END_MARKER
+            + "\n" + RE_ANCHOR_LINE
         )
         assert render_delta_frame("RENDERED BODY", initial=True, n_entries=4) == expected
 
@@ -504,6 +664,7 @@ class TestRenderDeltaFrame:
         expected = (
             DELTA_NONINITIAL_LINE_TEMPLATE.format(n=2)
             + "\nRENDERED BODY\n" + DELTA_END_MARKER
+            + "\n" + RE_ANCHOR_LINE
         )
         assert render_delta_frame("RENDERED BODY", initial=False, n_entries=2) == expected
 
@@ -516,6 +677,17 @@ class TestRenderDeltaFrame:
         framed = render_delta_frame("the rendered transcript", initial=True, n_entries=1)
         assert "the rendered transcript" in framed
         assert DELTA_END_MARKER in framed
+
+    def test_v1_1_re_anchor_line_ends_every_frame(self):
+        for kwargs in ({"initial": True, "n_entries": 4},
+                       {"initial": False, "n_entries": 2}):
+            framed = render_delta_frame("BODY", **kwargs)
+            assert framed.endswith(RE_ANCHOR_LINE)
+            assert framed.count(RE_ANCHOR_LINE) == 1
+
+    def test_v1_1_re_anchor_sits_after_end_marker(self):
+        framed = render_delta_frame("BODY", initial=False, n_entries=1)
+        assert framed.index(DELTA_END_MARKER) < framed.index(RE_ANCHOR_LINE)
 
     def test_deterministic_identical_bytes(self):
         a = render_delta_frame("body", initial=True, n_entries=7)
@@ -567,6 +739,15 @@ class TestRenderEntries:
 
 def _tool(name):
     return ToolDef(name=name, description=f"{name} tool", parameters={}, config={})
+
+
+class TestSystemPromptContract:
+    """v1.1 §D — output-contract tightening line (design §11 amendment)."""
+
+    def test_v1_1_prompt_tightening_line_present(self):
+        normalized = " ".join(SPOTTER_SYSTEM_PROMPT.split())
+        assert ("Your final response must begin immediately with SILENT or "
+                "the FLAG block — no preamble, no analysis prose.") in normalized
 
 
 class TestToolsForSpotter:
@@ -1081,6 +1262,195 @@ class TestWatchPassVerdicts:
 # §6 tool loop + compaction; §7 failure posture
 # ---------------------------------------------------------------------------
 
+class TestV11SessionStorage:
+    """v1.1 §B/§C/§E — canonical session storage, per-delta re-anchor line,
+    wrapper telemetry. Black-box per the module mocking discipline: stored
+    verdicts are observed through the messages= payloads captured from mocked
+    complete() calls (two-pass pattern: pass 2's payload exposes pass 1's
+    stored verdict), files through the §8 persistence paths."""
+
+    @pytest.mark.asyncio
+    async def test_wrapped_silent_stored_canonical_raw_only_in_transcript(self):
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        raw = "The delta shows nothing material.\n\nSILENT"
+        payloads = []
+
+        async def capturing_complete(*args, **kwargs):
+            payloads.append(list(kwargs["messages"]))
+            return Response(content=raw, model="synglm53",
+                            usage=Usage(input_tokens=10, output_tokens=5),
+                            stop_reason="end_turn")
+
+        history = base_history()
+        with patch("openalph.spotter.complete", side_effect=capturing_complete):
+            mgr.maybe_fire(ROOM, history, None, {})
+            assert await wait_until(lambda: len(payloads) >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            mgr.maybe_fire(ROOM, history + [{"role": "user", "content": "one more entry"}],
+                           None, {})
+            assert await wait_until(lambda: len(payloads) >= 2)
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+        session = payloads[1]
+        assert session[1]["role"] == "assistant"
+        assert session[1]["content"] == "SILENT", (
+            "session must store the CANONICAL verdict, never raw model text")
+        verdicts = [e for e in read_jsonl(transcript_path(agent.config.workspace))
+                    if e.get("event") == "verdict"]
+        assert verdicts and verdicts[0]["content"] == raw, (
+            "transcript keeps the RAW output (audit fidelity)")
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_wrapped_flag_stored_and_delivered_canonical(self):
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        raw = ("Analysis: the log contradicts the claim.\n\n"
+               + flag_block(claim="claim A", klass="safety", severity="high"))
+        payloads = []
+
+        async def capturing_complete(*args, **kwargs):
+            payloads.append(list(kwargs["messages"]))
+            return Response(content=raw, model="synglm53",
+                            usage=Usage(input_tokens=10, output_tokens=5),
+                            stop_reason="end_turn")
+
+        history = base_history()
+        with patch("openalph.spotter.complete", side_effect=capturing_complete):
+            mgr.maybe_fire(ROOM, history, None, {})
+            assert await wait_until(lambda: len(payloads) >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            mgr.maybe_fire(ROOM, history + [{"role": "user", "content": "one more entry"}],
+                           None, {})
+            assert await wait_until(lambda: len(payloads) >= 2)
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+        expected_block = flag_block(claim="claim A", klass="safety", severity="high")
+        session = payloads[1]
+        assert session[1]["content"] == expected_block, (
+            "session stores the canonical FLAG block, not the wrapped raw")
+        inbox = agent._spotter_inbox.get(ROOM)
+        assert inbox and inbox[0][1] == expected_block, (
+            "delivery carries the canonical block (format_flag_block), not raw")
+        assert inbox[0][0].startswith("[Spotter advisory")
+        verdicts = [e for e in read_jsonl(transcript_path(agent.config.workspace))
+                    if e.get("event") == "verdict"]
+        assert verdicts and verdicts[0]["content"] == raw
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_parse_error_stored_placeholder_never_raw(self):
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        raw = "I think the session is fine but I am not sure how to format this."
+        payloads = []
+
+        async def capturing_complete(*args, **kwargs):
+            payloads.append(list(kwargs["messages"]))
+            return Response(content=raw, model="synglm53",
+                            usage=Usage(input_tokens=10, output_tokens=5),
+                            stop_reason="end_turn")
+
+        history = base_history()
+        with patch("openalph.spotter.complete", side_effect=capturing_complete):
+            mgr.maybe_fire(ROOM, history, None, {})
+            assert await wait_until(lambda: len(payloads) >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            mgr.maybe_fire(ROOM, history + [{"role": "user", "content": "one more entry"}],
+                           None, {})
+            assert await wait_until(lambda: len(payloads) >= 2)
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+        assert payloads[1][1]["content"] == UNPARSED_VERDICT_TEXT, (
+            "parse_error verdicts store the fixed placeholder, never raw text")
+        verdicts = [e for e in read_jsonl(transcript_path(agent.config.workspace))
+                    if e.get("event") == "verdict"]
+        assert verdicts and verdicts[0]["content"] == raw
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_delta_frames_carry_re_anchor_line(self):
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        payloads = []
+
+        async def capturing_complete(*args, **kwargs):
+            payloads.append(list(kwargs["messages"]))
+            return silent_response()
+
+        with patch("openalph.spotter.complete", side_effect=capturing_complete):
+            mgr.maybe_fire(ROOM, base_history(), None, {})
+            assert await wait_until(lambda: len(payloads) >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+        delta = payloads[0][-1]
+        assert delta["role"] == "user"
+        assert delta["content"].endswith(RE_ANCHOR_LINE), (
+            "every [TRANSCRIPT DELTA] user frame ends with the re-anchor line")
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_ledger_pass_wrapper_telemetry_clean(self):
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        with patch("openalph.spotter.complete", new_callable=AsyncMock,
+                   return_value=silent_response()) as mock_complete:
+            mgr.maybe_fire(ROOM, base_history(), None, {})
+            assert await wait_until(lambda: mock_complete.await_count >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+        passes = [e for e in read_jsonl(ledger_path(agent.config.workspace))
+                  if e.get("event") == "pass"]
+        assert passes
+        assert passes[-1]["wrapper_type"] == "clean"
+        assert passes[-1]["wrapper_chars"] == 0
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_ledger_pass_wrapper_telemetry_prose_wrap(self):
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        raw = "Prose analysis of the delta, nothing specific.\n\nSILENT"
+        with patch("openalph.spotter.complete", new_callable=AsyncMock,
+                   return_value=Response(content=raw, model="synglm53",
+                                         usage=Usage(input_tokens=10, output_tokens=5),
+                                         stop_reason="end_turn")) as mock_complete:
+            mgr.maybe_fire(ROOM, base_history(), None, {})
+            assert await wait_until(lambda: mock_complete.await_count >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+        passes = [e for e in read_jsonl(ledger_path(agent.config.workspace))
+                  if e.get("event") == "pass"]
+        assert passes
+        assert passes[-1]["status"] == "silent"
+        assert passes[-1]["wrapper_type"] == "prose-wrap"
+        assert passes[-1]["wrapper_chars"] > 0
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_ledger_flag_event_wrapper_telemetry_think_wrap(self):
+        mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
+        raw = (THINK_OPEN + "the evidence is checkable" + THINK_CLOSE + "\n\n"
+               + flag_block(claim="credential exposure", klass="safety",
+                            severity="high"))
+        with patch("openalph.spotter.complete", new_callable=AsyncMock,
+                   return_value=Response(content=raw, model="synglm53",
+                                         usage=Usage(input_tokens=10, output_tokens=5),
+                                         stop_reason="end_turn")) as mock_complete:
+            mgr.maybe_fire(ROOM, base_history(), None, {})
+            assert await wait_until(lambda: mock_complete.await_count >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+        flags = [e for e in read_jsonl(ledger_path(agent.config.workspace))
+                 if e.get("event") == "flag"]
+        assert flags, "flag must be ledgered"
+        assert flags[-1]["wrapper_type"] == "think-wrap"
+        assert flags[-1]["wrapper_chars"] > 0
+        await settle_pending()
+
+
 class TestToolLoop:
 
     @staticmethod
@@ -1462,8 +1832,8 @@ def delta_event(pass_index, history_len, content):
             "history_len": history_len, "content": content}
 
 
-def verdict_event(pass_index, content="SILENT"):
-    return {"event": "verdict", "pass_index": pass_index, "status": "silent",
+def verdict_event(pass_index, content="SILENT", status="silent"):
+    return {"event": "verdict", "pass_index": pass_index, "status": status,
             "content": content, "tool_names": [], "usage": {}}
 
 
@@ -1561,6 +1931,42 @@ class TestRehydration:
                 await asyncio.sleep(0)
             assert mock_complete.await_count == 0, \
                 "clamped last_index → nothing new to watch"
+        await settle_pending()
+
+    @pytest.mark.asyncio
+    async def test_v1_1_rehydrate_canonicalizes_legacy_raw_verdicts(self):
+        """v1.1 §B across restarts: transcript files keep raw verdict content;
+        the REBUILT session stores the canonical form (status-mirrored). This
+        also heals pre-v1.1 sessions poisoned with wrapped few-shot examples."""
+        ws = "/tmp/test-spotter-units"
+        mgr, agent = make_manager(workspace=ws)
+        wrapped = "prose analysis of the delta\n\nSILENT"
+        write_transcript(ws, [
+            meta_event(),
+            delta_event(0, 2, "[TRANSCRIPT DELTA — 2 new entries]\nold entries\n[end of delta]"),
+            verdict_event(0, content=wrapped, status="parse_error"),
+            delta_event(1, 4, "[TRANSCRIPT DELTA — 2 new entries]\nmore old entries\n[end of delta]"),
+            verdict_event(1, content="SILENT", status="silent"),
+        ])
+        payloads = []
+
+        async def capturing_complete(*args, **kwargs):
+            payloads.append(list(kwargs["messages"]))
+            return silent_response()
+
+        history = base_history() + base_history() + [{"role": "user", "content": "newest entry"}]
+        with patch("openalph.spotter.complete", side_effect=capturing_complete):
+            mgr.maybe_fire(ROOM, history, None, {})
+            assert await wait_until(lambda: len(payloads) >= 1)
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+        messages = payloads[0]
+        assert len(messages) == 5, f"expected 2 rebuilt pairs + new delta, got {len(messages)}"
+        assert messages[1]["content"] == UNPARSED_VERDICT_TEXT, (
+            "legacy parse_error verdict rebuilds to the fixed placeholder")
+        assert messages[3]["content"] == "SILENT", (
+            "legacy silent verdict rebuilds to exact SILENT")
         await settle_pending()
 
 
