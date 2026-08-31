@@ -85,7 +85,7 @@ Skills are listed by name in the prompt; the agent reads their content on demand
 
 Enabled by placing `.toml` files in `workspace/tools/`. Empty file = tool enabled with defaults.
 
-Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `web_fetch_js`\*\*, `grep`, `glob`, `subagent`, `advisor`, `memory_search`, `send_media`, `view_image`, `context_status`, `todo_write`, `heartbeat`.
+Built-in tools: `shell`, `file_read`, `file_write`, `file_edit`, `file_patch`, `web_search`\*, `web_fetch`, `web_fetch_js`\*\*, `grep`, `glob`, `subagent`, `advisor`, `memory_search`, `send_media`, `view_image`, `context_status`, `todo_write`, `heartbeat`, `context_gc`, `set_active_project`.
 
 \*`web_search` requires a [Brave Search API key](https://brave.com/search/api/) configured in `workspace/tools/web_search.toml`. Without it, the tool is available but returns an error. `web_fetch` (direct URL fetching) works without any API key.
 
@@ -102,6 +102,22 @@ Vision is a **model-level capability**, not an agent-level one. When someone pos
 This makes `/model` switches safe in both directions: posting an image to a room running a blind model passes the tag through as plain text, and switching models mid-session is blocked only when the history contains images *and* the target model can't see. Supported image types: JPEG, PNG, GIF, WebP. Images count toward context at roughly 1 token per 750 raw bytes.
 
 Agents can also self-serve images with the `view_image` tool: it validates a workspace image (containment, type, 5 MB default cap, active-model vision gate), then stages it for injection as a framed user message at the next tool-loop boundary — never as a tool-result image block, which only Anthropic accepts. Subagents get their own vision inbox; images land in the sub's context, not the parent's.
+
+### Context GC
+
+Long sessions eventually carry more history than the model needs: tool outputs whose results are already folded into later reasoning, thinking blocks from finished turns, images nobody will look at again. Context GC applies a **boundary** — a marked position in the session history. Everything before the boundary is reduced at render time (the raw JSONL is never rewritten):
+
+- **Tool outputs** become pointer placeholders naming the call (`[expunged at GC boundary N: file_read path (12345 chars) — re-run the tool if the result is needed]`).
+- **Thinking** is dropped; a turn that carried only thinking is removed atomically.
+- **Media attachments** are expunged with a re-share note.
+- **Large tool-call inputs** (>500 chars) are compacted.
+- A **durable snapshot** — the active project's declared durable files plus its progress — is re-attached verbatim as a frozen user message. Durable content is never degraded to pointers.
+
+Boundaries are monotonic and coexist with umbral rotation: umbral archives and wipes the whole session (epoch-level), GC reduces a suffix (suffix-level). A boundary can be applied three ways: the operator's `/cache gc` room command, the agent's own `context_gc` tool (rate-limited by a cooldown), and an automatic turn-start tier that fires when the estimated context crosses 85% of the usable runway. The durable set is declared per room with `set_active_project` (or `/project set <name>`), pointing at a `memory/projects/<name>/durable-set.toml`.
+
+Subagents — whose contexts are built in-process rather than replayed from JSONL — get the same boundary rules as an automatic tier in their iteration loop: when the estimated context crosses the threshold, the same transform applies (with the original task preserved in full), and a boundary before the circuit-breaker summary keeps the deliverable-saving call under the ceiling.
+
+Configuration lives in the optional `[context]` TOML section: `gc_enabled` (default `true` — set `false` for byte-identical legacy behavior), `warn_pct`/`auto_pct`/`hard_pct` thresholds as percentages of usable runway (defaults 75/85/92), `durable_budget_pct`/`durable_budget_min_tokens` for the snapshot budget (defaults 15% of window, floor 48K tokens), and `durable_paths` glob classes. Boundary applications append a manifest (per-class strip counts, token before/after estimates, durable accounting) to the session JSONL — auditable, never injected into context.
 
 ### Guidance injection
 
@@ -137,6 +153,7 @@ src/openalph/
 ├── agent.py           Agent loop, tool dispatch, streaming, circuit breaker
 ├── cli.py             CLI entry points
 ├── config.py          TOML config, API key resolution
+├── context_gc.py      Context GC: boundary manifest + snapshot + transforms
 ├── heartbeat.py       Per-room recurring timers
 ├── matrix.py          Matrix client, sync, mention gating, slash commands
 ├── mention.py         Mention detection + room gating
@@ -208,7 +225,7 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | `/umbral stop` | Stop context rotation |
 | `/umbral status` | List active umbral timers across rooms |
 | `/cache <1h\|5m\|off>` | Anthropic prompt cache TTL (default `1h`; no argument shows current TTL + toolstrip state) |
-| `/cache toolstrip` | Reclaim context by replacing old tool outputs with placeholders |
+| `/cache gc` | Apply a context-GC boundary now: tool outputs → pointers, thinking dropped, durable set re-attached (replaces the old `/cache toolstrip`) |
 | `/timesense <on\|off>` | Prepend timestamp to every user message in LLM context (off by default; no argument shows current state) |
 | `/steer <message>` | Inject a mid-turn steering note into the **active** turn (real-time steering). Logged + delivered to the agent at the next tool-call boundary as a user message. Requires an active turn; deposits without interrupting. |
 | `/showprompt` | Display the assembled system prompt + tool list, delivered as a Markdown file attachment |

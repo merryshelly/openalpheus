@@ -395,9 +395,10 @@ See "Fixing Orphaned Heartbeats" in the Heartbeat System section above.
 | `/showprompt` | Display assembled system prompt |
 | `/model <provider/model>` | Switch model for this room (persisted) |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | Set reasoning effort level for this room (persisted) |
-| `/cache` | Show current cache TTL for this room |
+| `/cache` | Show current cache TTL for this room (+ GC boundary state) |
 | `/cache 1h` | Set 1-hour Anthropic prompt cache TTL (persisted, room-scoped) |
 | `/cache 5m` or `/cache off` | Revert to default 5-minute TTL |
+| `/cache gc` | Apply a context-GC boundary now: tool outputs → pointers, thinking dropped, durable set re-attached (replaces `/cache toolstrip`). Kill switch: `context.gc_enabled = false` in the agent TOML |
 | `/stop` | Cancel current processing and halt the room |
 | `/resume` | Re-enable a halted room |
 | `/heartbeat start <interval>` | Start periodic heartbeat (e.g., `5m`, `1h`) |
