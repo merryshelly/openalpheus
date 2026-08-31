@@ -109,11 +109,12 @@ trap 'exit 143' TERM
 readonly OPENALPH_MODEL_DIR="/opt/openalph/models"
 readonly OPENALPH_MODEL_NAME="nomic-embed-text-v1.5.Q8_0.gguf"
 readonly OPENALPH_MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
-# TODO(release): fill in before tagging v0.1.3 -- verify with
-#   curl -sL "$OPENALPH_MODEL_URL" | sha256sum
-# An empty value means "unverified"; the installer refuses to install the
-# model rather than trusting an unchecked download (fail closed).
-readonly OPENALPH_MODEL_SHA256=""
+# Pinned 2026-08-31: fresh download from $OPENALPH_MODEL_URL hashed, then
+# cross-checked against the HF LFS OID and the copy already deployed at
+# /opt/openalph/models/ (all three match). An empty value means "unverified";
+# the installer refuses to install the model rather than trusting an unchecked
+# download (fail closed).
+readonly OPENALPH_MODEL_SHA256="3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7"
 
 _fetch_embedding_model() {
     local _dest="${OPENALPH_MODEL_DIR}/${OPENALPH_MODEL_NAME}"
@@ -2317,9 +2318,8 @@ step_setup_cinny() {
     # SEC-8: pin the tarball's sha256. root serves the extracted contents as the
     # Matrix login page, so a poisoned or swapped tarball becomes persistent
     # credential-harvesting JS. When set, a mismatch aborts the install.
-    # TODO(release): fill in before tagging. Verify with:
-    #   curl -sL "$CINNY_URL" | sha256sum
-    local CINNY_SHA256=""
+    # Pinned 2026-08-31 from official release asset (downloaded + hashed).
+    local CINNY_SHA256="5b22aee9464f580efff055e251a9ae01bbb5bbc73a1d03b76ca5539b1239df3d"
 
     info "Downloading Cinny ${CINNY_VERSION}..."
     mkdir -p /opt/openalph/web
