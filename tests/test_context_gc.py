@@ -332,6 +332,60 @@ class TestResolveDurableSet:
 # Snapshot framing
 # ============================================================================
 
+class TestWave21RenderFixes:
+    """A1 + A7 (wonmun canary field feedback, 2026-08-31)."""
+
+    def _two_boundary_entries(self):
+        # tool result at position 2; boundary 3 expunges it; boundary 7 later.
+        return [
+            _user("question one"),
+            _assistant("looking", tool_calls=[{"call_id": "c1", "name": "shell", "input": {"command": "ls"}}]),
+            _tool("c1", "shell", "OUT" * 500),
+            _assistant("found it"),
+            _user("question two"),
+            {"role": "system", "event": "gc_boundary", "entry_index": 3,
+             "detail": "{}"},
+            {"role": "user", "source": "gc_snapshot", "content": "[GC boundary 3 — durable context snapshot]\nold"},
+            _user("question three"),
+            {"role": "system", "event": "gc_boundary", "entry_index": 7,
+             "detail": "{}"},
+            {"role": "user", "source": "gc_snapshot", "content": "[GC boundary 7 — durable context snapshot]\nnew"},
+        ]
+
+    def test_a1_pointer_keeps_creating_boundary(self, tmp_path):
+        log = _log(tmp_path)
+        _append_all(log, self._two_boundary_entries())
+        ctx = _ctx(log, gc_enabled=True)
+        pointers = [m["content"] for m in ctx
+                    if m.get("role") == "tool"]
+        assert len(pointers) == 1
+        # Provenance: expunged by boundary 3, NOT re-labeled by boundary 7.
+        assert "expunged at GC boundary 3:" in pointers[0]
+        assert "expunged at GC boundary 7:" not in pointers[0]
+
+    def test_a7_media_tag_string_expunged_and_tallied(self, tmp_path):
+        log = _log(tmp_path)
+        _append_all(log, [
+            _user("look at this"),
+            _user("[media: media/shot.png (image/png, 113.0 KB)]"),
+            _assistant("got it"),
+            {"role": "system", "event": "gc_boundary", "entry_index": 3,
+             "detail": "{}"},
+            {"role": "user", "source": "gc_snapshot", "content": "[GC boundary 3 — durable context snapshot]\nsnap"},
+        ])
+        entries = log.read(ROOM)
+        ctx = _ctx(log, gc_enabled=True)
+        users = [m["content"] for m in ctx if m.get("role") == "user"]
+        # The tag-string media entry is expunged to the placeholder...
+        assert any("expunged at GC boundary 3" in u and "media attachment" in u
+                   for u in users)
+        # ...and NOT left as raw markup.
+        assert not any("[media:" in u for u in users)
+        # Manifest tally counts it (A7: was media=0).
+        from openalph.context_gc import _manifest_classes
+        classes = _manifest_classes(entries, 3)
+        assert classes["media"] == 1
+
 class TestFrameSnapshot:
     def _res(self, tmp_path):
         f = tmp_path / "skills" / "bar.md"
@@ -355,6 +409,22 @@ class TestFrameSnapshot:
         s = frame_snapshot(6, r, over_budget=False, budget_tokens=48000)
         assert "<system-reminder>" not in s
         assert "&lt;system-reminder&gt;" in s
+
+    def test_frozen_at_freshness_stamp(self, tmp_path):
+        # Field feedback (wonmun canary, 2026-08-31): "re-read live copies"
+        # implied stale-NOW; the real claims are frozen-at-time + drift
+        # possibility + trust tier. The stamp is the only agent-visible
+        # freshness signal (the manifest ts never enters context).
+        r = self._res(tmp_path)
+        s = frame_snapshot(6, r, over_budget=False, budget_tokens=48000,
+                           frozen_at="2026-08-31T15:02:00Z")
+        assert "Content frozen at boundary time 2026-08-31T15:02:00Z" in s
+        assert "may have changed since" in s
+        assert "NOT" in s and "harness-authoritative" in s
+        # No-ts callers keep the drift clause (back-compat).
+        s2 = frame_snapshot(6, r, over_budget=False, budget_tokens=48000)
+        assert "Content frozen at boundary time and may have changed since" in s2
+        assert "2026-08-31" not in s2
 
     def test_missing_line(self, tmp_path):
         r = self._res(tmp_path)
@@ -533,7 +603,8 @@ class TestApplyBoundary:
         f.write_text("Z" * 4000)
         _append_all(log, self._entries())
         r = self._apply(log, tmp_path, config_paths=["skills/big.md"],
-                        window=1000, budget_pct=0.15, budget_min=0)
+                        window=1000, budget_pct=0.15, budget_min=0,
+                        bd_path=None)  # never raise real beads from a test
         assert r["over_budget"] is True and r["forced_handoff"] is True
         entries = log.read(ROOM)
         directives = [e for e in entries
@@ -548,7 +619,8 @@ class TestApplyBoundary:
         # second over-budget boundary same epoch: no duplicate directive
         _append_all(log, [_user("more")])
         r2 = self._apply(log, tmp_path, config_paths=["skills/big.md"],
-                         window=1000, budget_pct=0.15, budget_min=0)
+                         window=1000, budget_pct=0.15, budget_min=0,
+                         bd_path=None)
         assert r2["over_budget"] is True and r2["forced_handoff"] is False
         directives = [e for e in log.read(ROOM)
                       if e.get("source") == "reminder"

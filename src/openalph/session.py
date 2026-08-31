@@ -19,6 +19,8 @@ from pathlib import Path
 
 from openalph.context_gc import (
     GC_EVENT,
+    MEDIA_TAG_RE,
+    _marker_indexes,
     GC_SNAPSHOT_SOURCE,
     LEGACY_EVENT,
     current_boundary_index,
@@ -357,6 +359,10 @@ class SessionLog:
         # positions < boundary are reduced (uniform rule when gc_enabled,
         # legacy stripping otherwise); positions >= boundary are untouched.
         boundary_index = current_boundary_index(entries)
+        # All marker indexes (ascending) — a pre-boundary tool result was
+        # expunged by the FIRST boundary above it; its pointer must carry
+        # THAT id, not the newest boundary (wave-2.1 A1, wonmun canary).
+        _marker_list = _marker_indexes(entries) if gc_enabled else []
         if gc_enabled and boundary_index >= 0:
             # Crash-atomicity tripwire (audit): a marker without its
             # following snapshot entry means the process died mid-sequence —
@@ -436,12 +442,23 @@ class SessionLog:
                 # Uniform transform: pre-boundary media attachments are
                 # expunged to a pointer placeholder (image bytes are gone
                 # from context; the model is told how to recover).
+                _is_media_string = (
+                    isinstance(_user_content, str)
+                    and MEDIA_TAG_RE.search(_user_content) is not None
+                )
                 if (
                     not _render_snapshot
                     and gc_enabled
                     and entry_idx < boundary_index
-                    and isinstance(_user_content, (list, tuple))
+                    and (
+                        isinstance(_user_content, (list, tuple))
+                        or _is_media_string
+                    )
                 ):
+                    # Uniform transform: media attachments — whether the
+                    # in-memory expanded list form or the JSONL-persisted
+                    # [media:] tag-string form (wave-2.1, wonmun A7) — are
+                    # expunged to a pointer placeholder.
                     _user_content = (
                         f"[expunged at GC boundary {boundary_index}: "
                         "media attachment — re-share or re-generate the "
@@ -531,7 +548,11 @@ class SessionLog:
                             if call_id
                             else (name, None)
                         )
-                        output = tool_pointer(boundary_index, _call_name, _call_params, n)
+                        _exp_b = min(
+                            (m for m in _marker_list if m > entry_idx),
+                            default=boundary_index,
+                        )
+                        output = tool_pointer(_exp_b, _call_name, _call_params, n)
                     else:
                         output = legacy_tool_placeholder(name, n)
                 else:

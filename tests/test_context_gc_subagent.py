@@ -430,6 +430,47 @@ class TestApplyBoundaryToMessages:
 # --- seam tests appended by orchestrator ---
 
 
+
+class TestWave21TransformFixes:
+    """A1 + A7 message-list parity (wonmun canary field feedback)."""
+
+    def test_a1_transform_preserves_creating_id(self):
+        # Boundary 3 pointer survives boundary 7's application with its
+        # creating id intact (no re-labeling to 7).
+        scene = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc_obj("c1", "shell", {"command": "ls"})]},
+            {"role": "tool", "tool_call_id": "c1", "content": "OUT" * 100},
+            {"role": "user", "content": "later"},
+        ]
+        r1 = apply_boundary_to_messages(scene, boundary_index=3, task_text="t")
+        # Simulate the loop having moved on: append two more messages, then
+        # apply boundary 7 over the whole list.
+        grown = r1["messages"] + [
+            {"role": "assistant", "content": "more"},
+            {"role": "user", "content": "even later"},
+        ]
+        r2 = apply_boundary_to_messages(grown, boundary_index=6, task_text="t")
+        pointers = [m for m in r2["messages"] if m.get("role") == "tool"]
+        assert len(pointers) == 1
+        assert "expunged at GC boundary 3:" in pointers[0]["content"]
+        assert "expunged at GC boundary 7:" not in pointers[0]["content"]
+
+    def test_a7_transform_expunges_media_tag_strings(self):
+        scene = [
+            {"role": "user", "content": "q"},
+            {"role": "user", "content": "[media: media/shot.png (image/png, 113.0 KB)]"},
+            {"role": "assistant", "content": "got it"},
+            {"role": "user", "content": "later"},
+        ]
+        r = apply_boundary_to_messages(scene, boundary_index=4, task_text="t")
+        users = [m["content"] for m in r["messages"] if m.get("role") == "user"]
+        assert any("expunged at GC boundary 4" in u and "media attachment" in u
+                   for u in users)
+        assert not any("[media:" in u for u in users)
+        assert r["manifest"]["classes"]["media"] == 1
+
 # ============================================================================
 # Subagent GC seam (workspace-kdsn.305.4) — real-path tests over run_subagent
 # ============================================================================
