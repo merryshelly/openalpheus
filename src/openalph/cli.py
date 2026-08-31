@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import getpass
+import json
 import logging
 import os
 import signal
@@ -79,6 +80,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--room", default=None, help="Custom room ID for session isolation")
     p.add_argument("--truncate", type=int, default=None,
                      help="Tool-result preview character limit (default 200, 0=unlimited)")
+
+    # exec — one-shot headless turn (Stigmergy worker driver, bead workspace-e2uh.149).
+    # No Matrix, no SessionLog, no chat loop: a fresh Agent, a single
+    # handle_input, and EXACTLY ONE JSON line on stdout (everything else —
+    # including all logging — goes to stderr).
+    p = sub.add_parser("exec", help="Run one headless agent turn and emit one JSON result line")
+    p.add_argument("--agent", required=True, help="Agent name (config in CONFIG_DIR)")
+    p.add_argument("--task-file", required=True,
+                   help="Path to the task prompt file, or - for stdin")
+    p.add_argument("--model", default=None,
+                   help="Override the agent's default model (provider/model)")
+    p.add_argument("--effort", choices=("none", "low", "medium", "xhigh"),
+                   default=None, help="Reasoning effort (card-native values)")
+    p.add_argument("--max-turns", type=int, default=None,
+                   help="Override max tool-call iterations for this run")
+    p.add_argument("--tools", default=None,
+                   help="Comma-separated builtin tool names (bypasses workspace discovery)")
+    p.add_argument("--room", default=None,
+                   help="Room label for history isolation (default: _exec)")
 
     return parser.parse_args(argv)
 
@@ -481,6 +501,451 @@ def cmd_showprompt(args):
 
 
 # ---------------------------------------------------------------------------
+# exec — one-shot headless turn (Stigmergy worker driver, bead .149)
+# ---------------------------------------------------------------------------
+#
+# Design invariants (bead149-build-spec.md §3):
+#   * EXACTLY ONE json.dumps line on stdout. Every log line, warning, tool
+#     notice, and error message goes to stderr. The Stigmergy driver parses
+#     the raw stdout as one JSON object — any stray byte breaks
+#     classification, so stdout discipline is load-bearing.
+#   * No SessionLog, no HeadlessSinks, no chat plumbing: a fresh Agent, a
+#     single handle_input, then post-turn introspection (usage, iteration
+#     cap sentinel, stop_reason, tool trace).
+#   * --model / --max-turns are config-level replacements done BEFORE Agent
+#     construction (run_subagent's `replace(config, default_model=model)`
+#     pattern).
+#   * Exit codes: 0 done / 1 failed / 2 infra / 3 wedged (the JSON is
+#     authoritative; the code is a coarse mirror).
+
+# Structural iteration-cap sentinel appended to history by
+# Agent.handle_input when max_iterations is exhausted (agent.py). The
+# substring (up to the first '.') is what the cap message always starts
+# with; matching the prefix keeps detection robust to tail edits.
+_EXEC_ITERATION_CAP_SENTINEL = "[SYSTEM: Tool call limit reached."
+
+# Charter-native effort surface → OA `thinking=` kwarg (spec §2.8).
+_EXEC_EFFORT_MAP = {"none": "off", "low": "low", "medium": "medium",
+                    "xhigh": "xhigh"}
+
+# Stigmergy relay deny marker (bead .147/.134): a machine-readable
+# x-stigmergy-deny-reason header and/or a JSON body
+# {"error":{"type":"stigmergy_relay_deny","reason":...}}.
+_EXEC_DENY_REASON_HEADER = "x-stigmergy-deny-reason"
+_EXEC_DENY_TYPE_MARKER = "stigmergy_relay_deny"
+
+# Bound for the result detail string (spec §3.8: 500 chars).
+_EXEC_DETAIL_MAX = 500
+
+# Bound for the tool trace (spec §3.7: names + is_error only, cap 50).
+_EXEC_TOOL_TRACE_CAP = 50
+
+# Transport / infra error classes: genuinely-forwarded upstream failures
+# (spec §3.8). Checked by type-name across the exception + __cause__ chain
+# so the check does not hard-import httpx/openai here (they are already
+# process deps via openalph.provider, but name-matching keeps the seam
+# import-free and resilient to provider re-raises).
+_EXEC_INFRA_EXC_NAMES = {
+    "RemoteProtocolError",   # httpx.RemoteProtocolError
+    "APITimeoutError",       # openai.APITimeoutError (httpx.TimeoutException)
+    "ConnectError",          # httpx.ConnectError
+    "APIConnectionError",    # openai.APIConnectionError (wraps httpx connect)
+    "TimeoutException",      # httpx.TimeoutException base
+}
+# HTTP-error marker classes: any of these in the chain is an upstream/relay
+# HTTP failure; the deny marker then decides failed-vs-infra.
+_EXEC_HTTP_EXC_NAMES = {
+    "APIStatusError",        # openai.APIStatusError
+    "APIError",              # openai.APIError (base; has .response)
+    "HTTPStatusError",       # httpx.HTTPStatusError
+}
+
+
+def _exec_bounded_detail(detail: str) -> str:
+    """Bound the result detail to _EXEC_DETAIL_MAX chars (spec §3.8)."""
+    if len(detail) <= _EXEC_DETAIL_MAX:
+        return detail
+    return detail[:_EXEC_DETAIL_MAX]
+
+
+def _resolve_exec_tools(names: list[str]) -> list:
+    """Resolve --tools names against the BUILTIN_TOOLS registry.
+
+    Bypasses discover_tools entirely (the worker workspace has no tools/
+    dir). Raises ValueError on any unknown name; the caller maps that to
+    stderr + exit 1.
+    """
+    from openalph.tools import BUILTIN_TOOLS, ToolDef
+
+    defs = []
+    for name in names:
+        if not name:
+            continue
+        if name not in BUILTIN_TOOLS:
+            raise ValueError(
+                f"Unknown tool '{name}'. Available tools: "
+                f"{', '.join(sorted(BUILTIN_TOOLS.keys()))}"
+            )
+        builtin = BUILTIN_TOOLS[name]
+        defs.append(ToolDef(
+            name=name,
+            description=builtin["description"],
+            parameters=builtin["parameters"].copy(),
+            config=builtin["config"].copy(),
+        ))
+    return defs
+
+
+def _exec_ceil_to_int(v) -> int:
+    """Coerce a usage value to a non-negative int (zeros on failure)."""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return n if n >= 0 else 0
+
+
+def _exec_partial_usage(agent, room_id: str) -> dict:
+    """Best-effort 4-key usage {in, cached, out, reasoning} for a room.
+
+    Reads agent.last_turn_usage(room_id) (the real Agent's per-turn delta:
+    input/output/cache_read/cache_creation tokens). Zeros when unavailable —
+    never fabricated, never negative. The relay JSONL is the authoritative
+    meter; this is only the driver's view of what the turn reported.
+    """
+    ltu = None
+    try:
+        ltu = agent.last_turn_usage(room_id)
+    except Exception:
+        ltu = None
+    if not isinstance(ltu, dict):
+        return {"in": 0, "cached": 0, "out": 0, "reasoning": 0}
+    return {
+        "in": _exec_ceil_to_int(ltu.get("input_tokens", 0)),
+        "cached": _exec_ceil_to_int(ltu.get("cache_read_tokens", 0)),
+        "out": _exec_ceil_to_int(ltu.get("output_tokens", 0)),
+        # OA does not surface a separate reasoning-token count; reasoning
+        # tokens are folded into output_tokens by the provider adapters.
+        # Never fabricated — fixed 0 (spec §3.7: never fabricated).
+        "reasoning": 0,
+    }
+
+
+def _exec_iteration_cap_reached(agent, room_id: str) -> bool:
+    """Structural check: is the iteration-cap sentinel in this room's history?
+
+    On max_iterations exhaustion Agent.handle_input appends the exact
+    sentinel to history (agent.py) and forces a no-tools summary call. This
+    check finds it deterministically.
+    """
+    try:
+        history = agent.history(room_id)
+    except Exception:
+        return False
+    for m in history:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, str) and _EXEC_ITERATION_CAP_SENTINEL in content:
+            return True
+    return False
+
+
+def _exec_collect_tool_trace() -> list:
+    """Return (trace_list, async_on_tool_call) — trace holds {name, is_error}
+    entries bounded to _EXEC_TOOL_TRACE_CAP, names-only (post-mortem aid)."""
+    trace = []
+
+    async def _on_tool_call(call_id, name, input_data, result, is_error):
+        if len(trace) < _EXEC_TOOL_TRACE_CAP:
+            trace.append({"name": name, "is_error": bool(is_error)})
+
+    return trace, _on_tool_call
+
+
+def _exec_find_deny_reason(exc: BaseException) -> str | None:
+    """Walk the exception + __cause__ chain for a Stigmergy relay deny.
+
+    Returns the reason string if found, else None. Detects BOTH the
+    x-stigmergy-deny-reason header (any object carrying .response.headers or
+    .headers) and the machine-readable body
+    {"error":{"type":"stigmergy_relay_deny","reason":...}} (any object
+    carrying .response with a readable .text/.body or .body — the body may
+    be a str/bytes or an already-parsed JSON dict).
+    """
+    seen = set()
+    chain = []
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(cur)
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+
+    for obj in chain:
+        # Header form: .response.headers or a bare .headers mapping.
+        for headers in _exec_candidate_headers(obj):
+            try:
+                reason = headers.get(_EXEC_DENY_REASON_HEADER)
+            except Exception:
+                reason = None
+            if isinstance(reason, str) and reason:
+                return reason
+
+        # Body form: every candidate body location (the SDK's .body may be an
+        # already-parsed dict that is NOT the deny body, so scan ALL of them
+        # and return the first one carrying the marker).
+        for parsed in _exec_candidate_bodies(obj):
+            err = parsed.get("error")
+            if isinstance(err, dict) and \
+                    err.get("type") == _EXEC_DENY_TYPE_MARKER:
+                reason = err.get("reason")
+                if isinstance(reason, str) and reason:
+                    return reason
+    return None
+
+
+def _exec_candidate_headers(obj) -> list:
+    """Return header mappings reachable from an exception object (best-effort)."""
+    out = []
+    resp = getattr(obj, "response", None)
+    for h in (getattr(obj, "headers", None),
+              getattr(resp, "headers", None)):
+        if isinstance(h, dict):
+            out.append(h)
+        elif h is not None and hasattr(h, "get"):
+            out.append(h)
+    return out
+
+
+def _exec_candidate_bodies(obj) -> list:
+    """Best-effort extraction of error bodies from an exception object.
+
+    Yields a parsed JSON dict for EVERY candidate location that parses as a
+    JSON object: the SDK's pre-parsed .body (dict), the httpx response
+    .text/.content (str/bytes of JSON), and a bare .message. The caller
+    returns the first candidate carrying the deny marker, so a non-marker
+    body at one location never shadows the marker at another.
+    """
+    resp = getattr(obj, "response", None)
+    cands = [getattr(obj, "body", None),
+             getattr(resp, "text", None),
+             getattr(resp, "content", None),
+             getattr(obj, "message", None)]
+    out = []
+    for cand in cands:
+        if isinstance(cand, dict):
+            out.append(cand)
+        elif isinstance(cand, str) and cand:
+            try:
+                parsed = json.loads(cand)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(parsed, dict):
+                out.append(parsed)
+        elif isinstance(cand, (bytes, bytearray)):
+            try:
+                parsed = json.loads(bytes(cand).decode("utf-8", "replace"))
+            except (ValueError, TypeError, UnicodeDecodeError):
+                continue
+            if isinstance(parsed, dict):
+                out.append(parsed)
+    return out
+
+
+def _exec_chain_has_infra_transport(exc: BaseException) -> bool:
+    """True if the exception + __cause__/__context__ chain carries a
+    transport-level error (RemoteProtocolError / APITimeout / ConnectError /
+    APIConnectionError / TimeoutException)."""
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ in _EXEC_INFRA_EXC_NAMES:
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def _exec_chain_has_http_error(exc: BaseException) -> bool:
+    """True if the chain carries an HTTP-status error (openai.APIStatusError /
+    httpx.HTTPStatusError / openai.APIError)."""
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ in _EXEC_HTTP_EXC_NAMES:
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def _exec_classify_exception(exc: BaseException) -> tuple[str, str | None, str]:
+    """Classify a handle_input exception per spec §3.8.
+
+    Returns (status, deny_reason, detail):
+      * deny marker found        -> ("failed", reason, "relay-deny:<reason>")
+      * HTTP error, no marker    -> ("infra", None, <bounded str(exc)>)
+      * transport error          -> ("infra", None, <bounded str(exc)>)
+      * anything else            -> ("failed", None, <bounded str(exc)>)
+    """
+    reason = _exec_find_deny_reason(exc)
+    if reason is not None:
+        return "failed", reason, f"relay-deny:{reason}"
+    if _exec_chain_has_http_error(exc) or _exec_chain_has_infra_transport(exc):
+        return "infra", None, _exec_bounded_detail(str(exc))
+    return "failed", None, _exec_bounded_detail(str(exc))
+
+
+def _exec_read_task(args) -> str:
+    """Read the task from --task-file (or stdin for -). Raises on missing
+    file; the caller maps that to stderr + exit 1."""
+    if args.task_file == "-":
+        return sys.stdin.read()
+    path = Path(args.task_file)
+    if not path.is_file():
+        raise FileNotFoundError(f"Task file not found: {args.task_file}")
+    return path.read_text()
+
+
+def _exec_sanitize_room(label: str | None) -> str:
+    """Resolve --room to a room id; default _exec."""
+    if not label:
+        return "_exec"
+    return _sanitize_room_label(label)
+
+
+def cmd_exec(args):
+    """One-shot headless turn: fresh Agent, single handle_input, one JSON line.
+
+    See the module section above for the load-bearing stdout/stderr and
+    classification invariants. Exits 0 done / 1 failed / 2 infra / 3 wedged.
+    """
+    # stdout discipline: every log line goes to stderr, never stdout.
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.WARNING,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    def _fail(msg: str, code: int = 1) -> None:
+        print(f"exec: {msg}", file=sys.stderr)
+        sys.exit(code)
+
+    from dataclasses import replace
+    from openalph.agent import Agent
+
+    # 1. Config (fail loud, exit 1, stderr).
+    try:
+        config = load_agent_config(args.agent)
+    except ConfigError as e:
+        _fail(f"Config error: {e}", 1)
+
+    # 2. Tool resolution (bypass discover_tools; unknown -> exit 1).
+    if args.tools:
+        names = [n.strip() for n in args.tools.split(",") if n.strip()]
+        try:
+            resolved_tools = _resolve_exec_tools(names)
+        except ValueError as e:
+            _fail(str(e), 1)
+    else:
+        resolved_tools = None
+
+    # 3. Pre-construction config overrides (run_subagent replace pattern).
+    if args.model is not None:
+        config = replace(config, default_model=args.model)
+    if args.max_turns is not None:
+        config = replace(config, max_iterations=args.max_turns)
+    # The Spotter is an autonomous monitor that fires its own complete()
+    # calls (spotter_model) around turns. A worker dispatch is ONE
+    # deterministic handle_input metered against the capability's
+    # max_calls=driver_turns — the spotter would consume that budget and add
+    # nondeterminism the driver does not account for. Disable it for exec
+    # (spec §3: "fewer failure modes"). Matrix/chat agents are unaffected.
+    config = replace(config, spotter_enabled=False)
+
+    # 4. Effort -> thinking kwarg.
+    thinking = _EXEC_EFFORT_MAP.get(args.effort) if args.effort else None
+
+    # 5. Task text (missing file -> exit 1, stderr, empty stdout).
+    try:
+        task = _exec_read_task(args)
+    except (FileNotFoundError, OSError) as e:
+        _fail(str(e), 1)
+
+    # Room label (default _exec).
+    try:
+        room_id = _exec_sanitize_room(args.room)
+    except ValueError as e:
+        _fail(str(e), 1)
+
+    agent = Agent(config)
+
+    # --tools: install the resolved ToolDefs on the agent (fresh agent, so
+    # this fully determines the tool set; discovery is bypassed by design).
+    if resolved_tools is not None:
+        agent.tools = resolved_tools
+
+    # Tool trace capture (names + is_error only, bounded).
+    tool_trace, on_tool_call = _exec_collect_tool_trace()
+
+    content = None
+    status = "done"
+    deny_reason = None
+    ceiling_trip = None
+    detail = ""
+
+    async def _run():
+        return await agent.handle_input(
+            task, room_id,
+            on_tool_call=on_tool_call,
+            thinking=thinking,
+        )
+
+    try:
+        content = asyncio.run(_run())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        _fail("interrupted", 130)
+    except Exception as exc:
+        status, deny_reason, detail = _exec_classify_exception(exc)
+        logger.warning("exec handle_input failed: %s", exc)
+
+    # Post-turn introspection.
+    usage = _exec_partial_usage(agent, room_id)
+    stop_reason = None
+    try:
+        stop_reason = agent.last_stop_reason(room_id)
+    except Exception:
+        stop_reason = None
+
+    # Iteration cap -> structural ceiling trip (failed, not infra: this is
+    # Stigmergy's own per-dispatch driver-turn budget speaking, the exact
+    # analog of claude-code's error_max_turns).
+    if _exec_iteration_cap_reached(agent, room_id):
+        ceiling_trip = "driver_turns"
+        status = "failed"
+
+    result = {
+        "status": status,
+        "content": content,
+        "usage": usage,
+        "stop_reason": stop_reason,
+        "ceiling_trip": ceiling_trip,
+        "deny_reason": deny_reason,
+        "tool_trace": tool_trace,
+        "detail": detail,
+    }
+    print(json.dumps(result), flush=True)
+
+    if status == "done":
+        sys.exit(0)
+    if status == "infra":
+        sys.exit(2)
+    if status == "wedged":
+        sys.exit(3)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # CLI helpers — kdsn.237 Phase 1 (headless session support)
 # ---------------------------------------------------------------------------
 
@@ -780,6 +1245,7 @@ def main(argv=None) -> int:
         "monitor": cmd_monitor,
         "chat": cmd_chat,
         "showprompt": cmd_showprompt,
+        "exec": cmd_exec,
     }
 
     handler = dispatch[args.command]
