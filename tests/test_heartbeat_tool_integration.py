@@ -233,7 +233,7 @@ class TestI02BuildCallbacksManagerKeys:
         assert "umbral" in cb, "callbacks dict must expose the umbral manager"
         assert cb["heartbeat"] is hb
         assert cb["umbral"] is um
-        assert len(cb) == 17, f"build_callbacks must now return 17 keys, got {len(cb)}"
+        assert len(cb) == 19, f"build_callbacks must now return 19 keys (17 + spotter-era 18 + GC pair, kdsn.305), got {len(cb)}"
 
     @pytest.mark.asyncio
     async def test_bot_build_agent_callbacks_forwards_real_managers(self, tmp_path):

@@ -230,6 +230,30 @@ def plan_create_agent(name: str, *, force: bool = False) -> list[Operation]:
         ),
     ))
 
+    # Write the 8th operator-owned prompt file (workspace-kdsn.305): the
+    # continuity-artifacts file that prompt.py ships as a packaged fallback
+    # and that GC boundaries re-inject. Same skip-existing-unless---force
+    # contract as SECURITY_FOOTER.md above; content is the packaged template
+    # (byte-for-byte — the workspace file is operator-editable from here on).
+    # Read lazily at plan time; a missing template (corrupt install) is a
+    # hard authoring error, surfaced as AdminError rather than a silent skip.
+    continuity_template = Path(__file__).parent / "templates" / "CONTINUITY.md"
+    if not continuity_template.exists():
+        raise AdminError(
+            f"Packaged template missing: {continuity_template} — "
+            "cannot plan CONTINUITY.md (broken install?)"
+        )
+    ops.append(Operation(
+        kind="write_file",
+        path=home / "workspace" / "CONTINUITY.md",
+        content=continuity_template.read_text(),
+        overwrite=force,
+        description=(
+            "Write CONTINUITY.md template to workspace"
+            + ("" if force else " (skipped if it already exists)")
+        ),
+    ))
+
     # Set home permissions + recursive ownership (after mkdirs)
     ops.append(Operation(kind="chmod", path=home, mode="750", description=f"chmod 750 {home}"))
     ops.append(Operation(kind="chown", path=home, user=username, group=OPENALPH_GROUP, recursive=True, description=f"chown -R {username}:{OPENALPH_GROUP} {home}"))

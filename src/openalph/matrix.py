@@ -36,6 +36,15 @@ from nio import (
 )
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
+from openalph.context_gc import (
+    GC_EVENT,
+    LEGACY_EVENT,
+    ACTIVE_PROJECT_EVENT,
+    apply_boundary_and_rebuild,
+    current_boundary_index,
+    project_echo_text,
+    read_active_project,
+)
 from openalph.provider import ProviderError, ProviderUnavailableError, resolve_model_checked
 from openalph.config import MatrixConfig
 from openalph.session import SessionLog, persist_assistant_turn
@@ -85,8 +94,16 @@ def _is_streaming_edit(event) -> bool:
     and initial cursor-bearing sends from other agents).
     """
     source = getattr(event, 'source', None) or {}
-    content = source.get("content", {})
-    relates_to = content.get("m.relates_to", {})
+    # `source` (and its content/m.relates_to members) are untrusted input —
+    # malformed or synthetic events (test doubles carry e.g.
+    # m.relates_to=None) must degrade to "not an edit" rather than raising
+    # through the whole dispatch path.
+    content = source.get("content")
+    if not isinstance(content, dict):
+        content = {}
+    relates_to = content.get("m.relates_to")
+    if not isinstance(relates_to, dict):
+        relates_to = {}
     is_edit = relates_to.get("rel_type") == "m.replace"
 
     body = getattr(event, 'body', '') or ''
@@ -171,6 +188,105 @@ def _escape_capped(text: str, raw_cap: int, esc_cap: int) -> str:
     if amp != -1 and ";" not in cut[amp:]:
         cut = cut[:amp]
     return cut + "\n[truncated]"
+
+
+# --- Context GC command helpers (workspace-kdsn.305.1) ---------------------
+#
+# Shared by the /cache status line, the /cache gc subcommand, the
+# apply_gc_boundary tool callback, and the /project operator command so the
+# flag-off (legacy toolstrip) and flag-on (GC boundary) surfaces read state
+# identically. All readers are pure JSONL scans; writers go through
+# context_gc.apply_boundary (the ONLY boundary writer).
+
+#: [context]-section knobs and their defaults — the fallbacks mirror
+#: openalph.config's [context] defaults so a config object that predates the
+#: section (or a headless config without one) behaves as if defaults were in
+#: force. Sub C owns the authoritative [context] parser; these are the
+#: flag-off / pre-landing safety net only.
+_GC_DEFAULTS = {
+    "gc_enabled": True,
+    "durable_paths": [],
+    "durable_budget_pct": 15.0,
+    "durable_budget_min_tokens": 48000,
+    "turn_cooldown": 3,
+}
+
+
+def _gc_boundary_state(entries):
+    """(index, trigger) of the LATEST boundary marker (gc_boundary AND legacy
+    toolstrip kinds) in raw JSONL entries; (None, None) when there is none.
+
+    The trigger is read from the gc_boundary manifest (detail JSON); legacy
+    toolstrip markers (which carry no detail) surface as "toolstrip".
+    """
+    best = -1
+    trigger = None
+    for entry in entries:
+        if entry.get("role") != "system" or entry.get("event") not in (GC_EVENT, LEGACY_EVENT):
+            continue
+        try:
+            idx = int(entry.get("entry_index", -1))
+        except (TypeError, ValueError):
+            idx = -1
+        if idx > best:
+            best = idx
+            if entry.get("event") == GC_EVENT:
+                trigger = None
+                detail = entry.get("detail")
+                if isinstance(detail, str):
+                    try:
+                        manifest = json.loads(detail)
+                        if isinstance(manifest, dict) and isinstance(manifest.get("trigger"), str):
+                            trigger = manifest["trigger"]
+                    except json.JSONDecodeError:
+                        trigger = None
+                if trigger is None:
+                    trigger = "unknown"
+            else:
+                trigger = "toolstrip"
+    if best < 0:
+        return None, None
+    return best, trigger
+
+
+
+
+
+
+def _gc_confirm_text(outcome, trigger):
+    """Operator-facing confirmation for an APPLIED boundary."""
+    manifest = outcome.get("manifest") or {}
+    classes = manifest.get("classes") or {}
+    durable = manifest.get("durable") or {}
+    used = durable.get("used_tokens", 0)
+    budget = durable.get("budget_tokens", 0)
+    over = " — ⚠️ OVER BUDGET" if outcome.get("over_budget") else ""
+    return (
+        f"✅ GC boundary {manifest.get('boundary_index', '?')} applied "
+        f"(trigger: {trigger}). "
+        f"Stripped pre-boundary: "
+        f"tools={classes.get('tools', 0)}, "
+        f"thinking={classes.get('thinking', 0)}, "
+        f"inputs={classes.get('inputs', 0)}, "
+        f"media={classes.get('media', 0)}. "
+        f"Tokens {manifest.get('tokens_before', 0)} → "
+        f"{manifest.get('tokens_after_est', 0)} (est.). "
+        f"Durable budget {used}/{budget} tokens{over}."
+    )
+
+
+    try:
+        entries = parse_durable_set(toml_path.read_text(encoding="utf-8"))
+    except GCConfigError as e:
+        lines.append(f"Durable set: MALFORMED — {e}")
+        return "\n".join(lines)
+    if not entries:
+        lines.append("Durable set: 0 entries (durable-set.toml has no entries).")
+    else:
+        lines.append(f"Durable entries: {len(entries)}")
+        for item in entries:
+            lines.append(f"  - {item['path']} — {item['reason']}")
+    return "\n".join(lines)
 
 
 def _furl_tool_call_detail(input_data, result, is_error: bool) -> str:
@@ -1346,7 +1462,12 @@ class MatrixBot:
             self._advisor_results = {}
         if not hasattr(self, '_subagent_results'):
             self._subagent_results = {}
-        return build_callbacks(
+        # kdsn.305.1: the GC tool callbacks (apply_gc_boundary,
+        # set_active_project) are built at THE construction seam —
+        # callbacks.build_callbacks — so every transport (Matrix live,
+        # heartbeat/umbral, headless CLI) carries identical wiring. This
+        # wrapper only adds Matrix-specific keys below.
+        callbacks = build_callbacks(
             self.agent,
             room_id,
             sinks,
@@ -1358,6 +1479,8 @@ class MatrixBot:
             subagent_results=self._subagent_results,
             room_name=room_name,
         )
+
+        return callbacks
 
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
         """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
@@ -2658,15 +2781,24 @@ class MatrixBot:
 
         # Skip thinking blocks from other agents (custom content field)
         event_source = getattr(event, 'source', None) or {}
-        if event_source.get("content", {}).get("openalph.thinking") is True:
+        if not isinstance(event_source, dict):
+            event_source = {}
+        _ev_content = event_source.get("content")
+        if isinstance(_ev_content, dict) and _ev_content.get("openalph.thinking") is True:
             return
 
         room_id = room.room_id
 
         # For final edit events, use the replacement content (m.new_content)
         event_content = event_source.get("content", {})
-        if event_content.get("m.relates_to", {}).get("rel_type") == "m.replace":
-            body = event_content.get("m.new_content", {}).get("body", event.body).strip()
+        if not isinstance(event_content, dict):
+            event_content = {}
+        _relates = event_content.get("m.relates_to")
+        if isinstance(_relates, dict) and _relates.get("rel_type") == "m.replace":
+            _new_content = event_content.get("m.new_content")
+            if not isinstance(_new_content, dict):
+                _new_content = {}
+            body = _new_content.get("body", event.body).strip()
         else:
             body = event.body.strip()
 
@@ -3005,43 +3137,73 @@ class MatrixBot:
                             if e.get("role") == "tool" and i < boundary
                         )
                         strip_line = f"Toolstrip: active at entry {boundary} ({stripped_count} tool results stripped)"
-                await self.send(room_id, f"{ttl_line}\n{strip_line}")
+                # kdsn.305.1: extend the strip line with the GC boundary state
+                # (latest boundary index + trigger over gc_boundary system
+                # entries; legacy toolstrip markers count as boundaries too).
+                gc_line = "GC boundary: none"
+                if self.session_log:
+                    _gc_entries = self.session_log.read(room_id)
+                    _gc_idx, _gc_trigger = _gc_boundary_state(_gc_entries)
+                    if _gc_idx is not None:
+                        gc_line = f"GC boundary: {_gc_idx} ({_gc_trigger})"
+                await self.send(room_id, f"{ttl_line}\n{strip_line}\n{gc_line}")
                 return
             value = parts[1].strip().lower()
-            if value == "toolstrip":
-                # /cache toolstrip — mark strip point
+            if value == "gc":
+                # /cache gc — apply a GC boundary at a clean break
+                # (renamed from `/cache toolstrip`; the toolstrip name is
+                # retired). Flag-on: full GC boundary (manifest + durable
+                # snapshot + GC-aware history rebuild). Flag-off: EXACTLY the
+                # legacy toolstrip behavior — bare strip marker, legacy
+                # message, legacy rebuild (byte-equivalent behavior to the
+                # old /cache toolstrip).
                 if self.session_log:
-                    entries = self.session_log.read(room_id)
-                    entry_count = len(entries)
-                    # Compute what will be stripped
-                    # Respect existing strip boundary
-                    existing_markers = [
-                        e.get("entry_index", 0) for e in entries
-                        if e.get("role") == "system" and e.get("event") == "toolstrip"
-                    ]
-                    existing_boundary = max(existing_markers) if existing_markers else -1
-                    new_count = 0
-                    new_chars = 0
-                    for i, e in enumerate(entries):
-                        if e.get("role") == "tool" and i > existing_boundary:
-                            new_count += 1
-                            new_chars += len(e.get("output", ""))
-                    # Append the marker
-                    self.session_log.append(
-                        role="system",
-                        sender=event.sender,
-                        room=room_id,
-                        event_id=None,
-                        event="toolstrip",
-                        entry_index=entry_count,
-                    )
-                    # Refresh in-memory history to reflect the strip
-                    history = self.agent.history(room_id)
-                    history.clear()
-                    history.extend(self.session_log.build_context(room_id))
-                    msg = f"Toolstrip applied. Stripped {new_count} tool results (~{new_chars:,} chars) from context."
-                    msg += "\n⚠️ Previously loaded skills were stripped — re-read any skills needed for ongoing work."
-                    await self.send(room_id, msg)
+                    if self.agent.config.context.gc_enabled:
+                        outcome = apply_boundary_and_rebuild(
+                            self.agent, self.session_log, room_id,
+                            trigger="manual", exclude_inflight=False)
+                        if outcome.get("applied"):
+                            await self.send_notice(room_id, _gc_confirm_text(outcome, "manual"))
+                        else:
+                            await self.send_notice(
+                                room_id,
+                                f"⚠️ GC boundary not applied — "
+                                f"{outcome.get('noop_reason') or 'no-op'}",
+                            )
+                    else:
+                        # Flag OFF — legacy toolstrip path (behavior + message
+                        # byte-equivalent to the pre-GC /cache toolstrip).
+                        entries = self.session_log.read(room_id)
+                        entry_count = len(entries)
+                        # Compute what will be stripped
+                        # Respect existing strip boundary
+                        existing_markers = [
+                            e.get("entry_index", 0) for e in entries
+                            if e.get("role") == "system" and e.get("event") == "toolstrip"
+                        ]
+                        existing_boundary = max(existing_markers) if existing_markers else -1
+                        new_count = 0
+                        new_chars = 0
+                        for i, e in enumerate(entries):
+                            if e.get("role") == "tool" and i > existing_boundary:
+                                new_count += 1
+                                new_chars += len(e.get("output", ""))
+                        # Append the marker
+                        self.session_log.append(
+                            role="system",
+                            sender=event.sender,
+                            room=room_id,
+                            event_id=None,
+                            event="toolstrip",
+                            entry_index=entry_count,
+                        )
+                        # Refresh in-memory history to reflect the strip
+                        history = self.agent.history(room_id)
+                        history.clear()
+                        history.extend(self.session_log.build_context(room_id))
+                        msg = f"Toolstrip applied. Stripped {new_count} tool results (~{new_chars:,} chars) from context."
+                        msg += "\n⚠️ Previously loaded skills were stripped — re-read any skills needed for ongoing work."
+                        await self.send(room_id, msg)
                 else:
                     await self.send(room_id, "⚠️ No session log available.")
                 return
@@ -3077,6 +3239,89 @@ class MatrixBot:
                     detail=value,
                 )
             await self.send(room_id, f"Cache TTL set to **{value}** for this room")
+            return
+
+        if body.startswith("/project"):
+            # /project operator command — active-project declaration.
+            # Room-command path: operator AUTHORITY. Declaring again is an
+            # allowed override (announced); this deliberately bypasses the
+            # tool path's declare-once refusal.
+            parts = body.split()
+            # Grammar: `/project set <name>` (canonical), `/project <name>`
+            # (convenience), bare `/project` (status).
+            project = None
+            if len(parts) >= 3 and parts[1] == "set":
+                project = parts[2]
+            elif len(parts) == 3:
+                project = parts[2]  # `/project set` missing name handled above
+            elif len(parts) == 2 and parts[1] != "set":
+                project = parts[1]
+            if project is not None:
+                project = project.strip()
+                # Name guard: this detail feeds workspace-relative path joins
+                # at boundary application — no separators, no traversal.
+                if ("/" in project or "\\" in project or project.startswith(".")
+                        or project in ("", ".", "..")):
+                    await self.send(
+                        room_id,
+                        "⚠️ Invalid project name — use a bare directory name "
+                        "like `foo` (no paths, no dots-prefix).",
+                    )
+                    return
+                if not self.session_log:
+                    await self.send(room_id, "⚠️ No session log available.")
+                    return
+                agent_config = self.agent.config
+                workspace = Path(agent_config.workspace)
+                proj_dir = workspace / "memory" / "projects" / project
+                entries = self.session_log.read(room_id)
+                existing = read_active_project(entries)
+                self.session_log.append(
+                    role="system",
+                    sender=event.sender,
+                    room=room_id,
+                    event_id=None,
+                    event=ACTIVE_PROJECT_EVENT,
+                    detail=project,
+                )
+                text = project_echo_text(workspace, project)
+                if not proj_dir.is_dir():
+                    text = (
+                        f"⚠️ Directory not found: {proj_dir} — create "
+                        "memory/projects/<name>/ before the next boundary.\n"
+                        + text
+                    )
+                if existing is not None and existing != project:
+                    text = (
+                        f"⚠️ Operator override: was **{existing}**, now "
+                        f"**{project}**.\n{text}"
+                    )
+                elif existing == project:
+                    text = f"Re-declared (already **{project}**).\n{text}"
+                await self.send_notice(room_id, text)
+                return
+            # No args — status: current project + declaration count.
+            if self.session_log:
+                entries = self.session_log.read(room_id)
+            else:
+                entries = []
+            current = read_active_project(entries)
+            count = sum(
+                1 for e in entries
+                if e.get("role") == "system" and e.get("event") == ACTIVE_PROJECT_EVENT
+            )
+            if current is None:
+                await self.send(
+                    room_id,
+                    "Project: none declared. Use `/project set <name>` "
+                    "(memory/projects/<name>/ must exist).",
+                )
+            else:
+                await self.send(
+                    room_id,
+                    f"Project: **{current}** ({count} declaration(s) this epoch). "
+                    "Use `/project set <name>` to change it.",
+                )
             return
 
         if body.startswith("/timesense"):

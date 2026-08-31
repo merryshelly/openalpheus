@@ -83,6 +83,17 @@ class ReminderState:
     # skips (fail-safe direction: fewer nudges, never false urgency; also keeps
     # existing ReminderState constructions valid).
     available_tokens: int = 0
+    # Context GC (workspace-kdsn.305) — turn-start site only, both fields
+    # computed by the agent from [context] config + the room's usable runway.
+    # gc_warn_threshold: absolute token count at which the gc-warn reminder
+    # fires (int(available * warn_pct / 100)). Default 0 = unknown/disabled →
+    # SILENT SKIP, the same fail-safe convention as available_tokens (fewer
+    # nudges, never false urgency; also keeps existing constructions valid).
+    gc_warn_threshold: int = 0
+    # gc_budget_fraction: durable-set tokens used / durable budget (0.0–1.0+),
+    # from the last applied boundary's manifest. Default 0.0 = no boundary
+    # seen yet (in-memory only; restarts empty) → gc-budget silent.
+    gc_budget_fraction: float = 0.0
 
 
 @dataclass
@@ -115,6 +126,11 @@ class ReminderEngine:
         self._t3_fired: bool = False        # T3: once per session
         self._t5_fired: bool = False        # T5: once per session
         self._t6_fired: bool = False        # T6: once per session
+        # Context GC (kdsn.305): session-scoped fired-state for the two GC
+        # triggers (once-per-session latches, re-armed by reset() and
+        # rehydrated from JSONL like every other trigger).
+        self._gc_warn_fired: bool = False   # gc-warn: once per session
+        self._gc_budget_fired: bool = False # gc-budget: once per session
         # Context nudge ladder (replaces the single-shot T2 _t2_fired bool):
         # _ladder_fired — monotonic highest tier fired this session+model
         # (D1: single latch, never fire a tier ≤ one already fired; D3: no
@@ -238,6 +254,58 @@ class ReminderEngine:
                     detail=f"tier={fired_tier}",
                     text=_LADDER_TEXT[fired_tier].format(remaining=remaining),
                 ))
+
+        # Context GC — gc-warn (workspace-kdsn.305).  turn_start ONLY (the
+        # agent applies the auto boundary tier at turn start; mid-loop
+        # warnings would dilute the nudge ladder and can't be acted on
+        # between tool calls).  Predicate: gc_warn_threshold > 0 (0 =
+        # unknown/disabled → silent skip, the available_tokens convention)
+        # AND context has crossed it; once per session (rehydratable via
+        # source='reminder' trigger='gc-warn' entries, reset() re-arms).
+        # Text teaches the continuity artifacts and — per audit R1-6 — names
+        # the context_gc tool ONLY when the tool is actually enabled for
+        # this room (enabling is transport-wired, so a headless room must
+        # never be steered to a tool it cannot call).
+        if (state.evaluation_point == "turn_start"
+                and not self._gc_warn_fired
+                and state.gc_warn_threshold > 0
+                and state.context_tokens >= state.gc_warn_threshold):
+            self._gc_warn_fired = True
+            if "context_gc" in state.enabled_tools:
+                gc_tool_note = " Use the context_gc tool to apply a boundary."
+            else:
+                gc_tool_note = ""
+            results.append(Reminder(
+                trigger="gc-warn",
+                text=(
+                    "Context has crossed the GC warning threshold — finalize "
+                    "your continuity artifacts now: update progress.md and "
+                    "the durable-set.toml so the next garbage-collection "
+                    f"boundary re-injects current state.{gc_tool_note}"
+                ),
+            ))
+
+        # Context GC — gc-budget (kdsn.305).  turn_start ONLY, once per
+        # session.  Predicate: durable-set usage >= 50% of its budget
+        # (integer cross-multiplication, like the ladder — no float
+        # comparison at the 0.5 boundary).  0.0 = no boundary seen yet
+        # (in-memory cache, empty after restart) → silent skip.  States the
+        # percentage so the operator can see how close the durable set is to
+        # its re-injection budget.
+        if (state.evaluation_point == "turn_start"
+                and not self._gc_budget_fired
+                and state.gc_budget_fraction >= 0
+                and int(state.gc_budget_fraction * 200) >= 100):
+            self._gc_budget_fired = True
+            results.append(Reminder(
+                trigger="gc-budget",
+                text=(
+                    f"Your durable set uses {int(state.gc_budget_fraction * 100)}% "
+                    "of its re-injection budget. Prune it: drop durable-set "
+                    "entries that are no longer load-bearing and keep "
+                    "progress.md within ~1–2K tokens."
+                ),
+            ))
 
         # T3: memory-salience — turn_start, user-sourced, completed≥2,
         # memory_search enabled, zero memory_search calls; once/session
@@ -363,6 +431,13 @@ class ReminderEngine:
                 self._t5_fired = True
             elif trigger == "advisor-salience":
                 self._t6_fired = True
+            elif trigger == "gc-warn":
+                # Once-per-session latch (kdsn.305): a persisted gc-warn entry
+                # means it already fired this session — do not re-ping.
+                self._gc_warn_fired = True
+            elif trigger == "gc-budget":
+                # Same once-per-session latch.
+                self._gc_budget_fired = True
             elif trigger == "session-orient" and entry.get("detail") is not None:
                 # kdsn.298: restore the model-keyed orientation flag from the
                 # persisted detail. Last-wins in JSONL order (the final entry
@@ -380,6 +455,8 @@ class ReminderEngine:
         self._t3_fired = False
         self._t5_fired = False
         self._t6_fired = False
+        self._gc_warn_fired = False   # kdsn.305: re-arm both GC triggers
+        self._gc_budget_fired = False
         self._t4_fired_this_turn = False
         # Ladder re-arm (D7): umbral = new session, all tiers re-arm.
         self._ladder_fired = 0

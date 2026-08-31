@@ -7,13 +7,25 @@ directly with a different CommsSinks implementation.
 """
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+import logging
 import sys
 
 import mistune
 
 from openalph.reminders import Reminder
+from openalph.context_gc import (
+    ACTIVE_PROJECT_EVENT,
+    apply_boundary_and_rebuild,
+    current_boundary_index,
+    project_echo_text,
+    project_valid_name,
+    read_active_project,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -509,4 +521,95 @@ def build_callbacks(
     _spotter = getattr(agent, "_spotter", None)
     if type(_spotter).__name__ == "SpotterManager":
         _callbacks["log_spotter_flag"] = _log_spotter_flag_callback
+    # kdsn.305.1: GC boundary + project declaration tool callbacks. Built at
+    # THIS seam (the one construction seam) so every transport — Matrix live
+    # turns, heartbeat/umbral turns, headless CLI — carries identical wiring.
+    # session_log=None (no JSONL on this transport) → keys are None; the tool
+    # handlers steer to the operator command and the agent loop skips
+    # silently (durability-gate discipline).
+    if session_log is not None:
+        async def _gc_apply_cb(_room_id, *, trigger, exclude_inflight=True):
+            try:
+                entries = session_log.read(_room_id)
+            except Exception as e:
+                logger.warning("gc boundary read failed for %s: %s", _room_id, e)
+                return {
+                    "applied": False,
+                    "noop_reason": f"boundary failed: {type(e).__name__}",
+                    "manifest": None,
+                    "over_budget": False,
+                }
+            # Turn cooldown — TOOL-TRIGGERED boundaries only. Operator
+            # commands (/cache gc) and the loop's auto/hard tiers bypass it.
+            # Count by list POSITION: SessionLog.append only writes
+            # entry_index on marker events, never on assistant entries.
+            # Post-boundary positions start at `boundary`; no boundary (-1)
+            # counts everything.
+            if trigger == "tool" and exclude_inflight:
+                cfg = getattr(agent.config, "context", None)
+                cooldown = getattr(cfg, "turn_cooldown", 3)
+                boundary = current_boundary_index(entries)
+                count = sum(
+                    1 for p, e in enumerate(entries)
+                    if e.get("role") == "assistant" and p >= boundary
+                )
+                if count < cooldown:
+                    return {
+                        "applied": False,
+                        "noop_reason": (
+                            f"cooldown: {count} of {cooldown} turns "
+                            "since last boundary"
+                        ),
+                        "manifest": None,
+                        "over_budget": False,
+                    }
+            return apply_boundary_and_rebuild(
+                agent, session_log, _room_id,
+                trigger=trigger, exclude_inflight=exclude_inflight,
+            )
+
+        async def _gc_set_project_cb(project):
+            entries = session_log.read(room_id)
+            existing = read_active_project(entries)
+            if existing is not None:
+                if existing == project:
+                    return {"ok": True, "text": "already declared (no-op)"}
+                return {
+                    "ok": False,
+                    "text": (
+                        f"Project '{existing}' already declared for this room — "
+                        "one project per room; escalate to your operator"
+                    ),
+                }
+            if not project_valid_name(project):
+                return {
+                    "ok": False,
+                    "text": ("Invalid project name — use a bare directory "
+                             "name like `foo` (no paths, no dots-prefix)."),
+                }
+            workspace = Path(agent.config.workspace)
+            proj_dir = workspace / "memory" / "projects" / project
+            if not proj_dir.is_dir():
+                return {
+                    "ok": False,
+                    "text": f"Project directory does not exist: {proj_dir}",
+                }
+            session_log.append(
+                role="system",
+                sender=session_log.agent_user_id,
+                room=room_id,
+                event=ACTIVE_PROJECT_EVENT,
+                detail=project,
+            )
+            return {
+                "ok": True,
+                "text": project_echo_text(workspace, project),
+            }
+
+        _callbacks["apply_gc_boundary"] = _gc_apply_cb
+        _callbacks["set_active_project"] = _gc_set_project_cb
+    else:
+        _callbacks["apply_gc_boundary"] = None
+        _callbacks["set_active_project"] = None
+
     return _callbacks

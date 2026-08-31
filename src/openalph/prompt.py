@@ -9,6 +9,18 @@ logger = logging.getLogger("openalph.prompt")
 # editable like every other prompt file.
 SECURITY_FOOTER_FILENAME = "SECURITY_FOOTER.md"
 
+# The 8th operator-owned file (workspace-kdsn.305): teaches the two continuity
+# artifacts (progress.md + durable-set.toml) that survive GC boundaries. Like
+# SECURITY_FOOTER.md it ships in openalph/templates/ and is copied into a
+# workspace at agent creation (see admin.plan_create_agent), so it is
+# operator-owned, editable, and greppable. The packaged copy is the fallback
+# for workspaces created before the file existed.
+CONTINUITY_FILENAME = "CONTINUITY.md"
+# Directory holding the packaged templates (SECURITY_FOOTER.md, CONTINUITY.md,
+# and the other bootstrap files). Resolved relative to this module so the
+# fallback works from both the src tree and an installed site-packages.
+_PACKAGE_TEMPLATES_DIR = Path(__file__).parent / "templates"
+
 # PHIL-1: kept ONLY as the fallback for workspaces created before
 # SECURITY_FOOTER.md existed, so upgrading does not silently drop a security
 # instruction from every agent's prompt. It is byte-identical to
@@ -71,6 +83,7 @@ def assemble_prompt(
     workspace: Path,
     model_aliases: dict[str, str] | None = None,
     injection_defense: bool = True,
+    gc_enabled: bool = False,
 ) -> str:
     """
     Assemble the system prompt from workspace files and skills index.
@@ -89,6 +102,22 @@ def assemble_prompt(
       3. The `INJECTION_DEFENSE` constant -- fallback only, for workspaces
          created before this file existed, so an upgrade never silently drops
          the instruction. A warning is logged naming the file to create.
+
+    The continuity file (workspace-kdsn.305) resolves the same way when
+    `gc_enabled` is True: `<workspace>/CONTINUITY.md` first, else the packaged
+    template (openalph/templates/CONTINUITY.md). It is rendered as a
+    `## CONTINUITY.md` section positioned AFTER OPERATIONS.md and BEFORE the
+    skills index. `gc_enabled=False` appends nothing, ever.
+
+    NOTE on the default: the signature default is False (opt-in at the
+    function level), NOT True. The template is behavioural text, and the
+    PHIL-1 invariant (test_prompt_injection_defense.py::
+    test_no_behavioural_text_beyond_operator_files) pins that a DEFAULT
+    call adds only the mechanical `## Runtime` block — no behavioural
+    section the operator did not place. The AGENT passes
+    gc_enabled=config.context.gc_enabled explicitly (ContextGCConfig
+    defaults to True), so agents get the continuity section by default;
+    only direct default calls to this function are opt-in.
 
     Returns empty string if the workspace has no readable prompt files.
     """
@@ -116,7 +145,33 @@ def assemble_prompt(
             # Add header identifying the file
             prompt_parts.append(f"## {filename}")
             prompt_parts.append(file_path.read_text())
-    
+
+    # Append the continuity file (8th operator-owned file, kdsn.305) as its
+    # own section, positioned after OPERATIONS.md and before the skills index.
+    # Resolves like the security footer: workspace file first, packaged
+    # template as the fallback. gc_enabled=False appends nothing, ever.
+    if gc_enabled:
+        continuity_path = workspace / CONTINUITY_FILENAME
+        if continuity_path.exists():
+            prompt_parts.append(f"## {CONTINUITY_FILENAME}")
+            prompt_parts.append(continuity_path.read_text())
+        else:
+            packaged = _PACKAGE_TEMPLATES_DIR / CONTINUITY_FILENAME
+            if packaged.exists():
+                logger.warning(
+                    "%s not found in %s — falling back to the packaged "
+                    "continuity template. Copy it to make it visible and "
+                    "editable: cp %s %s",
+                    CONTINUITY_FILENAME, workspace, packaged, workspace,
+                )
+                prompt_parts.append(f"## {CONTINUITY_FILENAME}")
+                prompt_parts.append(packaged.read_text())
+            else:  # pragma: no cover — the template ships as package data
+                logger.warning(
+                    "%s not found in %s and no packaged template — skipping "
+                    "the continuity section", CONTINUITY_FILENAME, workspace,
+                )
+
     # Build skills index from .md files in skills/ directory
     skills_dir = workspace / "skills"
     if skills_dir.exists():

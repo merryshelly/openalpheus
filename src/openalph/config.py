@@ -73,6 +73,36 @@ class NotificationsConfig:
 
 
 @dataclass
+class ContextGCConfig:
+    """Context garbage-collection settings (workspace-kdsn.305, [context] section).
+
+    Tuning knobs for the unified context-boundary mechanism (context_gc.py):
+    the auto/hard boundary tiers, the gc-warn reminder threshold, and the
+    durable-set re-injection budget.  Absent [context] section → all defaults
+    (gc_enabled=True).  Parsing FAILS LOUD (ConfigError on bad type/range),
+    the same discipline as [model_vision] and [spotter]: these knobs govern
+    when context is reduced and what survives it, so a silently-dropped
+    setting would be fail-open on a data-loss surface.
+    """
+    gc_enabled: bool = True
+    # Reminder/boundary tier thresholds — percentages of the usable runway
+    # (available = window limit − max_tokens), strict (0, 100).
+    warn_pct: int = 75      # gc-warn reminder threshold
+    auto_pct: int = 85      # turn-start auto boundary tier
+    hard_pct: int = 92      # (reserved: hard tier is the send-time overflow guard)
+    # Durable-set re-injection budget: max(window * pct, min_tokens) tokens
+    # (see context_gc.durable_budget_tokens).
+    durable_budget_pct: float = 15.0          # > 0
+    durable_budget_min_tokens: int = 48000    # >= 0
+    # Workspace-relative glob patterns declaring additional durable path
+    # classes re-injected at every boundary (e.g. ["skills/*.md"]).
+    durable_paths: list[str] = field(default_factory=list)
+    # Minimum turns between two applied boundaries (cooldown; the boundary
+    # writer refuses a computed index that does not exceed the last one).
+    turn_cooldown: int = 3  # >= 0
+
+
+@dataclass
 class AgentConfig:
     """Configuration for an OpenAlph agent."""
     name: str
@@ -110,6 +140,10 @@ class AgentConfig:
     # call sites poke it defensively via getattr(config, "skipped_providers", {}).
     skipped_providers: dict[str, str] = field(default_factory=dict)
     notifications: NotificationsConfig | None = None
+    # workspace-kdsn.305: context GC settings ([context] section). Default
+    # factory keeps every pre-305 AgentConfig(...) construction working
+    # unchanged (absent [context] in TOML → same defaults the factory gives).
+    context: ContextGCConfig = field(default_factory=ContextGCConfig)
     # Spotter v1 (spotter-v1-design.md §1): an independent monitor that
     # watches this agent's live session, turn by turn. Optional [spotter]
     # TOML section; absent section → all defaults (enabled=True per D6
@@ -614,6 +648,10 @@ def load_config(path: Path) -> AgentConfig:
     # Parse optional [notifications] section (kdsn.292: ntfy degraded-start alert)
     notifications = _parse_notifications_config(toml_data)
 
+    # Parse optional [context] section (workspace-kdsn.305: context GC).
+    # Absent → all defaults; present-but-invalid → ConfigError (fail-LOUD).
+    context = _parse_context_gc_config(toml_data)
+
     # Return resolved configuration
     return AgentConfig(
         name=name,
@@ -637,6 +675,7 @@ def load_config(path: Path) -> AgentConfig:
         model_aliases=model_aliases,
         skipped_providers=skipped_map,
         notifications=notifications,
+        context=context,
         spotter_enabled=spotter_enabled,
         spotter_model=spotter_model,
         spotter_thinking=spotter_thinking,
@@ -692,6 +731,93 @@ def _parse_notifications_config(toml_data: dict) -> NotificationsConfig | None:
         ntfy_token = None
 
     return NotificationsConfig(ntfy_url=ntfy_url, ntfy_token=ntfy_token)
+
+
+def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
+    """Parse the optional [context] section (workspace-kdsn.305).
+
+    Absent section → all defaults (gc_enabled=True).  Present section with
+    ANY bad type or range RAISES ConfigError — fail-LOUD, mirroring the
+    [model_vision] precedent: these knobs control when context is reduced and
+    what survives, so a silently-dropped value would be fail-open on a
+    data-loss surface (a mistyped gc_enabled = "no" must not silently
+    disable GC; a pct of 150 must not silently cap a boundary tier).
+    """
+    if "context" not in toml_data:
+        return ContextGCConfig()
+
+    section = toml_data["context"]
+    if not isinstance(section, dict):
+        raise ConfigError("[context] section must be a table")
+
+    # bool knob
+    gc_enabled = section.get("gc_enabled", True)
+    if not isinstance(gc_enabled, bool):
+        raise ConfigError(
+            f"[context] gc_enabled must be a boolean, "
+            f"got {gc_enabled!r} ({type(gc_enabled).__name__})")
+
+    # pct knobs: strict (0, 100).  bool is an int subclass in Python —
+    # reject it explicitly (same discipline as [spotter] max_iterations).
+    def _pct(name: str, default: int) -> int:
+        v = section.get(name, default)
+        if isinstance(v, bool) or not isinstance(v, int) or not (0 < v < 100):
+            raise ConfigError(
+                f"[context] {name} must be an integer strictly between 0 and "
+                f"100, got {v!r}")
+        return v
+
+    warn_pct = _pct("warn_pct", 75)
+    auto_pct = _pct("auto_pct", 85)
+    hard_pct = _pct("hard_pct", 92)
+
+    # durable budget: pct > 0, min_tokens >= 0
+    durable_budget_pct = section.get("durable_budget_pct", 15.0)
+    if (isinstance(durable_budget_pct, bool)
+            or not isinstance(durable_budget_pct, (int, float))
+            or not math.isfinite(durable_budget_pct)
+            or durable_budget_pct <= 0):
+        raise ConfigError(
+            f"[context] durable_budget_pct must be a finite number > 0, "
+            f"got {durable_budget_pct!r}")
+    durable_budget_pct = float(durable_budget_pct)
+
+    durable_budget_min_tokens = section.get("durable_budget_min_tokens", 48000)
+    if (isinstance(durable_budget_min_tokens, bool)
+            or not isinstance(durable_budget_min_tokens, int)
+            or durable_budget_min_tokens < 0):
+        raise ConfigError(
+            f"[context] durable_budget_min_tokens must be an integer >= 0, "
+            f"got {durable_budget_min_tokens!r}")
+
+    # durable path globs
+    durable_paths = section.get("durable_paths", [])
+    if not isinstance(durable_paths, list) or not all(
+            isinstance(p, str) and p for p in durable_paths):
+        raise ConfigError(
+            "[context] durable_paths must be a list of non-empty strings, "
+            f"got {durable_paths!r}")
+    durable_paths = list(durable_paths)
+
+    # turn cooldown
+    turn_cooldown = section.get("turn_cooldown", 3)
+    if (isinstance(turn_cooldown, bool)
+            or not isinstance(turn_cooldown, int)
+            or turn_cooldown < 0):
+        raise ConfigError(
+            f"[context] turn_cooldown must be an integer >= 0, "
+            f"got {turn_cooldown!r}")
+
+    return ContextGCConfig(
+        gc_enabled=gc_enabled,
+        warn_pct=warn_pct,
+        auto_pct=auto_pct,
+        hard_pct=hard_pct,
+        durable_budget_pct=durable_budget_pct,
+        durable_budget_min_tokens=durable_budget_min_tokens,
+        durable_paths=durable_paths,
+        turn_cooldown=turn_cooldown,
+    )
 
 
 def _parse_matrix_config(toml_data: dict) -> MatrixConfig | None:

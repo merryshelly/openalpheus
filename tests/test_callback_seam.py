@@ -104,6 +104,9 @@ _EXPECTED_CALLBACK_KEYS = frozenset({
     "subagent_results",
     "heartbeat",
     "umbral",
+    # context-GC (workspace-kdsn.305): boundary application + project declaration
+    "apply_gc_boundary",
+    "set_active_project",
 })
 
 _SIDE_EFFECT_KEYS = frozenset({
@@ -138,11 +141,11 @@ class TestCallbacksDictKeys:
         cb = bot._build_agent_callbacks("!room:server", None)
         assert set(cb.keys()) == set(_EXPECTED_CALLBACK_KEYS)
 
-    def test_exact_key_count_is_17(self):
+    def test_exact_key_count_is_19(self):
         """kdsn.290: wire format grew 15 → 17 with the raw timer managers."""
         bot = _make_bot()
         cb = bot._build_agent_callbacks("!room:server", None)
-        assert len(cb) == 17
+        assert len(cb) == 19
 
     def test_manager_keys_carry_bot_managers(self):
         """kdsn.290: callbacks["heartbeat"]/["umbral"] forward bot.heartbeat /

@@ -793,6 +793,58 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "max_upload_bytes": 20971520
         }
     },
+    "context_gc": {
+        "description": (
+            "Apply a GC context boundary NOW, at a clean break: everything before the "
+            "boundary is reduced (tool outputs -> pointers, thinking dropped, durable "
+            "set re-attached as a frozen snapshot) and the prompt cache is flushed "
+            "from the edit point. "
+            "IMPORTANT: prefer calling this right after the harness warns you "
+            "(gc-warn reminder) or at a natural milestone; NEVER call it repeatedly — "
+            "each boundary flushes the prompt cache from the edit point and a turn "
+            "cooldown applies between boundaries. "
+            "IMPORTANT: no parameters — the room is resolved from the session context, "
+            "never from input. Not for sub-agents (subagents manage their own context). "
+            "WHEN NOT TO USE: mid-tool-loop on state you still need verbatim (the "
+            "pointer names what to re-run), or before any gc-warn with no milestone "
+            "reached — the boundary buys nothing yet. "
+            "The result reports the boundary index, per-class stripped counts, "
+            "tokens before -> after, and durable budget used/budget (with an "
+            "OVER BUDGET flag when the durable set exceeds its budget)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+        "config": {}
+    },
+    "set_active_project": {
+        "description": (
+            "Declare the active project for this room — the "
+            "memory/projects/<name>/ directory whose progress.md and "
+            "durable-set.toml form the room's durable set, re-attached as a "
+            "frozen snapshot at every GC boundary. "
+            "IMPORTANT: declare-once per session epoch and one project per room — "
+            "a second, different project is refused (escalate to the operator); "
+            "re-declaring the same project is a clean no-op. "
+            "IMPORTANT: the directory must already exist at "
+            "memory/projects/<name>/ under the workspace. "
+            "The result lists the parsed durable-set entries (path + reason) so "
+            "the operator can see exactly what a boundary will carry."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "memory/projects/<name>/ directory name"
+                }
+            },
+            "required": ["project"]
+        },
+        "config": {}
+    },
     "view_image": {
         "description": (
             "View an image that already exists in your workspace by attaching it to "
@@ -1509,6 +1561,195 @@ async def _execute_heartbeat_tool(input: dict, callbacks: dict | None) -> "ToolR
     )
 
 
+async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResult":
+    """Execute the built-in context_gc tool (workspace-kdsn.305.2).
+
+    Applies a GC context boundary NOW at a clean break in the owning room.
+    Room scoping ALWAYS comes from ``callbacks["room_id"]`` — never from any
+    input key (the tool has NO parameters).
+
+    Guards (all return ``ToolResult(is_error=True)`` without mutating state,
+    never raising):
+      - missing callbacks / no room id → transport-unavailable steering.
+      - sub-agent sentinel room ("__sub__") → refused (subagents manage their
+        own context).
+      - missing/None apply_gc_boundary callback → steering to the operator
+        ``/cache gc`` command.
+      - callback exception → caught and sanitized (type name only).
+
+    On success the result summarizes the boundary: index, per-class stripped
+    counts, tokens before -> after, and durable budget used/budget (OVER
+    BUDGET flagged loudly). On a no-op (cooldown / monotonicity refusal) the
+    callback's noop_reason is surfaced verbatim as an error.
+    """
+    # R4: never bare-subscript the room id. A malformed caller must get
+    # steering, not a KeyError escaping the tool and killing the turn.
+    room_id = callbacks.get("room_id") if callbacks else None
+    if room_id is None:
+        return ToolResult(
+            content=(
+                "Context GC tool unavailable: no room-scoped session context "
+                "(callbacks carry no \"room_id\"); GC boundaries are "
+                "per-room and cannot be applied without a room context."
+            ),
+            is_error=True,
+        )
+
+    # R3: the sub-agent sentinel refusal is checked BEFORE the transport
+    # guard — sub tool-call callbacks carry no "apply_gc_boundary" key, so
+    # the sub-specific refusal must not be masked by the generic steering.
+    if room_id == "__sub__":
+        return ToolResult(
+            content=(
+                "Sub-agents cannot apply GC boundaries — subagents manage "
+                "their own context; only the owning room session may flush "
+                "its prompt cache boundary."
+            ),
+            is_error=True,
+        )
+
+    apply_cb = callbacks.get("apply_gc_boundary") if callbacks else None
+    if apply_cb is None:
+        return ToolResult(
+            content=(
+                "GC boundaries are managed in Matrix rooms via the operator "
+                "`/cache gc` command — the context_gc tool is unavailable on "
+                "this interface (no boundary callback wired)."
+            ),
+            is_error=True,
+        )
+
+    try:
+        outcome = await apply_cb(room_id, trigger="tool", exclude_inflight=True)
+    except Exception as e:
+        logger.warning(
+            "context_gc: apply_gc_boundary raised %s in %s",
+            type(e).__name__, room_id, exc_info=True,
+        )
+        return ToolResult(
+            content=f"GC boundary application failed: {type(e).__name__}.",
+            is_error=True,
+        )
+
+    if not isinstance(outcome, dict):
+        return ToolResult(
+            content=(
+                "GC boundary callback returned a malformed result "
+                f"({type(outcome).__name__}); nothing was applied."
+            ),
+            is_error=True,
+        )
+
+    if not outcome.get("applied"):
+        # No-op (cooldown / monotonicity): surface the reason verbatim.
+        reason = outcome.get("noop_reason") or "no-op (no reason provided)"
+        return ToolResult(content=reason, is_error=True)
+
+    manifest = outcome.get("manifest") or {}
+    classes = manifest.get("classes") or {}
+    durable = manifest.get("durable") or {}
+    stripped = ", ".join(
+        f"{cls}={classes.get(cls, 0)}"
+        for cls in ("tools", "thinking", "inputs", "media")
+    )
+    used = durable.get("used_tokens", 0)
+    budget = durable.get("budget_tokens", 0)
+    flag = " — OVER BUDGET" if outcome.get("over_budget") else ""
+    # Plain ints (no thousands separators): the boundary index and the
+    # post-boundary token estimate are what the operator greps for.
+    return ToolResult(
+        content=(
+            f"GC boundary {manifest.get('boundary_index', '?')} applied "
+            f"(trigger=tool). Stripped pre-boundary: {stripped}. "
+            f"Tokens {manifest.get('tokens_before', 0)} -> "
+            f"{manifest.get('tokens_after_est', 0)} (est.). "
+            f"Durable budget {used}/{budget} tokens{flag}."
+        ),
+        is_error=False,
+    )
+
+
+async def _execute_set_active_project(input: dict, callbacks: dict | None) -> "ToolResult":
+    """Execute the built-in set_active_project tool (workspace-kdsn.305.2).
+
+    Declares the active project for the owning room. One project per room,
+    declare-once per session epoch — the enforcement lives in the matrix
+    callback, which owns the session-log state (tool path refuses a second,
+    different project; the operator ``/project set`` room command overrides
+    separately).
+
+    Guards (all return ``ToolResult(is_error=True)`` without mutating state,
+    never raising):
+      - missing callbacks / no room id → transport-unavailable steering.
+      - missing set_active_project callback → steering to the operator
+        ``/project set <name>`` command.
+      - ``project`` not a non-empty str → refused (callback NEVER called).
+      - callback exception → caught and sanitized (type name only).
+
+    The callback returns ``{"ok": bool, "text": str}``; the text is surfaced
+    verbatim (it names the project and lists the durable-set entries).
+    """
+    room_id = callbacks.get("room_id") if callbacks else None
+    if room_id is None:
+        return ToolResult(
+            content=(
+                "set_active_project unavailable: no room-scoped session "
+                "context (callbacks carry no \"room_id\"); project "
+                "declaration is per-room."
+            ),
+            is_error=True,
+        )
+
+    set_cb = callbacks.get("set_active_project") if callbacks else None
+    if set_cb is None:
+        return ToolResult(
+            content=(
+                "Projects are declared in Matrix rooms via the operator "
+                "`/project set <name>` command — the set_active_project tool "
+                "is unavailable on this interface (no project callback wired)."
+            ),
+            is_error=True,
+        )
+
+    project = input.get("project") if isinstance(input, dict) else None
+    if not isinstance(project, str) or not project.strip():
+        return ToolResult(
+            content=(
+                "Invalid project: 'project' must be a non-empty string — the "
+                "memory/projects/<name>/ directory name."
+            ),
+            is_error=True,
+        )
+    project = project.strip()
+
+    try:
+        outcome = await set_cb(project)
+    except Exception as e:
+        logger.warning(
+            "set_active_project: callback raised %s in %s",
+            type(e).__name__, room_id, exc_info=True,
+        )
+        return ToolResult(
+            content=f"Project declaration failed: {type(e).__name__}.",
+            is_error=True,
+        )
+
+    if not isinstance(outcome, dict):
+        return ToolResult(
+            content=(
+                "Project declaration callback returned a malformed result "
+                f"({type(outcome).__name__}); nothing was changed."
+            ),
+            is_error=True,
+        )
+
+    ok = bool(outcome.get("ok"))
+    text = outcome.get("text")
+    if not isinstance(text, str) or not text:
+        text = f"Project set to {project}." if ok else "Project declaration failed."
+    return ToolResult(content=text, is_error=not ok)
+
+
 def _update_read_registry(resolved_path: str | None, callbacks: dict | None) -> None:
     """Refresh the read-registry mtime entry for a resolved path after a mutation.
 
@@ -1611,6 +1852,17 @@ async def execute_tool(
     Returns:
         ToolResult with content and error status
     """
+    # kdsn.305.2 positional compat: the GC integration surface calls
+    # ``execute_tool(name, input, tool_config, <callbacks dict>)`` — the
+    # callbacks mapping as the FOURTH positional, with agent_config omitted.
+    # The production dispatch (agent.py / subagent.py / spotter.py) and every
+    # existing test pass ``agent_config=`` / ``callbacks=`` by keyword, and
+    # NO caller passes a non-None agent_config positionally, so normalize:
+    # a dict in the agent_config slot is a callbacks mapping, not a config.
+    # (Moving the parameter instead would be a fleet-wide signature break.)
+    if isinstance(agent_config, dict) and not isinstance(agent_config, ToolDef):
+        if callbacks is None:
+            callbacks, agent_config = agent_config, None
     result = await _execute_tool_inner(
         name=name,
         input=input,
@@ -2073,6 +2325,10 @@ async def _execute_tool_inner(
         result = await _execute_todo_write(input, callbacks)
     elif name == "heartbeat":
         result = await _execute_heartbeat_tool(input, callbacks)
+    elif name == "context_gc":
+        result = await _execute_context_gc(input, callbacks)
+    elif name == "set_active_project":
+        result = await _execute_set_active_project(input, callbacks)
     else:
         return ToolResult(
             content=f"Unknown tool: {name}",

@@ -183,6 +183,10 @@ class Agent:
             config.workspace,
             model_aliases=config.model_aliases,
             injection_defense=config.injection_defense,
+            # workspace-kdsn.305: the 8th operator file (CONTINUITY.md) is
+            # assembled only when context GC is on — gc_enabled=False (opt-out
+            # via [context]) appends nothing, ever.
+            gc_enabled=config.context.gc_enabled,
         )
         self._rooms: dict[str, list[dict]] = {}  # room_id → history
         self.uncached_input_tokens = 0
@@ -233,6 +237,20 @@ class Agent:
         # iteration into ONE framed user message. Agent-owned (moved off
         # MatrixBot) so heartbeat/umbral/CLI turns stage + inject too.
         self._vision_inbox: dict[str, list[str]] = {}
+        # Context GC (workspace-kdsn.305): per-room hard-tier strike counter
+        # (consecutive FAILED boundary attempts at the send-time overflow
+        # guard; >= _GC_HARD_STRIKE_LIMIT -> raise as today) and the last
+        # applied boundary's durable-set budget fraction (gc-budget reminder
+        # input). Both in-memory only: the fraction cache starts empty after
+        # restart -> 0.0 -> gc-budget silent (fail-safe, acceptable v1).
+        # The turn-start auto tier + hard tier consume the transport-wired
+        # callbacks["apply_gc_boundary"] seam (contract: async callable
+        # (room_id, *, trigger, exclude_inflight=True) -> {"applied",
+        # "noop_reason", "manifest", "over_budget"}; on applied=True it has
+        # ALREADY appended the JSONL entries AND rebuilt the room's
+        # in-memory history in place, so the caller re-reads history()).
+        self._gc_fail_strikes: dict[str, int] = {}
+        self._gc_last_budget: dict[str, float] = {}
         # Spotter v1 (design §2): an independent monitor that watches this
         # session turn by turn. Agent-owned — NOT transport-owned (kdsn.276
         # lesson: the transport must never own harness state) — so every real
@@ -331,6 +349,117 @@ class Agent:
         _spotter_inbox = getattr(self, "_spotter_inbox", None)
         if isinstance(_spotter_inbox, dict):
             _spotter_inbox.pop(room_id, None)
+        # kdsn.305: a reset room starts with no boundary history of its own.
+        self._gc_fail_strikes.pop(room_id, None)
+        self._gc_last_budget.pop(room_id, None)
+
+    # --- Context GC boundary consumption (workspace-kdsn.305) --------------
+    # The agent owns the CHECKS (auto tier at turn start, hard tier at the
+    # send-time overflow guard); the transport (MatrixBot) owns the WIRING —
+    # it injects callbacks["apply_gc_boundary"] into the per-turn callback
+    # dict. Every turn path (interactive/heartbeat/umbral/CLI) flows through
+    # handle_input, so the hooks below cover all seams; headless/CLI turns
+    # simply never carry the callback and skip silently (fail-safe).
+
+    # Consecutive failed hard-tier boundary attempts before we stop trying
+    # and raise ContextOverflowError as pre-GC (3-strike breaker: a wedged
+    # boundary writer must not turn the overflow guard into an infinite loop).
+    _GC_HARD_STRIKE_LIMIT = 3
+
+    async def _gc_apply_boundary(self, room_id: str, callbacks: dict | None, *,
+                                 trigger: str, exclude_inflight: bool) -> bool:
+        """Consume the transport-wired apply_gc_boundary callback (kdsn.305).
+
+        Returns True when the boundary APPLIED (the callback has already
+        appended the JSONL manifest + snapshot entries and rebuilt the room's
+        in-memory history IN PLACE — the caller must re-read
+        self.history(room_id) before re-estimating).
+
+        Contract guards, in order:
+          - callback absent (headless/CLI) -> False, silently;
+          - callback raises -> log a warning, return False (a failed GC must
+            NEVER kill a turn — the turn proceeds exactly as if GC were off);
+          - applied=True -> reset the room's ReminderEngine (coexist-with-
+            reset ruling: the nudge ladder re-arms after a boundary), reset
+            this room's hard-tier strikes to 0 (ANY applied boundary clears
+            them), and refresh the durable budget-fraction cache.
+          - applied=False (noop) -> strikes are the CALLER's concern (hard
+            tier only); auto tier simply skips.
+        """
+        cb = (callbacks or {}).get("apply_gc_boundary")
+        if cb is None:
+            return False
+        try:
+            res = await cb(room_id, trigger=trigger,
+                           exclude_inflight=exclude_inflight)
+        except Exception:
+            logger.warning(
+                "gc boundary callback failed in %s (trigger=%s) — continuing "
+                "without a boundary (fail-soft; a GC failure never kills a "
+                "turn)", room_id, trigger, exc_info=True)
+            return False
+        if not (isinstance(res, dict) and res.get("applied")):
+            return False
+        # APPLIED: the callback has already appended the JSONL entries and
+        # rebuilt the in-memory history in place.
+        self._engine_for(room_id).reset()
+        self._gc_fail_strikes[room_id] = 0
+        self._gc_last_budget[room_id] = self._gc_budget_fraction(res.get("manifest"))
+        return True
+
+    def _gc_budget_fraction(self, manifest: object) -> float:
+        """Durable-set usage fraction from an applied boundary's manifest.
+
+        used_tokens / budget_tokens, fail-soft: missing keys, non-numeric
+        values, or a non-positive budget all yield 0.0 (gc-budget stays
+        silent — never false urgency from a corrupt manifest).
+        """
+        if not isinstance(manifest, dict):
+            return 0.0
+        durable = manifest.get("durable")
+        if not isinstance(durable, dict):
+            return 0.0
+        used = durable.get("used_tokens")
+        budget = durable.get("budget_tokens")
+        if (isinstance(used, bool) or isinstance(budget, bool)
+                or not isinstance(used, (int, float))
+                or not isinstance(budget, (int, float))):
+            return 0.0
+        if budget <= 0:
+            return 0.0
+        return used / budget
+
+    def _gc_budget_cached(self, room_id: str) -> float:
+        """Last applied boundary's budget fraction (0.0 pre-boundary/restart)."""
+        return self._gc_last_budget.get(room_id, 0.0)
+
+    async def _gc_hard_tier(self, room_id: str, callbacks: dict | None, *,
+                            context_tokens: int, available: int) -> bool:
+        """Hard tier at the send-time overflow guard (kdsn.305).
+
+        Returns True when an applied boundary cleared the overflow (caller
+        re-estimates and proceeds), False when the caller must raise
+        ContextOverflowError. Never raises itself.
+
+        Gated: gc_enabled, callback present, and this room's consecutive
+        FAILED-attempt strikes < _GC_HARD_STRIKE_LIMIT. On a failed/noop
+        attempt the strike counter increments; at >= 3 attempts stop and
+        raise as pre-GC (3-strike breaker). Any applied boundary resets the
+        counter to 0 (in _gc_apply_boundary).
+        """
+        ctx = getattr(self.config, "context", None)
+        if ctx is None or not ctx.gc_enabled:
+            return False
+        if (callbacks or {}).get("apply_gc_boundary") is None:
+            return False
+        strikes = self._gc_fail_strikes.get(room_id, 0)
+        if strikes >= self._GC_HARD_STRIKE_LIMIT:
+            return False
+        applied = await self._gc_apply_boundary(
+            room_id, callbacks, trigger="hard", exclude_inflight=False)
+        if not applied:
+            self._gc_fail_strikes[room_id] = strikes + 1
+        return applied
 
     def _usage_for(self, room_id: str) -> dict[str, int]:
         """Lazily init + return the per-room counter record."""
@@ -764,6 +893,30 @@ class Agent:
                 )
                 limit = self._resolve_model_limit(room_id)
                 available = self._effective_available(limit)
+                # kdsn.305 turn-start AUTO tier: when the inclusive estimate
+                # crosses auto_pct of the usable runway, attempt a boundary
+                # BEFORE the overflow guard and ReminderState construction.
+                # Callback absent (headless/CLI) -> skip silently; a callback
+                # exception -> warn + continue the turn (never kill a turn
+                # because GC failed). On applied the in-memory history was
+                # rebuilt in place, so re-estimate for the guard below and
+                # for the ReminderState (D9 single-source `available`).
+                _gc_cfg = self.config.context
+                _gc_cb = (callbacks or {}).get("apply_gc_boundary")
+                if _gc_cfg.gc_enabled and _gc_cb is not None:
+                    _gc_auto_threshold = int(available
+                                             * _gc_cfg.auto_pct / 100)
+                    if context_tokens >= _gc_auto_threshold:
+                        if await self._gc_apply_boundary(
+                                room_id, callbacks,
+                                trigger="auto", exclude_inflight=False):
+                            # D12: re-estimate INCLUSIVELY — the user message
+                            # is not in history yet (append_user), so the
+                            # re-estimate must add its content_tokens back in,
+                            # exactly as the guard's initial estimate does.
+                            context_tokens = self._estimate_context_tokens(room_id) + (
+                                content_tokens if append_user else 0
+                            )
                 if context_tokens > available:
                     raise ContextOverflowError(context_tokens, limit)
 
@@ -837,6 +990,15 @@ class Agent:
                         context_limit=limit,
                         # D9: same expression as the overflow guard above.
                         available_tokens=available,
+                        # kdsn.305 GC inputs (turn-start site only): warn
+                        # threshold from [context].warn_pct of the usable
+                        # runway (0 when gc disabled -> engine silent), and
+                        # the last boundary's durable budget fraction
+                        # (0.0 pre-boundary/restart -> engine silent).
+                        gc_warn_threshold=(
+                            int(available * _gc_cfg.warn_pct / 100)
+                            if _gc_cfg.gc_enabled else 0),
+                        gc_budget_fraction=self._gc_budget_cached(room_id),
                         completed_turns=_completed_turns,
                         turn_source=_turn_source,
                         tool_calls_this_turn=_tool_calls_this_turn,
@@ -988,6 +1150,12 @@ class Agent:
                             tool_calls_session=dict(self._room_tool_counts.get(room_id, {})),
                             todo_list=list(_TODO_STATE.get(room_id, [])),  # R1-3
                             enabled_tools=_enabled_tools,
+                            # kdsn.305: the GC triggers are turn_start-only;
+                            # this site flows the default 0 threshold (the
+                            # fraction is passed for completeness — the engine
+                            # predicates on evaluation_point and ignores it
+                            # here).
+                            gc_budget_fraction=self._gc_budget_cached(room_id),
                         )
                         _boundary_reminders = self._engine_for(room_id).evaluate(_boundary_state)
                         for _rem in _boundary_reminders:
@@ -1019,7 +1187,23 @@ class Agent:
                     limit = self._resolve_model_limit(room_id)
                     available = self._effective_available(limit)
                     if context_tokens > available:
-                        raise ContextOverflowError(context_tokens, limit)
+                        # kdsn.305 HARD tier: one last boundary attempt
+                        # before failing the turn. 3-strike breaker — after
+                        # _GC_HARD_STRIKE_LIMIT consecutive failed attempts
+                        # in this room, stop trying and raise as pre-GC
+                        # (a wedged boundary writer must not wedge the
+                        # guard either). On applied the history was rebuilt
+                        # in place: re-estimate and proceed when the room is
+                        # back under the limit.
+                        _gc_cleared = False
+                        if await self._gc_hard_tier(
+                                room_id, callbacks,
+                                context_tokens=context_tokens,
+                                available=available):
+                            context_tokens = self._estimate_context_tokens(room_id)
+                            _gc_cleared = context_tokens <= available
+                        if not _gc_cleared:
+                            raise ContextOverflowError(context_tokens, limit)
 
                     # Pass tools=None if no tools discovered (backward compatibility)
                     tools_arg = self.tools if self.tools else None
