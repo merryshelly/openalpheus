@@ -99,6 +99,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Comma-separated builtin tool names (bypasses workspace discovery)")
     p.add_argument("--room", default=None,
                    help="Room label for history isolation (default: _exec)")
+    p.add_argument("--system-prompt-file", default=None,
+                   help="Path to a prompt artifact delivered as the agent's "
+                        "system prompt, byte-faithful (no preamble). The "
+                        "injection-defense footer is appended unless the "
+                        "agent's config sets injection_defense = false.")
 
     return parser.parse_args(argv)
 
@@ -823,6 +828,51 @@ def _exec_sanitize_room(label: str | None) -> str:
     return _sanitize_room_label(label)
 
 
+def _exec_read_system_prompt(path: str) -> str:
+    """Read a --system-prompt-file artifact BYTE-FAITHFULLY.
+
+    Returns the file's bytes decoded as UTF-8 EXACTLY: no universal-newline
+    translation (a CRLF stays CRLF — read_text() would collapse it to LF), no
+    trailing-newline strip, no BOM strip. The artifact is hash-checked for
+    provenance, so ANY transformation here would silently break the hash —
+    hence raw-bytes decode, not read_text(). Raises FileNotFoundError /
+    OSError on a missing or unreadable file, and a ValueError (naming the
+    path) on non-UTF-8 content; the caller maps those to stderr + exit 1
+    (matching the --task-file path).
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"System prompt file not found: {path}")
+    data = p.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        # Name the path (consistent with the missing-file error) rather than
+        # leaking a bare "invalid start byte" the operator can't attribute.
+        raise ValueError(f"System prompt file is not valid UTF-8: {path}") from None
+
+
+def _exec_injection_footer(workspace: Path, enabled: bool) -> str:
+    """The injection-defense footer exec appends to an artifact system prompt.
+
+    This mirrors prompt.py's assemble_prompt footer resolution EXACTLY (the
+    same seam an empty-workspace assembly uses): when `enabled` is false the
+    operator disabled the footer, so nothing is appended; otherwise the
+    workspace's SECURITY_FOOTER.md wins if present (operator-owned, editable,
+    greppable), else the built-in INJECTION_DEFENSE constant is the fallback.
+    The constants are imported from prompt.py — NOT copied here — so the
+    footer text can never drift from what the live agent receives.
+    """
+    if not enabled:
+        return ""
+    from openalph.prompt import INJECTION_DEFENSE, SECURITY_FOOTER_FILENAME
+
+    footer_path = workspace / SECURITY_FOOTER_FILENAME
+    if footer_path.exists():
+        return footer_path.read_text()
+    return INJECTION_DEFENSE
+
+
 def cmd_exec(args):
     """One-shot headless turn: fresh Agent, single handle_input, one JSON line.
 
@@ -881,6 +931,18 @@ def cmd_exec(args):
     except (FileNotFoundError, OSError) as e:
         _fail(str(e), 1)
 
+    # 5b. Optional system-prompt artifact (missing/unreadable -> exit 1,
+    # stderr, empty stdout — same fail-loud contract as --task-file).
+    # Read BEFORE construction so a bad path never burns an Agent build; the
+    # override itself happens right after Agent(config) (the prompt is
+    # assembled in __init__, so it can only be replaced post-construction).
+    system_prompt_override = None
+    if args.system_prompt_file is not None:
+        try:
+            system_prompt_override = _exec_read_system_prompt(args.system_prompt_file)
+        except (FileNotFoundError, OSError, ValueError) as e:
+            _fail(str(e), 1)
+
     # Room label (default _exec).
     try:
         room_id = _exec_sanitize_room(args.room)
@@ -893,6 +955,19 @@ def cmd_exec(args):
     # this fully determines the tool set; discovery is bypassed by design).
     if resolved_tools is not None:
         agent.tools = resolved_tools
+
+    # --system-prompt-file: replace the agent's system prompt with the
+    # artifact text, BYTE-FAITHFUL — exactly the file text, nothing
+    # prepended. A prior lesson: any unhashed preamble silently breaks
+    # prompt-artifact hash provenance, so the artifact must be a verbatim
+    # prefix of what the model receives. The only thing appended is the SAME
+    # injection-defense footer the empty-workspace assembly would add today
+    # (prompt.py's footer resolution, gated on the agent's injection_defense
+    # flag); it is never prepended, so the prefix property holds.
+    if system_prompt_override is not None:
+        footer = _exec_injection_footer(config.workspace,
+                                        config.injection_defense)
+        agent.system_prompt = system_prompt_override + footer
 
     # Tool trace capture (names + is_error only, bounded).
     tool_trace, on_tool_call = _exec_collect_tool_trace()
