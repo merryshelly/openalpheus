@@ -251,6 +251,12 @@ class Agent:
         # in-memory history in place, so the caller re-reads history()).
         self._gc_fail_strikes: dict[str, int] = {}
         self._gc_last_budget: dict[str, float] = {}
+        # Auto-tier churn guard (audit): True when the most recent auto
+        # boundary failed to bring the estimate under the auto threshold —
+        # re-applying every turn start would append a fresh snapshot per turn
+        # (JSONL growth) without ever clearing. Reset by any CLEARED boundary
+        # or reset_room.
+        self._gc_auto_uncleared: dict[str, bool] = {}
         # Spotter v1 (design §2): an independent monitor that watches this
         # session turn by turn. Agent-owned — NOT transport-owned (kdsn.276
         # lesson: the transport must never own harness state) — so every real
@@ -352,6 +358,7 @@ class Agent:
         # kdsn.305: a reset room starts with no boundary history of its own.
         self._gc_fail_strikes.pop(room_id, None)
         self._gc_last_budget.pop(room_id, None)
+        self._gc_auto_uncleared.pop(room_id, None)
 
     # --- Context GC boundary consumption (workspace-kdsn.305) --------------
     # The agent owns the CHECKS (auto tier at turn start, hard tier at the
@@ -405,6 +412,9 @@ class Agent:
         self._engine_for(room_id).reset()
         self._gc_fail_strikes[room_id] = 0
         self._gc_last_budget[room_id] = self._gc_budget_fraction(res.get("manifest"))
+        # An APPLIED boundary that was never proven unproductive re-arms the
+        # auto tier (the churn guard only latches on evidence of failure).
+        self._gc_auto_uncleared.pop(room_id, None)
         return True
 
     def _gc_budget_fraction(self, manifest: object) -> float:
@@ -906,7 +916,8 @@ class Agent:
                 if _gc_cfg.gc_enabled and _gc_cb is not None:
                     _gc_auto_threshold = int(available
                                              * _gc_cfg.auto_pct / 100)
-                    if context_tokens >= _gc_auto_threshold:
+                    _gc_auto_blocked = self._gc_auto_uncleared.get(room_id, False)
+                    if context_tokens >= _gc_auto_threshold and not _gc_auto_blocked:
                         if await self._gc_apply_boundary(
                                 room_id, callbacks,
                                 trigger="auto", exclude_inflight=False):
@@ -917,6 +928,15 @@ class Agent:
                             context_tokens = self._estimate_context_tokens(room_id) + (
                                 content_tokens if append_user else 0
                             )
+                            # Churn guard (audit): did this boundary actually
+                            # clear the threshold? A failed clear latches the
+                            # tier off until something clears it — re-applying
+                            # every turn would append a fresh snapshot per
+                            # turn without ever fitting.
+                            if context_tokens < _gc_auto_threshold:
+                                self._gc_auto_uncleared.pop(room_id, None)
+                            else:
+                                self._gc_auto_uncleared[room_id] = True
                 if context_tokens > available:
                     raise ContextOverflowError(context_tokens, limit)
 
@@ -1186,15 +1206,22 @@ class Agent:
                     context_tokens = self._estimate_context_tokens(room_id)
                     limit = self._resolve_model_limit(room_id)
                     available = self._effective_available(limit)
-                    if context_tokens > available:
-                        # kdsn.305 HARD tier: one last boundary attempt
-                        # before failing the turn. 3-strike breaker — after
-                        # _GC_HARD_STRIKE_LIMIT consecutive failed attempts
-                        # in this room, stop trying and raise as pre-GC
-                        # (a wedged boundary writer must not wedge the
-                        # guard either). On applied the history was rebuilt
-                        # in place: re-estimate and proceed when the room is
-                        # back under the limit.
+                    # kdsn.305 HARD tier: attempt a boundary once the
+                    # estimate crosses the hard threshold (hard_pct of usable,
+                    # default 92%) — a failed attempt must not kill a turn
+                    # that still fits, so the RAISE stays tied to >available
+                    # (audit: hard_pct was parsed-then-dead; the tier fired
+                    # only at 100%). 3-strike breaker — after
+                    # _GC_HARD_STRIKE_LIMIT consecutive failed attempts in
+                    # this room, stop trying and raise as pre-GC (a wedged
+                    # boundary writer must not wedge the guard either). On
+                    # applied the history was rebuilt in place: re-estimate
+                    # and proceed when the room is back under the limit.
+                    _gc_hard_threshold = int(
+                        available
+                        * getattr(self.config.context, "hard_pct", 92) / 100
+                    ) if getattr(self.config, "context", None) else available
+                    if context_tokens >= _gc_hard_threshold:
                         _gc_cleared = False
                         if await self._gc_hard_tier(
                                 room_id, callbacks,
@@ -1202,7 +1229,7 @@ class Agent:
                                 available=available):
                             context_tokens = self._estimate_context_tokens(room_id)
                             _gc_cleared = context_tokens <= available
-                        if not _gc_cleared:
+                        if context_tokens > available and not _gc_cleared:
                             raise ContextOverflowError(context_tokens, limit)
 
                     # Pass tools=None if no tools discovered (backward compatibility)

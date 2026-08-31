@@ -275,11 +275,6 @@ def _gc_confirm_text(outcome, trigger):
     )
 
 
-    try:
-        entries = parse_durable_set(toml_path.read_text(encoding="utf-8"))
-    except GCConfigError as e:
-        lines.append(f"Durable set: MALFORMED — {e}")
-        return "\n".join(lines)
     if not entries:
         lines.append("Durable set: 0 entries (durable-set.toml has no entries).")
     else:
@@ -491,7 +486,15 @@ class MatrixBot:
         # Handle test case where agent might not have .config yet
         workspace = getattr(getattr(agent, 'config', None), 'workspace', None)
         if workspace:
-            self.session_log = SessionLog(workspace, config.user_id)
+            self.session_log = SessionLog(
+                workspace, config.user_id,
+                # Audit: hydration/status/CLI renders must honor the
+                # GC flag — build_context without the kwarg now follows
+                # this default instead of silently resurrecting expunged
+                # content after a restart.
+                gc_default=getattr(config, "context", None) is not None
+                and config.context.gc_enabled,
+            )
             self.heartbeat = HeartbeatManager(
                 config_path=Path(workspace) / "heartbeats.json",
                 callback=self._inject_heartbeat,
@@ -3250,10 +3253,14 @@ class MatrixBot:
             # Grammar: `/project set <name>` (canonical), `/project <name>`
             # (convenience), bare `/project` (status).
             project = None
+            if len(parts) >= 2 and parts[1] == "set" and len(parts) < 3:
+                await self.send(
+                    room_id,
+                    "Usage: `/project set <name>` — a project name is required.",
+                )
+                return
             if len(parts) >= 3 and parts[1] == "set":
                 project = parts[2]
-            elif len(parts) == 3:
-                project = parts[2]  # `/project set` missing name handled above
             elif len(parts) == 2 and parts[1] != "set":
                 project = parts[1]
             if project is not None:

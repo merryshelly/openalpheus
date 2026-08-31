@@ -529,6 +529,17 @@ def build_callbacks(
     # silently (durability-gate discipline).
     if session_log is not None:
         async def _gc_apply_cb(_room_id, *, trigger, exclude_inflight=True):
+            # Opt-out is opt-out (audit): with context.gc_enabled=false the
+            # tool path must NOT apply boundaries either — the tiers and the
+            # operator command respect the flag; the seam did not.
+            _gc_cfg = getattr(agent.config, "context", None)
+            if _gc_cfg is None or not getattr(_gc_cfg, "gc_enabled", False):
+                return {
+                    "applied": False,
+                    "noop_reason": "context.gc_enabled is false — GC disabled for this agent",
+                    "manifest": None,
+                    "over_budget": False,
+                }
             try:
                 entries = session_log.read(_room_id)
             except Exception as e:
@@ -566,6 +577,10 @@ def build_callbacks(
             return apply_boundary_and_rebuild(
                 agent, session_log, _room_id,
                 trigger=trigger, exclude_inflight=exclude_inflight,
+                # Tool path = LIVE turn: the rebuild must preserve the
+                # in-flight assistant (audit: full-scan orphan repair would
+                # strip the live pair and orphan its result mid-loop).
+                live_turn=exclude_inflight,
             )
 
         async def _gc_set_project_cb(project):

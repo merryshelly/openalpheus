@@ -18,7 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openalph.context_gc import (
+    GC_EVENT,
     GC_SNAPSHOT_SOURCE,
+    LEGACY_EVENT,
     current_boundary_index,
     strip_thinking_entry,
     tool_pointer,
@@ -42,15 +44,23 @@ class SessionLog:
     each append for crash safety.
     """
 
-    def __init__(self, workspace: str | Path, agent_user_id: str):
+    def __init__(self, workspace: str | Path, agent_user_id: str,
+                 *, gc_default: bool = False):
         """Initialize session log.
 
         Args:
             workspace: Agent workspace directory (sessions/ created inside it)
             agent_user_id: Matrix user ID of the agent (e.g. @watson:matrix.local)
+            gc_default: Default GC render mode for build_context when called
+                without an explicit ``gc_enabled`` kwarg (audit: restart
+                hydration / status / CLI call sites omitted the flag,
+                resurrecting expunged content and superseded snapshots after
+                every restart). Wired from ``config.context.gc_enabled`` by
+                the transports; tests construct with the default (legacy).
         """
         self.workspace = Path(workspace)
         self.agent_user_id = agent_user_id
+        self.gc_default = gc_default
         self._sessions_dir = self.workspace / "sessions"
 
     def _room_id_safe(self, room_id: str) -> str:
@@ -299,7 +309,9 @@ class SessionLog:
         return totals
 
     def build_context(
-        self, room_id: str, *, skip_system: bool = True, gc_enabled: bool = False
+        self, room_id: str, *, skip_system: bool = True,
+        gc_enabled: bool | None = None,
+        gc_preserve_trailing: bool = False,
     ) -> list[dict]:
         """Build LLM conversation context from JSONL entries.
 
@@ -331,6 +343,8 @@ class SessionLog:
         Returns:
             List of message dicts ready for the LLM.
         """
+        if gc_enabled is None:
+            gc_enabled = self.gc_default
         entries = self.read(room_id)
         context = []
         # JSONL source position of each rendered message — parallel to
@@ -343,6 +357,28 @@ class SessionLog:
         # positions < boundary are reduced (uniform rule when gc_enabled,
         # legacy stripping otherwise); positions >= boundary are untouched.
         boundary_index = current_boundary_index(entries)
+        if gc_enabled and boundary_index >= 0:
+            # Crash-atomicity tripwire (audit): a marker without its
+            # following snapshot entry means the process died mid-sequence —
+            # the durable set is absent from every render until the next
+            # boundary. LOUD log; render semantics unchanged.
+            _marker_pos = max(
+                (i for i, e in enumerate(entries)
+                 if e.get("role") == "system"
+                 and e.get("event") in (GC_EVENT, LEGACY_EVENT)
+                 and e.get("entry_index") == boundary_index),
+                default=None,
+            )
+            if _marker_pos is not None and not any(
+                e.get("source") == GC_SNAPSHOT_SOURCE
+                for e in entries[_marker_pos + 1:]
+            ):
+                logger.warning(
+                    "gc_boundary %d has no following snapshot entry — a "
+                    "previous boundary application died mid-sequence; the "
+                    "durable set is missing from renders until the next "
+                    "boundary", boundary_index,
+                )
 
         # Pre-boundary call_id -> (name, input) map, harvested from the
         # pre-boundary assistant rehydration below (no second scan).  The
@@ -381,7 +417,7 @@ class SessionLog:
                     # internally, so live (agent.py loop-top drain) and rebuilt
                     # (this branch) advisory bytes are identical.
                     _user_content = frame_spotter_flag(_user_content)
-                elif _source not in ("reminder", "steer"):
+                elif _source not in ("reminder", "steer", GC_SNAPSHOT_SOURCE):
                     # R2-A: Escape user-origin &lt;system-reminder&gt; tags in context
                     # to prevent spoofing.  Reminder entries (source="reminder")
                     # are trusted harness content replayed verbatim.  JSONL stores
@@ -522,14 +558,30 @@ class SessionLog:
         # in-flight turn (apply_boundary exclude_inflight deliberately pulls
         # it back in) and must survive intact — the crash case and the
         # in-flight case are indistinguishable at render time, and the
-        # in-flight ruling wins.  (Accepted gap, noted for wave 2: a true
-        # post-boundary crash-orphan would render dangling.)  Legacy mode,
-        # and gc mode with no boundary yet, keep the full scan.
-        _orphan_scope = (
-            None
-            if not (gc_enabled and boundary_index >= 0)
-            else {entry_idx for entry_idx in msg_entry_idx if entry_idx < boundary_index}
-        )
+        # in-flight ruling wins.
+        # (Audit revision: the pass runs FULL-SCAN in gc mode too — a
+        # trailing unresolved assistant at render time is a crash orphan,
+        # and pre-boundary scoping bricked rooms on exactly the crash case
+        # the pass exists to repair. EXCEPTION: the mid-turn rebuild
+        # (context_gc tool path, gc_preserve_trailing=True) — the loop is
+        # LIVE and its in-flight assistant must survive until its result
+        # lands; scope then excludes the trailing unresolved pair.
+        # call_id collisions across a boundary are handled by the pairing
+        # scan below, same as legacy.)
+        _orphan_scope = None
+        if gc_enabled and gc_preserve_trailing:
+            for _pi in range(len(msg_entry_idx) - 1, -1, -1):
+                _pm = context[_pi]
+                if _pm.get("role") == "assistant" and _pm.get("tool_calls"):
+                    _needed = {tc.id for tc in _pm["tool_calls"]}
+                    _found = any(
+                        context[_j].get("role") == "tool"
+                        and context[_j].get("tool_call_id") in _needed
+                        for _j in range(_pi + 1, len(context))
+                    )
+                    if not _found:
+                        _orphan_scope = set(msg_entry_idx[:_pi])
+                    break
         
         # First pass: identify orphaned assistant messages
         orphaned_indices = []

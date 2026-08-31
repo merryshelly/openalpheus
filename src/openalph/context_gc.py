@@ -171,6 +171,29 @@ def _escape_reminder_tags(text: str) -> str:
     return escape_system_reminder_tags(text)
 
 
+def _frame_field(value: str) -> str:
+    """Snapshot FRAME metadata (path/reason/project/error text) hardened for
+    embedding: whitespace flattened (no forged new framing lines), reminder
+    markup escaped. Frame fields are agent-authored TOML metadata — they get
+    the same treatment as file bytes (audit: forged ``--- BEGIN`` /
+    reminder-markup injection via the reason field)."""
+    flat = re.sub(r"\s+", " ", str(value)).strip()
+    return _escape_reminder_tags(flat)
+
+
+def _freeze_file_text(text: str) -> str:
+    """File bytes at freeze time: credential redaction first (the snapshot
+    bypasses the tool-output redaction pipeline, so the same pass runs here —
+    audit: secrets persisted verbatim into the JSONL audit record), then the
+    R2-A reminder escape."""
+    try:
+        from openalph.tools.security import redact_credentials
+        text, _events = redact_credentials(text)
+    except Exception as e:  # redaction is defense-in-depth; never block a
+        logger.warning("gc snapshot redaction pass failed: %s", e)  # boundary
+    return _escape_reminder_tags(text)
+
+
 def _pointer_ident(name: str, params: dict | None) -> str:
     """Identifying fragment for a pointer: known param > first string param.
 
@@ -340,6 +363,18 @@ def resolve_durable_set(
             key = p.resolve()
         except (OSError, RuntimeError):
             key = Path(str(p).strip() or "/")
+        # WORKSPACE CONTAINMENT (audit: arbitrary-file-read via durable-set
+        # entries — `workspace / "../../etc/passwd"` or an absolute/symlinked
+        # path resolved straight out of the sandbox). Agent-authored TOML
+        # entries must never escape the workspace; violations are recorded,
+        # never read.
+        try:
+            ws_root = workspace.resolve()
+        except (OSError, RuntimeError):
+            ws_root = workspace
+        if not key.is_relative_to(ws_root):
+            errors.append(f"durable path escapes workspace: {p}")
+            return
         if key in seen:
             return
         seen.add(key)
@@ -377,7 +412,7 @@ def resolve_durable_set(
     for pattern in config_paths or []:
         try:
             matches = sorted(workspace.glob(pattern))
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             errors.append(f"config glob failed: {pattern}: {e}")
             continue
         for match in matches:
@@ -438,25 +473,26 @@ def frame_snapshot(
     """
     lines = [
         f"[GC boundary {boundary_index} — durable context snapshot]",
-        f"Project: {resolution.get('project') or 'none'}",
+        f"Project: {_frame_field(str(resolution.get('project') or 'none'))}",
         _SNAPSHOT_PROVENANCE,
     ]
     for f in resolution.get("files", []):
         if f.get("exists"):
-            escaped = _escape_reminder_tags(f.get("text", ""))
-            lines.append(f"--- BEGIN {f['path']} ({f['reason']}) ---")
+            escaped = _freeze_file_text(f.get("text", ""))
+            lines.append(f"--- BEGIN {_frame_field(f['path'])} ({_frame_field(f['reason'])}) ---")
             lines.append(escaped)
-            lines.append(f"--- END {f['path']} ---")
+            lines.append(f"--- END {_frame_field(f['path'])} ---")
     missing = resolution.get("missing", [])
     if missing:
         reasons = {f["path"]: f["reason"] for f in resolution.get("files", [])}
         for path in missing:
             lines.append(
-                f"[missing at snapshot time: {path} ({reasons.get(path, 'n/a')}) — "
+                f"[missing at snapshot time: {_frame_field(path)} "
+                f"({_frame_field(reasons.get(path, 'n/a'))}) — "
                 "re-read via file_read if it has since been created]"
             )
     for err in resolution.get("errors", []):
-        lines.append(f"[error: {err}]")
+        lines.append(f"[error: {_frame_field(str(err))}]")
     if over_budget:
         lines.append(
             f"[durable budget {resolution.get('used_tokens', 0)}/{budget_tokens} "
@@ -492,8 +528,16 @@ def _tool_output_chars(entry: dict) -> int:
     return len(output) if isinstance(output, str) else 0
 
 
-def _is_pre_boundary(entry: dict, boundary_index: int) -> bool:
-    """True for entries strictly BEFORE the boundary position."""
+def _is_pre_boundary(entry: dict, boundary_index: int, position: int | None = None) -> bool:
+    """True for entries strictly BEFORE the boundary position.
+
+    Position-based: ``entry_index`` is written only on marker events, so
+    classifying by that field would count every ordinary entry (default 0)
+    as pre-boundary. Callers pass the enumerate() position; the entry-key
+    fallback exists only for marker-style entries that carry one.
+    """
+    if position is not None:
+        return position < boundary_index
     return entry.get("entry_index", 0) < boundary_index
 
 
@@ -505,8 +549,8 @@ def _manifest_classes(entries: list[dict], boundary_index: int) -> dict:
     pre-boundary user entries whose content is a non-string (part) list.
     """
     tools = thinking = inputs = media = 0
-    for entry in entries:
-        if _is_pre_boundary(entry, boundary_index):
+    for position, entry in enumerate(entries):
+        if _is_pre_boundary(entry, boundary_index, position):
             role = entry.get("role")
             if role == "tool":
                 tools += 1
@@ -532,8 +576,8 @@ def _render_char_estimates(entries: list[dict], boundary_index: int) -> tuple[in
     """
     before_chars = 0
     after_chars = 0
-    for entry in entries:
-        if not _is_pre_boundary(entry, boundary_index):
+    for position, entry in enumerate(entries):
+        if not _is_pre_boundary(entry, boundary_index, position):
             continue
         role = entry.get("role")
         before_chars += _entry_content_chars(entry.get("content"))
@@ -586,6 +630,7 @@ def apply_boundary_and_rebuild(
     *,
     trigger: str,
     exclude_inflight: bool,
+    live_turn: bool = False,
 ) -> dict:
     """Apply a GC boundary and rebuild the room's in-memory history in place.
 
@@ -600,7 +645,11 @@ def apply_boundary_and_rebuild(
     """
     cfg = getattr(agent.config, "context", None)
     durable_paths = getattr(cfg, "durable_paths", []) or []
-    budget_pct = getattr(cfg, "durable_budget_pct", 15.0)
+    # [context].durable_budget_pct is a PERCENT (15.0 = 15%); the seam's
+    # formula expects a FRACTION (0.15). Normalize here — the one
+    # config→seam adapter (audit: percent-vs-fraction unit mismatch made
+    # every over-budget mechanism silently dead).
+    budget_pct = getattr(cfg, "durable_budget_pct", 15.0) / 100.0
     budget_min = getattr(cfg, "durable_budget_min_tokens", 48000)
     try:
         window = agent._resolve_model_limit(room_id)
@@ -628,14 +677,22 @@ def apply_boundary_and_rebuild(
             "over_budget": False,
         }
     if outcome.get("applied"):
+        # Materialize the rebuilt context BEFORE touching the live history —
+        # a failed build must leave the old history intact (audit: clear()
+        # before a fallible build left rooms amnesiac on transient I/O errors).
         try:
-            history = agent.history(room_id)
-            history.clear()
-            history.extend(session_log.build_context(room_id, gc_enabled=True))
+            rebuilt = session_log.build_context(
+                room_id, gc_enabled=True, gc_preserve_trailing=live_turn)
         except Exception as e:
             logger.warning(
-                "gc history rebuild failed for %s: %s", room_id, e, exc_info=True
+                "gc history rebuild failed for %s: %s — keeping the "
+                "pre-boundary in-memory history (the next render picks up "
+                "the boundary from JSONL)", room_id, e, exc_info=True
             )
+        else:
+            history = agent.history(room_id)
+            history.clear()
+            history.extend(rebuilt)
     return outcome
 
 
@@ -656,14 +713,14 @@ def frame_forced_handoff(used_tokens: int, budget_tokens: int) -> str:
 
     Deterministic; no timestamps (append-only render invariant)."""
     return (
-        "&lt;system-reminder&gt;\n"
+        "<system-reminder>\n"
         "Durable set over budget: "
         f"{used_tokens} / {budget_tokens} tokens. The durable set does not "
         "fit the reinjection budget — finalize the continuity artifact "
         "(progress.md State/Decisions/Next) and prune durable-set.toml to "
         "what a fresh session cannot re-derive cheaply, then execute "
         "session-handoff now. Do not continue expanding context.\n"
-        "&lt;/system-reminder&gt;"
+        "</system-reminder>"
     )
 
 

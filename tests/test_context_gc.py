@@ -454,10 +454,30 @@ class TestApplyBoundary:
         _append_all(log, entries)
         r = self._apply(log, tmp_path, exclude_inflight=True)
         assert r["applied"] and r["manifest"]["boundary_index"] == 5
-        ctx = _ctx(log, gc_enabled=True)
-        # in-flight assistant entry must be present post-boundary, thinking intact
+        # Mid-turn render (live turn): the in-flight assistant must survive
+        # the rebuild with thinking intact.
+        ctx = _ctx(log, gc_enabled=True, gc_preserve_trailing=True)
         assert any(m.get("role") == "assistant" and m.get("thinking") == "inflight"
                    for m in ctx)
+
+    def test_crash_orphan_trailing_unresolved_repaired_at_hydration(self, tmp_path):
+        # Same JSONL, but rendered WITHOUT the live-turn flag (turn start /
+        # hydration): the trailing unresolved assistant is a crash orphan —
+        # full-scan repair strips it so the provider never sees a dangling
+        # tool_use (audit: pre-boundary scoping bricked rooms on crash).
+        log = _log(tmp_path)
+        entries = self._entries()
+        entries.append(_assistant("", tool_calls=[_tc("c9", "shell", {"command": "ls"})],
+                                  thinking="crash"))
+        _append_all(log, entries)
+        apply_boundary(log, ROOM, workspace=tmp_path, trigger="manual",
+                       exclude_inflight=False,
+                       window=1_000_000, budget_pct=0.15, budget_min=48000)
+        ctx = _ctx(log, gc_enabled=True)
+        ids = [getattr(tc, "id", None) for m in ctx
+               for tc in m.get("tool_calls", [])]
+        assert "c9" not in ids, "crash orphan must be stripped at hydration"
+        assert "c1" in ids  # resolved pairs survive
 
     def test_monotonic_refusal(self, tmp_path):
         log = _log(tmp_path)
@@ -521,8 +541,10 @@ class TestApplyBoundary:
                       and e.get("trigger") == GC_FORCED_HANDOFF_TRIGGER]
         assert len(directives) == 1
         assert "session-handoff" in directives[0]["content"]
-        assert "&lt;system-reminder&gt;" in directives[0]["content"]
-        assert "<system-reminder>" not in directives[0]["content"]
+        # LITERAL reminder tags (Reminder.content convention — audit: the
+        # entity-escaped form degraded the one non-negotiable signal)
+        assert "<system-reminder>" in directives[0]["content"]
+        assert "&lt;system-reminder&gt;" not in directives[0]["content"]
         # second over-budget boundary same epoch: no duplicate directive
         _append_all(log, [_user("more")])
         r2 = self._apply(log, tmp_path, config_paths=["skills/big.md"],
