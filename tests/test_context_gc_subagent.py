@@ -649,3 +649,144 @@ class TestSubagentGcSeam:
         assert not r.is_error
         events = _read_transcript(str(tmp_path), "gcdeg")
         assert not any(e.get("event") == "gc_boundary" for e in events)
+
+
+# ============================================================================
+# Wave-2 audit fixes (3-lineage reconciliation, 2026-08-31)
+# ============================================================================
+
+from openalph.tools.subagent import _estimate_context_tokens as _est
+
+
+class TestEstimateContextTokens:
+    def test_str_only_unchanged(self):
+        msgs = [{"role": "user", "content": "a" * 400},
+                {"role": "assistant", "content": "b" * 400}]
+        assert _est(msgs) == 200
+
+    def test_list_content_counted(self):
+        # Vision block: base64 data + text — str-only counting gave 0. All
+        # string values count (type/media_type keys add ~18 chars — the
+        # conservative direction for a threshold trigger).
+        msgs = [{"role": "user", "content": [
+            {"type": "image", "media_type": "image/png", "data": "A" * 4000},
+            {"type": "text", "text": "t" * 400},
+        ]}]
+        # image part: 5 + 9 + 4000 = 4014; text part: 4 + 400 = 404
+        assert _est(msgs) == (4014 + 404) // 4 == 1104
+
+    def test_tool_call_inputs_counted(self):
+        msgs = [{"role": "assistant", "content": "",
+                 "tool_calls": [ToolCall(id="c1", name="file_write",
+                                         input={"path": "x", "content": "y" * 8000})]}]
+        assert _est(msgs) == (8000 + 1) // 4
+
+    def test_dict_tool_calls_counted(self):
+        msgs = [{"role": "assistant", "content": "ok",
+                 "tool_calls": [{"id": "c1", "name": "shell",
+                                 "input": {"command": "c" * 400}}]}]
+        assert _est(msgs) == (2 + 400) // 4
+
+
+class TestAuditFixTransform:
+    def test_non_dict_input_passthrough(self):
+        # input=None must survive unchanged — not be silently rewritten to {}
+        # (audit: falsifies model-visible history).
+        scene = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c1", "name": "shell", "input": None}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "out" * 50},
+            {"role": "user", "content": "after"},
+        ]
+        r = apply_boundary_to_messages(scene, boundary_index=3, task_text="t")
+        tc = r["messages"][1]["tool_calls"][0]
+        assert tc["input"] is None
+        assert r["manifest"]["classes"]["inputs"] == 0
+        # pointer still paired by name
+        assert "shell" in r["messages"][2]["content"]
+
+    def test_second_boundary_pointer_not_citing_placeholder(self):
+        # After boundary 1, the tool_call input is "[stripped: N chars]".
+        # A second boundary must not cite that placeholder as the pointer's
+        # identifying param.
+        scene = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc_dict("c1", "file_read", {"path": "p" * 700})]},
+            {"role": "tool", "tool_call_id": "c1", "content": "O" * 300},
+        ]
+        r1 = apply_boundary_to_messages(scene, boundary_index=3, task_text="t")
+        r2 = apply_boundary_to_messages(r1["messages"], boundary_index=3,
+                                        task_text="t")
+        pointers = [m for m in r2["messages"] if m.get("role") == "tool"]
+        assert len(pointers) == 1
+        assert "[stripped" not in pointers[0]["content"]
+        assert "expunged at GC boundary 3" in pointers[0]["content"]
+
+
+class TestAuditFixSeam:
+    @_pytest.mark.asyncio
+    async def test_breaker_summary_boundary(self, tmp_path, monkeypatch):
+        # At the breaker, the summary call ships the largest list ever — the
+        # boundary must land BEFORE it (convergent finding, all 3 lineages).
+        config = _gc_config(tmp_path)
+        seen = []
+
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+            seen.append([dict(m) for m in messages])
+            if len(seen) == 1:
+                return _tool_resp()
+            return _text_resp("summary text")
+
+        async def fake_execute_tool(**kwargs):
+            return _ToolResult(content="Z" * 8000, is_error=False)
+
+        monkeypatch.setattr(_subagent_mod, "complete", fake_complete)
+        monkeypatch.setattr("openalph.tools.execute_tool", fake_execute_tool)
+        r = await _run_subagent("x" * 800, config, tools=[], call_id="gcbrk",
+                                max_iterations=1)
+        assert r.is_error  # breaker path
+        assert "tool call limit (1 iterations)" in r.content
+        # TWO complete calls: the work turn + the summary turn.
+        assert len(seen) == 2
+        # The SUMMARY call saw the snapshot + pointer (boundary applied first).
+        assert any(isinstance(m.get("content"), str)
+                   and m["content"].startswith(SUB_SNAPSHOT_PREFIX)
+                   for m in seen[1])
+        assert "expunged at GC boundary" in seen[1][2]["content"]
+        events = _read_transcript(str(tmp_path), "gcbrk")
+        gc_events = [e for e in events if e.get("event") == "gc_boundary"]
+        assert len(gc_events) == 1
+        assert gc_events[0]["manifest"]["trigger"] == "breaker"
+
+    @_pytest.mark.asyncio
+    async def test_contextless_config_gc_on(self, tmp_path, monkeypatch):
+        # A config object without .context gets the documented GC-on default.
+        cfg = _gc_config(tmp_path)
+        cfg = cfg.__class__(**{**{f: getattr(cfg, f) for f in
+                                  ("name", "default_model", "model_max_tokens",
+                                   "model_limits", "max_tokens", "providers",
+                                   "workspace", "max_iterations",
+                                   "truncation_limit")},
+                               "context": None})
+        seen = []
+
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+            seen.append([dict(m) for m in messages])
+            return _text_resp("done")
+
+        monkeypatch.setattr(_subagent_mod, "complete", fake_complete)
+        r = await _run_subagent("x" * 3200, cfg, tools=[], call_id="gcnone")
+        assert not r.is_error
+        events = _read_transcript(str(tmp_path), "gcnone")
+        assert any(e.get("event") == "gc_boundary" for e in events)
+
+    def test_boundary_before_vision_drain(self, tmp_path):
+        # Structural: the seam must sit BEFORE the vision drain in the loop
+        # (freshly-drained images land post-boundary and survive, instead of
+        # being expunged before the model ever saw them).
+        src = open("/opt/openalph/src/openalph/tools/subagent.py").read()
+        seam_pos = src.index("GC auto tier (kdsn.305.4): apply a message-list boundary")
+        drain_pos = src.index("# Drain the per-sub vision inbox at the TOP")
+        assert seam_pos < drain_pos

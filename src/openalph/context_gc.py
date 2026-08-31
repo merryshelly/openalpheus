@@ -956,6 +956,19 @@ def frame_sub_snapshot(boundary_index: int, task_text: str, manifest: dict,
     )
 
 
+def _harvest_params(raw_input):
+    """Pairing-map params for pointer formatting: the input dict minus
+    already-stripped placeholder values — a second boundary over a
+    once-reduced list would otherwise cite "[stripped: N chars]" as the
+    pointer's identifying param (wave-2 audit). None when nothing usable
+    remains."""
+    if not isinstance(raw_input, dict):
+        return None
+    cleaned = {k: v for k, v in raw_input.items()
+               if not (isinstance(v, str) and v.startswith("[stripped: "))}
+    return cleaned or None
+
+
 def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
                                task_text: str, trigger: str = "auto") -> dict:
     """Apply a GC boundary to a plain OpenAI-style message list. PURE.
@@ -963,8 +976,8 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
     The message-list analog of the session.py render transform: every message
     at list position < boundary_index is reduced by the uniform rule;
     positions >= boundary_index are untouched. The input list and its dicts
-    are NEVER mutated (deep-copy touched entries); the result carries a new
-    list.
+    are NEVER mutated (transformed entries are copied; the input list keeps
+    its original nested values); the result carries a new list.
 
     Uniform rule over pre-boundary messages (mirrors session.py render):
       - user msg whose str content starts with SUB_SNAPSHOT_PREFIX -> dropped
@@ -1072,15 +1085,19 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
                     # the pre-strip value so an over-500 identifying param
                     # (e.g. a long path) still shows in the pointer.
                     if cid:
-                        pairing[cid] = (
-                            name, raw_input if isinstance(raw_input, dict) else None)
-                    si = {}
-                    for k, v in (raw_input.items()
-                                 if isinstance(raw_input, dict) else []):
-                        sv, stripped = _strip_value(v)
-                        if stripped:
-                            classes["inputs"] += 1
-                        si[k] = sv
+                        pairing[cid] = (name, _harvest_params(raw_input))
+                    if isinstance(raw_input, dict):
+                        si = {}
+                        for k, v in raw_input.items():
+                            sv, stripped = _strip_value(v)
+                            if stripped:
+                                classes["inputs"] += 1
+                            si[k] = sv
+                    else:
+                        # Non-dict input (e.g. null): pass through unchanged —
+                        # silently rewriting it to {} would falsify the
+                        # model-visible history (wave-2 audit, 3 lineages).
+                        si = raw_input
                     if isinstance(tc, _ToolCall):
                         new_tc.append(dataclasses.replace(tc, input=si))
                     else:

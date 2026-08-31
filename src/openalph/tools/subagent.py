@@ -84,6 +84,42 @@ def _resolve_sub_context_window(config: AgentConfig, model_str: str) -> int:
     return config.model_max_tokens
 
 
+def _estimate_context_tokens(msgs: list[dict]) -> int:
+    """Estimate token count from messages list (1 token ≈ 4 chars).
+
+    Counts str content, list-content parts (vision blocks: string values
+    incl. base64 image data), and assistant tool_call INPUT string values.
+    The wave-2 audit (all 3 lineages) found str-only counting blinded the GC
+    trigger to exactly the heavy-content runs the tier exists to protect
+    (vision-heavy and write-heavy subs never crossed the threshold).
+    """
+    total_chars = 0
+    for msg in msgs:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, (list, tuple)):
+            for part in content:
+                if isinstance(part, dict):
+                    for v in part.values():
+                        if isinstance(v, str):
+                            total_chars += len(v)
+                elif isinstance(part, str):
+                    total_chars += len(part)
+        for tc in msg.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                raw = tc.get("input")
+            else:
+                raw = getattr(tc, "input", None)
+            if isinstance(raw, dict):
+                for v in raw.values():
+                    if isinstance(v, str):
+                        total_chars += len(v)
+    return total_chars // 4
+
+
+
+
 async def run_subagent(
     task: str,
     config: AgentConfig,
@@ -207,15 +243,6 @@ async def run_subagent(
         "ts_start": int(run_start),
     })
 
-    def _estimate_context_tokens(msgs: list[dict]) -> int:
-        """Estimate token count from messages list (1 token ≈ 4 chars)."""
-        total_chars = 0
-        for msg in msgs:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total_chars += len(content)
-        return total_chars // 4
-
     # --- GC auto tier (workspace-kdsn.305.4): message-list boundary ----------
     #
     # Sub contexts are in-process message lists (no JSONL, no render pass), so
@@ -239,7 +266,10 @@ async def run_subagent(
     #   - Degenerate runway (max_tokens >= window) disables the tier: a
     #     threshold at or below zero would fire every iteration.
     _gc_cfg = getattr(config, "context", None)
-    _gc_enabled = bool(getattr(_gc_cfg, "gc_enabled", False))
+    # Documented default is GC-on; production configs always carry the
+    # [context] dataclass default (gc_enabled=True), so the fallback here
+    # only matters for context-less config objects (test harnesses).
+    _gc_enabled = bool(getattr(_gc_cfg, "gc_enabled", True))
     _gc_boundary_count = 0
     _gc_latched = False
     _gc_threshold = 0
@@ -391,35 +421,6 @@ async def run_subagent(
         for iteration in range(iteration_limit):
             iter_start = time.time()
 
-            # Drain the per-sub vision inbox at the TOP of the iteration (before
-            # complete()), so a view_image deposit from the previous batch lands as
-            # ONE user message AFTER all tool results of that batch (kdsn.276).
-            if _sub_vision_inbox:
-                from openalph.agent import _build_user_content
-                from openalph.provider import model_supports_vision as _sub_msv
-                from openalph.tools.vision import frame_vision_batch
-                _tags = list(_sub_vision_inbox)
-                _sub_vision_inbox.clear()
-                _framed = frame_vision_batch(_tags)
-                if _framed:
-                    from openalph.agent import MEDIA_TAG_RE as _SUB_MEDIA_RE
-                    _paths = [
-                        (m.group(1) if (m := _SUB_MEDIA_RE.search(t)) else t)
-                        for t in _tags
-                    ]
-                    messages.append({
-                        "role": "user",
-                        "content": _build_user_content(
-                            _framed, config,
-                            vision=_sub_msv(config.default_model, config)),
-                    })
-                    _append_transcript({
-                        "event": "view_image",
-                        "iteration": iteration,
-                        "paths": _paths,
-                        "count": len(_tags),
-                    })
-
             # GC auto tier (kdsn.305.4): apply a message-list boundary when
             # the estimated context reaches the auto threshold. Invariants in
             # the setup block above.
@@ -466,6 +467,36 @@ async def run_subagent(
                             "threshold %d — auto tier latched off for the "
                             "rest of this run", _gc_post, _gc_threshold,
                         )
+
+            # Drain the per-sub vision inbox at the TOP of the iteration (before
+            # complete()), so a view_image deposit from the previous batch lands as
+            # ONE user message AFTER all tool results of that batch (kdsn.276).
+            if _sub_vision_inbox:
+                from openalph.agent import _build_user_content
+                from openalph.provider import model_supports_vision as _sub_msv
+                from openalph.tools.vision import frame_vision_batch
+                _tags = list(_sub_vision_inbox)
+                _sub_vision_inbox.clear()
+                _framed = frame_vision_batch(_tags)
+                if _framed:
+                    from openalph.agent import MEDIA_TAG_RE as _SUB_MEDIA_RE
+                    _paths = [
+                        (m.group(1) if (m := _SUB_MEDIA_RE.search(t)) else t)
+                        for t in _tags
+                    ]
+                    messages.append({
+                        "role": "user",
+                        "content": _build_user_content(
+                            _framed, config,
+                            vision=_sub_msv(config.default_model, config)),
+                    })
+                    _append_transcript({
+                        "event": "view_image",
+                        "iteration": iteration,
+                        "paths": _paths,
+                        "count": len(_tags),
+                    })
+
 
             response = await complete(
                 config=config,
@@ -667,6 +698,42 @@ async def run_subagent(
             "Do NOT attempt further tool calls.]"
         )
         messages.append({"role": "user", "content": limit_notice})
+
+        # GC auto tier, breaker pass (wave-2 audit, convergent all 3
+        # lineages): the summary call ships the largest this list will ever
+        # be, and its failure loses the deliverable. Apply a boundary first —
+        # REGARDLESS of the turn-start latch (one last best-effort reduction
+        # before the deliverable-saving call; it cannot churn: it runs once).
+        if _gc_enabled:
+            _gc_est = _estimate_context_tokens(messages)
+            if _gc_est >= _gc_threshold:
+                _gc_outcome = apply_boundary_to_messages(
+                    messages,
+                    boundary_index=len(messages),
+                    task_text=task,
+                    trigger="breaker",
+                )
+                messages = _gc_outcome["messages"]
+                _gc_boundary_count += 1
+                _mf = _gc_outcome["manifest"]
+                _append_transcript({
+                    "event": "gc_boundary",
+                    "iteration": iteration_limit,
+                    "boundary": _gc_boundary_count,
+                    "manifest": _mf,
+                })
+                _append_log({
+                    "event": "gc_boundary",
+                    "iteration": iteration_limit,
+                    "boundary": _gc_boundary_count,
+                    "classes": _mf["classes"],
+                    "tokens_before": _mf["tokens_before"],
+                    "tokens_after_est": _mf["tokens_after_est"],
+                })
+                logger.info(
+                    "subagent GC boundary %d at breaker: %s",
+                    _gc_boundary_count, _mf["classes"],
+                )
 
         elapsed = time.time() - run_start
         _append_log({
