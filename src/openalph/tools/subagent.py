@@ -17,6 +17,7 @@ from pathlib import Path
 from openalph.provider import complete, compute_cost
 from openalph.tools import ToolDef, ToolResult, truncate_result, wrap_tool_result
 from openalph.config import AgentConfig
+from openalph.context_gc import apply_boundary_to_messages
 
 logger = logging.getLogger("openalph.subagent")
 
@@ -60,6 +61,27 @@ def _build_system_prompt(custom_prompt: str | None) -> str:
 def _sanitize_call_id(call_id: str) -> str:
     """Replace non-alphanumeric characters with underscores for safe filenames."""
     return re.sub(r"[^a-zA-Z0-9]", "_", call_id)
+
+
+def _resolve_sub_context_window(config: AgentConfig, model_str: str) -> int:
+    """3-layer context-window resolution for the sub's active model.
+
+    Mirrors Agent._resolve_model_limit_for (alias expansion -> [model_limits]
+    override -> curated provider table -> model_max_tokens fallback) without
+    needing an Agent instance — subs get only the parent config. No warn-once
+    set: sub runs are short-lived; a fallback window is inherently
+    conservative only if model_max_tokens is itself conservative, so callers
+    should treat this as an estimate (the GC threshold is derived from it).
+    """
+    if model_str in config.model_aliases:
+        model_str = config.model_aliases[model_str]
+    if model_str in config.model_limits:
+        return config.model_limits[model_str]
+    from openalph.provider import model_context_window
+    w = model_context_window(model_str)
+    if w is not None:
+        return w
+    return config.model_max_tokens
 
 
 async def run_subagent(
@@ -193,6 +215,48 @@ async def run_subagent(
             if isinstance(content, str):
                 total_chars += len(content)
         return total_chars // 4
+
+    # --- GC auto tier (workspace-kdsn.305.4): message-list boundary ----------
+    #
+    # Sub contexts are in-process message lists (no JSONL, no render pass), so
+    # the wave-1 session.py render transform cannot serve them. Instead the
+    # pure message-list transform (context_gc.apply_boundary_to_messages)
+    # runs at the TOP of each iteration (turn-start auto tier; the loop is
+    # between turns, so no in-flight pair exists) when the char-estimated
+    # context reaches the auto threshold. Invariants:
+    #   - Kill switch: parent [context] gc_enabled=False disables everything
+    #     (byte-identical legacy behavior).
+    #   - Monotonicity is structural: each boundary covers the FULL list, so a
+    #     later boundary's index always exceeds the earlier one, and the
+    #     prior snapshot is dropped as superseded by the transform itself.
+    #   - Churn guard (audit _gc_auto_uncleared analog): if a boundary fails
+    #     to buy runway back below the threshold, the auto tier latches OFF
+    #     for the rest of the run (the task echo is durable content a
+    #     boundary can never reduce).
+    #   - No cooldown and no hard tier for subs (bead .305.4: boundary
+    #     mechanics first, tuning last); the iteration circuit breaker is
+    #     untouched and a boundary costs zero iterations.
+    #   - Degenerate runway (max_tokens >= window) disables the tier: a
+    #     threshold at or below zero would fire every iteration.
+    _gc_cfg = getattr(config, "context", None)
+    _gc_enabled = bool(getattr(_gc_cfg, "gc_enabled", False))
+    _gc_boundary_count = 0
+    _gc_latched = False
+    _gc_threshold = 0
+    if _gc_enabled:
+        _gc_window = _resolve_sub_context_window(config, config.default_model)
+        _gc_max_tokens = max_tokens if max_tokens is not None else config.max_tokens
+        _gc_usable = _gc_window - _gc_max_tokens
+        _gc_auto_pct = int(getattr(_gc_cfg, "auto_pct", 85))
+        if _gc_usable <= 0:
+            logger.warning(
+                "subagent GC disabled: usable runway %d <= 0 "
+                "(window %d - max_tokens %d) for model %r",
+                _gc_usable, _gc_window, _gc_max_tokens, config.default_model,
+            )
+            _gc_enabled = False
+        else:
+            _gc_threshold = int(_gc_usable * _gc_auto_pct / 100)
 
     # Build conversation starting with task as user message
     messages = [{"role": "user", "content": task}]
@@ -355,6 +419,53 @@ async def run_subagent(
                         "paths": _paths,
                         "count": len(_tags),
                     })
+
+            # GC auto tier (kdsn.305.4): apply a message-list boundary when
+            # the estimated context reaches the auto threshold. Invariants in
+            # the setup block above.
+            if _gc_enabled and not _gc_latched:
+                _gc_est = _estimate_context_tokens(messages)
+                if _gc_est >= _gc_threshold:
+                    _gc_outcome = apply_boundary_to_messages(
+                        messages,
+                        boundary_index=len(messages),
+                        task_text=task,
+                        trigger="auto",
+                    )
+                    messages = _gc_outcome["messages"]
+                    _gc_boundary_count += 1
+                    _mf = _gc_outcome["manifest"]
+                    _append_transcript({
+                        "event": "gc_boundary",
+                        "iteration": iteration,
+                        "boundary": _gc_boundary_count,
+                        "manifest": _mf,
+                    })
+                    _append_log({
+                        "event": "gc_boundary",
+                        "iteration": iteration,
+                        "boundary": _gc_boundary_count,
+                        "classes": _mf["classes"],
+                        "tokens_before": _mf["tokens_before"],
+                        "tokens_after_est": _mf["tokens_after_est"],
+                    })
+                    logger.info(
+                        "subagent GC boundary %d at iteration %d: %s",
+                        _gc_boundary_count, iteration, _mf["classes"],
+                    )
+                    _gc_post = _estimate_context_tokens(messages)
+                    if _gc_post >= _gc_threshold:
+                        _gc_latched = True
+                        _append_transcript({
+                            "event": "gc_latched",
+                            "iteration": iteration,
+                            "reason": "boundary did not clear the auto threshold",
+                        })
+                        logger.warning(
+                            "subagent GC: post-boundary estimate %d still >= "
+                            "threshold %d — auto tier latched off for the "
+                            "rest of this run", _gc_post, _gc_threshold,
+                        )
 
             response = await complete(
                 config=config,

@@ -917,3 +917,263 @@ def apply_boundary(
         "over_budget": over_budget,
         "forced_handoff": forced_handoff,
     }
+
+# --- Message-list boundary transform (workspace-kdsn.305.4) -----------------
+
+#: Pre-frame prefix identifying a sub-snapshot user message in a plain
+#: message list. Load-bearing: the transform's superseded-snapshot rule
+#: detects prior snapshots by this prefix (message lists have no source
+#: field the way JSONL entries do).
+SUB_SNAPSHOT_PREFIX = "[GC sub-snapshot — boundary "
+
+
+def frame_sub_snapshot(boundary_index: int, task_text: str, manifest: dict,
+                       trigger: str = "auto") -> str:
+    """Frozen sub-snapshot content for the message-list boundary path.
+
+    Single string, first line EXACTLY:
+        [GC sub-snapshot — boundary {boundary_index} ({trigger})]
+    followed by:
+        task: <task_text escaped via _escape_reminder_tags — model-origin text>
+        manifest: tools={t} thinking={th} media={m} inputs={i}; tokens {before} -> {after} (est.); durable: task preserved in full
+
+    The durable ruling (SB): the task text is preserved IN FULL, never
+    truncated, never degraded to a pointer — over budget is flagged in the
+    manifest by the caller, never by dropping task content here.
+    Deterministic; no locale-dependent formatting; plain ints.
+    """
+    classes = manifest.get("classes", {})
+    return (
+        f"[GC sub-snapshot — boundary {boundary_index} ({trigger})]\n"
+        f"task: {_escape_reminder_tags(task_text)}\n"
+        f"manifest: tools={classes.get('tools', 0)} "
+        f"thinking={classes.get('thinking', 0)} "
+        f"media={classes.get('media', 0)} "
+        f"inputs={classes.get('inputs', 0)}; "
+        f"tokens {manifest.get('tokens_before', 0)} -> "
+        f"{manifest.get('tokens_after_est', 0)} (est.); "
+        "durable: task preserved in full"
+    )
+
+
+def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
+                               task_text: str, trigger: str = "auto") -> dict:
+    """Apply a GC boundary to a plain OpenAI-style message list. PURE.
+
+    The message-list analog of the session.py render transform: every message
+    at list position < boundary_index is reduced by the uniform rule;
+    positions >= boundary_index are untouched. The input list and its dicts
+    are NEVER mutated (deep-copy touched entries); the result carries a new
+    list.
+
+    Uniform rule over pre-boundary messages (mirrors session.py render):
+      - user msg whose str content starts with SUB_SNAPSHOT_PREFIX -> dropped
+        entirely (superseded by this boundary's snapshot; never
+        placeholder-ized).
+      - user msg with list/tuple content (media parts) -> content replaced by
+        the expunged-media string:
+        "[expunged at GC boundary {boundary_index}: media attachment — re-share or re-generate the image if needed]"
+        (byte-identical to session.py's render string; count "media").
+      - assistant msg: "thinking" field dropped (count "thinking" per message
+        that carried a non-empty thinking list). Thought-only message (string
+        content empty/whitespace AND no tool_calls) is deleted atomically —
+        never an empty shell. tool_calls: any STRING value in tc.input longer
+        than 500 chars replaced by "[stripped: {n} chars]" (count "inputs"
+        per replaced value); non-string values untouched.
+      - tool msg: content replaced by tool_pointer(boundary_index, name,
+        params, n_chars) where (name, params) come from the paired
+        pre-boundary assistant tool_call harvested by tool_call_id (pairing
+        map built in the same pass — no second scan); n_chars = original
+        content length (str content only, else 0). No pair found -> name
+        "tool", params None (generic pointer). Count "tools" per pointer.
+      - user msg with plain str content (non-snapshot) -> passes through
+        UNCHANGED. (Main-path parity: text inputs are not placeholder-ized.)
+
+    tool_calls entries may be ToolCall objects OR plain dicts — accept both;
+    the output mirrors the input type (objects via dataclasses.replace with
+    stripped input; dicts as new dicts). ToolCall is imported lazily inside
+    the function body from openalph.provider to keep context_gc importable
+    standalone.
+
+    Returns dict:
+      {
+        "applied": True,
+        "messages": <new list: transformed pre-boundary messages, untouched
+                     post-boundary messages, then ONE appended user message
+                     {"role": "user", "content": frame_sub_snapshot(...)}>,
+        "manifest": {
+            "boundary_index": int, "trigger": str,
+            "classes": {"tools": int, "thinking": int, "media": int,
+                        "inputs": int},
+            "tokens_before": int, "tokens_after_est": int,
+            "messages_before": int, "messages_after": int,
+        },
+        "snapshot_content": <the framed snapshot string>,
+        "noop_reason": None,
+      }
+    Never returns applied=False (monotonicity is the SEAM's job, tracked in
+    the caller's own counter — message lists carry no marker entries).
+    """
+    import dataclasses
+    from openalph.provider import ToolCall as _ToolCall
+
+    def _strip_value(v):
+        if isinstance(v, str) and len(v) > 500:
+            return f"[stripped: {len(v)} chars]", True
+        return v, False
+
+    # tool_call_id -> (name, ORIGINAL input). Harvested from pre-boundary
+    # assistant tool_calls IN THE TRANSFORM PASS BELOW (no second scan —
+    # mirrors session.py: an assistant call always precedes its tool result,
+    # so a pre-boundary tool message's pair is already collected by the time
+    # that tool message is rendered).
+    pairing: dict = {}
+    out: list = []
+    classes = {"tools": 0, "thinking": 0, "media": 0, "inputs": 0}
+    before_chars = 0
+    after_chars = 0
+
+    for pos, m in enumerate(messages):
+        if pos < boundary_index:
+            role = m.get("role")
+            content = m.get("content")
+            before_chars += _message_content_chars(content)
+
+            if role == "user":
+                if (
+                    isinstance(content, str)
+                    and content.startswith(SUB_SNAPSHOT_PREFIX)
+                ):
+                    continue  # superseded snapshot: dropped, contributes 0
+                if isinstance(content, (list, tuple)):
+                    classes["media"] += 1
+                    after_chars += len(_expunged_media_string(boundary_index))
+                    out.append({"role": "user",
+                                "content": _expunged_media_string(boundary_index)})
+                else:
+                    # Plain text passes through unchanged — surviving text
+                    # contributes its full length to the after-estimate.
+                    after_chars += _message_content_chars(content)
+                    out.append(dict(m))
+            elif role == "assistant":
+                tcs = m.get("tool_calls") or []
+                new_tc = []
+                for tc in tcs:
+                    if isinstance(tc, _ToolCall):
+                        raw_input = tc.input
+                        cid = tc.id
+                        name = tc.name
+                    else:
+                        raw_input = tc.get("input")
+                        cid = tc.get("call_id") or tc.get("id", "")
+                        name = tc.get("name", "")
+                    # Harvest (name, ORIGINAL input) for pointer pairing in
+                    # the same pass that renders the call. Pointer ident uses
+                    # the pre-strip value so an over-500 identifying param
+                    # (e.g. a long path) still shows in the pointer.
+                    if cid:
+                        pairing[cid] = (
+                            name, raw_input if isinstance(raw_input, dict) else None)
+                    si = {}
+                    for k, v in (raw_input.items()
+                                 if isinstance(raw_input, dict) else []):
+                        sv, stripped = _strip_value(v)
+                        if stripped:
+                            classes["inputs"] += 1
+                        si[k] = sv
+                    if isinstance(tc, _ToolCall):
+                        new_tc.append(dataclasses.replace(tc, input=si))
+                    else:
+                        new_tc.append({**tc, "input": si})
+                    # Conservative mirror of the entry-version quirk: the
+                    # after-estimate counts the input's FULL length even
+                    # though the transform shortens it.
+                    if isinstance(raw_input, dict):
+                        for v in raw_input.values():
+                            if isinstance(v, str):
+                                after_chars += len(v)
+                if m.get("thinking"):
+                    classes["thinking"] += 1
+                content_str = content if isinstance(content, str) else ""
+                if not content_str.strip() and not tcs:
+                    continue  # thought-only: deleted atomically, contributes 0
+                # Surviving text contributes its length to the after-estimate
+                # (thinking was never part of "content" and is dropped).
+                after_chars += _message_content_chars(content)
+                nm = dict(m)
+                nm.pop("thinking", None)
+                if tcs:
+                    nm["tool_calls"] = new_tc
+                out.append(nm)
+            elif role == "tool":
+                classes["tools"] += 1
+                content_len = len(content) if isinstance(content, str) else 0
+                call_id = m.get("tool_call_id")
+                _n, _p = pairing.get(call_id, ("tool", None))
+                pointer = tool_pointer(boundary_index, _n, _p, content_len)
+                after_chars += len(pointer)
+                nm = dict(m)
+                nm["content"] = pointer
+                out.append(nm)
+            else:
+                # system or other role: pass through untouched (surviving
+                # text still counts toward the after-estimate).
+                after_chars += _message_content_chars(content)
+                out.append(dict(m))
+        else:
+            # Post-boundary: untouched. A shallow copy keeps the returned
+            # list independent of the input list while sharing (unmutated)
+            # nested values — byte-identical either way, cheaper than a
+            # deep copy of the tail.
+            out.append(dict(m))
+
+    manifest = {
+        "boundary_index": boundary_index,
+        "trigger": trigger,
+        "classes": classes,
+        "tokens_before": before_chars // 4,
+        "tokens_after_est": after_chars // 4,
+        "messages_before": len(messages),
+        "messages_after": len(out) + 1,
+    }
+    snapshot = frame_sub_snapshot(boundary_index, task_text, manifest, trigger)
+    out.append({"role": "user", "content": snapshot})
+
+    return {
+        "applied": True,
+        "messages": out,
+        "manifest": manifest,
+        "snapshot_content": snapshot,
+        "noop_reason": None,
+    }
+
+
+def _message_content_chars(content) -> int:
+    """Deterministic char estimate of one message's renderable text content.
+
+    Identical semantics to _entry_content_chars: str -> len; list/tuple ->
+    sum of the str parts plus each dict part's str "text" value; else 0.
+    """
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, (list, tuple)):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+            elif isinstance(part, str):
+                total += len(part)
+        return total
+    return 0
+
+
+def _expunged_media_string(boundary_index: int) -> str:
+    """Byte-identical expunged-media placeholder used by the session.py
+    render transform."""
+    return (
+        f"[expunged at GC boundary {boundary_index}: "
+        "media attachment — re-share or re-generate the "
+        "image if needed]"
+    )
