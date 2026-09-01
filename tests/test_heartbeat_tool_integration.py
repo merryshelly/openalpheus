@@ -544,109 +544,415 @@ class TestI06HeadlessFailsClean:
 
 
 # ---------------------------------------------------------------------------
-# F5/F9 — same-batch [stop, start] inside a fired turn: start is refused
+# F5/F9 (rewritten, kdsn.310) — same-batch [stop, start] inside a fired turn
+# converges to ONE coherent state: the last-executed mutation wins. The old
+# "start is refused" pin inverted: refusing own-turn start made autonomous
+# heartbeat self-modification impossible (an agent that stopped its own
+# heartbeat could never re-arm until an operator message created a
+# non-heartbeat turn). The technical hazard the refusal guarded against —
+# cancel-and-replace arming a SECOND loop task while the fired loop is still
+# alive (double-fire) — is structurally closed by the in-place apply: it never
+# cancels, and on a missing entry it re-registers the STILL-RUNNING loop task
+# (captured at loop entry) instead of spawning a new one.
 # ---------------------------------------------------------------------------
 
 
-class TestF5SameBatchStopStart:
+class TestSameBatchStopStartConvergence:
+    @staticmethod
+    def _tool_callbacks(hb, room_id):
+        return {
+            "heartbeat": hb,
+            "umbral": None,
+            "room_id": room_id,
+            "send_notice": AsyncMock(),
+        }
+
     @pytest.mark.asyncio
-    async def test_stop_then_start_same_batch_start_refused_no_new_timer(
+    async def test_stop_then_start_same_batch_converges_running_new_interval(
         self, tmp_path
     ):
-        """F5/F9 (re-audit) integration pin: an agent that "restarts" its
-        heartbeat naturally batches [stop, start] into ONE tool-call batch,
-        which handle_input runs as ONE asyncio.gather. The stop sibling
-        (self-stop) removes the room's timer entry before the start sibling
-        reads any state — but the start MUST still be refused on the
-        loop-context mark ALONE (re-audit F5: the previous "entry exists"
-        AND-term let this same-batch bypass arm a NEW timer mid-turn,
-        violating the 'start from own turn is refused' policy). Real
-        HeartbeatManager, both calls in ONE gather (production wiring).
+        """[stop, start] in ONE gather (production tool-batch wiring) from
+        within the fired turn: both calls succeed; the stop sibling deletes
+        the entry, the start sibling re-registers the STILL-RUNNING loop
+        task (never a second task) with the new interval — the timer ends
+        the turn RUNNING at the new cadence. Exactly one fire over the
+        observation window (no double-fire), one live loop task, entry
+        persisted with the new interval."""
+        fired = []
+        results = {}
+        seen = {}
+        hb = None
 
-        Asserts: stop returned non-error; start is is_error with the
-        later-turn steering; the turn completes (wait_for fail-fast);
-        the manager is inactive; NO new timer entry exists and NO refire
-        over the ~3s observation window.
-        """
+        async def fire_turn(room_id):
+            fired.append(room_id)
+            loop_task = asyncio.current_task()
+            stop_r, start_r = await asyncio.gather(
+                _run_tool(
+                    {"action": "stop"}, self._tool_callbacks(hb, room_id)
+                ),
+                _run_tool(
+                    {"action": "start", "interval": 300, "directive": "phase 2"},
+                    self._tool_callbacks(hb, room_id),
+                ),
+            )
+            results["stop"] = stop_r
+            results["start"] = start_r
+            seen["active_in_turn"] = hb.is_active(room_id)
+            seen["loop_task_is_fired_task"] = hb._tasks.get(room_id) is loop_task
+            seen["interval"] = hb._intervals.get(room_id)
+            seen["directive"] = hb.directive_for(room_id)
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
+        await hb.start(ROOM_ID, 1)  # fires after ~1s
+
+        try:
+            await asyncio.wait_for(asyncio.sleep(3), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("same-batch [stop,start] observation window hung")
+
+        assert list(results) == ["stop", "start"], (
+            f"the turn must complete and deliver both results, got {results}"
+        )
+        assert results["stop"].is_error is False, results["stop"].content
+        assert results["start"].is_error is False, results["start"].content
+
+        # Converged RUNNING at the new cadence, on the SAME (still-running)
+        # loop task — the in-place apply must never spawn a second task.
+        assert seen["active_in_turn"] is True, seen
+        assert seen["loop_task_is_fired_task"] is True, (
+            "the re-registered task must be the fired turn's own loop task "
+            f"(a fresh task here means double-fire risk), got {seen}"
+        )
+        assert seen["interval"] == 300, seen
+        assert seen["directive"] == "phase 2", seen
+
+        # After the turn: still active, exactly one fire, no refire inside
+        # the 300s cadence within the ~3s window, and persisted.
+        assert hb.is_active(ROOM_ID)
+        assert fired == [ROOM_ID], fired
+        assert len(hb._tasks) == 1, hb._tasks
+        persisted = json.loads((tmp_path / "heartbeats.json").read_text())
+        entry = next(e for e in persisted if e["room_id"] == ROOM_ID)
+        assert entry["interval_seconds"] == 300, persisted
+        assert entry["directive"] == "phase 2", persisted
+
+        # External cleanup: operator-style stop cancels the loop task.
+        await hb.stop(ROOM_ID)
+        await hb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_start_then_stop_same_batch_converges_stopped(self, tmp_path):
+        """[start, stop] in ONE gather: the start applies in place, the stop
+        (executed last, matching gather order) removes the entry — the batch
+        converges STOPPED. Exactly one fire, no refire, nothing persisted."""
         fired = []
         results = {}
         hb = None
 
         async def fire_turn(room_id):
-            """ONE fired turn = ONE tool-call batch: both actions dispatched
-            in a SINGLE asyncio.gather, mirroring agent.py's tool batch —
-            contextvars copy into BOTH gather children (the exact
-            interleaving the F5 bypass depended on)."""
             fired.append(room_id)
-            stop_r, start_r = await asyncio.gather(
+            start_r, stop_r = await asyncio.gather(
                 _run_tool(
-                    {"action": "stop"},
-                    TestI04SelfStopFromWithinFiredTurn._tool_callbacks(
-                        hb, room_id
-                    ),
+                    {"action": "start", "interval": 300, "directive": "d"},
+                    self._tool_callbacks(hb, room_id),
                 ),
                 _run_tool(
-                    {"action": "start", "interval": 300},
-                    TestI04SelfStopFromWithinFiredTurn._tool_callbacks(
-                        hb, room_id
-                    ),
+                    {"action": "stop"}, self._tool_callbacks(hb, room_id)
                 ),
             )
-            results["stop"] = stop_r
             results["start"] = start_r
+            results["stop"] = stop_r
 
         hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
-        await hb.start(ROOM_ID, 1)  # fires after ~1s
-
-        async def _observe():
-            try:
-                await asyncio.sleep(3)
-            except asyncio.CancelledError:  # pragma: no cover - guard path
-                pytest.fail(
-                    "same-batch stop+start cancelled the timer task itself "
-                    "(cyclic-cancel class must stay closed, audit R1)"
-                )
+        await hb.start(ROOM_ID, 1)
 
         try:
-            await asyncio.wait_for(_observe(), timeout=15)
-        except asyncio.TimeoutError:  # pragma: no cover - regression path
-            pytest.fail(
-                "same-batch stop+start observation window hung: the turn "
-                "must EXIT cleanly inside 15s (fail-fast guard)"
-            )
+            await asyncio.wait_for(asyncio.sleep(3), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("same-batch [start,stop] observation window hung")
 
-        assert list(results) == ["stop", "start"], (
-            f"the turn must complete and deliver both results, got {results}"
-        )
-
-        stop_r = results["stop"]
-        assert stop_r.is_error is False, stop_r.content
-        assert "Heartbeat stopped." in stop_r.content
-
-        # Re-audit F5: the start sibling must be REFUSED even though the
-        # stop sibling already removed the entry — the refusal keys on
-        # in_own_loop (contextvar) ALONE.
-        start_r = results["start"]
-        assert start_r.is_error is True, (
-            "same-batch start must be refused from the room's own fired "
-            f"turn, got non-error: {start_r.content}"
-        )
-        assert "its own turn" in start_r.content, start_r.content
-        assert "later turn" in start_r.content, start_r.content
-
-        # Exactly ONE fire, no refire: no new timer may have been armed.
-        assert fired == [ROOM_ID], (
-            f"exactly one fire (a silently-armed new timer would refire "
-            f"inside the ~3s window), got {fired}"
-        )
+        assert results["start"].is_error is False, results["start"].content
+        assert results["stop"].is_error is False, results["stop"].content
+        assert fired == [ROOM_ID], fired
         assert not hb.is_active(ROOM_ID)
-        assert ROOM_ID not in hb._tasks, (
-            "no timer entry may exist after the turn — the same-batch "
-            "start must not have armed a replacement"
-        )
-        assert all(
-            e.room_id != ROOM_ID for e in hb.status()
-        ), "status() must show no entry for the room"
+        assert ROOM_ID not in hb._tasks
         persisted = json.loads((tmp_path / "heartbeats.json").read_text())
         assert all(e["room_id"] != ROOM_ID for e in persisted)
+        await hb.shutdown()
+
+
+class TestOwnTurnStartInPlaceIntegration:
+    """kdsn.310 integration: the heartbeat TOOL's start, called from within
+    the room's own fired turn (real HeartbeatManager, real tool dispatch),
+    updates cadence/directive in place — the loop task is never cancelled or
+    replaced, and the next fire uses the new cadence."""
+
+    @staticmethod
+    def _tool_callbacks(hb, room_id):
+        return {
+            "heartbeat": hb,
+            "umbral": None,
+            "room_id": room_id,
+            "send_notice": AsyncMock(),
+        }
+
+    @pytest.mark.asyncio
+    async def test_own_turn_tool_start_updates_interval_and_directive_in_place(
+        self, tmp_path
+    ):
+        """The live failure mode from session d0Oh5MZ7PC2ahnOs41 (an agent
+        re-pointing its heartbeat directive from inside its own heartbeat
+        turn, refused twice): must now succeed in place. The loop task
+        survives; the new interval/directive are live bookkeeping and
+        persisted before the turn ends."""
+        fired = []
+        results = {}
+        seen = {}
+        hb = None
+
+        async def fire_turn(room_id):
+            fired.append(room_id)
+            loop_task = asyncio.current_task()
+            r = await _run_tool(
+                {"action": "start", "interval": 300, "directive": "judging supervision"},
+                self._tool_callbacks(hb, room_id),
+            )
+            results["start"] = r
+            seen["loop_task_is_fired_task"] = hb._tasks.get(room_id) is loop_task
+            seen["interval"] = hb._intervals.get(room_id)
+            seen["directive"] = hb.directive_for(room_id)
+            seen["active_in_turn"] = hb.is_active(room_id)
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
+        await hb.start(ROOM_ID, 1)
+
+        try:
+            await asyncio.wait_for(asyncio.sleep(3), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("own-turn start observation window hung")
+
+        assert fired == [ROOM_ID], fired
+        r = results["start"]
+        assert r.is_error is False, (
+            f"own-turn start must succeed in place, got error: {r.content}"
+        )
+        assert "its own turn" not in r.content, r.content
+        assert seen == {
+            "loop_task_is_fired_task": True,
+            "interval": 300,
+            "directive": "judging supervision",
+            "active_in_turn": True,
+        }, seen
+
+        # Turn ended; the loop is still alive on the SAME task, sleeping the
+        # new interval. Persisted shape matches the slash-start contract.
+        assert hb.is_active(ROOM_ID)
+        assert len(hb._tasks) == 1
+        persisted = json.loads((tmp_path / "heartbeats.json").read_text())
+        entry = next(e for e in persisted if e["room_id"] == ROOM_ID)
+        assert entry["interval_seconds"] == 300, persisted
+        assert entry["directive"] == "judging supervision", persisted
+
+        await hb.stop(ROOM_ID)
+        await hb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_own_turn_tool_start_below_floor_still_rejected(self, tmp_path):
+        """Own-turn is an apply-mechanism switch, not a policy exemption:
+        the 5m floor holds inside the fired turn."""
+        fired = []
+        results = {}
+        hb = None
+
+        async def fire_turn(room_id):
+            fired.append(room_id)
+            r = await _run_tool(
+                {"action": "start", "interval": 30},
+                self._tool_callbacks(hb, room_id),
+            )
+            results["start"] = r
+            await hb.stop(room_id)  # one fire then exit
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
+        await hb.start(ROOM_ID, 1)
+
+        try:
+            await asyncio.wait_for(asyncio.sleep(3), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("own-turn floor observation window hung")
+
+        assert fired == [ROOM_ID], fired
+        r = results["start"]
+        assert r.is_error is True, r.content
+        assert FLOOR_MSG in r.content, r.content
+        await hb.shutdown()
+
+
+class TestManagerApplyInOwnTurn:
+    """Manager-level pins for RecurringTimerManager.apply_in_own_turn —
+    tiny intervals (below the tool floor, which is tool-side policy) prove
+    the NEW cadence actually drives subsequent fires."""
+
+    @pytest.mark.asyncio
+    async def test_apply_in_own_turn_next_fire_uses_new_interval(self, tmp_path):
+        """Fire at 0.05s cadence; inside the fired turn apply a 0.3s cadence.
+        The second fire must come at the NEW interval (>= 0.25s after the
+        first) and carry the new directive; the loop must still be a single
+        task. Callback self-stops after the second fire."""
+        fires = []
+        hb = None
+
+        async def fire_turn(room_id):
+            fires.append(asyncio.get_running_loop().time())
+            if len(fires) == 1:
+                await hb.apply_in_own_turn(room_id, 0.3, "phase 2")
+            else:
+                await hb.stop(room_id)
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
+        await hb.start(ROOM_ID, 0.05)
+        try:
+            await asyncio.wait_for(asyncio.sleep(2), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("cadence observation window hung")
+        await hb.shutdown()
+
+        assert len(fires) == 2, (
+            f"expected exactly two fires (old cadence, then new), got {fires}"
+        )
+        gap = fires[1] - fires[0]
+        assert gap >= 0.25, (
+            f"second fire must use the NEW interval (>=0.25s gap), got {gap:.3f}s"
+        )
+        assert hb.directive_for(ROOM_ID) is None  # self-stop cleared it
+        persisted = json.loads((tmp_path / "heartbeats.json").read_text())
+        assert all(e["room_id"] != ROOM_ID for e in persisted)
+
+    @pytest.mark.asyncio
+    async def test_apply_after_sibling_stop_resurrects_live_loop(self, tmp_path):
+        """Manager seam for the same-batch [stop, start] race: apply called
+        after stop deleted the entry must re-register the STILL-RUNNING loop
+        task (not spawn a second) — the loop keeps firing at the new cadence."""
+        events = []
+        hb = None
+
+        async def fire_turn(room_id):
+            events.append(("fire", asyncio.get_running_loop().time()))
+            if len(events) == 1:
+                await hb.stop(room_id)
+                assert not hb.is_active(room_id)
+                await hb.apply_in_own_turn(room_id, 0.3, "phase 2")
+                events.append(("resurrected", hb.is_active(room_id)))
+                events.append(("same_task", hb._tasks.get(room_id) is asyncio.current_task()))
+            else:
+                await hb.stop(room_id)
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
+        await hb.start(ROOM_ID, 0.05)
+        try:
+            await asyncio.wait_for(asyncio.sleep(2), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("resurrect observation window hung")
+        await hb.shutdown()
+
+        fires = [t for kind, t in events if kind == "fire"]
+        assert len(fires) == 2, (
+            f"the resurrected loop must fire again at the new cadence, got {events}"
+        )
+        assert ("resurrected", True) in events, events
+        assert ("same_task", True) in events, events
+        gap = fires[1] - fires[0]
+        assert gap >= 0.25, f"new cadence must apply, got gap {gap:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_apply_outside_own_turn_with_live_entry_is_still_in_place(
+        self, tmp_path
+    ):
+        """apply_in_own_turn with a live entry never cancels/replaces the
+        task regardless of caller context (policy lives in the tool). The
+        running loop picks up the new cadence on a subsequent iteration.
+
+        Timing note: an apply from OUTSIDE the fired turn cannot extend a
+        sleep already in progress — one final fire at the old cadence is
+        expected if the apply lands mid-sleep (the own-turn TOOL path never
+        sees this: its apply runs inside the callback, before the next
+        sleep). Assert the NEW cadence governs from the first fire scheduled
+        AFTER the apply."""
+        fires = []
+        hb = None
+        applied = asyncio.Event()
+
+        async def fire_turn(room_id):
+            fires.append(asyncio.get_running_loop().time())
+            if len(fires) == 1:
+                # simulate an EXTERNAL apply (no loop context): schedule it
+                # from a detached task while the fired turn runs
+                async def _external():
+                    await hb.apply_in_own_turn(room_id, 0.3, None)
+                    applied.set()
+                asyncio.create_task(_external())
+            elif len(fires) >= 3:
+                await hb.stop(room_id)
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
+        await hb.start(ROOM_ID, 0.05)
+        try:
+            await asyncio.wait_for(asyncio.sleep(3), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("external-apply observation window hung")
+        await hb.shutdown()
+        assert applied.is_set()
+        assert len(fires) >= 3, (
+            f"expected the loop to keep firing at the new cadence, got {fires}"
+        )
+        # From the first fire scheduled after the apply, the new cadence
+        # governs: at most ONE old-cadence gap may remain.
+        gaps = [fires[i + 1] - fires[i] for i in range(len(fires) - 1)]
+        assert gaps[-1] >= 0.25, (
+            f"the last gap must use the NEW interval, got gaps {gaps}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_refuses_resurrect_of_cancelling_loop(self, tmp_path):
+        """Audit qwen LOW-1: when the loop task has a PENDING cancellation
+        (external stop racing the batch: a sibling stop removed the entry,
+        the external cancel was requested, the task is not yet done), the
+        resurrect path must refuse — re-registering a cancelling task would
+        persist a "running" entry for a task that dies at its next
+        suspension (and resume() would re-arm a timer the operator
+        stopped). The apply falls through to a fresh _start_common task,
+        which is the coherent last-action-wins state."""
+        events = []
+        hb = None
+
+        async def fire_turn(room_id):
+            events.append("fire")
+            if len(events) == 1:
+                # Sibling stop removed the entry (self-stop path: no cancel),
+                # then an external cancel REQUEST races in before the task
+                # finishes its turn.
+                await hb.stop(room_id)
+                task = asyncio.current_task()
+                task.cancel()
+                assert task.cancelling() >= 1
+                await hb.apply_in_own_turn(room_id, 0.3, "phase 2")
+                entry = hb._tasks.get(room_id)
+                events.append(("entry_present", entry is not None))
+                events.append(("entry_is_cancelled_loop", entry is task))
+            else:
+                events.append("fire2")
+                await hb.stop(room_id)
+
+        hb = HeartbeatManager(tmp_path / "heartbeats.json", fire_turn)
+        await hb.start(ROOM_ID, 0.05)
+        try:
+            await asyncio.wait_for(asyncio.sleep(2), timeout=15)
+        except asyncio.TimeoutError:  # pragma: no cover
+            pytest.fail("cancel-pending observation window hung")
+
+        assert ("entry_present", True) in events, events
+        assert ("entry_is_cancelled_loop", False) in events, events
+        assert "fire2" in events, (
+            f"the fresh timer must fire again at the new cadence, got {events}"
+        )
         await hb.shutdown()

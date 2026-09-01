@@ -757,49 +757,142 @@ class TestT23ReplaceOnStart:
 # ---------------------------------------------------------------------------
 
 
-class TestR1StartRefusedFromOwnTurn:
-    """R1 tool policy: start from the room's own fired turn is refused with
-    steering (never delegated to the manager); anything else flows
-    through."""
+class TestR1StartFromOwnTurnInPlace:
+    """kdsn.310: start from the room's own fired turn is an IN-PLACE
+    cadence/directive update — never cancel-and-replace (the old loop task
+    is the ancestor of the tool's gather child; cancelling it cyclically
+    cancels the running turn), never a refusal (the old 'interval changes
+    need a later turn' contract made autonomous heartbeat self-modification
+    impossible: an agent that stopped its own heartbeat could never re-arm
+    until an operator message created a non-heartbeat turn — live session
+    d0Oh5MZ7PC2ahnOs41 lines 308-312, two consecutive refusals).
+
+    Validation (interval parse, floor, umbral exclusion, shapes) applies
+    EQUALLY in the own-turn path — own-turn is a different apply mechanism,
+    not a policy exemption."""
 
     @pytest.mark.asyncio
-    async def test_start_from_own_fired_turn_is_error_no_manager_calls(self):
-        """R1 tool-policy pin: start issued from within the room's OWN
-        fired heartbeat turn (manager.in_own_loop(room_id) true, an entry
-        present) must be REFUSED with steering — never delegated. Replacing
-        mid-turn would cancel the loop task that is the ancestor of the
-        tool's gather child; deferred replacement is out of scope for v1,
-        so the contract is 'interval changes need a later turn'."""
+    async def test_start_from_own_fired_turn_delegates_to_in_place_apply(self):
+        """Own-turn start → hb.apply_in_own_turn(room, seconds, directive);
+        the cancel-and-replace manager start must NEVER run from the room's
+        own fired turn."""
         hb, um = _fake_hb()
         hb.in_own_loop.return_value = True
+        hb.apply_in_own_turn = AsyncMock()
         cb = _callbacks(hb, um)
-        result = await _run({"action": "start", "interval": "30m"}, cb)
-        assert result.is_error is True
-        assert "its own turn" in result.content, result.content
-        assert "later turn" in result.content, result.content
+        result = await _run(
+            {"action": "start", "interval": "30m", "directive": "phase 2"}, cb
+        )
+        assert result.is_error is False, result.content
+        hb.apply_in_own_turn.assert_awaited_once_with(ROOM_ID, 1800, "phase 2")
         hb.start.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_start_from_own_turn_refused_even_with_no_entry(self):
-        """Re-audit F5/F9 unit pin: the refusal keys on in_own_loop ALONE —
-        a same-batch [stop, start] inside one fired turn has the stop
-        sibling remove the room's entry BEFORE this start probe reads
-        any state, so the entry-exists term the previous version ANDed in
-        silently skipped the refusal and armed a NEW timer mid-turn.
-        With in_own_loop True and status() == [] (the exact F5 bypass
-        condition), start MUST still be refused; the manager's start must
-        never run, and status() must not be consulted at all (race domain).
-        """
+    async def test_start_from_own_turn_floor_still_enforced(self):
         hb, um = _fake_hb()
         hb.in_own_loop.return_value = True
-        hb.status.return_value = []  # stop sibling already removed the entry
+        hb.apply_in_own_turn = AsyncMock()
+        cb = _callbacks(hb, um)
+        result = await _run({"action": "start", "interval": "1m"}, cb)
+        assert result.is_error is True
+        assert FLOOR_MSG in result.content, result.content
+        hb.apply_in_own_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_from_own_turn_invalid_interval_still_rejected(self):
+        hb, um = _fake_hb()
+        hb.in_own_loop.return_value = True
+        hb.apply_in_own_turn = AsyncMock()
+        cb = _callbacks(hb, um)
+        result = await _run({"action": "start", "interval": "abc"}, cb)
+        assert result.is_error is True
+        assert "Invalid interval" in result.content, result.content
+        hb.apply_in_own_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_from_own_turn_missing_interval_is_error(self):
+        hb, um = _fake_hb()
+        hb.in_own_loop.return_value = True
+        hb.apply_in_own_turn = AsyncMock()
+        cb = _callbacks(hb, um)
+        result = await _run({"action": "start"}, cb)
+        assert result.is_error is True
+        assert "Missing required parameter 'interval'" in result.content
+        hb.apply_in_own_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_from_own_turn_umbral_exclusion_still_enforced(self):
+        """R5 fail-closed: umbral verification/exclusion runs in the own-turn
+        path too — own-turn is not an exclusion bypass."""
+        hb, um = _fake_hb(umbral_active=True)
+        hb.in_own_loop.return_value = True
+        hb.apply_in_own_turn = AsyncMock()
         cb = _callbacks(hb, um)
         result = await _run({"action": "start", "interval": "30m"}, cb)
         assert result.is_error is True
-        assert "its own turn" in result.content, result.content
-        assert "later turn" in result.content, result.content
-        hb.start.assert_not_awaited()
-        hb.status.assert_not_called()
+        assert UMBRAL_EXCLUSION in result.content, result.content
+        hb.apply_in_own_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_from_own_turn_omitted_directive_clears_and_says_so(self):
+        """Directive semantics match the manager seam: None clears. When a
+        standing directive existed and start omits one, the result must say
+        it was cleared (silent clears are how agents lose standing
+        routines)."""
+        hb, um = _fake_hb()
+        hb.in_own_loop.return_value = True
+        hb.directive_for.return_value = "old standing directive"
+        hb.apply_in_own_turn = AsyncMock()
+        cb = _callbacks(hb, um)
+        result = await _run({"action": "start", "interval": "30m"}, cb)
+        assert result.is_error is False, result.content
+        hb.apply_in_own_turn.assert_awaited_once_with(ROOM_ID, 1800, None)
+        assert "cleared" in result.content.lower(), result.content
+
+    @pytest.mark.asyncio
+    async def test_start_from_own_turn_notice_emitted(self):
+        hb, um = _fake_hb()
+        hb.in_own_loop.return_value = True
+        hb.apply_in_own_turn = AsyncMock()
+        cb = _callbacks(hb, um)
+        await _run({"action": "start", "interval": "30m"}, cb)
+        cb["send_notice"].assert_awaited_once()
+        notice = cb["send_notice"].await_args.args[-1]
+        assert "30m" in notice, notice
+
+    @pytest.mark.asyncio
+    async def test_start_from_own_turn_apply_failure_is_error_never_raises(self):
+        hb, um = _fake_hb()
+        hb.in_own_loop.return_value = True
+        hb.apply_in_own_turn = AsyncMock(side_effect=RuntimeError("boom"))
+        cb = _callbacks(hb, um)
+        result = await _run({"action": "start", "interval": "30m"}, cb)
+        assert result.is_error is True
+        assert "Heartbeat update failed: RuntimeError" in result.content
+
+    @pytest.mark.asyncio
+    async def test_start_from_other_turn_still_replaces(self):
+        """R1 contract guard: in_own_loop False (start issued from a NORMAL
+        turn while the timer happens to be running) still delegates to the
+        manager — T23 replace semantics are untouched by the policy."""
+        hb, um = _fake_hb()
+        hb.status.return_value = [_entry()]
+        cb = _callbacks(hb, um)
+        result = await _run({"action": "start", "interval": "30m"}, cb)
+        assert result.is_error is False, result.content
+        hb.start.assert_awaited_once_with(ROOM_ID, 1800, None)
+
+    @pytest.mark.asyncio
+    async def test_in_own_loop_probe_failure_falls_through_never_raises(self):
+        """R1 robustness: a manager whose probe raises must not crash the
+        turn — the own-turn check is advisory and wraps its probe; the
+        ordinary start path then applies."""
+        hb, um = _fake_hb()
+        hb.in_own_loop.side_effect = RuntimeError("probe boom")
+        cb = _callbacks(hb, um)
+        result = await _run({"action": "start", "interval": "30m"}, cb)
+        assert result.is_error is False, result.content
+        hb.start.assert_awaited_once_with(ROOM_ID, 1800, None)
 
     @pytest.mark.asyncio
     async def test_start_from_other_turn_still_replaces(self):

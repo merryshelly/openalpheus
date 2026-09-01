@@ -1434,3 +1434,328 @@ class TestFeatureAttributesAbsent:
             "EXPECTED RED: build_context does not yet apply steer framing. "
             "This test fails RED until the feature is built."
         )
+
+
+# ---------------------------------------------------------------------------
+# G. Steering on heartbeat/umbral turns (kdsn.311)
+# ---------------------------------------------------------------------------
+
+
+class TestSteerHeartbeatTurn:
+    """G. /steer must work on heartbeat/umbral turns.
+
+    Pre-fix, _run_heartbeat_turn never marked _active_turns and never wired
+    the drain_steering closure into the callbacks dict, so /steer during a
+    fired heartbeat/umbral turn answered "No active turn to steer" even
+    though a turn WAS active — and an operator could not redirect a
+    long-running autonomous turn at all. The heartbeat path must arm the
+    SAME steering seam as the live-message path (one shared construction
+    seam — no drift)."""
+
+    def _make_hb_bot(self, agent, tmp_path, **overrides):
+        bot = _make_bot(agent=agent, **overrides)
+        bot._steering_inbox = {}
+        bot._active_turns = set()
+        bot._advisor_results = {}
+        bot._subagent_results = {}
+        return bot
+
+    async def _deposit(self, bot, note):
+        room = _make_room()
+        event = _make_event(body=f"/steer {note}")
+        await bot._handle_room_message(room, event)
+
+    def _extract_calls(self, mock_append, **match):
+        calls = []
+        for c in mock_append.call_args_list:
+            kwargs = c.kwargs
+            if all(kwargs.get(k) == v for k, v in match.items()):
+                calls.append(kwargs)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_G1_steer_deposits_during_heartbeat_turn(self):
+        """G1. A heartbeat turn IS an active turn: /steer deposits while
+        _run_heartbeat_turn is in flight (no 'No active turn' notice)."""
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        captured_kwargs = {}
+
+        async def blocking_turn(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            entered.set()
+            await release.wait()
+            return "heartbeat turn done"
+
+        agent = MagicMock()
+        agent._rooms = {}
+        agent.handle_input = AsyncMock(side_effect=blocking_turn)
+        agent.history = MagicMock(
+            side_effect=lambda rid: agent._rooms.setdefault(rid, []))
+        agent.cancel = MagicMock(return_value=None)
+        agent.tools = []
+        agent.config = MagicMock()
+        agent.config.workspace = "/tmp/test-workspace"
+        agent.config.model_aliases = {}
+
+        bot = self._make_hb_bot(agent, tmp_path=None)
+        notices = []
+        bot.send_notice = AsyncMock(side_effect=lambda rid, t: notices.append(t))
+
+        turn_task = asyncio.create_task(
+            bot._run_heartbeat_turn(ROOM_A, "hb content", turn_source="heartbeat")
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert ROOM_A in bot._active_turns, (
+                "heartbeat turn must mark the room active (kdsn.311)"
+            )
+            # Callbacks shape (audit kimi LOW): the heartbeat path wires the
+            # drain seam but NOT the stall-watchdog liveness hook (the turn
+            # runs inside the timer-loop task; there is no watchdog to feed).
+            cb = captured_kwargs.get("callbacks") or {}
+            assert "drain_steering" in cb, (
+                "heartbeat path must wire callbacks['drain_steering']"
+            )
+            assert "turn_progress" not in cb, (
+                "heartbeat path must not carry the live path's "
+                "turn_progress liveness hook"
+            )
+
+            await self._deposit(bot, "mid-heartbeat note")
+            inbox = bot._steering_inbox.get(ROOM_A, [])
+            assert inbox == ["mid-heartbeat note"], inbox
+            assert any("queue" in n.lower() or "🧭" in n for n in notices), notices
+        finally:
+            release.set()
+            await asyncio.wait_for(turn_task, timeout=10)
+
+        # Turn over: active mark discarded.
+        assert ROOM_A not in bot._active_turns
+
+    @pytest.mark.asyncio
+    async def test_G2_heartbeat_turn_drain_logs_and_delivers(self):
+        """G2. Notes deposited during a heartbeat turn are logged to JSONL
+        (role=user, source=steer) and confirmed with a delivered notice —
+        the final-drain pass in _run_heartbeat_turn's finally, same race
+        rule as the live path."""
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def blocking_turn(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return "heartbeat turn done"
+
+        agent = MagicMock()
+        agent._rooms = {}
+        agent.handle_input = AsyncMock(side_effect=blocking_turn)
+        agent.history = MagicMock(
+            side_effect=lambda rid: agent._rooms.setdefault(rid, []))
+        agent.cancel = MagicMock(return_value=None)
+        agent.tools = []
+        agent.config = MagicMock()
+        agent.config.workspace = "/tmp/test-workspace"
+        agent.config.model_aliases = {}
+
+        bot = self._make_hb_bot(agent, tmp_path=None)
+        notices = []
+        bot.send_notice = AsyncMock(side_effect=lambda rid, t: notices.append(t))
+
+        turn_task = asyncio.create_task(
+            bot._run_heartbeat_turn(ROOM_A, "hb content", turn_source="heartbeat")
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await self._deposit(bot, "logged note")
+        finally:
+            release.set()
+            await asyncio.wait_for(turn_task, timeout=10)
+
+        logged = self._extract_calls(
+            bot.session_log.append, role="user", source="steer"
+        )
+        assert any(c.get("content") == "logged note" for c in logged), logged
+        assert any("delivered" in n.lower() for n in notices), notices
+
+    @pytest.mark.asyncio
+    async def test_G3_late_deposit_during_last_iteration_not_dropped(self):
+        """G3. A note deposited while the loop was on its last iteration is
+        logged by the final drain pass, not silently dropped."""
+        bot_ref = {}
+
+        async def depositing_turn(*args, **kwargs):
+            # Simulate a /steer arriving during the last iteration: deposit
+            # directly into the inbox as the slash handler would, then return
+            # (the loop will NOT iterate again — the note survives only if
+            # the final drain pass runs).
+            bot_ref["bot"]._steering_inbox.setdefault(ROOM_A, []).append("late note")
+            return "turn done"
+
+        agent = MagicMock()
+        agent._rooms = {}
+        agent.handle_input = AsyncMock(side_effect=depositing_turn)
+        agent.history = MagicMock(
+            side_effect=lambda rid: agent._rooms.setdefault(rid, []))
+        agent.cancel = MagicMock(return_value=None)
+        agent.tools = []
+        agent.config = MagicMock()
+        agent.config.workspace = "/tmp/test-workspace"
+        agent.config.model_aliases = {}
+
+        bot = self._make_hb_bot(agent, tmp_path=None)
+        bot_ref["bot"] = bot
+        notices = []
+        bot.send_notice = AsyncMock(side_effect=lambda rid, t: notices.append(t))
+
+        await asyncio.wait_for(
+            bot._run_heartbeat_turn(ROOM_A, "hb content", turn_source="heartbeat"),
+            timeout=10,
+        )
+
+        logged = self._extract_calls(
+            bot.session_log.append, role="user", source="steer"
+        )
+        assert any(c.get("content") == "late note" for c in logged), logged
+        assert any("delivered" in n.lower() for n in notices), notices
+
+    @pytest.mark.asyncio
+    async def test_G4_steer_works_on_umbral_turns(self):
+        """G4. _run_heartbeat_turn serves umbral too — same steering seam.
+        (A note logged immediately before the umbral wipe lands in the
+        archived JSONL; harmless by design.)"""
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def blocking_turn(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return "umbral turn done"
+
+        agent = MagicMock()
+        agent._rooms = {}
+        agent.handle_input = AsyncMock(side_effect=blocking_turn)
+        agent.history = MagicMock(
+            side_effect=lambda rid: agent._rooms.setdefault(rid, []))
+        agent.cancel = MagicMock(return_value=None)
+        agent.tools = []
+        agent.config = MagicMock()
+        agent.config.workspace = "/tmp/test-workspace"
+        agent.config.model_aliases = {}
+
+        bot = self._make_hb_bot(agent, tmp_path=None)
+        notices = []
+        bot.send_notice = AsyncMock(side_effect=lambda rid, t: notices.append(t))
+
+        turn_task = asyncio.create_task(
+            bot._run_heartbeat_turn(ROOM_A, "umbral content", turn_source="umbral")
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert ROOM_A in bot._active_turns
+            await self._deposit(bot, "umbral steer")
+            assert bot._steering_inbox.get(ROOM_A) == ["umbral steer"]
+        finally:
+            release.set()
+            await asyncio.wait_for(turn_task, timeout=10)
+
+        logged = self._extract_calls(
+            bot.session_log.append, role="user", source="steer"
+        )
+        assert any(c.get("content") == "umbral steer" for c in logged), logged
+
+    @pytest.mark.asyncio
+    async def test_G5_heartbeat_path_injects_note_into_provider_messages(
+        self, tmp_path
+    ):
+        """G5 (gold, real-path). REAL Agent on the heartbeat turn path with
+        the drain_steering closure wired via _build_agent_callbacks: a note
+        deposited mid-turn appears — with framing — in the messages sent to
+        the provider on the next loop iteration."""
+        config = _make_agent_config(tmp_path)
+        agent = Agent(config)
+        bot = self._make_hb_bot(agent, tmp_path)
+
+        provider_calls = []
+        first_call_done = asyncio.Event()
+        deposit_gate = asyncio.Event()
+        call_idx = [0]
+
+        with patch("openalph.agent.stream") as mock_stream:
+            async def capturing_stream(*args, **kwargs):
+                provider_calls.append(list(kwargs.get("messages", [])))
+                call_idx[0] += 1
+                if call_idx[0] == 1:
+                    # Hold call 1 open until the test has deposited the
+                    # steering note — guarantees the note is in the inbox
+                    # BEFORE iteration 2's drain runs (drain happens at the
+                    # top of the loop iteration, before the API call).
+                    first_call_done.set()
+                    await deposit_gate.wait()
+                    tc = ToolCall(id="tc_hb_1", name="shell",
+                                  input={"command": "echo one"})
+                    yield StreamEvent(type="tool_done", tool_index=0, tool_call=tc)
+                    yield StreamEvent(
+                        type="done",
+                        response=Response(
+                            content="", tool_calls=[tc],
+                            model="claude-sonnet-4-20250514",
+                            usage=Usage(input_tokens=10, output_tokens=5),
+                            stop_reason="tool_use"),
+                        stop_reason="tool_use",
+                        model="claude-sonnet-4-20250514")
+                else:
+                    yield StreamEvent(type="text", content="hb done")
+                    yield StreamEvent(
+                        type="done",
+                        response=Response(
+                            content="hb done",
+                            model="claude-sonnet-4-20250514",
+                            usage=Usage(input_tokens=10, output_tokens=5),
+                            stop_reason="end_turn"),
+                        stop_reason="end_turn",
+                        model="claude-sonnet-4-20250514")
+
+            mock_stream.side_effect = capturing_stream
+
+            tools_dir = tmp_path / "tools"
+            tools_dir.mkdir(exist_ok=True)
+            (tools_dir / "shell.toml").write_text("[config]\n")
+
+            bot.send_notice = AsyncMock()
+
+            turn_task = asyncio.create_task(
+                bot._run_heartbeat_turn(ROOM_A, "hb content",
+                                        turn_source="heartbeat")
+            )
+            try:
+                # Iteration 1 in flight (drain already ran, inbox empty):
+                # deposit through the REAL /steer slash path mid-turn.
+                await asyncio.wait_for(first_call_done.wait(), timeout=10)
+                assert ROOM_A in bot._active_turns, (
+                    "heartbeat turn must mark the room active (kdsn.311)"
+                )
+                await self._deposit(bot, "hb steer note")
+                assert bot._steering_inbox.get(ROOM_A) == ["hb steer note"]
+                deposit_gate.set()
+                await asyncio.wait_for(turn_task, timeout=15)
+            except BaseException:
+                deposit_gate.set()
+                turn_task.cancel()
+                raise
+
+        assert len(provider_calls) >= 2, (
+            f"expected tool-loop iteration on the heartbeat path, got "
+            f"{len(provider_calls)} provider call(s)"
+        )
+        second_call_msgs = provider_calls[1]
+        steer_msgs = [
+            m for m in second_call_msgs
+            if m.get("role") == "user" and STEER_FRAMING in m.get("content", "")
+        ]
+        assert steer_msgs, (
+            "steering note must be injected (with framing) into the next "
+            f"provider call on the heartbeat path. User messages: "
+            f"{[m.get('content') for m in second_call_msgs if m.get('role') == 'user']}"
+        )

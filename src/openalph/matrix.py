@@ -1463,6 +1463,51 @@ class MatrixBot:
 
         return callbacks
 
+    def _make_steering_drain(self, room_id: str, turn_progress=None):
+        """Build the per-turn steering drain closure (kdsn.311).
+
+        ONE construction seam shared by _process_message and
+        _run_heartbeat_turn so the live and synthetic turn paths cannot
+        drift (duplicated callback construction was the root cause of ~5
+        audit findings per the tool-management skill). The closure pops the
+        room's steering inbox atomically (list.pop is GIL-safe), logs each
+        note to JSONL as role=user/source=steer (build_context re-frames
+        source==steer entries on replay, so live and rebuild match), emits
+        a delivered notice, and returns the note strings for the agent loop
+        to inject at the next tool-loop boundary.
+
+        ``turn_progress`` is the stall-watchdog liveness hook; the
+        heartbeat/umbral path runs inside the timer-loop task with no
+        watchdog and passes None.
+        """
+        if not hasattr(self, '_steering_inbox'):
+            self._steering_inbox = {}
+
+        async def _drain_steering() -> list:
+            notes = self._steering_inbox.pop(room_id, [])
+            if notes and turn_progress is not None:
+                turn_progress()
+            for _n in notes:
+                # Log to JSONL: role=user, source=steer, original text
+                _sl2 = getattr(self, 'session_log', None)
+                if _sl2:
+                    _sl2.append(
+                        role="user",
+                        sender=self.config.user_id,
+                        room=room_id,
+                        event_id=None,
+                        content=_n,
+                        source="steer",
+                    )
+                # Emit "delivered" notice to operator
+                try:
+                    await self.send_notice(room_id, "🧭 Steering note delivered")
+                except Exception:
+                    pass
+            return notes
+
+        return _drain_steering
+
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
         """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
 
@@ -1480,6 +1525,12 @@ class MatrixBot:
         _tool_notice, _tool_intent = self._make_tool_callbacks(room_id)
 
         # Process through agent
+        # kdsn.311: pre-initialized so the finally below can never hit an
+        # UnboundLocalError if the try body raises before the drain is armed
+        # (e.g. a _set_typing network failure) — same guard pattern as the
+        # live path's _drain_steering_fn. A raise before arming leaves the
+        # active-turn mark untouched (never added) and skips the final drain.
+        _hb_drain = None
         try:
             await self._set_typing(room_id, True)
 
@@ -1573,6 +1624,27 @@ class MatrixBot:
             # R1 refactor: use shared _build_agent_callbacks for identical wiring
             callbacks = self._build_agent_callbacks(room_id, turn_source)
 
+            # kdsn.311: steering works on heartbeat/umbral turns too. Arm the
+            # SAME active-turn mark + drain seam as the live path so /steer
+            # can redirect a long-running autonomous turn ("No active turn
+            # to steer" was inaccurate — the heartbeat turn IS a turn). The
+            # timer-loop task runs this turn; the drain closure rides the
+            # callbacks dict via the shared _make_steering_drain seam.
+            if not hasattr(self, '_active_turns'):
+                self._active_turns = set()
+            self._active_turns.add(room_id)
+            _hb_drain = self._make_steering_drain(room_id)
+            callbacks['drain_steering'] = _hb_drain
+            # NOTE (audit qwen MEDIUM-2): heartbeat turns do not hold the
+            # per-room session lock, so a fired heartbeat turn CAN overlap a
+            # live operator turn in this room. Both install drains over the
+            # SAME per-room inbox; whichever reaches a tool-loop boundary
+            # first consumes a deposited note (first-drainer-wins). A note
+            # consumed by the "wrong" turn is still JSONL-logged, noticed,
+            # and framed into context on the next rebuild — degraded
+            # delivery, never lost. Per-turn inbox scoping is bead-tracked
+            # follow-up work.
+
             response = await self.agent.handle_input(
                 content,
                 room_id,
@@ -1624,6 +1696,16 @@ class MatrixBot:
                             "after retry. This may indicate degeneration or a provider issue.")
         finally:
             await self._set_typing(room_id, False)
+            # kdsn.311 race rule (same as _process_message): final drain
+            # pass to catch notes that arrived during the last iteration,
+            # THEN discard the active-turn mark.
+            if _hb_drain is not None:
+                try:
+                    await _hb_drain()
+                except Exception:
+                    pass
+            if hasattr(self, '_active_turns'):
+                self._active_turns.discard(room_id)
 
     def _build_context_status(self, rid: str) -> dict:
         """Assemble context status data dict for the context_status tool.
@@ -2393,40 +2475,17 @@ class MatrixBot:
                         )
 
                 # Build drain_steering closure and mark turn active.
-                # The closure pops the inbox atomically (list.pop is GIL-safe),
-                # logs each note to JSONL, emits a "delivered" notice, and
-                # returns the note strings so the agent loop can inject them.
-                # _active_turns is set here, BEFORE handle_input, so that a
-                # concurrent /steer command can detect the active turn.
-                if not hasattr(self, '_steering_inbox'):
-                    self._steering_inbox = {}
+                # The closure is built by the ONE shared seam
+                # (_make_steering_drain, kdsn.311) also used by the
+                # heartbeat/umbral path, so the two turn paths cannot
+                # drift. _active_turns is set here, BEFORE handle_input,
+                # so that a concurrent /steer command can detect the
+                # active turn.
                 if not hasattr(self, '_active_turns'):
                     self._active_turns = set()
                 self._active_turns.add(room_id)
 
-                async def _drain_steering() -> list:
-                    notes = self._steering_inbox.pop(room_id, [])
-                    if notes:
-                        _turn_progress()
-                    for _n in notes:
-                        # Log to JSONL: role=user, source=steer, original text
-                        _sl2 = getattr(self, 'session_log', None)
-                        if _sl2:
-                            _sl2.append(
-                                role="user",
-                                sender=self.config.user_id,
-                                room=room_id,
-                                event_id=None,
-                                content=_n,
-                                source="steer",
-                            )
-                        # Emit "delivered" notice to operator
-                        try:
-                            await self.send_notice(room_id, "🧭 Steering note delivered")
-                        except Exception:
-                            pass
-                    return notes
-
+                _drain_steering = self._make_steering_drain(room_id, _turn_progress)
                 _drain_steering_fn = _drain_steering
 
                 # Pass drain_steering via callbacks dict so that test mocks

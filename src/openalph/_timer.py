@@ -105,6 +105,106 @@ class RecurringTimerManager:
         # could not cancel it, and it fired at double cadence. The lock makes the
         # cancel-and-replace atomic per room.
         self._start_locks: dict[str, asyncio.Lock] = {}
+        # kdsn.310: the loop task serving each room, captured at loop entry.
+        # apply_in_own_turn() uses it to RE-REGISTER the still-running loop
+        # after a same-batch sibling stop() deleted the entry — spawning a
+        # fresh task there would leave the old loop alive (its post-callback
+        # exit check only sees the room back in _tasks) → two loops, one room.
+        # Popped when the loop task actually exits (never by stop(), which
+        # must leave it readable for the resurrect path mid-turn).
+        self._fired_loop_tasks: dict[str, asyncio.Task] = {}
+
+    async def apply_in_own_turn(
+        self,
+        room_id: str,
+        interval_seconds: float,
+        directive: str | None = None,
+    ) -> None:
+        """Replace the cadence/directive for ``room_id`` WITHOUT cancelling
+        or spawning a loop task (kdsn.310).
+
+        This is the manager seam for the heartbeat tool's own-turn start:
+        the room's fired turn runs INSIDE the loop task, so the tool's call
+        executes in a gather child of it — cancelling that ancestor kills
+        the running turn (cyclic cancel, kdsn.290 audit R1), and spawning a
+        replacement would race the still-running old loop into a
+        double-fire. Instead:
+
+        - entry present → mutate bookkeeping in place. The loop re-reads
+          ``_intervals``/``_schedules`` at the top of every iteration, so
+          the next sleep already uses the new cadence.
+        - entry absent (same-batch sibling ``stop`` already removed it) →
+          re-register the STILL-RUNNING loop task from ``_fired_loop_tasks``
+          so the post-callback exit check finds the room live again and the
+          loop continues on the new cadence.
+        - no live loop at all → fall back to ``_start_common`` (fresh task),
+          so a late/external apply can never strand the change.
+
+        Interval-only by contract (the tool owns that policy): applying to
+        a schedule-mode entry converts it to interval mode. Directive
+        semantics match ``_start_common``: ``None`` clears. The
+        decide+mutate block is fully synchronous (no awaits) so a concurrent
+        gather sibling — the same-batch ``[start, stop]`` race — cannot
+        interleave mid-mutation; the resulting state is always ONE coherent
+        terminal state (running-with-new-params, or stopped).
+
+        NOT a generic start replacement: unlike ``_start_common`` it takes
+        no per-room lock (no cancel-and-replace to serialize), so a
+        concurrent external ``start()`` is last-writer-wins — coherent, but
+        don't build on the interleaving order.
+        """
+        # Defense-in-depth for non-tool callers (the tool path floors at
+        # 300s before reaching here): a non-positive interval would arm a
+        # busy-fire loop.
+        if (
+            not isinstance(interval_seconds, (int, float))
+            or isinstance(interval_seconds, bool)
+            or interval_seconds <= 0
+        ):
+            raise ValueError(
+                f"interval_seconds must be a positive number, got "
+                f"{interval_seconds!r}"
+            )
+        if room_id not in self._tasks:
+            task = self._fired_loop_tasks.get(room_id)
+            # cancelling() > 0 means an external stop() has already requested
+            # cancellation of this loop — re-registering it would persist a
+            # "running" entry for a task that dies at its next suspension
+            # (audit qwen LOW-1). Fall through to a fresh start instead,
+            # which is the coherent last-action-wins state.
+            if (
+                task is not None
+                and not task.done()
+                and task.cancelling() == 0
+            ):
+                self._tasks[room_id] = task
+            else:
+                await self._start_common(
+                    room_id, interval_seconds, None, None, directive
+                )
+                return
+
+        # Interval-only by contract (the heartbeat tool is interval-only;
+        # cron schedules stay operator slash-command territory). Applying
+        # to a schedule-mode entry converts it to interval mode — the same
+        # conversion a slash `start <interval>` would perform.
+        self._intervals[room_id] = interval_seconds
+        self._schedules.pop(room_id, None)
+        self._timezones.pop(room_id, None)
+
+        # Same non-str coercion as _start_common (corrupt-JSON / future-
+        # caller safety — the directive escaper must never see a non-str).
+        if directive is not None and not isinstance(directive, str):
+            logger.warning(
+                "Ignoring non-str directive for %s (%s)",
+                room_id, type(directive).__name__,
+            )
+            directive = None
+        self._directives[room_id] = directive
+        # Fresh-cadence semantics (mirror _start_common's fresh start): the
+        # new interval counts from the apply, not from the old fire time.
+        self._last_fired[room_id] = time.time()
+        await self._persist()
 
     async def start(
         self,
@@ -508,6 +608,13 @@ class RecurringTimerManager:
     ) -> None:
         """Shared loop. Cadence is selected by ``_drift_correct``/``_overlap_guard``."""
         try:
+            # kdsn.310: capture THIS task as the room's loop task so
+            # apply_in_own_turn can re-register it after a same-batch
+            # sibling stop() removed the entry mid-turn (a fresh task there
+            # would double-fire against this still-running loop). Cleared
+            # only when the loop actually exits — stop() deliberately does
+            # NOT clear it, because the resurrect path reads it mid-turn.
+            self._fired_loop_tasks[room_id] = asyncio.current_task()
             first = True
             while True:
                 if first and initial_delay is not None:
@@ -586,6 +693,13 @@ class RecurringTimerManager:
                     break
         except asyncio.CancelledError:
             pass  # normal shutdown — don't propagate
+        finally:
+            # Identity-guarded: if this loop was superseded mid-turn (own-turn
+            # apply falling back to a fresh _start_common task), the dict
+            # already holds the NEW task's capture — a blind pop here would
+            # erase it and blind a later resurrect.
+            if self._fired_loop_tasks.get(room_id) is asyncio.current_task():
+                self._fired_loop_tasks.pop(room_id, None)
 
     async def _persist(self) -> None:
         """Write current timers to disk atomically."""

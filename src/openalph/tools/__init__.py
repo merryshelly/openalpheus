@@ -738,6 +738,13 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "tokens on every fire — ALWAYS stop the heartbeat when the "
             "supervised job completes. Minimum interval is 5 minutes. "
             "Re-issuing start replaces the existing timer for this room. "
+            "IMPORTANT: start issued from within this room's own fired "
+            "heartbeat turn updates the interval/directive IN PLACE — "
+            "effective for the next fire; the running turn is not "
+            "interrupted. One start call is enough to change interval "
+            "and/or directive — no stop+start pair needed. Omitting "
+            "directive on start clears any standing directive (pass "
+            "directive explicitly to keep or replace it). "
             "Cannot start while an umbral timer is active in the room. "
             "IMPORTANT: interval mode only (\"15m\", \"1h\", or seconds as an "
             "integer) — cron schedules remain operator slash-command territory "
@@ -1304,32 +1311,24 @@ async def _execute_heartbeat_tool(input: dict, callbacks: dict | None) -> "ToolR
     # start
     # =====================================================================
     if action == "start":
-        # R1 (tool policy): start issued from within the room's OWN fired
-        # heartbeat turn is refused. Re-issue=start replaces the timer, and
-        # replacement cancels the current loop task — the ancestor of the
-        # gather child this call runs in — recreating the cyclic-cancel the
-        # manager-side R1 fix prevents for stop. A deferred-replacement
-        # mechanism ("apply at end of the turn") is out of scope for v1, so
-        # the contract is: interval changes must come from a LATER turn.
-        # The refusal keys on in_own_loop ALONE (re-audit F5): a same-batch
-        # [stop, start] pair inside one fired turn runs as parallel gather
-        # siblings, and the stop sibling removes the room's entry BEFORE
-        # this probe can read it — any additional "entry exists" AND-term
-        # would silently skip the refusal and arm a NEW timer mid-turn,
-        # violating the steering's "the current timer keeps running"
-        # promise. Keying exclusively on the contextvar closes the race:
-        # the mark survives the sibling's bookkeeping removal for the
-        # whole turn.
-        # Checked early, before interval validation: fired turns only enter
-        # here with a complete tool-call input (action is required by the
-        # schema), and a fixed refusal beats a confusing per-field error
-        # sample for a call that could never have succeeded.
+        # Own-turn detection (kdsn.310): a start issued from within the
+        # room's OWN fired heartbeat turn is an IN-PLACE cadence/directive
+        # update via manager.apply_in_own_turn — never the cancel-and-
+        # replace start() (that would cancel the loop task this tool call
+        # runs inside: the loop task is the ancestor of this gather child;
+        # cyclic cancel, kdsn.290 audit R1). The old unconditional refusal
+        # ("interval changes need a later turn") made autonomous heartbeat
+        # self-modification impossible — an agent that stopped its own
+        # heartbeat could never re-arm until an operator message created a
+        # non-heartbeat turn. Same-batch [stop, start] gather races are
+        # handled manager-side (apply re-registers the still-running loop
+        # task; never a second task).
+        # The probe is advisory (getattr + never-raise): any failure reading
+        # it falls through to the ordinary start path, which has its own
+        # exception hygiene. Own-turn is an apply-mechanism switch, NOT a
+        # policy exemption — every validation below (interval parse, floor,
+        # directive shape, umbral exclusion) applies to both paths.
         _in_own_turn = False
-        # getattr defends against contract drift (a mock or partial manager
-        # lacking the helper); a REAL manager always exposes both. Any error
-        # reading state here MUST NOT crash the turn (never-raise rule) —
-        # fall through to the ordinary start path, which has its own
-        # exception hygiene around hb.start.
         try:
             _has = getattr(hb, "in_own_loop", None)
             if _has is not None:
@@ -1339,15 +1338,6 @@ async def _execute_heartbeat_tool(input: dict, callbacks: dict | None) -> "ToolR
                 "in_own_loop probe failed for %s; treating as not-own-turn",
                 room_id,
                 exc_info=True,
-            )
-        if _in_own_turn:
-            return ToolResult(
-                content=(
-                    "Heartbeat is running its own turn right now — interval "
-                    "changes take effect only if issued from a later turn; "
-                    "the current timer keeps running."
-                ),
-                is_error=True,
             )
 
         # interval required for start.
@@ -1444,6 +1434,46 @@ async def _execute_heartbeat_tool(input: dict, callbacks: dict | None) -> "ToolR
                     ),
                     is_error=True,
                 )
+
+        # --- Own-turn path: in-place cadence/directive update (kdsn.310) ---
+        if _in_own_turn:
+            # Read the standing directive BEFORE applying so an omitted
+            # directive can be reported as cleared (silent clears are how
+            # agents lose standing routines).
+            _prev_directive = None
+            if directive is None:
+                try:
+                    _prev_directive = hb.directive_for(room_id)
+                except Exception:
+                    _prev_directive = None
+            try:
+                await hb.apply_in_own_turn(room_id, seconds, directive)
+            except Exception as e:
+                return ToolResult(
+                    content=f"Heartbeat update failed: {type(e).__name__}.",
+                    is_error=True,
+                )
+            human = format_interval(seconds)
+            if send_notice is not None:
+                try:
+                    await send_notice(
+                        room_id, f"💓 Heartbeat updated — every {human} (next fire)"
+                    )
+                except Exception:
+                    logger.warning("heartbeat update notice failed in %s", room_id)
+            content = (
+                f"Heartbeat updated in place: every {human} in this room — "
+                "effective for the next fire; the running timer was not "
+                "interrupted.\n"
+                "Persists across process restarts. Stop with action=\"stop\" "
+                "when done."
+            )
+            if directive is None and _prev_directive:
+                content += (
+                    "\nStanding directive cleared — pass directive on start "
+                    "to set one."
+                )
+            return ToolResult(content=content, is_error=False)
 
         # Delegate to the manager (replace is the tested manager contract —
         # no refusal, no special message for an already-active timer).
