@@ -1,21 +1,42 @@
-"""Tests for reasoning_content replay on OpenAI-compatible providers (kdsn.241.2).
+"""Tests for reasoning_content replay on OpenAI-compatible providers (kdsn.241.2, kdsn.308).
 
 Vendor requirement (Moonshot Kimi K2.6, Z.AI GLM-5.2, Fireworks): within a
 multi-step tool-calling loop, the client MUST send stored reasoning_content back
 on replayed assistant turns, or the model degenerates / errors. OpenAlph
 historically STRIPPED thinking from all assistant messages before replay to
-OpenAI-compatible providers. This restores it, gated behind a per-provider
-`reasoning_replay` quirk (opt-in; strict endpoints that reject the field keep
-the strip behavior by default).
+OpenAI-compatible providers. kdsn.241.2 restored it gated behind the opt-in
+`reasoning_replay` quirk; kdsn.308 flips the default ON for every openai-type
+provider (passback is self-gating — a model that emits no thinking has nothing
+replayed), with the `no_reasoning_replay` quirk as the opt-out for strict
+endpoints. The legacy `reasoning_replay` quirk is still tolerated (it now means
+the default) but logs a warn-once deprecation.
 """
 import json
+import logging
+
 import pytest
 
+import openalph.provider as provider_module
 from openalph.provider import (
     _convert_messages_for_openai,
     _convert_messages_for_provider,
     ToolCall,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_reasoning_replay_warn_latch():
+    """Each test starts with the deprecation warn-once latch empty.
+
+    getattr-tolerant: the latch set must exist in provider.py for the suite to
+    be meaningful, but a missing attribute must not convert assertion reds into
+    fixture-setup errors during red-first development."""
+    latch = getattr(provider_module, "_REASONING_REPLAY_DEPRECATION_WARNED", None)
+    if latch is not None:
+        latch.clear()
+    yield
+    if latch is not None:
+        latch.clear()
 
 
 def _assistant_with_thinking(content="", thinking_texts=(), tool_calls=None):
@@ -27,22 +48,42 @@ def _assistant_with_thinking(content="", thinking_texts=(), tool_calls=None):
     return msg
 
 
-class TestReplayDisabledByDefault:
-    """Default (no quirk): current behavior preserved — thinking stripped, no reasoning_content."""
+_DEPRECATION_FRAGMENT = "deprecated"
+_CONFLICT_FRAGMENT = "conflict"
 
-    def test_thinking_stripped_when_replay_off(self):
+
+def _deprecation_warnings(caplog):
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and _DEPRECATION_FRAGMENT in r.getMessage().lower()
+    ]
+
+
+def _conflict_warnings(caplog):
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and _CONFLICT_FRAGMENT in r.getMessage().lower()
+    ]
+
+
+class TestReplayDefault:
+    """Default (no quirk): kdsn.308-inverted behavior — thinking replayed as reasoning_content."""
+
+    def test_thinking_replayed_on_plain_turn_by_default(self):
         msgs = [_assistant_with_thinking(content="hi", thinking_texts=["secret reasoning"])]
-        out = _convert_messages_for_openai(msgs)  # reasoning_replay defaults False
+        out = _convert_messages_for_openai(msgs)  # reasoning_replay defaults True (kdsn.308)
+        assert out[0]["reasoning_content"] == "secret reasoning"
         assert "thinking" not in out[0]
-        assert "reasoning_content" not in out[0]
         assert out[0]["content"] == "hi"
 
-    def test_thinking_stripped_with_tool_calls_when_replay_off(self):
+    def test_thinking_replayed_with_tool_calls_by_default(self):
         tc = ToolCall(id="call_1", name="do_thing", input={"x": 1})
         msgs = [_assistant_with_thinking(content="", thinking_texts=["reasoning"], tool_calls=[tc])]
         out = _convert_messages_for_openai(msgs)
+        assert out[0]["reasoning_content"] == "reasoning"
         assert "thinking" not in out[0]
-        assert "reasoning_content" not in out[0]
         assert out[0]["tool_calls"][0]["function"]["name"] == "do_thing"
 
 
@@ -108,23 +149,74 @@ class TestReplayEnabled:
 
 
 class TestQuirkThreadingViaProvider:
-    """_convert_messages_for_provider derives reasoning_replay from the quirks list."""
+    """_convert_messages_for_provider resolves reasoning_replay from the quirks list (kdsn.308:
+    default ON, `no_reasoning_replay` opts out, legacy `reasoning_replay` tolerated + warn-once)."""
 
-    def test_quirk_enables_replay(self):
-        msgs = [_assistant_with_thinking(content="a", thinking_texts=["reasoning here"])]
-        out = _convert_messages_for_provider(msgs, "openai", quirks=["reasoning_replay"])
-        assert out[0]["reasoning_content"] == "reasoning here"
-
-    def test_no_quirk_strips(self):
+    def test_no_quirk_replays_default(self):
         msgs = [_assistant_with_thinking(content="a", thinking_texts=["reasoning here"])]
         out = _convert_messages_for_provider(msgs, "openai", quirks=[])
+        assert out[0]["reasoning_content"] == "reasoning here"
+        assert "thinking" not in out[0]
+
+    def test_quirks_none_replays_default(self):
+        msgs = [_assistant_with_thinking(content="a", thinking_texts=["r"])]
+        out = _convert_messages_for_provider(msgs, "openai")
+        assert out[0]["reasoning_content"] == "r"
+
+    def test_legacy_quirk_replays_and_warns(self, caplog):
+        msgs = [_assistant_with_thinking(content="a", thinking_texts=["reasoning here"])]
+        with caplog.at_level(logging.WARNING, logger="openalph.provider"):
+            out = _convert_messages_for_provider(msgs, "openai", quirks=["reasoning_replay"])
+        assert out[0]["reasoning_content"] == "reasoning here"
+        deprecation = _deprecation_warnings(caplog)
+        assert len(deprecation) == 1
+        assert "reasoning_replay" in deprecation[0].getMessage()
+
+    def test_optout_strips(self, caplog):
+        msgs = [_assistant_with_thinking(content="a", thinking_texts=["reasoning here"])]
+        with caplog.at_level(logging.WARNING, logger="openalph.provider"):
+            out = _convert_messages_for_provider(msgs, "openai", quirks=["no_reasoning_replay"])
         assert "reasoning_content" not in out[0]
         assert "thinking" not in out[0]
 
-    def test_quirks_none_defaults_to_strip(self):
+    def test_optout_no_warning(self, caplog):
+        """Deliberate operator opt-out: stripped, and no deprecation warning emitted."""
         msgs = [_assistant_with_thinking(content="a", thinking_texts=["r"])]
-        out = _convert_messages_for_provider(msgs, "openai")
+        with caplog.at_level(logging.WARNING, logger="openalph.provider"):
+            out = _convert_messages_for_provider(msgs, "openai", quirks=["no_reasoning_replay"])
         assert "reasoning_content" not in out[0]
+        assert _deprecation_warnings(caplog) == []
+        assert _conflict_warnings(caplog) == []
+
+    def test_legacy_warn_latches(self, caplog):
+        """Warn-once: two conversions with the legacy quirk produce exactly one warning."""
+        msgs = [_assistant_with_thinking(content="a", thinking_texts=["r"])]
+        with caplog.at_level(logging.WARNING, logger="openalph.provider"):
+            _convert_messages_for_provider(msgs, "openai", quirks=["reasoning_replay"])
+            _convert_messages_for_provider(msgs, "openai", quirks=["reasoning_replay"])
+        assert len(_deprecation_warnings(caplog)) == 1
+
+    def test_both_quirks_optout_wins_and_warns(self, caplog):
+        """Both quirks present: opt-out wins (strip) + a DISTINCT conflict warning."""
+        msgs = [_assistant_with_thinking(content="a", thinking_texts=["reasoning here"])]
+        with caplog.at_level(logging.WARNING, logger="openalph.provider"):
+            out = _convert_messages_for_provider(
+                msgs, "openai", quirks=["reasoning_replay", "no_reasoning_replay"])
+        assert "reasoning_content" not in out[0]
+        assert "thinking" not in out[0]
+        conflict = _conflict_warnings(caplog)
+        assert len(conflict) == 1
+        # Distinct message: not the plain deprecation text
+        assert _deprecation_warnings(caplog) == []
+
+    def test_convert_openai_default_param_flipped(self):
+        """_convert_messages_for_openai's reasoning_replay default flipped False -> True."""
+        msgs = [_assistant_with_thinking(content="a", thinking_texts=["r"])]
+        assert _convert_messages_for_openai(msgs)[0]["reasoning_content"] == "r"
+        # Explicit False still strips (strict endpoints can force the old behavior).
+        out = _convert_messages_for_openai(msgs, reasoning_replay=False)
+        assert "reasoning_content" not in out[0]
+        assert "thinking" not in out[0]
 
     def test_reasoning_replay_quirk_ignored_for_anthropic(self):
         """Anthropic path has its own thinking mechanism; the openai-only quirk

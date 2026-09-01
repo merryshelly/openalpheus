@@ -607,6 +607,14 @@ _MACSTUDIO_QWEN_EFFORT_MAP: dict[str, str] = {
 # _BLACKWELL_EFFORT_WARNED / _SYNTHETIC_EFFORT_WARNED.
 _MACSTUDIO_QWEN_EFFORT_WARNED: set[str] = set()
 
+# reasoning_replay quirk notices already WARNed about (one warning per
+# process, never per message): "deprecation" for the legacy opt-in quirk
+# (kdsn.308 made replay the default, so it is now redundant), "conflict"
+# when both quirks are present. House convention mirrors
+# _BLACKWELL_EFFORT_WARNED / _VISION_WARNED. Tests only clear this set and
+# assert via caplog.
+_REASONING_REPLAY_DEPRECATION_WARNED: set[str] = set()
+
 
 def model_supports_vision(api_model: str, config) -> bool:
     """Resolve whether a model accepts image content blocks (kdsn.275).
@@ -1088,7 +1096,33 @@ def _convert_messages_for_provider(
     if provider_type == "anthropic":
         return _convert_messages_for_anthropic(messages)
     elif provider_type == "openai":
-        reasoning_replay = "reasoning_replay" in (quirks or [])
+        # reasoning_replay defaults ON (kdsn.308): passback is self-gating —
+        # a model that emits no thinking has nothing replayed. The
+        # no_reasoning_replay quirk opts out (strict endpoints that reject
+        # the unknown field); the legacy reasoning_replay quirk is tolerated
+        # (it now means the default) with a warn-once deprecation. Both
+        # quirks present: opt-out wins + a distinct warn-once conflict.
+        quirks = quirks or []
+        if "no_reasoning_replay" in quirks:
+            if "reasoning_replay" in quirks:
+                if "conflict" not in _REASONING_REPLAY_DEPRECATION_WARNED:
+                    _REASONING_REPLAY_DEPRECATION_WARNED.add("conflict")
+                    logger.warning("Conflicting quirks on openai provider: "
+                                   "both 'reasoning_replay' and "
+                                   "'no_reasoning_replay' present; "
+                                   "'no_reasoning_replay' wins (strip).")
+            reasoning_replay = False
+        else:
+            if "reasoning_replay" in quirks:
+                if "deprecation" not in _REASONING_REPLAY_DEPRECATION_WARNED:
+                    _REASONING_REPLAY_DEPRECATION_WARNED.add("deprecation")
+                    logger.warning("The 'reasoning_replay' quirk is "
+                                   "deprecated: replay is now the default "
+                                   "for openai-type providers (kdsn.308). "
+                                   "Remove the quirk, or opt out with "
+                                   "'no_reasoning_replay' for strict "
+                                   "endpoints.")
+            reasoning_replay = True
         return _convert_messages_for_openai(messages, reasoning_replay=reasoning_replay)
     return messages
 
@@ -1226,18 +1260,21 @@ def _convert_messages_for_anthropic(messages: list[dict]) -> list[dict]:
 
 
 def _convert_messages_for_openai(
-    messages: list[dict], reasoning_replay: bool = False,
+    messages: list[dict], reasoning_replay: bool = True,
 ) -> list[dict]:
     """Convert normalized messages to OpenAI format.
 
-    reasoning_replay: when True, stored thinking blocks on assistant turns are
-    re-emitted as a flat ``reasoning_content`` string (the OpenAI-compat wire
-    field) instead of being dropped. Vendor thinking models (Kimi K2.6,
-    GLM-5.2) require the reasoning to be sent back within a multi-step
-    tool-calling loop or they degenerate/loop (kdsn.241.2; vendor-guidance.md).
-    Opt-in per-provider via the ``reasoning_replay`` quirk, because some strict
-    OpenAI-compatible endpoints reject the unknown field; Fireworks accepts it.
-    When False (default), the historical strip behavior is preserved.
+    reasoning_replay: when True (the default, kdsn.308), stored thinking
+    blocks on assistant turns are re-emitted as a flat ``reasoning_content``
+    string (the OpenAI-compat wire field) instead of being dropped. Vendor
+    thinking models (Kimi K2.6, GLM-5.2) require the reasoning to be sent
+    back within a multi-step tool-calling loop or they degenerate/loop
+    (kdsn.241.2; vendor-guidance.md). Passback is self-gating: a model that
+    emits no thinking has nothing replayed. Strict OpenAI-compatible
+    endpoints that reject the unknown field opt out via the
+    ``no_reasoning_replay`` quirk (or by passing False here); a strict
+    endpoint that lacks the opt-out fails LOUD (400 naming the field) — by
+    design.
     """
     # Belt-and-suspenders: drop duplicate trailing user message if present.
     # The gated-room path should prevent this via append_user=False, but we
