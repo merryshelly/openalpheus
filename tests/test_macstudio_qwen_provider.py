@@ -21,8 +21,10 @@ _build_openai_kwargs (not _supports_reasoning_extra — and that gate emits
 the nested reasoning.effort form llama.cpp ignores anyway) -> OA sent
 nothing and the server-side pin was the only effort control (kdsn.271 bug
 class: silent server-default override of operator intent). Map:
-off->none, low/medium/xhigh 1:1, max ceiling->xhigh, high DOWN->medium,
-each lossy remap warn-once — never up.
+off->none, low/medium/xhigh 1:1, high and max ceiling->xhigh, each lossy
+remap warn-once (the high up-map is an SB override of the blackwell
+never-up rule, 2026-09-01: xhigh is the only tier above medium on this
+template, and the alternative was a 500 turn-crash).
 """
 
 import logging
@@ -81,15 +83,17 @@ class TestMacstudioQwenEffortMapping:
         kw = _build_openai_kwargs(**self._args(level))
         assert self._effort(kw) == level
 
-    def test_high_maps_to_medium_with_warning(self, caplog):
-        """'high' is a 500 (Jinja raise_exception) on this template. Collapse
-        DOWN to medium + warn-once — NEVER up to xhigh: mapping up would
-        silently multiply reasoning volume against operator intent, and SB
-        observed xhigh overthinking on this model (the reason the medium
-        pin existed at all)."""
+    def test_high_maps_to_xhigh_with_warning(self, caplog):
+        """'high' is a 500 (Jinja raise_exception) on this template.
+        Ceiling-map UP to xhigh (template top) + warn-once — SB override of
+        the blackwell never-up rule (2026-09-01, "high -> xhigh, please"):
+        xhigh is the only tier above medium on this template, so the
+        alternative to mapping up was a 500 turn-crash, not a graceful
+        downgrade. The warn-once keeps the non-native request visible in
+        logs even though the direction is now up."""
         with caplog.at_level(logging.WARNING):
             kw = _build_openai_kwargs(**self._args("high"))
-        assert self._effort(kw) == "medium"
+        assert self._effort(kw) == "xhigh"
         assert any(
             "high" in r.message and "reasoning_effort" in r.message
             for r in caplog.records

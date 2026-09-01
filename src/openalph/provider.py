@@ -584,8 +584,11 @@ _BLACKWELL_EFFORT_WARNED: set[str] = set()
 # chat_template_kwargs, overriding the CLI --chat-template-kwargs pin
 # per-key; "none" sets enable_thinking=false and erases any pinned kwarg
 # (thinking-off works even with a pin live). ALWAYS send explicitly
-# (kdsn.271 omitted-param bug class). high collapses DOWN to medium and max
-# ceiling-maps to xhigh (template top), each warn-once — never map up.
+# (kdsn.271 omitted-param bug class). high and max both ceiling-map to
+# xhigh (template top), each warn-once — SB overrode the house never-up
+# default for this model 2026-09-01 ("high -> xhigh, please"): xhigh is
+# the only tier above medium here, and the alternative to mapping up was
+# a 500 turn-crash, not a graceful downgrade.
 # NOTE: the server-side pin was removed in the same change; clients that
 # omit the param now get the template default xhigh. OA never omits it.
 # Tier ranking left uncharacterized (n=1 probe at temp 1.0 was too noisy);
@@ -594,6 +597,7 @@ _MACSTUDIO_QWEN_EFFORT_MAP: dict[str, str] = {
     "off": "none",
     "low": "low",
     "medium": "medium",
+    "high": "xhigh",
     "xhigh": "xhigh",
     "max": "xhigh",
 }
@@ -1816,14 +1820,22 @@ def _build_openai_kwargs(
         # DSv4F text-prefix branch below (different provider key "macstudio"
         # AND different model string) can never see these requests.
         _mq_effort = _MACSTUDIO_QWEN_EFFORT_MAP.get(thinking_level, "medium")
-        _req_tier = _TIER.get("none" if thinking_level == "off" else thinking_level)
-        if (_req_tier is not None and _TIER.get(_mq_effort, -1) < _req_tier
+        # Warn-once on ANY non-identity remap of a KNOWN OA level — tier
+        # drops (max->xhigh) AND up-maps (high->xhigh, SB 2026-09-01): the
+        # sent effort must never silently differ from the requested one.
+        # off->none is the disable-alias, identity after normalization —
+        # never warns. Out-of-enum values (absent from _TIER) stay silent
+        # per the NOTE-3 convention: warnings are for real levels the
+        # template rejects, not for garbage that should never occur.
+        _req_name = "none" if thinking_level == "off" else thinking_level
+        if (_TIER.get(_req_name) is not None
+                and _mq_effort != _req_name
                 and thinking_level not in _MACSTUDIO_QWEN_EFFORT_WARNED):
             _MACSTUDIO_QWEN_EFFORT_WARNED.add(thinking_level)
             logger.warning(
                 "macstudio-qwen (qwen38 template) does not support "
-                "reasoning_effort=%r; remapping to %r (operator intent is "
-                "lossy).", thinking_level, _mq_effort,
+                "reasoning_effort=%r; remapping to %r.",
+                thinking_level, _mq_effort,
             )
         extra_body["reasoning_effort"] = _mq_effort
     elif thinking_level == "off" and "deepseek-v4-flash" in api_model.lower():
