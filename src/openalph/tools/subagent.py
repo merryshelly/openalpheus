@@ -17,7 +17,7 @@ from pathlib import Path
 from openalph.provider import complete, compute_cost
 from openalph.tools import ToolDef, ToolResult, truncate_result, wrap_tool_result
 from openalph.config import AgentConfig
-from openalph.context_gc import apply_boundary_to_messages
+from openalph.context_gc import apply_boundary_to_messages, gc_thinking_tail_kwargs
 
 logger = logging.getLogger("openalph.subagent")
 
@@ -432,6 +432,7 @@ async def run_subagent(
                         boundary_index=len(messages),
                         task_text=task,
                         trigger="auto",
+                        **gc_thinking_tail_kwargs(config),
                     )
                     messages = _gc_outcome["messages"]
                     _gc_boundary_count += 1
@@ -712,6 +713,7 @@ async def run_subagent(
                     boundary_index=len(messages),
                     task_text=task,
                     trigger="breaker",
+                    **gc_thinking_tail_kwargs(config),
                 )
                 messages = _gc_outcome["messages"]
                 _gc_boundary_count += 1

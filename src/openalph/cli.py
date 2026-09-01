@@ -1059,6 +1059,7 @@ def _sanitize_room_label(label: str) -> str:
 def _setup_cli_session(config, agent, room_id, *, explicit_room=False):
     """Create or resume a CLI session. Returns (session_log, room_name, is_new)."""
     from openalph.session import SessionLog
+    from openalph.context_gc import gc_thinking_tail_kwargs
     # Resolve user_id: Phase 1 agents have config.user_id; legacy agents use matrix.user_id
     uid = getattr(config, "user_id", None) or (config.matrix.user_id if config.matrix else "cli")
     sl = SessionLog(config.workspace, uid)
@@ -1074,7 +1075,11 @@ def _setup_cli_session(config, agent, room_id, *, explicit_room=False):
         # Rehydrate history + usage + reminders
         history = agent.history(room_id)
         history.clear()
-        history.extend(sl.build_context(room_id))
+        # Thinking-tail preservation (workspace-kdsn.305.13 T4): the config
+        # knobs flow into the render; fail-closed to full strip (0/0,
+        # byte-identical legacy) when the config lacks them.
+        history.extend(sl.build_context(
+            room_id, **gc_thinking_tail_kwargs(config)))
         agent.restore_usage(room_id, sl.usage_totals(room_id))
         try:
             agent.rehydrate_reminders(room_id, entries)

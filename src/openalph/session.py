@@ -25,6 +25,7 @@ from openalph.context_gc import (
     LEGACY_EVENT,
     current_boundary_index,
     strip_thinking_entry,
+    thinking_tail_indices,
     tool_pointer,
     legacy_tool_placeholder,
 )
@@ -314,6 +315,8 @@ class SessionLog:
         self, room_id: str, *, skip_system: bool = True,
         gc_enabled: bool | None = None,
         gc_preserve_trailing: bool = False,
+        thinking_tail_turns: int = 0,
+        thinking_tail_max_tokens: int = 0,
     ) -> list[dict]:
         """Build LLM conversation context from JSONL entries.
 
@@ -341,6 +344,20 @@ class SessionLog:
                 (already framed and escaped at freeze time — never
                 re-framed).  JSONL entries are NEVER modified; all
                 reduction happens here at render time.
+            thinking_tail_turns / thinking_tail_max_tokens:
+                thinking-tail preservation (workspace-kdsn.305.13 T1/T4).
+                DEFAULT ZERO = FULL STRIP — byte-identical to pre-.13
+                renders for any caller that does not pass them.  When both
+                are non-zero AND gc_enabled with an active boundary, the
+                ``thinking_tail_indices`` selection (newest->oldest,
+                contiguous, chars//4 ceiling) names the pre-boundary
+                assistant positions whose thinking is retained VERBATIM
+                instead of stripped; every other transform for those
+                entries (tool-call compaction, media, orphan repair, …) is
+                unchanged — only the thinking-strip is skipped.  Config
+                values are passed explicitly by the production call sites
+                (the agent render paths and context_gc.apply_boundary_
+                and_rebuild); nothing changes for existing callers.
 
         Returns:
             List of message dicts ready for the LLM.
@@ -363,6 +380,20 @@ class SessionLog:
         # expunged by the FIRST boundary above it; its pointer must carry
         # THAT id, not the newest boundary (wave-2.1 A1, wonmun canary).
         _marker_list = _marker_indexes(entries) if gc_enabled else []
+        # Thinking-tail retention (workspace-kdsn.305.13 T1): computed ONCE
+        # per render, only when the tail can actually apply (gc_enabled +
+        # active boundary + both knobs non-zero).  Positions whose thinking
+        # is retained VERBATIM (pre-boundary span); empty = legacy full
+        # strip.  session.py renders by enumerate position, so the set keys
+        # onto entry_idx directly.
+        retained_tail = (
+            thinking_tail_indices(
+                entries, boundary_index,
+                thinking_tail_turns, thinking_tail_max_tokens)
+            if (gc_enabled and boundary_index >= 0
+                and thinking_tail_turns > 0 and thinking_tail_max_tokens > 0)
+            else frozenset()
+        )
         if gc_enabled and boundary_index >= 0:
             # Crash-atomicity tripwire (audit): a marker without its
             # following snapshot entry means the process died mid-sequence —
@@ -474,7 +505,17 @@ class SessionLog:
                 # Uniform transform: drop pre-boundary thinking; a
                 # thought-only turn (no content, no tool_calls) is deleted
                 # atomically — never leave an empty shell.
-                if gc_enabled and entry_idx < boundary_index:
+                # Thinking-tail (workspace-kdsn.305.13 T1): entries at a
+                # retained position keep their "thinking" into the rendered
+                # msg (the msg["thinking"] assignment below sees
+                # entry["thinking"]); everything else about that entry's
+                # processing is UNCHANGED (tool_call compaction, pairing
+                # harvest, media, orphan repair all still apply).  The
+                # retained set only ever contains eligible entries (content
+                # or tool_calls present), so a retained entry is never
+                # deleted here and no empty shell can result.
+                if (gc_enabled and entry_idx < boundary_index
+                        and entry_idx not in retained_tail):
                     _stripped_entry = strip_thinking_entry(entry)
                     if _stripped_entry is None:
                         continue

@@ -80,6 +80,8 @@ __all__ = [
     "legacy_tool_placeholder",
     "legacy_input_placeholder",
     "strip_thinking_entry",
+    "thinking_tail_indices",
+    "gc_thinking_tail_kwargs",
     "parse_durable_set",
     "resolve_durable_set",
     "durable_budget_tokens",
@@ -285,6 +287,126 @@ def strip_thinking_entry(entry: dict) -> dict | None:
     if not content_ok and not tool_calls:
         return None
     return out
+
+
+# ---------------------------------------------------------------------------
+# Thinking-tail preservation (workspace-kdsn.305.13)
+# ---------------------------------------------------------------------------
+
+def _thinking_block_chars(thinking) -> int:
+    """Deterministic char size of one thinking block (single source).
+
+    str thinking: len(str).  Structured (list of blocks): len(json.dumps(
+    thinking, sort_keys=True)) — sorted keys, so the estimate is stable
+    across renders and across the selection/estimator boundary.  Anything
+    else: 0.  BOTH consumers MUST go through this helper:
+      - ``thinking_tail_indices`` counts block est = _chars // 4 tokens
+        against the ceiling (whole-block, contiguous);
+      - ``_render_char_estimates`` / the message-list transform add the raw
+        _chars to the retained-thinking char total (divided ONCE, with the
+        rest of the span — a shared division carry may shift the composite
+        by one token vs the selection's per-block division).
+    A divergence between selection-fit math and manifest math is a defect.
+    """
+    if isinstance(thinking, str):
+        return len(thinking)
+    if thinking:
+        return len(json.dumps(thinking, sort_keys=True))
+    return 0
+
+
+def _tail_eligible(entry: dict) -> bool:
+    """Tail-eligibility (T1/T1a): pre-boundary assistant entries whose
+    thinking is retained — role assistant, non-empty thinking, AND
+    non-empty content (str, non-whitespace) or tool_calls.  Thought-only
+    entries (thinking with neither) are NEVER eligible: a thinking-only
+    assistant message is an untested render shape on the Anthropic path,
+    and thought-only turns are always stripped/deleted exactly as legacy.
+    Shape-agnostic: works on both JSONL entries and plain message dicts
+    (the subagent path's "id"-keyed tool_calls included — only truthiness
+    is consulted, never the key names)."""
+    if entry.get("role") != "assistant" or not entry.get("thinking"):
+        return False
+    content = entry.get("content")
+    content_ok = isinstance(content, str) and bool(content.strip())
+    return content_ok or bool(entry.get("tool_calls"))
+
+
+def thinking_tail_indices(entries: list, boundary_index: int, n: int,
+                          ceiling: int) -> frozenset[int]:
+    """Positions of the retained thinking tail (workspace-kdsn.305.13 T1).
+
+    Walk the pre-boundary span (position < boundary_index) NEWEST to
+    OLDEST.  An entry is TAIL-ELIGIBLE iff it is an assistant entry with
+    non-empty thinking AND non-empty content or tool_calls (thought-only
+    entries are never eligible and never consume slots — T1a).  Retain an
+    eligible entry's thinking while (a) retained count < n AND (b)
+    cumulative retained estimate + this block's estimate <= ceiling —
+    CONTIGUOUS-STOP on the first overflow: never skip to an older smaller
+    block (an older-without-newer tail is incoherent).  Whole blocks only —
+    never a partial thinking field.
+
+    Block estimate: ``_thinking_block_chars(thinking) // 4`` tokens
+    (deterministic — see the shared helper).  n <= 0, ceiling <= 0, or
+    boundary_index < 0 → empty set (full strip).  Returns a frozenset of
+    list POSITIONS (the same positions enumerate() assigns over the
+    pre-boundary span — session.py render and the message-list transform
+    both key on enumerate positions, so the set works for both shapes).
+    """
+    if n <= 0 or ceiling <= 0 or boundary_index < 0:
+        return frozenset()
+    retained: set[int] = set()
+    count = 0
+    cumulative = 0
+    for pos in range(min(boundary_index, len(entries)) - 1, -1, -1):
+        entry = entries[pos]
+        if not isinstance(entry, dict) or not _tail_eligible(entry):
+            continue
+        block_est = _thinking_block_chars(entry["thinking"]) // 4
+        if count < n and cumulative + block_est <= ceiling:
+            retained.add(pos)
+            count += 1
+            cumulative += block_est
+        else:
+            break  # contiguous stop on first overflow
+    return frozenset(retained)
+
+
+def gc_thinking_tail_kwargs(config) -> dict:
+    """build_context tail kwargs from an agent config (T4 default-to-legacy).
+
+    The single source for the PRODUCTION render call sites (matrix/cli/
+    callbacks): returns a dict ready to splat into
+    ``build_context(room_id, **kw)`` so a real config's tail knobs reach the
+    render.  Both keys are ALWAYS present (even when 0/0 — the legacy
+    full-strip defaults, byte-identical to pre-.13).
+
+    Fail-closed to FULL-STRIP (0/0) on anything that is not a clean
+    non-negative int — this is the "config absent / not yet loaded / mock"
+    case. Two distinct absences both land at 0/0 (legacy render):
+      - ``config.context`` missing (pre-.13 config, or a MagicMock agent
+        whose auto-attribute is not a real ContextGCConfig) → 0/0;
+      - either field missing or non-int (a partial mock / a bool / a
+        negative) → that field 0.
+    A real ContextGCConfig carries real ints, so this passes its values
+    through unchanged. The isinstance gate (not just getattr-with-default)
+    is load-bearing: ``getattr(MagicMock, "thinking_tail_turns", 0)``
+    returns a MagicMock, which would raise on ``> 0`` and, worse, be truthy
+    enough to flip the tail ON for mock agents — the guard forces 0/0.
+    """
+    ctx = getattr(config, "context", None)
+    turns = getattr(ctx, "thinking_tail_turns", 0)
+    max_tokens = getattr(ctx, "thinking_tail_max_tokens", 0)
+    if not (isinstance(turns, int) and not isinstance(turns, bool)
+            and turns >= 0):
+        turns = 0
+    if not (isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+            and max_tokens >= 0):
+        max_tokens = 0
+    return {
+        "thinking_tail_turns": turns,
+        "thinking_tail_max_tokens": max_tokens,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -573,14 +695,24 @@ def _is_pre_boundary(entry: dict, boundary_index: int, position: int | None = No
     return entry.get("entry_index", 0) < boundary_index
 
 
-def _manifest_classes(entries: list[dict], boundary_index: int) -> dict:
+def _manifest_classes(entries: list[dict], boundary_index: int,
+                      retained: frozenset[int] | None = None) -> dict:
     """Class counts over pre-boundary entries (deterministic).
 
-    tools: tool-result entries; thinking: assistant entries carrying
-    thinking; inputs: tool_call string input values > 500 chars; media:
+    tools: tool-result entries; thinking: pre-boundary assistant entries
+    whose thinking is STRIPPED (deleted or thinking-removed — i.e. NOT at a
+    retained position); thinking_retained (workspace-kdsn.305.13 T5): the
+    subset at retained positions (``retained`` — positions from
+    ``thinking_tail_indices``; None or empty = legacy full strip, count 0).
+    The two are a partition of the pre-boundary assistant entries carrying
+    thinking: ``thinking + thinking_retained == total-with-thinking`` (the
+    retained set only ever contains entries that carry truthy thinking, so
+    every retained position is counted exactly once, in thinking_retained).
+    inputs: tool_call string input values > 500 chars; media:
     pre-boundary user entries whose content is a non-string (part) list.
     """
-    tools = thinking = inputs = media = 0
+    tools = thinking = thinking_retained = inputs = media = 0
+    retained = retained or frozenset()
     for position, entry in enumerate(entries):
         if _is_pre_boundary(entry, boundary_index, position):
             role = entry.get("role")
@@ -588,7 +720,10 @@ def _manifest_classes(entries: list[dict], boundary_index: int) -> dict:
                 tools += 1
             elif role == "assistant":
                 if entry.get("thinking"):
-                    thinking += 1
+                    if position in retained:
+                        thinking_retained += 1
+                    else:
+                        thinking += 1
                 for tc in entry.get("tool_calls") or []:
                     value = tc.get("input") if isinstance(tc, dict) else None
                     if isinstance(value, str) and len(value) > 500:
@@ -600,10 +735,12 @@ def _manifest_classes(entries: list[dict], boundary_index: int) -> dict:
                 # [media: ...] tag-string form (wave-2.1, wonmun A7): expunged
                 # at the boundary exactly like list-form media — count it.
                 media += 1
-    return {"tools": tools, "thinking": thinking, "media": media, "inputs": inputs}
+    return {"tools": tools, "thinking": thinking, "thinking_retained": thinking_retained,
+            "media": media, "inputs": inputs}
 
 
-def _render_char_estimates(entries: list[dict], boundary_index: int) -> tuple[int, int]:
+def _render_char_estimates(entries: list[dict], boundary_index: int,
+                           retained: frozenset[int] | None = None) -> tuple[int, int]:
     """(tokens_before, tokens_after_est) char//4 estimates — deterministic.
 
     before: every pre-boundary entry's full renderable text.
@@ -618,7 +755,15 @@ def _render_char_estimates(entries: list[dict], boundary_index: int) -> tuple[in
         (it survives reduction, so it contributes its full content chars —
         the pre-R4 estimate was blind to it, which understated
         tokens_after and delayed the handoff, the wrong direction);
-      - assistant thinking -> dropped (counted in before only);
+      - assistant thinking -> dropped (counted in before only) — EXCEPT the
+        retained thinking tail (workspace-kdsn.305.13 T3/T3a): when
+        ``retained`` (positions from ``thinking_tail_indices``) is passed,
+        the retained blocks' chars (via the shared ``_thinking_block_chars``
+        — single source with the selection's block estimate) are ADDED to
+        after_chars, because they remain renderable pre-boundary content.
+        ``tokens_before`` keeps its content-only basis either way (mild
+        asymmetry: before never counted thinking; after now counts the
+        retained subset — documented, never a blocker);
       - assistant tool_call string inputs -> the full input length
         (conservative: the render shortens >500-char values to
         "[stripped: N chars]" — counting the full length overstates, the
@@ -626,9 +771,16 @@ def _render_char_estimates(entries: list[dict], boundary_index: int) -> tuple[in
     Post-boundary entries contribute zero here — the in-flight tail is
     measured separately by ``_post_boundary_tail_tokens``; the two combine
     into the composite ``manifest.runway.tokens_after``.
+
+    The retained set's chars are summed and divided ONCE at the end (with
+    the rest of the span) — the selection helper divides per block; the
+    shared division carry may therefore shift tokens_after_est by exactly
+    one token relative to the selection-fit math (the red suite pins the
+    delta to {q, q+1}).
     """
     before_chars = 0
     after_chars = 0
+    retained = retained or frozenset()
     for position, entry in enumerate(entries):
         if not _is_pre_boundary(entry, boundary_index, position):
             continue
@@ -647,6 +799,12 @@ def _render_char_estimates(entries: list[dict], boundary_index: int) -> tuple[in
                 value = tc.get("input") if isinstance(tc, dict) else None
                 if isinstance(value, str):
                     after_chars += len(value)
+            if position in retained:
+                # Retained thinking tail (workspace-kdsn.305.13 T3): the
+                # block survives reduction and renders verbatim — count its
+                # chars (shared _thinking_block_chars, single source with
+                # the selection's block estimate).
+                after_chars += _thinking_block_chars(entry.get("thinking"))
         elif (role == "user"
               and isinstance(entry.get("content"), (list, tuple, str))
               and not (isinstance(entry.get("content"), str)
@@ -725,7 +883,12 @@ def apply_boundary_and_rebuild(
     loop auto/hard tiers + context_gc tool) and the /cache gc room command.
     Config comes from ``agent.config.context`` (ContextGCConfig; defaults via
     getattr for pre-305 mock configs). window for the durable budget is the
-    room model's context window. Never raises into the caller: failures
+    room model's context window. The thinking-tail knobs (workspace-
+    kdsn.305.13 T4a) are read from the same config (ContextGCConfig defaults
+    8/32768 when the fields are absent; FULL-STRIP 0/0 when the whole
+    config is absent — pre-.13 mock agents keep the legacy render) and
+    passed to BOTH apply_boundary (manifest + estimator) and the
+    build_context rebuild. Never raises into the caller: failures
     return {"applied": False, "noop_reason": ...}. On applied=True the room's
     in-memory history is rebuilt IN PLACE (object identity preserved — the
     running loop's next request carries the reduced context).
@@ -743,6 +906,17 @@ def apply_boundary_and_rebuild(
     # getattr with NEW defaults: pre-305.12 mock configs lack the fields.
     handoff_pct = getattr(cfg, "handoff_runway_pct", 10.0) / 100.0
     handoff_min = getattr(cfg, "handoff_runway_min_tokens", 24000)
+    # Thinking-tail preservation (workspace-kdsn.305.13 T4a): the config
+    # knobs flow into BOTH the apply_boundary call (manifest + estimator)
+    # and the in-memory rebuild (build_context). THE seam is
+    # gc_thinking_tail_kwargs(agent.config) — the same fail-closed helper
+    # every production render site uses (audit M2: a raw getattr here let a
+    # MagicMock ``cfg`` smuggle non-int knobs into thinking_tail_indices,
+    # raising TypeError that the broad except swallowed into a silent GC
+    # no-op for the room; the isinstance-gated helper forces 0/0 instead).
+    _tt = gc_thinking_tail_kwargs(agent.config)
+    thinking_tail_turns = _tt["thinking_tail_turns"]
+    thinking_tail_max_tokens = _tt["thinking_tail_max_tokens"]
     try:
         window = agent._resolve_model_limit(room_id)
     except Exception as e:  # fail-soft: a window resolution failure must not
@@ -782,6 +956,8 @@ def apply_boundary_and_rebuild(
             max_tokens=max(window - available, 0),
             handoff_pct=handoff_pct,
             handoff_min=handoff_min,
+            thinking_tail_turns=thinking_tail_turns,
+            thinking_tail_max_tokens=thinking_tail_max_tokens,
         )
     except Exception as e:
         logger.warning("gc boundary failed for %s: %s", room_id, e, exc_info=True)
@@ -797,7 +973,9 @@ def apply_boundary_and_rebuild(
         # before a fallible build left rooms amnesiac on transient I/O errors).
         try:
             rebuilt = session_log.build_context(
-                room_id, gc_enabled=True, gc_preserve_trailing=live_turn)
+                room_id, gc_enabled=True, gc_preserve_trailing=live_turn,
+                thinking_tail_turns=thinking_tail_turns,
+                thinking_tail_max_tokens=thinking_tail_max_tokens)
         except Exception as e:
             logger.warning(
                 "gc history rebuild failed for %s: %s — keeping the "
@@ -887,6 +1065,19 @@ def apply_boundary(
     handoff_pct: float = 0.10,
     handoff_min: int = 24000,
     bd_path: str | None = BD_PATH,
+    thinking_tail_turns: int = 0,
+    # NOTE the asymmetry (workspace-kdsn.305.13 T4/T5, pinned by the red
+    # suite's TestTailEstimator._apply): ``thinking_tail_turns`` defaults to
+    # 0 (FAIL-CLOSED — no retention unless a caller turns it ON) while
+    # ``thinking_tail_max_tokens`` defaults to the config default 32768.
+    # The two default together = full strip (turns 0 -> empty set regardless
+    # of ceiling). The ceiling default mirrors the config default (and the
+    # .12 handoff_min=24000 precedent) so a caller that sets ``turns>0`` and
+    # omits the ceiling gets the documented config ceiling, not a silent
+    # 0-ceiling that would make retention a no-op. The PRODUCTION caller
+    # (apply_boundary_and_rebuild) always passes BOTH explicitly, so this
+    # default only affects direct apply_boundary(...) callers / tests.
+    thinking_tail_max_tokens: int = 32768,
 ) -> dict:
     """Apply a GC boundary: append manifest event + snapshot entry to JSONL.
 
@@ -907,7 +1098,8 @@ def apply_boundary(
 
     Appends, in order:
       1. system entry event=GC_EVENT, entry_index=<index>, detail=json manifest:
-         {ts, boundary_index, trigger, classes: {tools, thinking, media, inputs},
+         {ts, boundary_index, trigger, classes: {tools, thinking,
+          thinking_retained, media, inputs},
           tokens_before, tokens_after_est, durable: {project, files:
           [{path, reason, origin, chars}], budget_tokens, used_tokens,
           over_budget}, runway: {available, tokens_after, runway_after,
@@ -939,6 +1131,28 @@ def apply_boundary(
     confirm text and subagent manifests). Once per epoch: the existing
     latch scans the room's JSONL for a prior GC_FORCED_HANDOFF_TRIGGER
     reminder entry.
+
+    Thinking-tail preservation (workspace-kdsn.305.13 T3/T3a): with
+    thinking_tail_turns / thinking_tail_max_tokens non-zero, the retained
+    pre-boundary thinking blocks' chars are added to tokens_after_est (via
+    the shared selection set — see ``thinking_tail_indices``), so the .12
+    runway composite (runway.tokens_after) grows with retention and the
+    handoff gate sees the retained load.  The manifest classes gain
+    "thinking_retained" (present even when 0); "thinking" keeps its
+    STRIPPED count semantics — it counts the pre-boundary assistant entries
+    carrying thinking that were NOT retained (thinking +
+    thinking_retained == total with thinking).  The kwarg defaults are
+    ASYMMETRIC by decision (workspace-kdsn.305.13): thinking_tail_turns
+    defaults to 0 (FAIL-CLOSED — no retention unless a caller turns it ON)
+    while thinking_tail_max_tokens defaults to 32768, mirroring the config
+    default (the .12 kwarg-defaults-equal-production-defaults precedent:
+    handoff_min=24000). With turns=0 the ceiling is moot — the retained set
+    is empty regardless — so the defaults together still give a full strip,
+    but a caller that sets turns>0 and omits the ceiling gets the documented
+    32768 ceiling instead of a silent 0-ceiling no-op. The PRODUCTION caller
+    (apply_boundary_and_rebuild) always passes both explicitly, so this
+    default only affects direct apply_boundary(...) callers / tests.
+    turns=0 → byte-identical legacy manifest (empty retained set).
 
     Durable problems (missing files, malformed TOML, unreadable) never raise —
     they land in errors/warnings and the boundary still applies.
@@ -977,8 +1191,16 @@ def apply_boundary(
     budget_tokens = durable_budget_tokens(window, budget_pct, budget_min)
     used_tokens = resolution["used_tokens"]
     over_budget = used_tokens > budget_tokens
-    classes = _manifest_classes(entries, boundary_index)
-    tokens_before, tokens_after_est = _render_char_estimates(entries, boundary_index)
+    # Thinking-tail selection (workspace-kdsn.305.13 T3a): apply_boundary
+    # owns entries + boundary_index + the tail config, so it computes the
+    # retained set ONCE and passes it to both the class tally and the
+    # char-estimate (the estimator does not re-select).  Default-zero
+    # kwargs → empty set → byte-identical legacy manifest.
+    retained_tail = thinking_tail_indices(
+        entries, boundary_index, thinking_tail_turns, thinking_tail_max_tokens)
+    classes = _manifest_classes(entries, boundary_index, retained_tail)
+    tokens_before, tokens_after_est = _render_char_estimates(
+        entries, boundary_index, retained_tail)
 
     # Runway-gated handoff (kdsn.305.12 D1): the handoff decision is about
     # POST-BOUNDARY runway, never about durable-set size.  The composite
@@ -1163,7 +1385,9 @@ def _harvest_params(raw_input):
 
 
 def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
-                               task_text: str, trigger: str = "auto") -> dict:
+                               task_text: str, trigger: str = "auto",
+                               thinking_tail_turns: int = 0,
+                               thinking_tail_max_tokens: int = 0) -> dict:
     """Apply a GC boundary to a plain OpenAI-style message list. PURE.
 
     The message-list analog of the session.py render transform: every message
@@ -1186,6 +1410,18 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
         never an empty shell. tool_calls: any STRING value in tc.input longer
         than 500 chars replaced by "[stripped: {n} chars]" (count "inputs"
         per replaced value); non-string values untouched.
+      - assistant thinking-tail retention (workspace-kdsn.305.13 T4 parity):
+        with thinking_tail_turns / thinking_tail_max_tokens non-zero, the
+        positions from ``thinking_tail_indices`` (same selection over the
+        message list, position semantics as everywhere here) keep their
+        "thinking" field VERBATIM (both dict and ToolCall-object input
+        shapes — only the thinking key is consulted, tool_calls are
+        transformed exactly as legacy).  count "thinking_retained" per such
+        message; "thinking" counts the STRIPPED ones (pre-boundary assistant
+        msgs carrying thinking that were NOT retained — the two partition
+        the total).  Retained thinking chars join the after-estimate
+        (shared ``_thinking_block_chars`` — single source with the
+        selection).  Default-zero kwargs → byte-identical legacy transform.
       - tool msg: content replaced by tool_pointer(boundary_index, name,
         params, n_chars) where (name, params) come from the paired
         pre-boundary assistant tool_call harvested by tool_call_id (pairing
@@ -1209,8 +1445,8 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
                      {"role": "user", "content": frame_sub_snapshot(...)}>,
         "manifest": {
             "boundary_index": int, "trigger": str,
-            "classes": {"tools": int, "thinking": int, "media": int,
-                        "inputs": int},
+            "classes": {"tools": int, "thinking": int, "thinking_retained": int,
+                        "media": int, "inputs": int},
             "tokens_before": int, "tokens_after_est": int,
             "messages_before": int, "messages_after": int,
         },
@@ -1235,9 +1471,15 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
     # that tool message is rendered).
     pairing: dict = {}
     out: list = []
-    classes = {"tools": 0, "thinking": 0, "media": 0, "inputs": 0}
+    classes = {"tools": 0, "thinking": 0, "thinking_retained": 0,
+               "media": 0, "inputs": 0}
     before_chars = 0
     after_chars = 0
+    # Thinking-tail retention (workspace-kdsn.305.13 T4 parity): the same
+    # selection as the entry path, over the message list (position
+    # semantics). Default-zero kwargs → empty set → legacy transform.
+    retained_tail = thinking_tail_indices(
+        messages, boundary_index, thinking_tail_turns, thinking_tail_max_tokens)
 
     for pos, m in enumerate(messages):
         if pos < boundary_index:
@@ -1310,15 +1552,25 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
                             if isinstance(v, str):
                                 after_chars += len(v)
                 if m.get("thinking"):
-                    classes["thinking"] += 1
+                    if pos in retained_tail:
+                        # Retained thinking tail (workspace-kdsn.305.13 T4):
+                        # the block survives VERBATIM (str or list-of-blocks
+                        # — both provider shapes) and its chars join the
+                        # after-estimate (shared _thinking_block_chars).
+                        classes["thinking_retained"] += 1
+                        after_chars += _thinking_block_chars(m["thinking"])
+                    else:
+                        classes["thinking"] += 1
                 content_str = content if isinstance(content, str) else ""
                 if not content_str.strip() and not tcs:
                     continue  # thought-only: deleted atomically, contributes 0
                 # Surviving text contributes its length to the after-estimate
-                # (thinking was never part of "content" and is dropped).
+                # (dropped thinking was never part of "content"; retained
+                # thinking is counted above).
                 after_chars += _message_content_chars(content)
                 nm = dict(m)
-                nm.pop("thinking", None)
+                if pos not in retained_tail:
+                    nm.pop("thinking", None)
                 if tcs:
                     nm["tool_calls"] = new_tc
                 out.append(nm)
@@ -1368,6 +1620,12 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
         "applied": True,
         "messages": out,
         "manifest": manifest,
+        # Top-level classes (workspace-kdsn.305.13 T5 parity): the red suite's
+        # TestTailSubagent reads ``out["classes"]`` at the top level (the same
+        # dict object as ``manifest["classes"]``). Additive — the pre-.13
+        # nested ``manifest["classes"]`` is unchanged, and the subagent.py
+        # consumer (which reads ["messages"]/["manifest"]) is unaffected.
+        "classes": classes,
         "snapshot_content": snapshot,
         "noop_reason": None,
     }

@@ -153,7 +153,8 @@ class TestApplyBoundaryToMessages:
         mf = r["manifest"]
         assert mf["boundary_index"] == 7
         assert mf["trigger"] == "auto"
-        assert mf["classes"] == {"tools": 1, "thinking": 2, "media": 1, "inputs": 0}
+        assert mf["classes"] == {"tools": 1, "thinking": 2, "thinking_retained": 0,
+                                 "media": 1, "inputs": 0}
         assert mf["messages_before"] == 10
         assert mf["messages_after"] == 9
         assert mf["tokens_before"] > 0
@@ -357,7 +358,8 @@ class TestApplyBoundaryToMessages:
         ]
         r = apply_boundary_to_messages(scene, boundary_index=7, task_text="t")
         assert r["manifest"]["classes"] == {
-            "tools": 2, "thinking": 2, "media": 1, "inputs": 1,
+            "tools": 2, "thinking": 2, "thinking_retained": 0,
+            "media": 1, "inputs": 1,
         }
         assert r["manifest"]["messages_before"] == 8
         assert r["manifest"]["messages_after"] == 8  # 8 - 1 dropped + 1 snapshot

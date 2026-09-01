@@ -41,6 +41,7 @@ from openalph.context_gc import (
     LEGACY_EVENT,
     ACTIVE_PROJECT_EVENT,
     apply_boundary_and_rebuild,
+    gc_thinking_tail_kwargs,
     project_echo_text,
     read_active_project,
 )
@@ -1938,7 +1939,9 @@ class MatrixBot:
                 # Restore context from session log
                 history = self.agent.history(room_id)
                 history.clear()
-                history.extend(session_log.build_context(room_id))
+                _tt_kw = gc_thinking_tail_kwargs(self.agent.config)
+                history.extend(session_log.build_context(
+                    room_id, **_tt_kw))
                 self.agent.restore_usage(room_id, session_log.usage_totals(room_id))
 
                 # R1-4: Rehydrate per-room reminder engine fired-state from JSONL
@@ -2153,7 +2156,9 @@ class MatrixBot:
             if gated and room_id in self._active_rooms and self.session_log:
                 history = self.agent.history(room_id)
                 history.clear()
-                history.extend(self.session_log.build_context(room_id))
+                _tt_kw = gc_thinking_tail_kwargs(self.agent.config)
+                history.extend(self.session_log.build_context(
+                    room_id, **_tt_kw))
                 logger.info("Hydrated context for %s: %d entries", room_id, len(history))
                 user_already_in_history = True
             # --- End mention gating ---
@@ -2535,7 +2540,9 @@ class MatrixBot:
                 try:
                     _sh = None
                     if getattr(self, 'session_log', None):
-                        _sh = self.session_log.build_context(room_id)
+                        _sh = self.session_log.build_context(
+                            room_id, **gc_thinking_tail_kwargs(
+                                self.agent.config))
                     _status = self.agent.status(room_id, history=_sh)
                     _pct = _status.get("context_pct", 0)
                     if _pct >= 80:
@@ -2983,7 +2990,8 @@ class MatrixBot:
             # Pass build_context output so the estimate reflects toolstrip
             _status_history = None
             if getattr(self, 'session_log', None):
-                _status_history = self.session_log.build_context(room_id)
+                _status_history = self.session_log.build_context(
+                    room_id, **gc_thinking_tail_kwargs(self.agent.config))
             status = self.agent.status(room_id, history=_status_history)
             ctx = status['context_tokens']
             ctx_max = status['context_max']
@@ -3202,7 +3210,9 @@ class MatrixBot:
                         # Refresh in-memory history to reflect the strip
                         history = self.agent.history(room_id)
                         history.clear()
-                        history.extend(self.session_log.build_context(room_id))
+                        _tt_kw = gc_thinking_tail_kwargs(self.agent.config)
+                        history.extend(self.session_log.build_context(
+                            room_id, **_tt_kw))
                         msg = f"Toolstrip applied. Stripped {new_count} tool results (~{new_chars:,} chars) from context."
                         msg += "\n⚠️ Previously loaded skills were stripped — re-read any skills needed for ongoing work."
                         await self.send(room_id, msg)

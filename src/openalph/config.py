@@ -77,8 +77,9 @@ class ContextGCConfig:
     """Context garbage-collection settings (workspace-kdsn.305, [context] section).
 
     Tuning knobs for the unified context-boundary mechanism (context_gc.py):
-    the auto/hard boundary tiers, the gc-warn reminder threshold, and the
-    durable-set re-injection budget.  Absent [context] section → all defaults
+    the auto/hard boundary tiers, the gc-warn reminder threshold, the
+    durable-set re-injection budget, and the thinking-tail preservation
+    knobs (workspace-kdsn.305.13).  Absent [context] section → all defaults
     (gc_enabled=True).  Parsing FAILS LOUD (ConfigError on bad type/range),
     the same discipline as [model_vision] and [spotter]: these knobs govern
     when context is reduced and what survives it, so a silently-dropped
@@ -106,6 +107,13 @@ class ContextGCConfig:
     # on the same fail-loud discipline as the tier knobs; min >= 0.
     handoff_runway_pct: float = 10.0              # 0 < pct < 100
     handoff_runway_min_tokens: int = 24000        # >= 0
+    # Thinking-tail preservation (workspace-kdsn.305.13 T2): at a boundary,
+    # the N most recent ELIGIBLE pre-boundary assistant thinking blocks are
+    # retained verbatim instead of stripped — newest->oldest, contiguous,
+    # capped at max_tokens (chars//4 estimates). 0 for either knob = full
+    # strip, byte-identical to pre-.13 behavior.
+    thinking_tail_turns: int = 8                  # >= 0
+    thinking_tail_max_tokens: int = 32768         # >= 0
     # Workspace-relative glob patterns declaring additional durable path
     # classes re-injected at every boundary (e.g. ["skills/*.md"]).
     durable_paths: list[str] = field(default_factory=list)
@@ -840,6 +848,25 @@ def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
             f"[context] turn_cooldown must be an integer >= 0, "
             f"got {turn_cooldown!r}")
 
+    # thinking-tail preservation (workspace-kdsn.305.13 T2): both >= 0;
+    # bool rejected explicitly (int subclass). 0 disables the tail
+    # (byte-identical legacy full strip).
+    thinking_tail_turns = section.get("thinking_tail_turns", 8)
+    if (isinstance(thinking_tail_turns, bool)
+            or not isinstance(thinking_tail_turns, int)
+            or thinking_tail_turns < 0):
+        raise ConfigError(
+            f"[context] thinking_tail_turns must be an integer >= 0, "
+            f"got {thinking_tail_turns!r}")
+
+    thinking_tail_max_tokens = section.get("thinking_tail_max_tokens", 32768)
+    if (isinstance(thinking_tail_max_tokens, bool)
+            or not isinstance(thinking_tail_max_tokens, int)
+            or thinking_tail_max_tokens < 0):
+        raise ConfigError(
+            f"[context] thinking_tail_max_tokens must be an integer >= 0, "
+            f"got {thinking_tail_max_tokens!r}")
+
     return ContextGCConfig(
         gc_enabled=gc_enabled,
         warn_pct=warn_pct,
@@ -849,6 +876,8 @@ def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
         durable_budget_min_tokens=durable_budget_min_tokens,
         handoff_runway_pct=handoff_runway_pct,
         handoff_runway_min_tokens=handoff_runway_min_tokens,
+        thinking_tail_turns=thinking_tail_turns,
+        thinking_tail_max_tokens=thinking_tail_max_tokens,
         durable_paths=durable_paths,
         turn_cooldown=turn_cooldown,
     )
