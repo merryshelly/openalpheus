@@ -810,7 +810,8 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "reached — the boundary buys nothing yet. "
             "The result reports the boundary index, per-class stripped counts, "
             "tokens before -> after, and durable budget used/budget (with an "
-            "OVER BUDGET flag when the durable set exceeds its budget)."
+            "informational note when the durable set exceeds its budget — the "
+            "budget is an informational marker, not a cap)."
         ),
         "parameters": {
             "type": "object",
@@ -1654,7 +1655,7 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
     )
     used = durable.get("used_tokens", 0)
     budget = durable.get("budget_tokens", 0)
-    flag = " — OVER BUDGET" if outcome.get("over_budget") else ""
+    flag = " — over reinjection budget (informational)" if outcome.get("over_budget") else ""
     # Plain ints (no thousands separators): the boundary index and the
     # post-boundary token estimate are what the operator greps for.
     return ToolResult(

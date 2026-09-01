@@ -240,9 +240,11 @@ class Agent:
         # Context GC (workspace-kdsn.305): per-room hard-tier strike counter
         # (consecutive FAILED boundary attempts at the send-time overflow
         # guard; >= _GC_HARD_STRIKE_LIMIT -> raise as today) and the last
-        # applied boundary's durable-set budget fraction (gc-budget reminder
-        # input). Both in-memory only: the fraction cache starts empty after
-        # restart -> 0.0 -> gc-budget silent (fail-safe, acceptable v1).
+        # applied boundary's post-boundary runway consumption fraction
+        # (gc-runway reminder input, kdsn.305.12 D5 — replaces the retired
+        # durable-budget fraction). Both in-memory only: the fraction cache
+        # starts empty after restart -> 0.0 -> gc-runway silent (fail-safe,
+        # acceptable v1).
         # The turn-start auto tier + hard tier consume the transport-wired
         # callbacks["apply_gc_boundary"] seam (contract: async callable
         # (room_id, *, trigger, exclude_inflight=True) -> {"applied",
@@ -250,7 +252,7 @@ class Agent:
         # ALREADY appended the JSONL entries AND rebuilt the room's
         # in-memory history in place, so the caller re-reads history()).
         self._gc_fail_strikes: dict[str, int] = {}
-        self._gc_last_budget: dict[str, float] = {}
+        self._gc_last_runway: dict[str, float] = {}
         # Auto-tier churn guard (audit): True when the most recent auto
         # boundary failed to bring the estimate under the auto threshold —
         # re-applying every turn start would append a fresh snapshot per turn
@@ -357,7 +359,7 @@ class Agent:
             _spotter_inbox.pop(room_id, None)
         # kdsn.305: a reset room starts with no boundary history of its own.
         self._gc_fail_strikes.pop(room_id, None)
-        self._gc_last_budget.pop(room_id, None)
+        self._gc_last_runway.pop(room_id, None)
         self._gc_auto_uncleared.pop(room_id, None)
 
     # --- Context GC boundary consumption (workspace-kdsn.305) --------------
@@ -386,10 +388,10 @@ class Agent:
           - callback absent (headless/CLI) -> False, silently;
           - callback raises -> log a warning, return False (a failed GC must
             NEVER kill a turn — the turn proceeds exactly as if GC were off);
-          - applied=True -> reset the room's ReminderEngine (coexist-with-
-            reset ruling: the nudge ladder re-arms after a boundary), reset
-            this room's hard-tier strikes to 0 (ANY applied boundary clears
-            them), and refresh the durable budget-fraction cache.
+          - applied=True -> record the outcome via _note_gc_boundary_applied
+            (the single applied-boundary bookkeeping seam, shared with the
+            matrix /cache gc operator path: ReminderEngine reset, hard-tier
+            strikes to 0, runway-fraction cache refresh, churn-guard re-arm).
           - applied=False (noop) -> strikes are the CALLER's concern (hard
             tier only); auto tier simply skips.
         """
@@ -409,39 +411,64 @@ class Agent:
             return False
         # APPLIED: the callback has already appended the JSONL entries and
         # rebuilt the in-memory history in place.
+        self._note_gc_boundary_applied(room_id, res)
+        return True
+
+    def _note_gc_boundary_applied(self, room_id: str, res: dict) -> None:
+        """Record the APPLIED-boundary consequences on this agent (kdsn.305.12).
+
+        THE single place that consumes an applied boundary's outcome
+        (``apply_boundary_and_rebuild`` result: {"applied", "noop_reason",
+        "manifest", "over_budget", "handoff_advised", "forced_handoff"}) for
+        the agent's per-room GC bookkeeping — four state updates, one seam:
+          - per-room ReminderEngine reset (coexist-with-reset ruling: the
+            nudge ladder re-arms after a boundary);
+          - hard-tier fail-strikes reset to 0 (ANY applied boundary clears
+            them);
+          - runway-fraction cache refresh (tokens_after / available from the
+            manifest "runway" block) — feeds the gc-runway reminder;
+          - auto-tier churn-guard re-arm (a boundary never proven
+            unproductive re-arms the auto tier).
+        Called from BOTH boundary-consumption seams: the callback consumer
+        (``_gc_apply_boundary`` — auto/hard tiers + context_gc tool) and the
+        matrix ``/cache gc`` operator path (which applies the boundary
+        directly and must not leave the runway cache stale).
+        Fail-soft: a malformed outcome must never break the caller.
+        """
         self._engine_for(room_id).reset()
         self._gc_fail_strikes[room_id] = 0
-        self._gc_last_budget[room_id] = self._gc_budget_fraction(res.get("manifest"))
+        self._gc_last_runway[room_id] = self._gc_runway_fraction(res.get("manifest"))
         # An APPLIED boundary that was never proven unproductive re-arms the
         # auto tier (the churn guard only latches on evidence of failure).
         self._gc_auto_uncleared.pop(room_id, None)
-        return True
 
-    def _gc_budget_fraction(self, manifest: object) -> float:
-        """Durable-set usage fraction from an applied boundary's manifest.
+    def _gc_runway_fraction(self, manifest: object) -> float:
+        """Post-boundary runway consumption fraction (kdsn.305.12 D5).
 
-        used_tokens / budget_tokens, fail-soft: missing keys, non-numeric
-        values, or a non-positive budget all yield 0.0 (gc-budget stays
-        silent — never false urgency from a corrupt manifest).
+        tokens_after / available from the manifest's "runway" block — the
+        same composite the boundary applier used to gate the handoff.
+        Fail-soft: a missing/corrupt runway block, non-numeric values, or a
+        zero-or-negative available all yield 0.0 (gc-runway stays silent —
+        never false urgency from a corrupt manifest).
         """
         if not isinstance(manifest, dict):
             return 0.0
-        durable = manifest.get("durable")
-        if not isinstance(durable, dict):
+        runway = manifest.get("runway")
+        if not isinstance(runway, dict):
             return 0.0
-        used = durable.get("used_tokens")
-        budget = durable.get("budget_tokens")
-        if (isinstance(used, bool) or isinstance(budget, bool)
-                or not isinstance(used, (int, float))
-                or not isinstance(budget, (int, float))):
+        tokens_after = runway.get("tokens_after")
+        available = runway.get("available")
+        if (isinstance(tokens_after, bool) or isinstance(available, bool)
+                or not isinstance(tokens_after, (int, float))
+                or not isinstance(available, (int, float))):
             return 0.0
-        if budget <= 0:
+        if available <= 0:
             return 0.0
-        return used / budget
+        return tokens_after / available
 
-    def _gc_budget_cached(self, room_id: str) -> float:
-        """Last applied boundary's budget fraction (0.0 pre-boundary/restart)."""
-        return self._gc_last_budget.get(room_id, 0.0)
+    def _gc_runway_cached(self, room_id: str) -> float:
+        """Last applied boundary's runway fraction (0.0 pre-boundary/restart)."""
+        return self._gc_last_runway.get(room_id, 0.0)
 
     async def _gc_hard_tier(self, room_id: str, callbacks: dict | None, *,
                             context_tokens: int, available: int) -> bool:
@@ -1013,12 +1040,13 @@ class Agent:
                         # kdsn.305 GC inputs (turn-start site only): warn
                         # threshold from [context].warn_pct of the usable
                         # runway (0 when gc disabled -> engine silent), and
-                        # the last boundary's durable budget fraction
-                        # (0.0 pre-boundary/restart -> engine silent).
+                        # the last boundary's post-boundary runway
+                        # consumption fraction (kdsn.305.12 D5;
+                        # 0.0 pre-boundary/restart -> engine silent).
                         gc_warn_threshold=(
                             int(available * _gc_cfg.warn_pct / 100)
                             if _gc_cfg.gc_enabled else 0),
-                        gc_budget_fraction=self._gc_budget_cached(room_id),
+                        gc_runway_fraction=self._gc_runway_cached(room_id),
                         completed_turns=_completed_turns,
                         turn_source=_turn_source,
                         tool_calls_this_turn=_tool_calls_this_turn,
@@ -1175,7 +1203,7 @@ class Agent:
                             # fraction is passed for completeness — the engine
                             # predicates on evaluation_point and ignores it
                             # here).
-                            gc_budget_fraction=self._gc_budget_cached(room_id),
+                            gc_runway_fraction=self._gc_runway_cached(room_id),
                         )
                         _boundary_reminders = self._engine_for(room_id).evaluate(_boundary_state)
                         for _rem in _boundary_reminders:

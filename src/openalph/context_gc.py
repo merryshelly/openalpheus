@@ -65,7 +65,6 @@ ACTIVE_PROJECT_EVENT = "active_project"
 
 #: reminder trigger ids (fired-state lives in the per-room ReminderEngine).
 TRIGGER_GC_WARN = "gc-warn"
-TRIGGER_GC_BUDGET = "gc-budget"
 
 __all__ = [
     "GCConfigError",
@@ -74,7 +73,6 @@ __all__ = [
     "LEGACY_EVENT",
     "ACTIVE_PROJECT_EVENT",
     "TRIGGER_GC_WARN",
-    "TRIGGER_GC_BUDGET",
     "current_boundary_index",
     "_marker_indexes",
     "read_active_project",
@@ -94,9 +92,10 @@ class GCConfigError(Exception):
     """Raised by parse_durable_set on malformed durable-set TOML."""
 
 
-#: reminder trigger for the forced-handoff directive at durable-budget
-#: overflow (workspace-kdsn.305.3). One per epoch; the bead is the
-#: cross-session signal.
+#: reminder trigger for the forced-handoff directive at post-boundary
+#: RUNWAY exhaustion (workspace-kdsn.305.3, reworked kdsn.305.12 D1). One
+#: per epoch; the bead is the cross-session signal. The durable budget is
+#: informational only and never raises this.
 GC_FORCED_HANDOFF_TRIGGER = "gc-forced-handoff"
 
 #: fleet bd binary for the handoff pointer bead (fail-soft; None disables).
@@ -484,7 +483,9 @@ def frame_snapshot(
         [missing at snapshot time: <path> (<reason>) — re-read via file_read
         if it has since been created]
         [<error lines from resolution["errors"]>]
-        [durable budget <used>/<budget> tokens — OVER BUDGET when over_budget]
+        [durable budget <used>/<budget> tokens — over reinjection budget;
+        informational only, prune durable-set.toml when convenient
+        (informational marker since kdsn.305.12 — NOT an alarm, NOT a cap)]
 
     File bytes MUST pass through openalph.tools.escape_system_reminder_tags
     before embedding (R2-A discipline: snapshot content is file-data, and must
@@ -526,7 +527,8 @@ def frame_snapshot(
     if over_budget:
         lines.append(
             f"[durable budget {resolution.get('used_tokens', 0)}/{budget_tokens} "
-            "tokens — OVER BUDGET]"
+            "tokens — over reinjection budget; informational only, prune "
+            "durable-set.toml when convenient]"
         )
     else:
         lines.append(
@@ -604,10 +606,26 @@ def _manifest_classes(entries: list[dict], boundary_index: int) -> dict:
 def _render_char_estimates(entries: list[dict], boundary_index: int) -> tuple[int, int]:
     """(tokens_before, tokens_after_est) char//4 estimates — deterministic.
 
-    before: every pre-boundary entry's full renderable text. after: the same
-    minus pre-boundary tool outputs (replaced by their pointer strings) and
-    assistant thinking (dropped); post-boundary entries contribute zero —
-    the estimate covers the expunged span, not the untouched tail.
+    before: every pre-boundary entry's full renderable text.
+
+    after (kdsn.305.12 R4): the post-boundary RENDER estimate of the
+    expunged span — what survives reduction in place:
+      - tool outputs -> their pointer strings (the expunged bytes are gone);
+      - media attachments (list/tuple content, or the [media: ...] tag
+        string) -> the expunged-media placeholder (they do NOT survive
+        verbatim — counted at placeholder size, not content size);
+      - user/assistant TEXT content -> rendered in full after the boundary
+        (it survives reduction, so it contributes its full content chars —
+        the pre-R4 estimate was blind to it, which understated
+        tokens_after and delayed the handoff, the wrong direction);
+      - assistant thinking -> dropped (counted in before only);
+      - assistant tool_call string inputs -> the full input length
+        (conservative: the render shortens >500-char values to
+        "[stripped: N chars]" — counting the full length overstates, the
+        safe direction).
+    Post-boundary entries contribute zero here — the in-flight tail is
+    measured separately by ``_post_boundary_tail_tokens``; the two combine
+    into the composite ``manifest.runway.tokens_after``.
     """
     before_chars = 0
     after_chars = 0
@@ -623,11 +641,45 @@ def _render_char_estimates(entries: list[dict], boundary_index: int) -> tuple[in
             after_chars += len(tool_pointer(boundary_index, entry.get("name", "?"), None,
                                             output_chars))
         elif role == "assistant":
+            # Surviving text renders in full after the boundary (R4).
+            after_chars += _entry_content_chars(entry.get("content"))
             for tc in entry.get("tool_calls") or []:
                 value = tc.get("input") if isinstance(tc, dict) else None
                 if isinstance(value, str):
                     after_chars += len(value)
+        elif (role == "user"
+              and isinstance(entry.get("content"), (list, tuple, str))
+              and not (isinstance(entry.get("content"), str)
+                       and MEDIA_TAG_RE.search(entry["content"]))):
+            # Surviving text renders in full after the boundary (R4).
+            after_chars += _entry_content_chars(entry.get("content"))
+        elif (role == "user" and isinstance(entry.get("content"), str)
+              and MEDIA_TAG_RE.search(entry["content"])):
+            # Media (list/tuple or tag-string form) is expunged to the
+            # placeholder, which is what renders after the boundary.
+            after_chars += len(_expunged_media_string(boundary_index))
     return before_chars // 4, after_chars // 4
+
+
+def _post_boundary_tail_tokens(entries: list[dict], boundary_index: int) -> int:
+    """chars//4 estimate of the post-boundary tail (entries at position >=
+    boundary_index — the in-flight tail that stays after the boundary when
+    exclude_inflight; empty for a settled turn).
+
+    The runway composite (kdsn.305.12 D1) needs it because
+    ``tokens_after_est`` covers only the expunged span. Entries the module
+    never reads are counted by their content via the shared
+    ``_entry_content_chars`` helper; anything garbled (non-dict entry,
+    non-string/str-part-list content) contributes 0 — the estimator is
+    best-effort and must never raise inside a boundary.
+    """
+    total = 0
+    for position in range(boundary_index, len(entries)):
+        entry = entries[position]
+        if not isinstance(entry, dict):
+            continue
+        total += _entry_content_chars(entry.get("content"))
+    return total // 4
 
 
 def project_echo_text(workspace: Path, project: str) -> str:
@@ -680,17 +732,42 @@ def apply_boundary_and_rebuild(
     """
     cfg = getattr(agent.config, "context", None)
     durable_paths = getattr(cfg, "durable_paths", []) or []
-    # [context].durable_budget_pct is a PERCENT (15.0 = 15%); the seam's
-    # formula expects a FRACTION (0.15). Normalize here — the one
+    # [context].durable_budget_pct is a PERCENT (25.0 = 25%); the seam's
+    # formula expects a FRACTION (0.25). Normalize here — the one
     # config→seam adapter (audit: percent-vs-fraction unit mismatch made
     # every over-budget mechanism silently dead).
-    budget_pct = getattr(cfg, "durable_budget_pct", 15.0) / 100.0
-    budget_min = getattr(cfg, "durable_budget_min_tokens", 48000)
+    budget_pct = getattr(cfg, "durable_budget_pct", 25.0) / 100.0
+    budget_min = getattr(cfg, "durable_budget_min_tokens", 96000)
+    # Runway-gated handoff thresholds (kdsn.305.12 D1): [context].
+    # handoff_runway_pct is a PERCENT too — same percent→fraction adapter.
+    # getattr with NEW defaults: pre-305.12 mock configs lack the fields.
+    handoff_pct = getattr(cfg, "handoff_runway_pct", 10.0) / 100.0
+    handoff_min = getattr(cfg, "handoff_runway_min_tokens", 24000)
     try:
         window = agent._resolve_model_limit(room_id)
     except Exception as e:  # fail-soft: a window resolution failure must not
         logger.warning("gc window resolution failed for %s: %s", room_id, e)
         window = getattr(agent.config, "model_max_tokens", 200000)
+    # Usable runway (im7t.46 D9 single-source): available must come from the
+    # agent's own expression (window − output reserve), NOT be re-derived
+    # here. Agent._effective_available(self, limit: int) takes the RESOLVED
+    # WINDOW LIMIT (an int), not a room id — pass the window resolved above.
+    # getattr-guarded for pre-305 mock agents that lack the method. A raise
+    # inside it (a pre-305 mock, or a signature mismatch on the agent's own
+    # method) degrades the runway math to window-only — but it is ALWAYS
+    # logged at WARNING so a REAL Agent mismatch can never be swallowed
+    # invisibly (audit R1: a swallowed TypeError silently widened `available`
+    # by the output reserve and delayed the handoff — spec D1b's wrong
+    # direction). The boundary still applies either way.
+    available = window
+    _eff = getattr(agent, "_effective_available", None)
+    if callable(_eff):
+        try:
+            available = _eff(window)
+        except Exception as e:  # fail-soft: runway math degrades to
+            logger.warning(          # window-only, the boundary still applies
+                "gc available resolution failed for %s: %s", room_id, e)
+            available = window
     try:
         outcome = apply_boundary(
             session_log,
@@ -702,6 +779,9 @@ def apply_boundary_and_rebuild(
             window=window,
             budget_pct=budget_pct,
             budget_min=budget_min,
+            max_tokens=max(window - available, 0),
+            handoff_pct=handoff_pct,
+            handoff_min=handoff_min,
         )
     except Exception as e:
         logger.warning("gc boundary failed for %s: %s", room_id, e, exc_info=True)
@@ -743,19 +823,24 @@ def project_valid_name(project: str) -> bool:
     )
 
 
-def frame_forced_handoff(used_tokens: int, budget_tokens: int) -> str:
-    """The durable-budget-overflow directive, stored as a reminder entry.
+def frame_forced_handoff(runway_after: int, available: int) -> str:
+    """The runway-exhausted forced-handoff directive (kdsn.305.12 D1),
+    stored as a reminder entry.
 
-    Deterministic; no timestamps (append-only render invariant)."""
+    Gates on POST-BOUNDARY runway, never on durable-set size: this fires
+    when the post-snapshot residue consumes nearly all usable runway and
+    the room cannot make useful forward progress. Deterministic; no
+    timestamps (append-only render invariant)."""
+    pct = 0 if available <= 0 else min(100, int((available - runway_after)
+                                                * 100 / available))
     return (
-        "<system-reminder>\n"
-        "Durable set over budget: "
-        f"{used_tokens} / {budget_tokens} tokens. The durable set does not "
-        "fit the reinjection budget — finalize the continuity artifact "
-        "(progress.md State/Decisions/Next) and prune durable-set.toml to "
-        "what a fresh session cannot re-derive cheaply, then execute "
-        "session-handoff now. Do not continue expanding context.\n"
-        "</system-reminder>"
+        "&lt;system-reminder&gt;\n"
+        f"Post-GC context consumes {pct}% of the usable runway — "
+        f"{runway_after} tokens remain after this boundary. The room cannot "
+        "make useful forward progress in what is left: finalize the "
+        "continuity artifact (progress.md State/Decisions/Next) and execute "
+        "session-handoff before the next turn.\n"
+        "&lt;/system-reminder&gt;"
     )
 
 
@@ -767,12 +852,13 @@ def _raise_handoff_bead(room_id: str, project: str | None, bd_path: str | None) 
     if not bd_path:
         return
     try:
-        title = f"GC forced handoff: durable budget exceeded ({room_id})"
+        title = f"GC forced handoff: post-GC runway exhausted ({room_id})"
         desc = (
-            "The context-GC durable set exceeded its reinjection budget at a "
-            "GC boundary. The harness injected the forced-handoff directive "
-            f"(active project: {project or 'none'}). Execute session-handoff "
-            "triage."
+            "The context-GC post-boundary runway was nearly exhausted at a "
+            "GC boundary (the durable budget is an informational marker and "
+            "is NOT the trigger). The harness injected the forced-handoff "
+            f"directive (active project: {project or 'none'}). Execute "
+            "session-handoff triage."
         )
         subprocess.run(
             [bd_path, "create", title, "-t", "task", "-p", "P2",
@@ -797,6 +883,9 @@ def apply_boundary(
     window: int,
     budget_pct: float,
     budget_min: int,
+    max_tokens: int | None = None,
+    handoff_pct: float = 0.10,
+    handoff_min: int = 24000,
     bd_path: str | None = BD_PATH,
 ) -> dict:
     """Apply a GC boundary: append manifest event + snapshot entry to JSONL.
@@ -821,17 +910,41 @@ def apply_boundary(
          {ts, boundary_index, trigger, classes: {tools, thinking, media, inputs},
           tokens_before, tokens_after_est, durable: {project, files:
           [{path, reason, origin, chars}], budget_tokens, used_tokens,
-          over_budget}, errors}
+          over_budget}, runway: {available, tokens_after, runway_after,
+          threshold_tokens, handoff_advised}, errors}
+      where runway.tokens_after is the POST-BOUNDARY RENDER estimate
+      (tokens_after_est + framed-snapshot bytes//4 + post-boundary tail
+      chars//4), runway_after = available - runway.tokens_after.
       2. user entry source=GC_SNAPSHOT_SOURCE with frame_snapshot() content.
 
-    Over budget: manifest records it; the snapshot still includes ALL durable
-    files (NEVER degrade-to-pointers for durable-class content — SB ruling).
-    The caller owns the forced-handoff response (directive + bead).
+    Over budget (kdsn.305.12 D2): manifest + snapshot-header marker record
+    it (informational — the budget is NOT a cap); the snapshot still includes
+    ALL durable files (NEVER degrade-to-pointers for durable-class content —
+    SB ruling). Over-budget alone NEVER forces a handoff.
+
+    Runway-gated forced handoff (kdsn.305.12 D1): available = window −
+    max_tokens (None → 0); tokens_after = tokens_after_est (expunged-span
+    residual) + framed-snapshot bytes//4 (ALWAYS appended) + the
+    post-boundary tail chars//4 (entries at/after boundary_index — the
+    in-flight tail under exclude_inflight, zero for a settled turn);
+    runway_after = available − tokens_after;
+    threshold = max(int(window * handoff_pct), handoff_min),
+    handoff_advised = runway_after < threshold (strict < — equality does
+    NOT fire). The forced-handoff directive + handoff bead fire ONLY when
+    handoff_advised — decoupled from the durable-set budget (the durable
+    set may be over budget with ample runway: marker only; it may be
+    under budget with exhausted runway: handoff still fires). The composite
+    lives ONLY in manifest.runway.tokens_after — tokens_after_est keeps its
+    documented meaning (expunged-span residual estimate, operator-visible in
+    confirm text and subagent manifests). Once per epoch: the existing
+    latch scans the room's JSONL for a prior GC_FORCED_HANDOFF_TRIGGER
+    reminder entry.
 
     Durable problems (missing files, malformed TOML, unreadable) never raise —
     they land in errors/warnings and the boundary still applies.
     Returns {"applied": bool, "noop_reason": str | None, "manifest": dict | None,
-             "over_budget": bool}.
+             "over_budget": bool, "handoff_advised": bool,
+             "forced_handoff": bool}.
     """
     workspace = Path(workspace)
     entries = session_log.read(room_id)
@@ -856,6 +969,7 @@ def apply_boundary(
             ),
             "manifest": None,
             "over_budget": False,
+            "handoff_advised": False,
         }
 
     project = read_active_project(entries)
@@ -866,8 +980,34 @@ def apply_boundary(
     classes = _manifest_classes(entries, boundary_index)
     tokens_before, tokens_after_est = _render_char_estimates(entries, boundary_index)
 
+    # Runway-gated handoff (kdsn.305.12 D1): the handoff decision is about
+    # POST-BOUNDARY runway, never about durable-set size.  The composite
+    # tokens_after is the POST-BOUNDARY RENDER estimate: the expunged-span
+    # residual (tokens_after_est) PLUS the framed snapshot bytes ALWAYS
+    # appended at this boundary PLUS the in-flight tail (entries at/after
+    # boundary_index — zero for a settled turn).  A small durable set plus a
+    # fat in-flight tail still triggers the handoff; a big durable snapshot
+    # correctly consumes runway even though tokens_after_est never sees it.
+    # The chars//4 estimator undercounts, which OVERSTATES runway_after and
+    # therefore DELAYS the handoff — the wrong direction, strictly (accepted
+    # v1, spec D1b: the 75/85/92 ladder guards exhaustion between
+    # boundaries).
+    _mt = 0 if max_tokens is None else int(max_tokens)
+    available = int(window) - _mt
+    # Single ts for the whole boundary application: the manifest stamp and
+    # the snapshot's frozen_at must be the SAME value (frozen snapshot bytes
+    # are deterministic given frozen_at — two now() calls could disagree).
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snapshot = frame_snapshot(boundary_index, resolution, over_budget,
+                              budget_tokens, frozen_at=ts)
+    tokens_after = tokens_after_est + len(snapshot) // 4 \
+        + _post_boundary_tail_tokens(entries, boundary_index)
+    runway_after = available - tokens_after
+    threshold_tokens = max(int(int(window) * handoff_pct), int(handoff_min))
+    handoff_advised = runway_after < threshold_tokens
+
     manifest = {
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts": ts,
         "boundary_index": boundary_index,
         "trigger": trigger,
         "classes": classes,
@@ -888,13 +1028,18 @@ def apply_boundary(
             "used_tokens": used_tokens,
             "over_budget": over_budget,
         },
+        "runway": {
+            "available": available,
+            "tokens_after": tokens_after,
+            "runway_after": runway_after,
+            "threshold_tokens": threshold_tokens,
+            "handoff_advised": handoff_advised,
+        },
         "errors": resolution["errors"],
     }
 
     # Belt against non-serializable stragglers; values are JSON-native anyway.
     detail = json.dumps(manifest, ensure_ascii=False, default=str)
-    snapshot = frame_snapshot(boundary_index, resolution, over_budget,
-                              budget_tokens, frozen_at=manifest["ts"])
 
     session_log.append(
         role="system",
@@ -912,24 +1057,35 @@ def apply_boundary(
         source=GC_SNAPSHOT_SOURCE,
     )
 
-    forced_handoff = False
     if over_budget:
+        # kdsn.305.12 D2: over-budget is demoted to the snapshot-header
+        # marker (informational) + manifest record.  NO directive, NO bead,
+        # NO ntfy — the full durable set is attached verbatim regardless.
         logger.warning(
-            "gc_boundary %d: durable set over budget (%d > %d tokens)",
+            "gc_boundary %d: durable set over reinjection budget (%d > %d "
+            "tokens) — informational marker only",
             boundary_index,
             used_tokens,
             budget_tokens,
         )
-        # FORCED HANDOFF (workspace-kdsn.305.3, Fable #3: MECHANISM, not
-        # policy) — "durable budget exceeded" must be an actionable harness
-        # signal, never a silent degradation and never a pointer-ization of
-        # durable content. Inject a durable reminder directive telling the
-        # agent to finalize the continuity artifact and execute
-        # session-handoff, and raise a handoff pointer bead as the
-        # cross-session signal. Once per epoch: skip when this room's JSONL
-        # already carries the directive (a boundary re-applied over budget
-        # must not spam). Fail-soft end to end: a bd failure logs and moves
-        # on — the reminder entry is the durable signal.
+
+    # FORCED HANDOFF (kdsn.305.12 D1, reworked from kdsn.305.3): fires ONLY
+    # when the POST-BOUNDARY runway is exhausted — the room genuinely cannot
+    # make useful forward progress.  Decoupled from the durable-set budget
+    # (over-budget with ample runway is marker-only; under-budget with
+    # exhausted runway still hands off). Once per epoch: skip when this
+    # room's JSONL already carries the directive (a second boundary in the
+    # same epoch must not re-fire). Fail-soft end to end: a bd failure logs
+    # and moves on — the reminder entry is the durable signal.
+    forced_handoff = False
+    if handoff_advised:
+        logger.warning(
+            "gc_boundary %d: post-boundary runway exhausted (%d < %d tokens "
+            "threshold) — forced handoff",
+            boundary_index,
+            runway_after,
+            threshold_tokens,
+        )
         if not any(
             e.get("role") == "user" and e.get("source") == "reminder"
             and e.get("trigger") == GC_FORCED_HANDOFF_TRIGGER
@@ -940,7 +1096,7 @@ def apply_boundary(
                 role="user",
                 sender=session_log.agent_user_id,
                 room=room_id,
-                content=frame_forced_handoff(used_tokens, budget_tokens),
+                content=frame_forced_handoff(runway_after, available),
                 source="reminder",
                 trigger=GC_FORCED_HANDOFF_TRIGGER,
             )
@@ -952,6 +1108,7 @@ def apply_boundary(
         "manifest": manifest,
         "over_budget": over_budget,
         "forced_handoff": forced_handoff,
+        "handoff_advised": handoff_advised,
     }
 
 # --- Message-list boundary transform (workspace-kdsn.305.4) -----------------

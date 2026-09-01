@@ -90,10 +90,13 @@ class ReminderState:
     # SILENT SKIP, the same fail-safe convention as available_tokens (fewer
     # nudges, never false urgency; also keeps existing constructions valid).
     gc_warn_threshold: int = 0
-    # gc_budget_fraction: durable-set tokens used / durable budget (0.0–1.0+),
-    # from the last applied boundary's manifest. Default 0.0 = no boundary
-    # seen yet (in-memory only; restarts empty) → gc-budget silent.
-    gc_budget_fraction: float = 0.0
+    # gc_runway_fraction: post-boundary runway consumption
+    # (tokens_after / available, 0.0–1.0+) from the last applied boundary's
+    # manifest "runway" block (kdsn.305.12 D5 — replaces gc_budget_fraction;
+    # the durable budget is informational-only and no longer feeds a
+    # trigger). Default 0.0 = no boundary seen yet (in-memory only; restarts
+    # empty) → gc-runway silent.
+    gc_runway_fraction: float = 0.0
 
 
 @dataclass
@@ -130,7 +133,7 @@ class ReminderEngine:
         # triggers (once-per-session latches, re-armed by reset() and
         # rehydrated from JSONL like every other trigger).
         self._gc_warn_fired: bool = False   # gc-warn: once per session
-        self._gc_budget_fired: bool = False # gc-budget: once per session
+        self._gc_runway_fired: bool = False # gc-runway: once per session
         # Context nudge ladder (replaces the single-shot T2 _t2_fired bool):
         # _ladder_fired — monotonic highest tier fired this session+model
         # (D1: single latch, never fire a tier ≤ one already fired; D3: no
@@ -285,25 +288,31 @@ class ReminderEngine:
                 ),
             ))
 
-        # Context GC — gc-budget (kdsn.305).  turn_start ONLY, once per
-        # session.  Predicate: durable-set usage >= 50% of its budget
-        # (integer cross-multiplication, like the ladder — no float
-        # comparison at the 0.5 boundary).  0.0 = no boundary seen yet
-        # (in-memory cache, empty after restart) → silent skip.  States the
-        # percentage so the operator can see how close the durable set is to
-        # its re-injection budget.
+        # Context GC — gc-runway (kdsn.305.12 D5, replaces the retired
+        # gc-budget trigger).  turn_start ONLY, once per session.  Predicate
+        # (integer test, audited kdsn.305.12 R6): the runway fraction is
+        # scaled to an integer PERCENT and compared to the 90 threshold —
+        # ``int(fraction * 100) >= 90``.  This is an integer comparison at
+        # the percent level (no float-vs-0.9 boundary test), but note the
+        # ``int()`` truncates: any fraction in [0.90, 0.91) — e.g. 0.905 —
+        # also fires, and the printed percentage is the truncated integer.
+        # 0.0 = no boundary seen yet (in-memory cache, empty after restart)
+        # → silent skip.  This PLANS FOR a handoff, it does not force one:
+        # the durable snapshot + post-boundary residue nearly exhausts the
+        # runway, so the next turn may not finish.  States the integer
+        # percentage so the agent can size the urgency.
         if (state.evaluation_point == "turn_start"
-                and not self._gc_budget_fired
-                and state.gc_budget_fraction >= 0
-                and int(state.gc_budget_fraction * 200) >= 100):
-            self._gc_budget_fired = True
+                and not self._gc_runway_fired
+                and state.gc_runway_fraction >= 0
+                and int(state.gc_runway_fraction * 100) >= 90):
+            self._gc_runway_fired = True
             results.append(Reminder(
-                trigger="gc-budget",
+                trigger="gc-runway",
                 text=(
-                    f"Your durable set uses {int(state.gc_budget_fraction * 100)}% "
-                    "of its re-injection budget. Prune it: drop durable-set "
-                    "entries that are no longer load-bearing and keep "
-                    "progress.md within ~1–2K tokens."
+                    f"Context is {int(state.gc_runway_fraction * 100)}% durable "
+                    "snapshot + post-boundary residue after the last GC "
+                    "boundary — runway is nearly consumed. Plan a handoff "
+                    "before the next turn."
                 ),
             ))
 
@@ -435,9 +444,9 @@ class ReminderEngine:
                 # Once-per-session latch (kdsn.305): a persisted gc-warn entry
                 # means it already fired this session — do not re-ping.
                 self._gc_warn_fired = True
-            elif trigger == "gc-budget":
-                # Same once-per-session latch.
-                self._gc_budget_fired = True
+            elif trigger == "gc-runway":
+                # Same once-per-session latch (kdsn.305.12 D5).
+                self._gc_runway_fired = True
             elif trigger == "session-orient" and entry.get("detail") is not None:
                 # kdsn.298: restore the model-keyed orientation flag from the
                 # persisted detail. Last-wins in JSONL order (the final entry
@@ -456,7 +465,7 @@ class ReminderEngine:
         self._t5_fired = False
         self._t6_fired = False
         self._gc_warn_fired = False   # kdsn.305: re-arm both GC triggers
-        self._gc_budget_fired = False
+        self._gc_runway_fired = False
         self._t4_fired_this_turn = False
         # Ladder re-arm (D7): umbral = new session, all tiers re-arm.
         self._ladder_fired = 0

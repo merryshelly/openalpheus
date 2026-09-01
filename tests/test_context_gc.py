@@ -439,9 +439,15 @@ class TestFrameSnapshot:
         assert "malformed" in s
 
     def test_over_budget_line(self, tmp_path):
+        # kdsn.305.12 D2: over-budget is demoted to an INFORMATIONAL
+        # snapshot-header marker — no alarm wording, NOT a cap.
         r = self._res(tmp_path)
         s = frame_snapshot(6, r, over_budget=True, budget_tokens=100)
-        assert "OVER BUDGET" in s and "100" in s
+        assert "over reinjection budget" in s.lower()
+        assert "informational" in s.lower()
+        assert "10/100" in s or "/100" in s  # used/budget counts retained
+        assert "prune" in s.lower()
+        assert "OVER BUDGET" not in s
 
     def test_deterministic_no_timestamps(self, tmp_path):
         r = self._res(tmp_path)
@@ -595,45 +601,16 @@ class TestApplyBoundary:
         snap = log.read(ROOM)[6]["content"]
         assert "skills/ghost.md" in snap  # named, not silently skipped
 
-    def test_forced_handoff_directive_once_per_epoch(self, tmp_path):
-        from openalph.context_gc import GC_FORCED_HANDOFF_TRIGGER
-        log = _log(tmp_path)
-        f = tmp_path / "skills" / "big.md"
-        f.parent.mkdir(parents=True)
-        f.write_text("Z" * 4000)
-        _append_all(log, self._entries())
-        r = self._apply(log, tmp_path, config_paths=["skills/big.md"],
-                        window=1000, budget_pct=0.15, budget_min=0,
-                        bd_path=None)  # never raise real beads from a test
-        assert r["over_budget"] is True and r["forced_handoff"] is True
-        entries = log.read(ROOM)
-        directives = [e for e in entries
-                      if e.get("source") == "reminder"
-                      and e.get("trigger") == GC_FORCED_HANDOFF_TRIGGER]
-        assert len(directives) == 1
-        assert "session-handoff" in directives[0]["content"]
-        # LITERAL reminder tags (Reminder.content convention — audit: the
-        # entity-escaped form degraded the one non-negotiable signal)
-        assert "<system-reminder>" in directives[0]["content"]
-        assert "&lt;system-reminder&gt;" not in directives[0]["content"]
-        # second over-budget boundary same epoch: no duplicate directive
-        _append_all(log, [_user("more")])
-        r2 = self._apply(log, tmp_path, config_paths=["skills/big.md"],
-                         window=1000, budget_pct=0.15, budget_min=0,
-                         bd_path=None)
-        assert r2["over_budget"] is True and r2["forced_handoff"] is False
-        directives = [e for e in log.read(ROOM)
-                      if e.get("source") == "reminder"
-                      and e.get("trigger") == GC_FORCED_HANDOFF_TRIGGER]
-        assert len(directives) == 1
-
-    def test_forced_handoff_under_budget_silent(self, tmp_path):
-        log = _log(tmp_path)
-        _append_all(log, self._entries())
-        r = self._apply(log, tmp_path)
-        assert r["over_budget"] is False and r["forced_handoff"] is False
-        assert not any(e.get("trigger") == "gc-forced-handoff"
-                       for e in log.read(ROOM))
+    # kdsn.305.12 D1: the handoff is RUNWAY-gated (post-snapshot residue vs
+    # threshold), decoupled from the durable-set budget. The old
+    # over-budget-driven epoch-latch test (test_forced_handoff_directive_
+    # once_per_epoch) and the over-budget-silent shape
+    # (test_forced_handoff_under_budget_silent) are fully subsumed by the red
+    # suite (tests/test_context_gc_runway_handoff.py
+    # TestRunwayHandoffSemantics) and are deleted here; the two bead tests
+    # are retargeted to a genuine runway-exhausted scenario (fat durable
+    # snapshot vs a small window), keeping their unique bd-argv and
+    # bd_path=None coverage.
 
     def test_forced_handoff_bead_raised(self, tmp_path, monkeypatch):
         import openalph.context_gc as gcmod
@@ -645,10 +622,13 @@ class TestApplyBoundary:
         log = _log(tmp_path)
         f = tmp_path / "skills" / "big.md"
         f.parent.mkdir(parents=True)
-        f.write_text("Z" * 4000)
+        f.write_text("Z" * 200000)  # ~50K-token snapshot
         _append_all(log, self._entries())
+        # window 60000, no max_tokens -> available 60000; the ~50K snapshot
+        # leaves runway_after far below the 24000 floor -> handoff.
         r = self._apply(log, tmp_path, config_paths=["skills/big.md"],
-                        window=1000, budget_pct=0.15, budget_min=0)
+                        window=60000, budget_pct=0.25, budget_min=10)
+        assert r["handoff_advised"] is True
         assert r["forced_handoff"] is True
         assert len(calls) == 1
         argv = calls[0][0]
@@ -656,6 +636,8 @@ class TestApplyBoundary:
         assert "create" in argv and "handoff" in argv
 
     def test_forced_handoff_bead_bd_path_none_disables(self, tmp_path, monkeypatch):
+        # Same runway-exhausted scenario, bd_path=None: the bead raise is
+        # disabled end-to-end (fail-soft) while the directive still fires.
         import openalph.context_gc as gcmod
         calls = []
         monkeypatch.setattr(gcmod.subprocess, "run",
@@ -663,10 +645,12 @@ class TestApplyBoundary:
         log = _log(tmp_path)
         f = tmp_path / "skills" / "big.md"
         f.parent.mkdir(parents=True)
-        f.write_text("Z" * 4000)
+        f.write_text("Z" * 200000)  # ~50K-token snapshot
         _append_all(log, self._entries())
         r = self._apply(log, tmp_path, config_paths=["skills/big.md"],
-                        window=1000, budget_pct=0.15, budget_min=0, bd_path=None)
+                        window=60000, budget_pct=0.25, budget_min=10,
+                        bd_path=None)
+        assert r["handoff_advised"] is True
         assert r["forced_handoff"] is True
         assert calls == []
 

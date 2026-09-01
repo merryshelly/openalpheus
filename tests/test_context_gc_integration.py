@@ -3,7 +3,7 @@
 The tests are the specification. Scope of this file:
   - [context] TOML config parsing (Sub C: config.py)
   - CONTINUITY.md prompt assembly, 8th operator file (Sub C: prompt.py + template)
-  - gc-warn / gc-budget reminder triggers, coexist-with-reset (Sub C: reminders.py)
+  - gc-warn / gc-runway reminder triggers, coexist-with-reset (Sub C: reminders.py)
   - context_gc + set_active_project tools (Sub D: tools/__init__.py)
   - /cache gc + /cache status + /project matrix commands (Sub D: matrix.py)
 
@@ -106,8 +106,11 @@ class TestConfigContextSection:
         assert c.warn_pct == 75
         assert c.auto_pct == 85
         assert c.hard_pct == 92
-        assert c.durable_budget_pct == 15.0
-        assert c.durable_budget_min_tokens == 48000
+        assert c.durable_budget_pct == 25.0
+        assert c.durable_budget_min_tokens == 96000
+        # kdsn.305.12 D3: runway-gated handoff thresholds
+        assert c.handoff_runway_pct == 10.0
+        assert c.handoff_runway_min_tokens == 24000
         assert c.durable_paths == []
         assert c.turn_cooldown == 3
 
@@ -180,7 +183,7 @@ class TestContinuityPrompt:
 
 
 # ============================================================================
-# gc-warn / gc-budget reminder triggers (coexist-with-reset)
+# gc-warn / gc-runway reminder triggers (coexist-with-reset)
 # ============================================================================
 
 class TestGCTriggers:
@@ -228,16 +231,11 @@ class TestGCTriggers:
                     evaluation_point="tool_loop_boundary")
         assert [r for r in eng.evaluate(st) if r.trigger == "gc-warn"] == []
 
-    def test_gc_budget_at_50pct(self, tmp_path):
-        eng = self._eng(tmp_path)
-        st = _state(gc_budget_fraction=0.5)
-        out = [r for r in eng.evaluate(st) if r.trigger == "gc-budget"]
-        assert len(out) == 1 and "prune" in out[0].text.lower()
-
-    def test_gc_budget_below_half_silent(self, tmp_path):
-        eng = self._eng(tmp_path)
-        st = _state(gc_budget_fraction=0.49)
-        assert [r for r in eng.evaluate(st) if r.trigger == "gc-budget"] == []
+    # kdsn.305.12 D5: the gc-budget trigger (durable-set usage >= 50% of
+    # budget) is REMOVED — replaced by gc-runway (post-boundary runway
+    # consumption >= 90%, once/session). The two tests below are deleted
+    # as fully subsumed by the red suite
+    # (tests/test_context_gc_runway_handoff.py TestGCRunwayReminder).
 
     def test_triggers_rehydrate(self, tmp_path):
         eng = self._eng(tmp_path)
@@ -251,10 +249,10 @@ class TestGCTriggers:
     def test_reset_rearms_both(self, tmp_path):
         eng = self._eng(tmp_path)
         eng.evaluate(_state(context_tokens=USABLE_262K, gc_warn_threshold=1000,
-                            gc_budget_fraction=0.9))
+                            gc_runway_fraction=0.95))
         eng.reset()
         assert eng.evaluate(_state(context_tokens=USABLE_262K, gc_warn_threshold=1000))
-        assert eng.evaluate(_state(gc_budget_fraction=0.9))
+        assert eng.evaluate(_state(gc_runway_fraction=0.95))
 
 
 # ============================================================================

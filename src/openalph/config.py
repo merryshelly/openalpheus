@@ -91,9 +91,21 @@ class ContextGCConfig:
     auto_pct: int = 85      # turn-start auto boundary tier
     hard_pct: int = 92      # (reserved: hard tier is the send-time overflow guard)
     # Durable-set re-injection budget: max(window * pct, min_tokens) tokens
-    # (see context_gc.durable_budget_tokens).
-    durable_budget_pct: float = 15.0          # > 0
-    durable_budget_min_tokens: int = 48000    # >= 0
+    # (see context_gc.durable_budget_tokens). INFORMATIONAL marker threshold
+    # ONLY (kdsn.305.12 D2): over-budget is demoted to the snapshot-header
+    # marker — it is NOT a cap, the full durable set is attached verbatim
+    # regardless, and it never forces a handoff. Generous on purpose: the
+    # failure mode is agents keeping too little, never too much (SB
+    # 2026-08-31 / 2026-09-01).
+    durable_budget_pct: float = 25.0          # > 0
+    durable_budget_min_tokens: int = 96000    # >= 0
+    # Runway-gated forced handoff (kdsn.305.12 D1): at an applied boundary,
+    # handoff is advised when the post-snapshot residue consumes the usable
+    # runway down to threshold = max(window * pct / 100, min_tokens) —
+    # decoupled from the durable-set budget entirely. pct strict (0, 100)
+    # on the same fail-loud discipline as the tier knobs; min >= 0.
+    handoff_runway_pct: float = 10.0              # 0 < pct < 100
+    handoff_runway_min_tokens: int = 24000        # >= 0
     # Workspace-relative glob patterns declaring additional durable path
     # classes re-injected at every boundary (e.g. ["skills/*.md"]).
     durable_paths: list[str] = field(default_factory=list)
@@ -772,7 +784,7 @@ def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
     hard_pct = _pct("hard_pct", 92)
 
     # durable budget: pct > 0, min_tokens >= 0
-    durable_budget_pct = section.get("durable_budget_pct", 15.0)
+    durable_budget_pct = section.get("durable_budget_pct", 25.0)
     if (isinstance(durable_budget_pct, bool)
             or not isinstance(durable_budget_pct, (int, float))
             or not math.isfinite(durable_budget_pct)
@@ -782,13 +794,33 @@ def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
             f"got {durable_budget_pct!r}")
     durable_budget_pct = float(durable_budget_pct)
 
-    durable_budget_min_tokens = section.get("durable_budget_min_tokens", 48000)
+    durable_budget_min_tokens = section.get("durable_budget_min_tokens", 96000)
     if (isinstance(durable_budget_min_tokens, bool)
             or not isinstance(durable_budget_min_tokens, int)
             or durable_budget_min_tokens < 0):
         raise ConfigError(
             f"[context] durable_budget_min_tokens must be an integer >= 0, "
             f"got {durable_budget_min_tokens!r}")
+
+    # runway-gated handoff thresholds (kdsn.305.12 D1/D3): pct strict
+    # (0, 100) — bool rejected explicitly (int subclass); min >= 0.
+    handoff_runway_pct = section.get("handoff_runway_pct", 10.0)
+    if (isinstance(handoff_runway_pct, bool)
+            or not isinstance(handoff_runway_pct, (int, float))
+            or not math.isfinite(handoff_runway_pct)
+            or not (0 < handoff_runway_pct < 100)):
+        raise ConfigError(
+            f"[context] handoff_runway_pct must be a finite number strictly "
+            f"between 0 and 100, got {handoff_runway_pct!r}")
+    handoff_runway_pct = float(handoff_runway_pct)
+
+    handoff_runway_min_tokens = section.get("handoff_runway_min_tokens", 24000)
+    if (isinstance(handoff_runway_min_tokens, bool)
+            or not isinstance(handoff_runway_min_tokens, int)
+            or handoff_runway_min_tokens < 0):
+        raise ConfigError(
+            f"[context] handoff_runway_min_tokens must be an integer >= 0, "
+            f"got {handoff_runway_min_tokens!r}")
 
     # durable path globs
     durable_paths = section.get("durable_paths", [])
@@ -815,6 +847,8 @@ def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
         hard_pct=hard_pct,
         durable_budget_pct=durable_budget_pct,
         durable_budget_min_tokens=durable_budget_min_tokens,
+        handoff_runway_pct=handoff_runway_pct,
+        handoff_runway_min_tokens=handoff_runway_min_tokens,
         durable_paths=durable_paths,
         turn_cooldown=turn_cooldown,
     )

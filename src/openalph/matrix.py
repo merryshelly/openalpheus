@@ -41,7 +41,6 @@ from openalph.context_gc import (
     LEGACY_EVENT,
     ACTIVE_PROJECT_EVENT,
     apply_boundary_and_rebuild,
-    current_boundary_index,
     project_echo_text,
     read_active_project,
 )
@@ -198,20 +197,6 @@ def _escape_capped(text: str, raw_cap: int, esc_cap: int) -> str:
 # identically. All readers are pure JSONL scans; writers go through
 # context_gc.apply_boundary (the ONLY boundary writer).
 
-#: [context]-section knobs and their defaults — the fallbacks mirror
-#: openalph.config's [context] defaults so a config object that predates the
-#: section (or a headless config without one) behaves as if defaults were in
-#: force. Sub C owns the authoritative [context] parser; these are the
-#: flag-off / pre-landing safety net only.
-_GC_DEFAULTS = {
-    "gc_enabled": True,
-    "durable_paths": [],
-    "durable_budget_pct": 15.0,
-    "durable_budget_min_tokens": 48000,
-    "turn_cooldown": 3,
-}
-
-
 def _gc_boundary_state(entries):
     """(index, trigger) of the LATEST boundary marker (gc_boundary AND legacy
     toolstrip kinds) in raw JSONL entries; (None, None) when there is none.
@@ -260,7 +245,8 @@ def _gc_confirm_text(outcome, trigger):
     durable = manifest.get("durable") or {}
     used = durable.get("used_tokens", 0)
     budget = durable.get("budget_tokens", 0)
-    over = " — ⚠️ OVER BUDGET" if outcome.get("over_budget") else ""
+    over = (" — over reinjection budget (informational)"
+            if outcome.get("over_budget") else "")
     return (
         f"✅ GC boundary {manifest.get('boundary_index', '?')} applied "
         f"(trigger: {trigger}). "
@@ -273,15 +259,6 @@ def _gc_confirm_text(outcome, trigger):
         f"{manifest.get('tokens_after_est', 0)} (est.). "
         f"Durable budget {used}/{budget} tokens{over}."
     )
-
-
-    if not entries:
-        lines.append("Durable set: 0 entries (durable-set.toml has no entries).")
-    else:
-        lines.append(f"Durable entries: {len(entries)}")
-        for item in entries:
-            lines.append(f"  - {item['path']} — {item['reason']}")
-    return "\n".join(lines)
 
 
 def _furl_tool_call_detail(input_data, result, is_error: bool) -> str:
@@ -3166,6 +3143,28 @@ class MatrixBot:
                             self.agent, self.session_log, room_id,
                             trigger="manual", exclude_inflight=False)
                         if outcome.get("applied"):
+                            # kdsn.305.12 R3: this operator path applies the
+                            # boundary DIRECTLY (not via the apply_gc_boundary
+                            # callback), so the agent's applied-boundary
+                            # bookkeeping — engine reset, hard-tier strikes,
+                            # runway-fraction cache, churn-guard re-arm — must
+                            # be driven here through the SAME seam the
+                            # callback consumer uses (Agent._note_gc_boundary_applied).
+                            # Without it the gc-runway reminder would keep
+                            # evaluating the STALE pre-boundary runway.
+                            # Fail-soft: a mock/legacy agent without the seam
+                            # (or a malformed outcome) must never break the
+                            # operator command.
+                            _note = getattr(self.agent,
+                                            "_note_gc_boundary_applied", None)
+                            if callable(_note):
+                                try:
+                                    _note(room_id, outcome)
+                                except Exception:
+                                    logger.warning(
+                                        "gc /cache: applied-boundary note "
+                                        "failed for %s (fail-soft)",
+                                        room_id, exc_info=True)
                             await self.send_notice(room_id, _gc_confirm_text(outcome, "manual"))
                         else:
                             await self.send_notice(
