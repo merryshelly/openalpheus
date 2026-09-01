@@ -573,6 +573,36 @@ _BLACKWELL_EFFORT_MAP: dict[str, str] = {
 # "max"). House convention mirrors _SYNTHETIC_EFFORT_WARNED / _VISION_WARNED.
 _BLACKWELL_EFFORT_WARNED: set[str] = set()
 
+# Mac Studio qwen38 (local llama.cpp rig, :8010) reasoning_effort remap
+# (2026-09-01, SB steering: "effort pinned medium is no good — passthrough").
+# Wire-probed vs http://10.0.20.104:8010, llama.cpp 4df29be-era build, served
+# model qwen38-coder. Legality authority = the GGUF template's own error
+# text: "Supported types are xhigh (default), medium, and low" — high/max/
+# garbage -> HTTP 500 (Jinja raise_exception), so OA must never pass them
+# through. Server source (tools/server/server-common.cpp) parses TOP-LEVEL
+# reasoning_effort natively: non-empty values are written into
+# chat_template_kwargs, overriding the CLI --chat-template-kwargs pin
+# per-key; "none" sets enable_thinking=false and erases any pinned kwarg
+# (thinking-off works even with a pin live). ALWAYS send explicitly
+# (kdsn.271 omitted-param bug class). high collapses DOWN to medium and max
+# ceiling-maps to xhigh (template top), each warn-once — never map up.
+# NOTE: the server-side pin was removed in the same change; clients that
+# omit the param now get the template default xhigh. OA never omits it.
+# Tier ranking left uncharacterized (n=1 probe at temp 1.0 was too noisy);
+# only legality + the disable path are encoded here.
+_MACSTUDIO_QWEN_EFFORT_MAP: dict[str, str] = {
+    "off": "none",
+    "low": "low",
+    "medium": "medium",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+}
+
+# macstudio-qwen reasoning_effort remaps already WARNed about (one warning
+# per OA level per process). House convention mirrors
+# _BLACKWELL_EFFORT_WARNED / _SYNTHETIC_EFFORT_WARNED.
+_MACSTUDIO_QWEN_EFFORT_WARNED: set[str] = set()
+
 
 def model_supports_vision(api_model: str, config) -> bool:
     """Resolve whether a model accepts image content blocks (kdsn.275).
@@ -1774,6 +1804,28 @@ def _build_openai_kwargs(
                 "%r (operator intent is lossy).", thinking_level, _bw_effort,
             )
         extra_body["reasoning_effort"] = _bw_effort
+    elif provider_key == "macstudio-qwen":
+        # 2026-09-01 (SB steering): local llama.cpp qwen38 rig takes
+        # TOP-LEVEL reasoning_effort (like Fireworks/Synthetic/blackwell),
+        # never OpenRouter's nested reasoning.effort. Legality per the
+        # template's own error text: only xhigh (default) / medium / low;
+        # high/max/garbage -> 500 LOUD. "none" is intercepted server-side
+        # (enable_thinking=false + pinned-kwarg erase). See
+        # _MACSTUDIO_QWEN_EFFORT_MAP above for the full evidence block.
+        # Collision note: this provider serves only qwen38-coder — the
+        # DSv4F text-prefix branch below (different provider key "macstudio"
+        # AND different model string) can never see these requests.
+        _mq_effort = _MACSTUDIO_QWEN_EFFORT_MAP.get(thinking_level, "medium")
+        _req_tier = _TIER.get("none" if thinking_level == "off" else thinking_level)
+        if (_req_tier is not None and _TIER.get(_mq_effort, -1) < _req_tier
+                and thinking_level not in _MACSTUDIO_QWEN_EFFORT_WARNED):
+            _MACSTUDIO_QWEN_EFFORT_WARNED.add(thinking_level)
+            logger.warning(
+                "macstudio-qwen (qwen38 template) does not support "
+                "reasoning_effort=%r; remapping to %r (operator intent is "
+                "lossy).", thinking_level, _mq_effort,
+            )
+        extra_body["reasoning_effort"] = _mq_effort
     elif thinking_level == "off" and "deepseek-v4-flash" in api_model.lower():
         # DSv4 thinks BY DEFAULT (template enable_thinking=true). llama.cpp
         # disables thinking only on TOP-LEVEL reasoning_effort="none" (verified
