@@ -135,6 +135,9 @@ class AgentConfig:
     matrix: MatrixConfig | None = None
     max_iterations: int = 100
     truncation_limit: int = 50000
+    # kdsn.315 P3: budget for continuation attempts on a NON-EMPTY length-stop
+    # (stop_reason=max_tokens) in the text branch. 0 = legacy keep-as-is.
+    max_continuations: int = 1
     # Per-turn stall watchdog: cancel a turn that has made no room-observable
     # progress for this many seconds. 0 disables the watchdog entirely.
     # Guards against the provider-retry wedge (RCA 2026-08-03): the SDK retry
@@ -179,6 +182,18 @@ class AgentConfig:
     spotter_thinking: str = "off"
     spotter_max_iterations: int = 8
     spotter_disabled_rooms: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        # kdsn.315 P3: fail-loud on a bad max_continuations at BOTH entry
+        # points — the TOML parse path (load_config) and direct
+        # AgentConfig(...) construction (CLI, tests, subagent configs).
+        # bool is an int subclass in Python — rejected explicitly.
+        mc = self.max_continuations
+        if (isinstance(mc, bool)
+                or not isinstance(mc, int)
+                or mc < 0):
+            raise ConfigError(
+                f"max_continuations must be an integer >= 0, got {mc!r}")
 
 
 def resolve_model(
@@ -361,6 +376,20 @@ def load_config(path: Path) -> AgentConfig:
     max_iterations = agent_section.get("max_iterations", 100)
     if not isinstance(max_iterations, int) or max_iterations <= 0:
         raise ConfigError("max_iterations must be a positive integer")
+
+    # max_continuations defaults to 1 (kdsn.315 P3): the per-turn budget of
+    # continuation attempts on a non-empty length-stop. bool is an int
+    # subclass in Python — reject it explicitly. 0 restores legacy behavior
+    # (truncated text kept as-is, no continuation). Fail-loud like
+    # thinking_tail_max_tokens: silently dropping a bad knob would leave the
+    # operator believing a budget they do not have.
+    max_continuations = agent_section.get("max_continuations", 1)
+    if (isinstance(max_continuations, bool)
+            or not isinstance(max_continuations, int)
+            or max_continuations < 0):
+        raise ConfigError(
+            f"max_continuations must be an integer >= 0, "
+            f"got {max_continuations!r}")
     
     # truncation_limit defaults to 50000 if not specified
     truncation_limit = agent_section.get("truncation_limit", 50000)
@@ -688,6 +717,7 @@ def load_config(path: Path) -> AgentConfig:
         matrix=matrix,
         max_iterations=max_iterations,
         truncation_limit=truncation_limit,
+        max_continuations=max_continuations,
         turn_stall_timeout_seconds=turn_stall_timeout_seconds,
         reminders=reminders,
         injection_defense=injection_defense,

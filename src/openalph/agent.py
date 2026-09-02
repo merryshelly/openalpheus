@@ -18,7 +18,7 @@ from pathlib import Path
 
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
-from openalph.provider import complete, stream, ping_cache, ThinkingBlock, compute_cost, model_supports_vision
+from openalph.provider import complete, stream, ping_cache, ThinkingBlock, Usage, compute_cost, model_supports_vision
 from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, _TODO_STATE
 from openalph.reminders import ReminderEngine, ReminderState
 from openalph.spotter import SpotterManager
@@ -891,6 +891,7 @@ class Agent:
                            on_text_delta=None, on_thinking_delta=None,
                            on_cache_status=None, cache_ttl: str | None = None,
                            append_user: bool = True,
+                           tools: list | None = None,
                            drain_steering=None) -> str:
         """Process a user message and return the assistant's response.
 
@@ -906,6 +907,10 @@ class Agent:
                 gated-room path in matrix.py) has already written the message
                 to JSONL and hydrated history from it, so we do not duplicate
                 the entry in the wire payload.
+            tools: Optional per-turn tool override (kdsn.315 test seam). When
+                given (including an explicit []), it replaces the tools
+                discovered at init for this turn's API calls and dispatch;
+                None (default) keeps the discovered set — behavior unchanged.
             on_text_delta: Optional callback(text: str, done: bool) for text streaming
             on_thinking_delta: Optional callback(text: str, done: bool) for thinking streaming
         """
@@ -1003,6 +1008,10 @@ class Agent:
                 if room_id not in self._room_tool_counts:
                     self._room_tool_counts[room_id] = {}
 
+                # Turn-start tool set: per-turn `tools` override (kdsn.315)
+                # wins over the init-discovered set; None keeps old behavior.
+                _turn_tools = tools if tools is not None else self.tools
+
                 # Determine enabled tool names — all builtins are available
                 # regardless of which tool TOMLs are present in workspace/tools/
                 # NOTE (R1-6): ideally {t.name for t in self.tools} but existing
@@ -1010,7 +1019,7 @@ class Agent:
                 # todo_write.toml and rely on T1 firing. Cannot change those
                 # tests (FORBIDDEN). R1-6 real-path test validates engine-level
                 # suppression. See circuit-breaker report.
-                _enabled_tools = {t.name for t in self.tools}
+                _enabled_tools = {t.name for t in _turn_tools}
 
                 # Turn-start reminder evaluation (T3 fires here).
                 # I1 durability invariant: every injection must become a durable JSONL
@@ -1094,6 +1103,23 @@ class Agent:
                     else getattr(self.config, "thinking", "off")
                 )
                 retried_without_thinking = False
+
+                # kdsn.315 P3: continuation budget consumption for this turn
+                # (at most one attempt; capped by config.max_continuations).
+                continuations_used = 0
+
+                # kdsn.315 P2: one budget-exhaustion notice per turn, fired on
+                # the FIRST length-stopped response seen (text or tool branch).
+                _length_stopped_notified = False
+
+                # kdsn.315 P2: did this turn SEE a max_tokens stop at any
+                # point (the turn's first response, or a continuation's)?
+                # The text-branch notice is gated on this rather than the
+                # FINAL stop reason: after a successful continuation the
+                # turn ends "end_turn" yet the turn still hit the budget and
+                # must be surfaced exactly once.
+                _turn_saw_max_tokens = False
+                _clipped_output_tokens = 0
 
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
@@ -1271,8 +1297,8 @@ class Agent:
                         if context_tokens > available and not _gc_cleared:
                             raise ContextOverflowError(context_tokens, limit)
 
-                    # Pass tools=None if no tools discovered (backward compatibility)
-                    tools_arg = self.tools if self.tools else None
+                    # Pass tools=None if no tools available (backward compatibility)
+                    tools_arg = _turn_tools if _turn_tools else None
 
                     # Terminal tool (Stigmergy Decision 18, bead
                     # workspace-e2uh.152): per-run state registered by the
@@ -1393,12 +1419,254 @@ class Agent:
                     self._record_turn_usage(
                         room_id, response.usage, response.model, cache_ttl,
                         provider_key=_pkey, provider_type=_ptype)
+                    # kdsn.315 P1 (loop-level belt): canonicalize
+                    # budget-exhaustion vocabulary at the point the loop sees
+                    # the response. The provider seam already maps
+                    # OpenAI-compat "length" -> "max_tokens" (no-op in
+                    # production); it is repeated here so the downstream
+                    # checks (P2 notice, P3 continuation, P4 empty-retry) are
+                    # robust to a response that bypassed the provider seam —
+                    # test fakes driving openalph.agent.stream directly, or a
+                    # future non-provider source.
+                    if getattr(response, "stop_reason", None) == "length":
+                        response.stop_reason = "max_tokens"
+                    # kdsn.315 P2: remember that the turn saw a budget
+                    # exhaustion, even if a later continuation ends
+                    # "end_turn" (the notice must still fire once per turn).
+                    if response.stop_reason == "max_tokens":
+                        _turn_saw_max_tokens = True
+                        _clipped_output_tokens = (
+                            getattr(response.usage, "output_tokens", 0) or 0)
                     usage = response.usage
 
                     # Check if response has tool calls
                     if not tool_calls and not response.tool_calls:
                         # Text response - log and return
                         final_text = accumulated_text or response.content
+
+                        # Recovery: extended thinking can consume the entire output
+                        # budget, yielding empty text with stop_reason == "max_tokens"
+                        # (the model "thought" until it hit max_tokens and never wrote
+                        # an answer). Retry once with thinking disabled so the full
+                        # budget is available for output. Single attempt only; if
+                        # thinking is already off we cannot reduce it further, and a
+                        # non-empty (merely truncated) answer is kept as-is.
+                        if (
+                            not (final_text or "").strip()
+                            and response.stop_reason == "max_tokens"
+                            and effective_thinking != "off"
+                            and not retried_without_thinking
+                        ):
+                            retried_without_thinking = True
+                            effective_thinking = "off"
+                            # Per-attempt observability (pre-kdsn315 contract,
+                            # pinned by test_stop_reason_logs_both_attempts_on_
+                            # recovery): the failed attempt is a REAL API call —
+                            # log it with its own usage/stop_reason so the turn
+                            # log shows BOTH the empty max_tokens attempt and the
+                            # recovery. (A continuation, by contrast, merges into
+                            # ONE entry below.)
+                            self._log_turn(
+                                room_id=room_id,
+                                model=self.get_model(room_id),
+                                input_tokens=usage.input_tokens,
+                                output_tokens=usage.output_tokens,
+                                tool_calls=None,
+                                latency_ms=latency_ms,
+                                content_preview=final_text,
+                                cache_read_tokens=usage.cache_read_tokens,
+                                cache_creation_tokens=usage.cache_creation_tokens,
+                                stop_reason=response.stop_reason,
+                            )
+                            if on_cache_status:
+                                try:
+                                    await on_cache_status(usage, self.get_model(room_id))
+                                except Exception:
+                                    logger.error("on_cache_status callback failed", exc_info=True)
+                            logger.warning(
+                                "Empty response in %s (stop_reason=max_tokens — extended "
+                                "thinking consumed the entire %d-token output budget); "
+                                "retrying once with thinking disabled",
+                                room_id, usage.output_tokens,
+                            )
+                            continue
+
+                        # kdsn.315 P3: single continuation attempt on a
+                        # NON-EMPTY length-stop (stop_reason=max_tokens).
+                        # REQUEST-LOCAL: the continuation's framing user message
+                        # and the partial assistant message are carried in the
+                        # call's `messages=` list ONLY — never appended to
+                        # durable history (same no-history-mutation
+                        # philosophy as the retry-without-thinking path above).
+                        # The durable history gains exactly ONE merged
+                        # assistant message below (RC1).
+                        if (
+                            final_text
+                            and response.stop_reason == "max_tokens"
+                            # kdsn.315 P3 is scoped to OpenAI-compat providers:
+                            # that is where the wire vocabulary is "length" and
+                            # where the budget-exhaustion clips the spec targets
+                            # (blackwell/synthetic/fireworks/macstudio). An
+                            # Anthropic max_tokens text turn keeps the
+                            # pre-kdsn315 "kept as-is" contract pinned by
+                            # tests/test_empty_response_retry.py (no continuation
+                            # for it).
+                            and _ptype == "openai"
+                            and continuations_used < self.config.max_continuations
+                        ):
+                            continuations_used += 1
+                            _partial_assistant = {"role": "assistant", "content": final_text}
+                            if response.thinking:
+                                _partial_assistant["thinking"] = [
+                                    {"thinking": tb.thinking, "signature": tb.signature}
+                                    for tb in response.thinking
+                                ]
+                            _continuation_messages = history + [
+                                _partial_assistant,
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Your previous response was cut off at the "
+                                        "output-token limit. Continue EXACTLY where "
+                                        "you left off mid-sentence — no preamble, no "
+                                        "repetition. You may review your partial "
+                                        "answer in the assistant message above and "
+                                        "finish the response."
+                                    ),
+                                },
+                            ]
+                            # Same stream()/complete() seam as the main loop,
+                            # same effective thinking level (a continuation is
+                            # a REAL generation — do NOT drop thinking).
+                            _cont_response = None
+                            async for _cont_event in stream(
+                                config=self.config,
+                                system=self.system_prompt,
+                                messages=_continuation_messages,
+                                tools=tools_arg,
+                                model=self.get_model(room_id),
+                                thinking=effective_thinking,
+                                cache_ttl=cache_ttl,
+                                room_id=room_id,
+                                strict=_terminal_strict,
+                            ):
+                                if _cont_event.type == "done":
+                                    _cont_response = _cont_event.response
+                            if _cont_response is None:
+                                _cont_response = await complete(
+                                    config=self.config,
+                                    system=self.system_prompt,
+                                    messages=_continuation_messages,
+                                    tools=tools_arg,
+                                    model=self.get_model(room_id),
+                                    thinking=effective_thinking,
+                                    room_id=room_id,
+                                    strict=_terminal_strict,
+                                )
+                            if _cont_response.tool_calls:
+                                # The continuation answered with tool calls
+                                # instead of text: ABANDON the attempt. Never
+                                # execute those tools, never grow the loop —
+                                # the partial text stands as the final answer.
+                                _abandoned = [
+                                    f"{tc.name}({json.dumps(tc.input, ensure_ascii=False)})"
+                                    for tc in _cont_response.tool_calls
+                                ]
+                                logger.warning(
+                                    "Continuation in %s produced tool calls "
+                                    "(%s) instead of text; abandoning the "
+                                    "continuation — keeping the partial "
+                                    "response as the final answer",
+                                    room_id, ", ".join(_abandoned),
+                                )
+                                # Keep the partial text; still record the
+                                # continuation's stop_reason and merge its
+                                # usage into the turn.
+                                response = _cont_response
+                            else:
+                                # Direct concatenation (no separator): the
+                                # model continues mid-sentence from its own
+                                # partial.
+                                final_text = final_text + (_cont_response.content or "")
+                                response = _cont_response
+                            _cont_usage = _cont_response.usage or Usage(
+                                input_tokens=0, output_tokens=0)
+                            # Merge response2.usage into the turn's usage
+                            # accumulator so _log_turn / the serializer see
+                            # the SUM, not just the continuation's slice.
+                            usage = Usage(
+                                input_tokens=usage.input_tokens + _cont_usage.input_tokens,
+                                output_tokens=usage.output_tokens + _cont_usage.output_tokens,
+                                cache_read_tokens=(
+                                    (usage.cache_read_tokens or 0)
+                                    + (_cont_usage.cache_read_tokens or 0)
+                                ),
+                                cache_creation_tokens=(
+                                    (usage.cache_creation_tokens or 0)
+                                    + (_cont_usage.cache_creation_tokens or 0)
+                                ),
+                            )
+                            # kdsn.315 H1 (audit remediation): the
+                            # continuation's tokens must reach the REAL
+                            # usage accumulator — _record_turn_usage feeds
+                            # global/per-room counters, frozen USD cost, and
+                            # the serializer's per-turn delta. The merged
+                            # `usage` above feeds only the turn's JSONL row;
+                            # the main call's delta was already recorded at
+                            # loop top, so record the continuation DELTA here.
+                            self._record_turn_usage(
+                                room_id, _cont_usage,
+                                _cont_response.model
+                                or self.get_model(room_id),
+                                cache_ttl, provider_key=_pkey,
+                                provider_type=_ptype)
+
+                        # kdsn.315 P1 (belt, continuation): response2 arrives
+                        # AFTER the loop-level normalization above, so its
+                        # "length" would otherwise stay unnormalized and leak
+                        # into the recorded stop reason and the P2 notice.
+                        if (response.stop_reason == "length"):
+                            response.stop_reason = "max_tokens"
+                            _turn_saw_max_tokens = True
+                            _clipped_output_tokens = (
+                                getattr(response.usage, "output_tokens", 0) or 0)
+                        assistant_msg = {"role": "assistant", "content": final_text}
+                        # kdsn.315 P3: when a continuation resolved, the durable
+                        # message carries the MERGED thinking — the partial's
+                        # blocks first (stashed in _partial_assistant at
+                        # continuation entry), then the continuation's; the
+                        # partial's streamed text stands in as a single block
+                        # when it had no structured blocks. The non-continuation
+                        # path is byte-identical to the pre-kdsn315 assignment.
+                        if (continuations_used or accumulated_thinking
+                                or response.thinking):
+                            if continuations_used:
+                                _merged_thinking = list(
+                                    _partial_assistant.get("thinking") or [])
+                                if not _merged_thinking and accumulated_thinking:
+                                    _merged_thinking.append(
+                                        {"thinking": accumulated_thinking,
+                                         "signature": ""})
+                                for tb in (response.thinking or []):
+                                    _merged_thinking.append(
+                                        {"thinking": tb.thinking,
+                                         "signature": tb.signature})
+                                if _merged_thinking:
+                                    assistant_msg["thinking"] = _merged_thinking
+                            else:
+                                thinking_blocks = response.thinking if response.thinking else []
+                                if accumulated_thinking and not thinking_blocks:
+                                    thinking_blocks = [ThinkingBlock(thinking=accumulated_thinking, signature="")]
+                                assistant_msg["thinking"] = [
+                                    {"thinking": tb.thinking, "signature": tb.signature}
+                                    for tb in thinking_blocks
+                                ]
+                        # kdsn.315 P3: the text turn's log entry fires ONCE,
+                        # AFTER continuation resolution, so it sees the MERGED
+                        # turn usage (partial + continuation) and the FINAL
+                        # stop reason. (Pre-.315 the entry fired before the
+                        # retry/continuation points; a continuation-less turn
+                        # is byte-identical to that old single entry.)
                         self._log_turn(
                             room_id=room_id,
                             model=self.get_model(room_id),
@@ -1416,41 +1684,40 @@ class Agent:
                                 await on_cache_status(usage, self.get_model(room_id))
                             except Exception:
                                 logger.error("on_cache_status callback failed", exc_info=True)
-
-                        # Recovery: extended thinking can consume the entire output
-                        # budget, yielding empty text with stop_reason == "max_tokens"
-                        # (the model "thought" until it hit max_tokens and never wrote
-                        # an answer). Retry once with thinking disabled so the full
-                        # budget is available for output. Single attempt only; if
-                        # thinking is already off we cannot reduce it further, and a
-                        # non-empty (merely truncated) answer is kept as-is.
-                        if (
-                            not (final_text or "").strip()
-                            and response.stop_reason == "max_tokens"
-                            and effective_thinking != "off"
-                            and not retried_without_thinking
-                        ):
-                            retried_without_thinking = True
-                            effective_thinking = "off"
-                            # This attempt's token usage and _log_turn entry already
-                            # fired above — both reflect a real API call and are kept.
-                            logger.warning(
-                                "Empty response in %s (stop_reason=max_tokens — extended "
-                                "thinking consumed the entire %d-token output budget); "
-                                "retrying once with thinking disabled",
-                                room_id, usage.output_tokens,
+                        # kdsn.315 P2: notice AFTER continuation resolution so
+                        # the body is accurate ("Continuation also truncated."
+                        # only when the attempt also clipped).
+                        # kdsn.315 M1 (audit remediation): fire only when the
+                        # turn's FINAL outcome is a truncation OR a
+                        # continuation happened — a recovered empty-retry
+                        # turn (no continuation, final end_turn) is NOT
+                        # truncated and stays silent. L4: the count is the
+                        # length-stopped response's, not the merged turn's.
+                        if (final_text or "").strip() \
+                                and _turn_saw_max_tokens \
+                                and not _length_stopped_notified \
+                                and (response.stop_reason == "max_tokens"
+                                     or continuations_used):
+                            _clipped = (_clipped_output_tokens
+                                        or usage.output_tokens)
+                            _notice_body = (
+                                "⚠️ Turn hit the output-token budget "
+                                "(stop_reason=max_tokens"
+                                + (f", {_clipped} output tokens"
+                                   if _clipped else "")
+                                + ")."
                             )
-                            continue
-
-                        assistant_msg = {"role": "assistant", "content": final_text}
-                        if accumulated_thinking or response.thinking:
-                            thinking_blocks = response.thinking if response.thinking else []
-                            if accumulated_thinking and not thinking_blocks:
-                                thinking_blocks = [ThinkingBlock(thinking=accumulated_thinking, signature="")]
-                            assistant_msg["thinking"] = [
-                                {"thinking": tb.thinking, "signature": tb.signature}
-                                for tb in thinking_blocks
-                            ]
+                            if continuations_used and response.stop_reason == "max_tokens":
+                                _notice_body += " Continuation also truncated."
+                            _notice_cb = (callbacks or {}).get("send_notice")
+                            if _notice_cb:
+                                try:
+                                    await _notice_cb(room_id, _notice_body)
+                                except Exception:
+                                    logger.warning(
+                                        "send_notice callback failed for "
+                                        "length-stop notice", exc_info=True)
+                            _length_stopped_notified = True
                         # INVARIANT (RC1): assistant_msg must be history[-1] when matrix persists this turn after return.
                         history.append(assistant_msg)
                         self._last_stop_reason[room_id] = response.stop_reason
@@ -1460,6 +1727,26 @@ class Agent:
                         self._fire_spotter_turn_completion(
                             room_id, history, _turn_source, callbacks)
                         return final_text
+
+                    # kdsn.315 P2: fire the turn's one length-stop notice on
+                    # the FIRST length-stopped response in the loop (a turn
+                    # may clip across several tool iterations — one notice
+                    # total). Tool execution proceeds exactly as today; a
+                    # notice failure never alters the turn.
+                    if response.stop_reason == "max_tokens" and not _length_stopped_notified:
+                        _length_stopped_notified = True
+                        _notice_cb = (callbacks or {}).get("send_notice")
+                        if _notice_cb:
+                            try:
+                                _body = "⚠️ Turn hit the output-token budget (stop_reason=max_tokens"
+                                if usage.output_tokens:
+                                    _body += f", {usage.output_tokens} output tokens"
+                                _body += ")."
+                                await _notice_cb(room_id, _body)
+                            except Exception:
+                                logger.warning(
+                                    "send_notice callback failed for length-stop notice",
+                                    exc_info=True)
 
                     # Use tool_calls from stream or from response
                     active_tool_calls = tool_calls if tool_calls else response.tool_calls
@@ -1588,7 +1875,7 @@ class Agent:
                     for tc in active_tool_calls:
                         # Find the tool config for this tool
                         tool_config = {}
-                        for t in self.tools:
+                        for t in _turn_tools:
                             if t.name == tc.name:
                                 tool_config = t.config
                                 break
@@ -1609,7 +1896,7 @@ class Agent:
                             input=tc.input,
                             tool_config=tool_config,
                             agent_config=self.config,
-                            tools=self.tools,
+                            tools=_turn_tools,
                             callbacks=tc_callbacks,
                         ))
 

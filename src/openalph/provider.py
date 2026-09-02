@@ -1472,6 +1472,18 @@ def _openai_usage(u) -> Usage:
     )
 
 
+def _normalize_stop_reason(value):   # str | None -> str | None
+    """Canonicalize budget-exhaustion vocabulary: OpenAI 'length' -> 'max_tokens'.
+
+    OpenAI-compat providers report output-budget exhaustion as
+    finish_reason="length"; Anthropic already emits stop_reason="max_tokens".
+    Everything else (None, "stop", "end_turn", "tool_calls", "tool_use",
+    "max_tokens", ...) passes through unchanged so downstream both-keyed
+    checkers (subagent/spotter/advisor) keep working on either vocabulary.
+    """
+    return "max_tokens" if value == "length" else value
+
+
 def _parse_openai_response(response) -> Response:
     """Parse OpenAI response into normalized Response."""
     message = response.choices[0].message
@@ -1514,7 +1526,7 @@ def _parse_openai_response(response) -> Response:
         thinking=thinking_blocks,
         model=response.model,
         usage=_openai_usage(response.usage),
-        stop_reason=response.choices[0].finish_reason,
+        stop_reason=_normalize_stop_reason(response.choices[0].finish_reason),
         generation_id=getattr(response, "id", "") or "",
     )
 
@@ -2297,7 +2309,7 @@ async def stream(
                     
                     # Track finish reason
                     if choice.finish_reason:
-                        stop_reason = choice.finish_reason
+                        stop_reason = _normalize_stop_reason(choice.finish_reason)
             
             # Mid-stream degeneration abort (kdsn.241.4). We broke out of the
             # consume loop; tear down the HTTP stream so we stop reading (and,
