@@ -28,7 +28,6 @@ from openalph.context_gc import (
     read_active_project,
     tool_pointer,
     legacy_tool_placeholder,
-    legacy_input_placeholder,
     strip_thinking_entry,
     parse_durable_set,
     durable_budget_tokens,
@@ -167,8 +166,13 @@ class TestPlaceholders:
     def test_legacy_tool_placeholder_byte_exact(self):
         assert legacy_tool_placeholder("file_read", 5000) == "[stripped: file_read result, 5000 chars]"
 
-    def test_legacy_input_placeholder_byte_exact(self):
-        assert legacy_input_placeholder(600) == "[stripped: 600 chars]"
+    def test_legacy_input_placeholder_deleted_37ch(self):
+        # 37ch: input-side compaction retired — the generator is gone; the
+        # "[stripped: N chars]" literal lives on for LEGACY pre-37ch
+        # contexts only (sentry family 1 covers it by literal).
+        import openalph.context_gc as cg
+        assert not hasattr(cg, "legacy_input_placeholder")
+        assert "legacy_input_placeholder" not in cg.__all__
 
 
 # ============================================================================
@@ -732,7 +736,7 @@ class TestRenderGC:
         tool_msg = [m for m in ctx if m.get("tool_call_id") == "c2"][0]
         assert tool_msg["content"] == "out" * 900  # post-boundary output full
 
-    def test_large_input_placeholder_rule_kept(self, tmp_path):
+    def test_large_input_rendered_verbatim_37ch(self, tmp_path):
         log = _log(tmp_path)
         _append_all(log, [
             _user("q"),
@@ -745,9 +749,14 @@ class TestRenderGC:
                        window=1_000_000, budget_pct=0.15, budget_min=48000)
         ctx = _ctx(log, gc_enabled=True)
         a = [m for m in ctx if m.get("role") == "assistant"][0]
-        val = a["tool_calls"][0].input["content"]
-        assert val == "[stripped: 900 chars]"  # existing >500 input rule, unchanged
+        # 37ch: >500-char input values render VERBATIM — the render no
+        # longer writes "[stripped: N chars]" input placeholders.
+        assert a["tool_calls"][0].input["content"] == "y" * 900
+        assert "[stripped:" not in a["tool_calls"][0].input["content"]
         assert "path" in a["tool_calls"][0].input  # small params untouched
+        # Result-side pointer family is UNCHANGED.
+        tool_msg = [m for m in ctx if m.get("tool_call_id") == "c1"][0]
+        assert "expunged at GC boundary" in tool_msg["content"]
 
     def test_superseded_snapshot_dropped_wholesale(self, tmp_path):
         log = self._scene(tmp_path)

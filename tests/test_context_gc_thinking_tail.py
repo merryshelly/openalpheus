@@ -261,8 +261,8 @@ class TestTailRender:
 
     def test_surrounding_transforms_intact_on_retained(self, tmp_path):
         # Fixture where the retained assistant has a >500-char string input:
-        # thinking retained, input STILL compacted pre-boundary (T1 keeps
-        # the entry whole; only stripping is skipped).
+        # thinking retained; 37ch: input renders VERBATIM (no input
+        # compaction at all pre-boundary).
         entries = [
             _user("start"),                                              # 0
             _assistant("big input", thinking="K" * 200,
@@ -280,8 +280,10 @@ class TestTailRender:
                  if m.get("role") == "assistant" and m.get("content") == "big input")
         assert a["thinking"] == "K" * 200
         tc = a["tool_calls"][0]
-        compacted = tc.input if isinstance(tc.input, dict) else {}
-        assert compacted.get("command") == "[stripped: 900 chars]"
+        input_dict = tc.input if isinstance(tc.input, dict) else {}
+        # 37ch: the >500-char input renders verbatim, byte-identical.
+        assert input_dict.get("command") == "Y" * 900
+        assert "[stripped:" not in input_dict.get("command", "")
 
     def test_default_kwargs_are_full_strip(self, tmp_path):
         # T4 safety net: no tail kwargs == legacy full strip. Renders over

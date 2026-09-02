@@ -353,7 +353,7 @@ class SessionLog:
                 contiguous, chars//4 ceiling) names the pre-boundary
                 assistant positions whose thinking is retained VERBATIM
                 instead of stripped; every other transform for those
-                entries (tool-call compaction, media, orphan repair, …) is
+                entries (tool-result pointer, media, orphan repair, …) is
                 unchanged — only the thinking-strip is skipped.  Config
                 values are passed explicitly by the production call sites
                 (the agent render paths and context_gc.apply_boundary_
@@ -509,8 +509,9 @@ class SessionLog:
                 # retained position keep their "thinking" into the rendered
                 # msg (the msg["thinking"] assignment below sees
                 # entry["thinking"]); everything else about that entry's
-                # processing is UNCHANGED (tool_call compaction, pairing
-                # harvest, media, orphan repair all still apply).  The
+                # processing is UNCHANGED (tool-result pointer, pairing
+                # harvest, media, orphan repair all still apply — inputs
+                # render verbatim, 37ch).  The
                 # retained set only ever contains eligible entries (content
                 # or tool_calls present), so a retained entry is never
                 # deleted here and no empty shell can result.
@@ -527,43 +528,32 @@ class SessionLog:
                 if entry.get("tool_calls"):
                     # Rehydrate dicts back to ToolCall objects so the
                     # provider serialisation path (tc.id, tc.name, tc.input)
-                    # works unchanged.
+                    # works unchanged.  Pre-boundary inputs render VERBATIM
+                    # (raw input, any length) — input compaction retired
+                    # (workspace-37ch); the harvest below is unchanged and
+                    # feeds the tool-RESULT pointer formatting.
+                    tool_calls = [
+                        ToolCall(
+                            id=tc.get("call_id") or tc.get("id", ""),
+                            name=tc.get("name", ""),
+                            input=tc.get("input", {}),
+                            extra_content=tc.get("extra_content"),
+                        )
+                        for tc in entry["tool_calls"]
+                    ]
                     if boundary_index >= 0 and entry_idx < boundary_index:
-                        # Before the strip boundary: replace any large string
-                        # input values with compact placeholders.
-                        tool_calls = []
+                        # Harvest (name, RAW input) for pointer formatting —
+                        # the same pass, no second scan.  Pointer idents must
+                        # cite the original input even though the render is
+                        # now verbatim.
                         for tc in entry["tool_calls"]:
                             raw_input = tc.get("input", {})
-                            # Harvest (name, input) for pointer formatting —
-                            # the same pass, no second scan.
                             _cid = tc.get("call_id") or tc.get("id", "")
                             if _cid:
                                 pre_boundary_calls[_cid] = (
                                     tc.get("name", ""),
                                     raw_input if isinstance(raw_input, dict) else None,
                                 )
-                            stripped_input = {
-                                k: (f"[stripped: {len(v)} chars]"
-                                    if isinstance(v, str) and len(v) > 500
-                                    else v)
-                                for k, v in raw_input.items()
-                            }
-                            tool_calls.append(ToolCall(
-                                id=tc.get("call_id") or tc.get("id", ""),
-                                name=tc.get("name", ""),
-                                input=stripped_input,
-                                extra_content=tc.get("extra_content"),
-                            ))
-                    else:
-                        tool_calls = [
-                            ToolCall(
-                                id=tc.get("call_id") or tc.get("id", ""),
-                                name=tc.get("name", ""),
-                                input=tc.get("input", {}),
-                                extra_content=tc.get("extra_content"),
-                            )
-                            for tc in entry["tool_calls"]
-                        ]
                     msg["tool_calls"] = tool_calls
                 if entry.get("thinking"):
                     msg["thinking"] = entry["thinking"]

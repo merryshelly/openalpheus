@@ -176,11 +176,12 @@ class TestApplyBoundaryToMessages:
         assert "/tmp/big.md" in r["messages"][2]["content"]
         assert "5000 chars" in r["messages"][2]["content"]
 
-    def test_pairing_uses_original_input_not_stripped(self):
-        # Same-pass harvesting (session.py parity): the pointer's identifying
-        # param comes from the call's ORIGINAL input — an over-500 path must
-        # still appear in the pointer (truncated to 80), not the "[stripped]"
-        # placeholder the transform wrote into the rendered tool_call.
+    def test_pairing_uses_original_input_verbatim_37ch(self):
+        # 37ch: the render no longer strips — the tool_call input passes
+        # VERBATIM (byte-identical to the original), and the pointer's
+        # identifying param is harvested from the SAME raw input in the
+        # same pass, so an over-500 path still appears in the pointer
+        # (truncated to 80).
         path = "p" * 700
         scene = [
             {"role": "assistant", "content": "",
@@ -190,7 +191,8 @@ class TestApplyBoundaryToMessages:
         ]
         r = apply_boundary_to_messages(scene, boundary_index=2, task_text="t")
         rendered = r["messages"][0]["tool_calls"][0]["input"]["path"]
-        assert rendered == "[stripped: 700 chars]"  # transform applied
+        assert rendered == path  # 37ch: input rendered verbatim
+        assert "[stripped:" not in rendered
         pointer = r["messages"][1]["content"]
         expected = tool_pointer(2, "file_read", {"path": path}, 100)
         assert pointer == expected
@@ -251,7 +253,10 @@ class TestApplyBoundaryToMessages:
         assert isinstance(m[0]["tool_calls"][0], ToolCall)
         assert m[1]["role"] == "tool"
 
-    def test_long_input_value_stripped_objects(self):
+    def test_long_input_value_verbatim_objects_37ch(self):
+        # 37ch: >500-char input values render VERBATIM (any length, incl.
+        # >500); the "inputs" class is retired — pinned 0 for schema
+        # stability.
         scene = [
             {"role": "user", "content": "q"},
             {"role": "assistant", "content": "",
@@ -263,8 +268,9 @@ class TestApplyBoundaryToMessages:
         tc = r["messages"][1]["tool_calls"][0]
         assert isinstance(tc, ToolCall)
         assert tc.id == "c1"
-        assert tc.input == {"path": "a.md", "content": "[stripped: 600 chars]"}
-        assert r["manifest"]["classes"]["inputs"] == 1
+        assert tc.input == {"path": "a.md", "content": "y" * 600}
+        assert "[stripped:" not in tc.input["content"]
+        assert r["manifest"]["classes"]["inputs"] == 0  # retired (37ch), key kept
 
     def test_input_value_exactly_500_not_stripped(self):
         scene = [
@@ -359,7 +365,7 @@ class TestApplyBoundaryToMessages:
         r = apply_boundary_to_messages(scene, boundary_index=7, task_text="t")
         assert r["manifest"]["classes"] == {
             "tools": 2, "thinking": 2, "thinking_retained": 0,
-            "media": 1, "inputs": 1,
+            "media": 1, "inputs": 0,  # 37ch: input compaction retired, key kept
         }
         assert r["manifest"]["messages_before"] == 8
         assert r["manifest"]["messages_after"] == 8  # 8 - 1 dropped + 1 snapshot

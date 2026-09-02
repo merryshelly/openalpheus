@@ -214,8 +214,9 @@ class TestToolstripBasic:
 
 class TestToolCallInputStripping:
 
-    def test_large_input_values_stripped(self, tmp_path):
-        """Tool call input values > 500 chars get placeholder."""
+    def test_large_input_values_rendered_verbatim(self, tmp_path):
+        """Pre-boundary tool call input values (ANY length, incl. >500)
+        render verbatim — input compaction retired (workspace-37ch)."""
         big_content = "x" * 600
         sl = make_sl(tmp_path)
         append_user(sl)
@@ -230,11 +231,15 @@ class TestToolCallInputStripping:
         ctx = sl.build_context(ROOM_ID)
         assistant_msgs = [m for m in ctx if m.get("tool_calls")]
         tc = assistant_msgs[0]["tool_calls"][0]
-        # Path should be preserved (short)
+        # Path preserved (short)
         assert tc.input["path"] == "/tmp/file.txt"
-        # Content should be stripped
-        assert "[stripped:" in tc.input["content"]
-        assert "600" in tc.input["content"]
+        # 37ch: the >500 input renders VERBATIM — byte-identical to the
+        # JSONL content, no "[stripped: N chars]" input placeholder.
+        assert tc.input["content"] == big_content
+        assert "[stripped:" not in tc.input["content"]
+        # Result-side placeholder family is UNCHANGED.
+        tool_msgs = [m for m in ctx if m["role"] == "tool"]
+        assert "[stripped:" in tool_msgs[0]["content"]
 
     def test_small_input_values_preserved(self, tmp_path):
         """Tool call input values <= 500 chars are not touched."""

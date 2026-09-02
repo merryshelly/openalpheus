@@ -316,10 +316,15 @@ class TestS7Nested:
 class TestS8GeneratorSync:
     def test_regex_matches_live_generators(self):
         from openalph.context_gc import (
-            legacy_input_placeholder, legacy_tool_placeholder, tool_pointer)
+            legacy_tool_placeholder, tool_pointer)
         from openalph.tools import _GC_PLACEHOLDER_RE
         for marker in (
-                legacy_input_placeholder(4760),
+                # The legacy input placeholder generator (context_gc.
+                # legacy_input_placeholder) was DELETED in workspace-37ch —
+                # input compaction is gone; family 1 ("[stripped: N chars]")
+                # is covered for legacy render bytes only, pinned by literal
+                # (MARKER_INPUT) plus T4 in test_input_passthrough_37ch.py.
+                "[stripped: 4760 chars]",
                 legacy_tool_placeholder("file_read", 2043),
                 tool_pointer(304, "shell", {"command": "x"}, 4760),
                 tool_pointer(304, "tool", None, 0),

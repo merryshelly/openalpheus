@@ -78,7 +78,6 @@ __all__ = [
     "read_active_project",
     "tool_pointer",
     "legacy_tool_placeholder",
-    "legacy_input_placeholder",
     "strip_thinking_entry",
     "thinking_tail_indices",
     "gc_thinking_tail_kwargs",
@@ -260,11 +259,6 @@ def tool_pointer(boundary_index: int, name: str, params: dict | None, n_chars: i
 def legacy_tool_placeholder(name: str, n_chars: int) -> str:
     """Byte-identical legacy strip placeholder: ``[stripped: {name} result, {n} chars]``."""
     return f"[stripped: {name} result, {n_chars} chars]"
-
-
-def legacy_input_placeholder(n_chars: int) -> str:
-    """Byte-identical legacy input placeholder: ``[stripped: {n} chars]``."""
-    return f"[stripped: {n_chars} chars]"
 
 
 # ---------------------------------------------------------------------------
@@ -708,9 +702,14 @@ def _manifest_classes(entries: list[dict], boundary_index: int,
     thinking: ``thinking + thinking_retained == total-with-thinking`` (the
     retained set only ever contains entries that carry truthy thinking, so
     every retained position is counted exactly once, in thinking_retained).
-    inputs: tool_call string input values > 500 chars; media:
-    pre-boundary user entries whose content is a non-string (part) list.
+    inputs: RETIRED (workspace-37ch — input compaction removed; inputs
+    render verbatim) — always 0, key retained for schema stability;
+    media: pre-boundary user entries whose content is a non-string (part)
+    list.
     """
+    # "inputs" is pinned 0 (retired, workspace-37ch): the key stays in the
+    # manifest so consumers (matrix.py, tools/__init__.py, subagent.py,
+    # frame_sub_snapshot) keep working unchanged.
     tools = thinking = thinking_retained = inputs = media = 0
     retained = retained or frozenset()
     for position, entry in enumerate(entries):
@@ -724,10 +723,7 @@ def _manifest_classes(entries: list[dict], boundary_index: int,
                         thinking_retained += 1
                     else:
                         thinking += 1
-                for tc in entry.get("tool_calls") or []:
-                    value = tc.get("input") if isinstance(tc, dict) else None
-                    if isinstance(value, str) and len(value) > 500:
-                        inputs += 1
+                # (inputs counting retired, workspace-37ch — verbatim render)
             elif role == "user" and isinstance(entry.get("content"), (list, tuple)):
                 media += 1
             elif (role == "user" and isinstance(entry.get("content"), str)
@@ -765,9 +761,8 @@ def _render_char_estimates(entries: list[dict], boundary_index: int,
         asymmetry: before never counted thinking; after now counts the
         retained subset — documented, never a blocker);
       - assistant tool_call string inputs -> the full input length
-        (conservative: the render shortens >500-char values to
-        "[stripped: N chars]" — counting the full length overstates, the
-        safe direction).
+        (exact since 37ch: inputs render verbatim, so the estimate counts
+        precisely what the render emits).
     Post-boundary entries contribute zero here — the in-flight tail is
     measured separately by ``_post_boundary_tail_tokens``; the two combine
     into the composite ``manifest.runway.tokens_after``.
@@ -1407,9 +1402,9 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
       - assistant msg: "thinking" field dropped (count "thinking" per message
         that carried a non-empty thinking list). Thought-only message (string
         content empty/whitespace AND no tool_calls) is deleted atomically —
-        never an empty shell. tool_calls: any STRING value in tc.input longer
-        than 500 chars replaced by "[stripped: {n} chars]" (count "inputs"
-        per replaced value); non-string values untouched.
+        never an empty shell. tool_calls: inputs render VERBATIM since 37ch
+        (input compaction retired — no "[stripped: N chars]" placeholders;
+        the "inputs" class stays in the manifest, pinned 0).
       - assistant thinking-tail retention (workspace-kdsn.305.13 T4 parity):
         with thinking_tail_turns / thinking_tail_max_tokens non-zero, the
         positions from ``thinking_tail_indices`` (same selection over the
@@ -1433,7 +1428,8 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
 
     tool_calls entries may be ToolCall objects OR plain dicts — accept both;
     the output mirrors the input type (objects via dataclasses.replace with
-    stripped input; dicts as new dicts). ToolCall is imported lazily inside
+    the raw input; dicts as new dicts — inputs verbatim since 37ch).
+    ToolCall is imported lazily inside
     the function body from openalph.provider to keep context_gc importable
     standalone.
 
@@ -1459,11 +1455,6 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
     import dataclasses
     from openalph.provider import ToolCall as _ToolCall
 
-    def _strip_value(v):
-        if isinstance(v, str) and len(v) > 500:
-            return f"[stripped: {len(v)} chars]", True
-        return v, False
-
     # tool_call_id -> (name, ORIGINAL input). Harvested from pre-boundary
     # assistant tool_calls IN THE TRANSFORM PASS BELOW (no second scan —
     # mirrors session.py: an assistant call always precedes its tool result,
@@ -1471,6 +1462,8 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
     # that tool message is rendered).
     pairing: dict = {}
     out: list = []
+    # "inputs" retired (workspace-37ch): pinned 0, key retained for schema
+    # stability.
     classes = {"tools": 0, "thinking": 0, "thinking_retained": 0,
                "media": 0, "inputs": 0}
     before_chars = 0
@@ -1522,31 +1515,23 @@ def apply_boundary_to_messages(messages: list[dict], *, boundary_index: int,
                         raw_input = tc.get("input")
                         cid = tc.get("call_id") or tc.get("id", "")
                         name = tc.get("name", "")
-                    # Harvest (name, ORIGINAL input) for pointer pairing in
-                    # the same pass that renders the call. Pointer ident uses
-                    # the pre-strip value so an over-500 identifying param
-                    # (e.g. a long path) still shows in the pointer.
+                    # Harvest (name, RAW input) for pointer pairing in the
+                    # same pass that renders the call. The pointer ident
+                    # cites the original value, so an over-500 identifying
+                    # param (e.g. a long path) still shows in the pointer;
+                    # _harvest_params also filters legacy "[stripped: "
+                    # markers still present in pre-37ch lists.
                     if cid:
                         pairing[cid] = (name, _harvest_params(raw_input))
-                    if isinstance(raw_input, dict):
-                        si = {}
-                        for k, v in raw_input.items():
-                            sv, stripped = _strip_value(v)
-                            if stripped:
-                                classes["inputs"] += 1
-                            si[k] = sv
-                    else:
-                        # Non-dict input (e.g. null): pass through unchanged —
-                        # silently rewriting it to {} would falsify the
-                        # model-visible history (wave-2 audit, 3 lineages).
-                        si = raw_input
+                    # 37ch: the input passes through VERBATIM (dict or
+                    # non-dict, e.g. null) — rewriting it would falsify the
+                    # model-visible history (wave-2 audit, 3 lineages).
                     if isinstance(tc, _ToolCall):
-                        new_tc.append(dataclasses.replace(tc, input=si))
+                        new_tc.append(dataclasses.replace(tc, input=raw_input))
                     else:
-                        new_tc.append({**tc, "input": si})
-                    # Conservative mirror of the entry-version quirk: the
-                    # after-estimate counts the input's FULL length even
-                    # though the transform shortens it.
+                        new_tc.append({**tc, "input": raw_input})
+                    # The after-estimate counts the input's FULL length —
+                    # exact since 37ch (the render no longer shortens it).
                     if isinstance(raw_input, dict):
                         for v in raw_input.values():
                             if isinstance(v, str):
