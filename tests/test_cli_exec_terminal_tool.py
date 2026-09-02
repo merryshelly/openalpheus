@@ -397,7 +397,14 @@ class TestExecSubmitSchemaResult:
         assert obj["status"] == "done"
         assert obj["content"] == "SUBMISSION ACK"
         # Provenance: the terminal call is in the trace, like any tool call.
-        assert {"name": "submit_validation", "is_error": False} in obj["tool_trace"]
+        # bead .162 audit fix: trace entries gained an additive "executed" flag
+        # (False only for terminal-batch not-executed calls); a terminal call is
+        # by definition executed.
+        assert {
+            "name": "submit_validation",
+            "is_error": False,
+            "executed": True,
+        } in obj["tool_trace"]
         # Existing fields untouched (additive contract).
         assert obj["ceiling_trip"] is None
         assert obj["deny_reason"] is None

@@ -726,13 +726,28 @@ def _exec_iteration_cap_reached(agent, room_id: str) -> bool:
 
 
 def _exec_collect_tool_trace() -> list:
-    """Return (trace_list, async_on_tool_call) — trace holds {name, is_error}
-    entries bounded to _EXEC_TOOL_TRACE_CAP, names-only (post-mortem aid)."""
+    """Return (trace_list, async_on_tool_call) — trace holds
+    {name, is_error, executed} entries bounded to _EXEC_TOOL_TRACE_CAP,
+    names-only (post-mortem aid). ``executed`` is False only for calls the
+    terminal tool ended before running ("not executed: turn ended by
+    terminal tool", agent.py terminal-batch semantics) — bead .162 audit
+    fix: the station filing tripwire counts ONLY these as batch-lost, so
+    healthy in-session retries (rejected then re-called) never read as
+    losses."""
     trace = []
 
     async def _on_tool_call(call_id, name, input_data, result, is_error):
         if len(trace) < _EXEC_TOOL_TRACE_CAP:
-            trace.append({"name": name, "is_error": bool(is_error)})
+            not_executed = isinstance(result, str) and result.startswith(
+                "not executed"
+            )
+            trace.append(
+                {
+                    "name": name,
+                    "is_error": bool(is_error),
+                    "executed": not not_executed,
+                }
+            )
 
     return trace, _on_tool_call
 
@@ -1043,6 +1058,27 @@ def cmd_exec(args):
             agent.tools = []
         agent.tools.append(terminal_tool[1])
 
+    # file_ticket per-run filing sink (Stigmergy Decision 18, bead
+    # workspace-e2uh.162): a PER-RUN list — created on the fresh agent here
+    # and never cached, so concurrent or repeated exec runs cannot leak one
+    # run's filings into another. The file_ticket handler appends validated
+    # filings to it; the additive result["filed_proposals"] below (present
+    # only when non-empty) is how the stations harvest them. No env, no
+    # path, no JSONL parsing — per-process by construction.
+    filed_sink: list = []
+    # Wired into handle_input ONLY when file_ticket is in this run's
+    # toolset (resolved builtins, or the terminal-tool union): a plain
+    # exec with no tools keeps passing no callbacks at all (the
+    # no-chat-plumbing invariant), while consumers that opt into the filing
+    # channel (--tools file_ticket: the station critics today, in-cage
+    # workers once the driver lists it) get the per-run sink.
+    _file_ticket_enabled = any(
+        getattr(t, "name", None) == "file_ticket" for t in (agent.tools or [])
+    )
+    _run_callbacks = (
+        {"filed_proposals_sink": filed_sink} if _file_ticket_enabled else None
+    )
+
     # --system-prompt-file: replace the agent's system prompt with the
     # artifact text, BYTE-FAITHFUL — exactly the file text, nothing
     # prepended. A prior lesson: any unhashed preamble silently breaks
@@ -1070,6 +1106,7 @@ def cmd_exec(args):
             task, room_id,
             on_tool_call=on_tool_call,
             thinking=thinking,
+            callbacks=_run_callbacks,
         )
 
     try:
@@ -1123,6 +1160,13 @@ def cmd_exec(args):
             _submit = None
         if isinstance(_submit, dict):
             result["result"] = _submit
+    # Additive top-level `filed_proposals` (Stigmergy Decision 18, bead
+    # workspace-e2uh.162): present ONLY when at least one validated filing
+    # landed in this run's per-run sink (file_ticket appends there). The
+    # harvest side reads it defensively (never-raises). Existing fields
+    # and exit codes are untouched.
+    if filed_sink:
+        result["filed_proposals"] = filed_sink
     print(json.dumps(result), flush=True)
 
     if status == "done":
