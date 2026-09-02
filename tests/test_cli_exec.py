@@ -347,6 +347,20 @@ class TestExecEffort:
 
         assert agent.handle_input.call_args.kwargs.get("thinking") == "xhigh"
 
+    def test_high_maps_to_high(self, tmp_path):
+        """SB ruling 2026-09-02: 'high' is card-native on Synthetic GLM/Kimi
+        (lh3c.11 wire probe: 1:1 pass-through) — a legal charter-native
+        effort value for the subscription worker rungs."""
+        config = make_config(tmp_path)
+        agent = make_agent_stub()
+        task = tmp_path / "p.md"
+        task.write_text("t")
+
+        run_exec(["exec", "--agent", "w", "--task-file", str(task),
+                  "--effort", "high"], config=config, agent=agent)
+
+        assert agent.handle_input.call_args.kwargs.get("thinking") == "high"
+
     def test_no_effort_sends_none(self, tmp_path):
         """When --effort is absent, thinking is not forced (None)."""
         config = make_config(tmp_path)

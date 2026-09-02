@@ -91,7 +91,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Path to the task prompt file, or - for stdin")
     p.add_argument("--model", default=None,
                    help="Override the agent's default model (provider/model)")
-    p.add_argument("--effort", choices=("none", "low", "medium", "xhigh"),
+    p.add_argument("--effort", choices=("none", "low", "medium", "high", "xhigh"),
                    default=None, help="Reasoning effort (card-native values)")
     p.add_argument("--max-turns", type=int, default=None,
                    help="Override max tool-call iterations for this run")
@@ -547,9 +547,13 @@ def cmd_showprompt(args):
 # with; matching the prefix keeps detection robust to tail edits.
 _EXEC_ITERATION_CAP_SENTINEL = "[SYSTEM: Tool call limit reached."
 
-# Charter-native effort surface → OA `thinking=` kwarg (spec §2.8).
+# Charter-native effort surface → OA `thinking=` kwarg (spec §2.8). "high"
+# is card-native on the Synthetic GLM/Kimi cards (lh3c.11 wire probe: 1:1
+# pass-through; xhigh≈max at the model level) — SB ruling 2026-09-02
+# legalizes it for the subscription worker rungs. "max" stays rejected
+# (non-card-native xhigh alias).
 _EXEC_EFFORT_MAP = {"none": "off", "low": "low", "medium": "medium",
-                    "xhigh": "xhigh"}
+                    "high": "high", "xhigh": "xhigh"}
 
 # Stigmergy relay deny marker (bead .147/.134): a machine-readable
 # x-stigmergy-deny-reason header and/or a JSON body
