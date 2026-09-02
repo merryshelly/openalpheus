@@ -6,6 +6,7 @@ Tool registry, discovery, schema generation, and result truncation.
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -15,6 +16,48 @@ from typing import Any
 import tomllib
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# GC placeholder sentry (workspace-3ejn.2, 2026-09-01 crit)
+# ---------------------------------------------------------------------------
+# The render transforms (session.build_context;
+# context_gc.apply_boundary_to_messages) replace pre-boundary tool I/O with
+# these bracketed markers. After a boundary, local models (qwen38-27b
+# observed) regurgitate the syntax as their OWN tool-call payload values
+# (calibrated size estimates — generation, not copy), and the transform-free
+# dispatch path executes them literally. The sentry refuses such values at
+# the trust boundary. WHOLE-VALUE MATCH ONLY — a substring inside a
+# legitimate payload must never trip it. If marker wording is ever changed,
+# keep these patterns in sync with the generators (context_gc.
+# legacy_input_placeholder / legacy_tool_placeholder / tool_pointer;
+# session.py media-expunge string).
+_GC_PLACEHOLDER_RE = re.compile(
+    r"^\[stripped: \d+ chars\]$"
+    r"|^\[stripped: [^\]]{1,200} result, \d+ chars\]$"
+    r"|^\[expunged at GC boundary \d+: .{1,300}\(\d+ chars\) [—-] re-run the tool if the result is needed\]$"
+    r"|^\[expunged at GC boundary \d+: media attachment [—-] re-share or re-generate the image if needed\]$"
+)
+
+
+def _gc_placeholder_param(input: dict) -> str | None:
+    """Return the first param name carrying a context-GC elision marker —
+    as a whole string value (after strip), or inside a list item's string
+    value (one level: list of strings, or list of dicts such as
+    todo_write's `todos`) — else None. Never mutates input."""
+    def _hit(v) -> bool:
+        return isinstance(v, str) and bool(_GC_PLACEHOLDER_RE.match(v.strip()))
+    if not isinstance(input, dict):
+        return None
+    for key, value in input.items():
+        if _hit(value):
+            return key
+        if isinstance(value, list):
+            for item in value:
+                if _hit(item) or (isinstance(item, dict)
+                                  and any(_hit(v) for v in item.values())):
+                    return key
+    return None
+
 
 # NOTE: there is deliberately no subagent progress-ping cadence constant here.
 # Parent-turn liveness during a sub run comes from REAL milestones emitted by
@@ -1978,6 +2021,22 @@ async def _execute_tool_inner(
             is_error=True,
         )
     
+    # GC placeholder sentry (workspace-3ejn.2): refuse model-regurgitated
+    # elision markers at the trust boundary — handlers must never see them.
+    _marker_param = _gc_placeholder_param(input)
+    if _marker_param is not None:
+        logger.warning(
+            "GC placeholder sentry: %s param %r is a context-elision marker; "
+            "refusing before dispatch", name, _marker_param)
+        return ToolResult(
+            content=(f"{name} refused: parameter '{_marker_param}' contained a "
+                     "context-GC elision marker instead of real content — those "
+                     "bracketed markers are rendered by the harness in place of "
+                     "old tool I/O after a context boundary and are never valid "
+                     "input. Regenerate this tool call with the full, actual payload."),
+            is_error=True,
+        )
+
     # Never mutate caller's input dict
     input = dict(input)
 
