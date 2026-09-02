@@ -58,6 +58,7 @@ from openalph.spotter import (
     SpotterManager,
 )
 from openalph.tools import ToolDef, ToolResult
+import openalph.spotter as _spotter_mod
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -103,21 +104,10 @@ DELTA_END_MARKER = "[end of delta]"
 THINK_OPEN = "<" + "think>"
 THINK_CLOSE = "</" + "think>"
 
-# v1.1 §C — per-delta contract re-anchor line (design §5 amendment).
-RE_ANCHOR_LINE = "Respond with exactly SILENT or the FLAG block — nothing else."
-
-# v1.1 §B — canonical session storage: parse_error verdicts never enter
-# state.messages raw; this fixed placeholder does instead. v1.1b: it ends
-# with a standalone SILENT line so that VERBATIM IMITATION parses as silent
-# and stores canonical "SILENT" — the imitation lineage self-extinguishes
-# (2026-08-30 wonmun o9RB: qwen38 echoed the original placeholder verbatim,
-# because any fixed stored string is an imitable few-shot pattern).
-UNPARSED_VERDICT_TEXT = (
-    "[SPOTTER SYSTEM: the previous verdict could not be parsed. The output "
-    "contract is exactly SILENT, or the FLAG block (claim/class/severity/"
-    "evidence) — nothing else.]"
-    "\n\nSILENT"
-)
+# v2 (2026-09-01): the contract strings live in the module — tests REFERENCE
+# them, never copy them (the v1 copies drifted when v2 changed the contract).
+RE_ANCHOR_LINE = _spotter_mod._RE_ANCHOR_LINE
+UNPARSED_VERDICT_TEXT = _spotter_mod._UNPARSED_VERDICT_TEXT
 
 
 def make_provider(key="anthropic", type="anthropic", api_key="sk-test",
@@ -127,7 +117,9 @@ def make_provider(key="anthropic", type="anthropic", api_key="sk-test",
 
 
 def make_config(workspace, **kwargs):
-    """AgentConfig with the §1 [spotter] fields at their documented defaults."""
+    """AgentConfig for watch tests. NOTE (v2 G10): the PRODUCT default for
+    `enabled` is False (explicit arming only) — these tests exercise watch
+    behavior, so they arm explicitly via config."""
     defaults = dict(
         name="spotter-test",
         default_model="anthropic/claude-sonnet-4-20250514",
@@ -179,6 +171,29 @@ def flag_response(**kw):
     return Response(content=flag_block(**kw), model="synglm53",
                     usage=Usage(input_tokens=100, output_tokens=20),
                     stop_reason="end_turn")
+
+
+def verdict_tool_call(call_id="tv1", status="silent", **flag_fields):
+    """A report_verdict TOOL CALL — the v2 primary verdict channel."""
+    if status == "flag":
+        args = {"status": "flag",
+                "claim": flag_fields.get("claim", "claim A"),
+                "class": flag_fields.get("klass", "safety"),
+                "severity": flag_fields.get("severity", "high"),
+                "evidence": flag_fields.get("evidence", "tool-verified pointer")}
+    else:
+        args = {"status": "silent", "claim": "", "class": "",
+                "severity": "", "evidence": ""}
+    return ToolCall(id=call_id, name="report_verdict", input=args)
+
+
+def verdict_response(call_id="tv1", status="silent", narration="", **flag_fields):
+    """Terminal verdict via the report_verdict tool call (v2 contract):
+    one call ends the pass; narration rides alongside as content."""
+    return Response(content=narration, model="synglm53",
+                    usage=Usage(input_tokens=100, output_tokens=20),
+                    stop_reason="tool_calls",
+                    tool_calls=[verdict_tool_call(call_id, status, **flag_fields)])
 
 
 def base_history():
@@ -269,10 +284,12 @@ def write_toml(tmp_path, extra=""):
 class TestConfig:
 
     def test_defaults_when_section_absent(self, tmp_path):
-        """§1: absent [spotter] → all defaults (enabled=True per D6 single knob)."""
+        """§1 v2 (G10, SB 2026-09-01): absent [spotter] → DISABLED (code
+        default OFF — explicit arming only, via config yes or in-room start).
+        Supersedes v1 D6's default-true."""
         cfg = load_config(write_toml(tmp_path))
-        assert cfg.spotter_enabled is True
-        assert cfg.spotter_model == "synglm53"
+        assert cfg.spotter_enabled is False
+        assert cfg.spotter_model == "qwen38blackwell"
         assert cfg.spotter_thinking == "off"
         assert cfg.spotter_max_iterations == 8
         assert cfg.spotter_disabled_rooms == []
@@ -786,9 +803,12 @@ class TestSystemPromptContract:
     """v1.1 §D — output-contract tightening line (design §11 amendment)."""
 
     def test_v1_1_prompt_tightening_line_present(self):
+        """v2: the output contract is the report_verdict TOOL CALL — a text
+        response is narration and can never terminate a pass."""
         normalized = " ".join(SPOTTER_SYSTEM_PROMPT.split())
-        assert ("Your final response must begin immediately with SILENT or "
-                "the FLAG block — no preamble, no analysis prose.") in normalized
+        assert ("A pass ends ONLY by calling the report_verdict tool") in normalized
+        assert 'status="silent"' in normalized or "status='silent'" in normalized or \
+            'status="silent" —' in normalized.replace('"', '"')
 
 
 class TestToolsForSpotter:
@@ -993,7 +1013,9 @@ class TestMaybeFireGating:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 await unblock.wait()
-            return silent_response()
+            # v2: each pass ends with ONE terminating verdict call, so the
+            # coalesced second pass runs as soon as pass 1 ends.
+            return verdict_response(call_id=f"tv{call_count['n']}")
 
         history = base_history()
         with patch("openalph.spotter.complete",
@@ -1073,7 +1095,7 @@ class TestWatchPassVerdicts:
     async def test_transcript_records_meta_delta_verdict(self):
         mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
         with patch("openalph.spotter.complete", new_callable=AsyncMock,
-                   return_value=silent_response()) as mock_complete:
+                   return_value=verdict_response()) as mock_complete:
             mgr.maybe_fire(ROOM, base_history(), None, {})
             assert await wait_until(lambda: mock_complete.await_count >= 1)
             for _ in range(20):
@@ -1083,6 +1105,11 @@ class TestWatchPassVerdicts:
             assert kinds[0] == "meta"
             assert kinds == ["meta", "delta", "verdict"], \
                 f"session shape invariant violated: {kinds}"
+            # v2: the verdict event carries the CANONICAL tool-call args
+            # (raw args live in args_raw for audit fidelity).
+            assert events[-1]["args"] == {"status": "silent", "claim": "",
+                                          "class": "", "severity": "",
+                                          "evidence": ""}
         await settle_pending()
 
     @pytest.mark.asyncio
@@ -1177,7 +1204,7 @@ class TestWatchPassVerdicts:
 
         async def capturing_complete(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
-            return silent_response()
+            return verdict_response()
 
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
             mgr.maybe_fire(ROOM, base_history(), None, {})
@@ -1200,7 +1227,7 @@ class TestWatchPassVerdicts:
 
         async def capturing_complete(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
-            return silent_response()
+            return verdict_response()
 
         history = base_history()
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
@@ -1214,10 +1241,12 @@ class TestWatchPassVerdicts:
 
         first_delta = payloads[0][-1]["content"]
         second_call_messages = payloads[1]
-        # Persistent session: [delta, verdict, delta]
-        assert len(second_call_messages) == 3
+        # v2 persistent session at pass 2's call: [delta, verdict pair, delta2]
+        assert len(second_call_messages) == 4
         assert second_call_messages[1]["role"] == "assistant"
-        assert second_call_messages[1]["content"] == "SILENT"
+        assert second_call_messages[1]["tool_calls"][0]["name"] == "report_verdict"
+        assert second_call_messages[1]["tool_calls"][0]["input"]["status"] == "silent"
+        assert second_call_messages[2]["role"] == "tool"
         second_delta = second_call_messages[-1]["content"]
         assert DELTA_NONINITIAL_LINE_TEMPLATE.format(n=1) in second_delta
         assert "initial render" not in second_delta
@@ -1312,15 +1341,23 @@ class TestV11SessionStorage:
 
     @pytest.mark.asyncio
     async def test_wrapped_silent_stored_canonical_raw_only_in_transcript(self):
+        """v2: the anti-drift principle moves to the verdict CALL ARGS — the
+        session stores the CANONICAL silent args (siblings emptied, padding
+        dropped), the transcript keeps args_raw (audit fidelity)."""
         mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
-        raw = "The delta shows nothing material.\n\nSILENT"
+        padded = {"status": "silent", "claim": "nothing material happened here",
+                  "class": "guidance", "severity": "low",
+                  "evidence": "the delta shows nothing material"}
         payloads = []
 
         async def capturing_complete(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
-            return Response(content=raw, model="synglm53",
+            return Response(content="The delta shows nothing material.",
+                            model="synglm53",
                             usage=Usage(input_tokens=10, output_tokens=5),
-                            stop_reason="end_turn")
+                            stop_reason="tool_calls",
+                            tool_calls=[ToolCall(id="tv1", name="report_verdict",
+                                                 input=dict(padded))])
 
         history = base_history()
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
@@ -1336,26 +1373,36 @@ class TestV11SessionStorage:
 
         session = payloads[1]
         assert session[1]["role"] == "assistant"
-        assert session[1]["content"] == "SILENT", (
-            "session must store the CANONICAL verdict, never raw model text")
+        assert session[1]["tool_calls"][0]["name"] == "report_verdict"
+        assert session[1]["tool_calls"][0]["input"] == {
+            "status": "silent", "claim": "", "class": "", "severity": "",
+            "evidence": ""}, (
+            "session must store CANONICAL silent args, never the padded raw")
         verdicts = [e for e in read_jsonl(transcript_path(agent.config.workspace))
                     if e.get("event") == "verdict"]
-        assert verdicts and verdicts[0]["content"] == raw, (
-            "transcript keeps the RAW output (audit fidelity)")
+        assert verdicts and verdicts[0]["args_raw"] == padded, (
+            "transcript keeps the RAW args (audit fidelity)")
         await settle_pending()
 
     @pytest.mark.asyncio
     async def test_wrapped_flag_stored_and_delivered_canonical(self):
+        """v2: the verdict arrives as a report_verdict call; the session
+        stores the canonical validated args, delivery carries the canonical
+        format_flag_block, the transcript keeps raw args (audit fidelity)."""
         mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
-        raw = ("Analysis: the log contradicts the claim.\n\n"
-               + flag_block(claim="claim A", klass="safety", severity="high"))
+        raw_args = {"status": "flag", "claim": "  claim A  ", "class": "safety",
+                    "severity": "high",
+                    "evidence": "tool_result id=tc_1: deploy status=failed"}
         payloads = []
 
         async def capturing_complete(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
-            return Response(content=raw, model="synglm53",
+            return Response(content="Analysis: the log contradicts the claim.",
+                            model="synglm53",
                             usage=Usage(input_tokens=10, output_tokens=5),
-                            stop_reason="end_turn")
+                            stop_reason="tool_calls",
+                            tool_calls=[ToolCall(id="tv1", name="report_verdict",
+                                                 input=dict(raw_args))])
 
         history = base_history()
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
@@ -1371,28 +1418,42 @@ class TestV11SessionStorage:
 
         expected_block = flag_block(claim="claim A", klass="safety", severity="high")
         session = payloads[1]
-        assert session[1]["content"] == expected_block, (
-            "session stores the canonical FLAG block, not the wrapped raw")
+        assert session[1]["role"] == "assistant"
+        assert session[1]["tool_calls"][0]["name"] == "report_verdict"
+        assert session[1]["tool_calls"][0]["input"] == {
+            "status": "flag", "claim": "claim A", "class": "safety",
+            "severity": "high",
+            "evidence": "tool_result id=tc_1: deploy status=failed"}, (
+            "session stores the VALIDATED canonical args (strips whitespace)")
         inbox = agent._spotter_inbox.get(ROOM)
         assert inbox and inbox[0][1] == expected_block, (
             "delivery carries the canonical block (format_flag_block), not raw")
         assert inbox[0][0].startswith("[Spotter advisory")
         verdicts = [e for e in read_jsonl(transcript_path(agent.config.workspace))
                     if e.get("event") == "verdict"]
-        assert verdicts and verdicts[0]["content"] == raw
+        assert verdicts and verdicts[0]["args_raw"] == raw_args, (
+            "transcript keeps the RAW args (audit fidelity)")
+        assert verdicts[0]["content"] == "Analysis: the log contradicts the claim."
         await settle_pending()
 
     @pytest.mark.asyncio
     async def test_parse_error_stored_placeholder_never_raw(self):
+        """v2: an INVALID verdict call (bad class) → parse_error equivalent →
+        the fixed placeholder is stored as plain assistant text (the session
+        must not learn a malformed call shape), raw args kept in transcript."""
         mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
-        raw = "I think the session is fine but I am not sure how to format this."
+        raw_args = {"status": "flag", "claim": "c", "class": "bogus",
+                    "severity": "high", "evidence": "e"}
+        raw_text = "I think the session is fine but I am not sure how to format this."
         payloads = []
 
         async def capturing_complete(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
-            return Response(content=raw, model="synglm53",
+            return Response(content=raw_text, model="synglm53",
                             usage=Usage(input_tokens=10, output_tokens=5),
-                            stop_reason="end_turn")
+                            stop_reason="tool_calls",
+                            tool_calls=[ToolCall(id="tv1", name="report_verdict",
+                                                 input=dict(raw_args))])
 
         history = base_history()
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
@@ -1408,29 +1469,40 @@ class TestV11SessionStorage:
 
         assert payloads[1][1]["content"] == UNPARSED_VERDICT_TEXT, (
             "parse_error verdicts store the fixed placeholder, never raw text")
+        assert "tool_calls" not in payloads[1][1], (
+            "a failed verdict call must NOT enter the session as a pair — "
+            "the few-shot examples must stay schema-clean")
         verdicts = [e for e in read_jsonl(transcript_path(agent.config.workspace))
                     if e.get("event") == "verdict"]
-        assert verdicts and verdicts[0]["content"] == raw
+        assert verdicts and verdicts[0]["args_raw"] == raw_args, (
+            "transcript keeps the RAW invalid args (audit fidelity)")
+        assert verdicts[0]["status"] == "parse_error"
         await settle_pending()
 
     @pytest.mark.asyncio
     async def test_placeholder_echo_parses_and_self_extinguishes(self):
-        """v1.1b: pass 1 parse_error stores the placeholder; pass 2's model
-        ECHOES it verbatim (the observed qwen38 failure) — the echo must
-        parse as silent and store canonical "SILENT", so the imitation
-        lineage dies within one generation."""
+        """v2 form of the v1.1b lesson: pass 1's verdict call has INVALID
+        args → the placeholder (ending in SILENT) is stored as narration;
+        pass 2's model, having that few-shot in view, produces a VALID
+        silent verdict call → canonical args stored — the failure lineage
+        dies within one generation."""
         mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
-        garbage = "I think the session is fine but I am not sure how to format this."
+        bad_args = {"status": "flag", "claim": "c", "class": "bogus",
+                    "severity": "high", "evidence": "e"}
         payloads = []
         calls = {"n": 0}
 
         async def scripted_complete(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
             calls["n"] += 1
-            content = {1: garbage, 2: UNPARSED_VERDICT_TEXT, 3: "SILENT"}[calls["n"]]
-            return Response(content=content, model="qwen38blackwell",
-                            usage=Usage(input_tokens=10, output_tokens=5),
-                            stop_reason="end_turn")
+            if calls["n"] == 1:
+                return Response(content="unsure how to format this",
+                                model="qwen38blackwell",
+                                usage=Usage(input_tokens=10, output_tokens=5),
+                                stop_reason="tool_calls",
+                                tool_calls=[ToolCall(id="t1", name="report_verdict",
+                                                     input=dict(bad_args))])
+            return verdict_response(call_id=f"t{calls['n']}")
 
         history = base_history()
         with patch("openalph.spotter.complete", side_effect=scripted_complete):
@@ -1442,17 +1514,19 @@ class TestV11SessionStorage:
                 for _ in range(20):
                     await asyncio.sleep(0)
 
-        # pass 3's payload = session after pass 2 stored its verdict
+        # pass 3's payload = the session after pass 2 stored its verdict:
+        # [delta1, placeholder, delta2, verdict pair, delta3]
         session = payloads[2]
         assert session[1]["content"] == UNPARSED_VERDICT_TEXT, (
-            "pass 1 parse_error stores the placeholder")
-        assert session[3]["content"] == "SILENT", (
-            "the echoed placeholder parses as silent and stores CANONICAL "
-            "SILENT — imitation self-extinguishes")
+            "pass 1 invalid-args verdict stores the placeholder as narration")
+        assert session[3]["tool_calls"][0]["input"]["status"] == "silent", (
+            "pass 2's valid verdict call stores CANONICAL silent args — "
+            "the failure lineage self-extinguishes")
         passes = [e for e in read_jsonl(ledger_path(agent.config.workspace))
                   if e.get("event") == "pass"]
+        assert passes[0]["status"] == "parse_error"
         assert passes[1]["status"] == "silent", (
-            "the echo pass itself is a clean silent, not a parse_error")
+            "the recovery pass itself is a clean silent, not a parse_error")
         await settle_pending()
 
     @pytest.mark.asyncio
@@ -1462,7 +1536,7 @@ class TestV11SessionStorage:
 
         async def capturing_complete(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
-            return silent_response()
+            return verdict_response()
 
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
             mgr.maybe_fire(ROOM, base_history(), None, {})
@@ -1612,19 +1686,23 @@ class TestToolLoop:
                              stop_reason="tool_use", tool_calls=[tc])
 
         async def two_step(*args, **kwargs):
-            if kwargs.get("tools"):
+            if len(payloads_r) < 1:
+                payloads_r.append(kwargs)
                 return tool_resp
-            return silent_response()
+            return verdict_response()
 
+        payloads_r = []
         with patch("openalph.spotter.complete", side_effect=two_step), \
              patch("openalph.spotter.execute_tool", new_callable=AsyncMock,
                    return_value=ToolResult(content="ok", is_error=False)):
             mgr.maybe_fire(ROOM, base_history(), None, {})
+            # v2 (G4): investigation traffic PERSISTS — the transcript records
+            # the full pass: meta, delta, the tool exchange, verdict.
             ok = await wait_until(
                 lambda: [e.get("event") for e in
                          read_jsonl(transcript_path(agent.config.workspace))]
-                == ["meta", "delta", "verdict"])
-            assert ok, "transcript must record exactly meta+delta+verdict (compacted)"
+                == ["meta", "delta", "tool_calls", "tool_result", "verdict"])
+            assert ok, "transcript must record meta+delta+traffic+verdict (persisted)"
         await settle_pending()
 
     @pytest.mark.asyncio
@@ -1642,6 +1720,9 @@ class TestToolLoop:
         async def always_tools(*args, **kwargs):
             payloads.append(list(kwargs["messages"]))
             call_kwargs.append(kwargs)
+            if kwargs.get("tool_choice"):
+                # v2: the FORCED call — provider-enforced report_verdict.
+                return verdict_response(call_id="forced")
             if kwargs.get("tools") is None:
                 return flag_response()
             return tool_resp
@@ -1655,7 +1736,11 @@ class TestToolLoop:
                 await asyncio.sleep(0)
 
         summary_kwargs = call_kwargs[-1]
-        assert summary_kwargs.get("tools") is None
+        # v2: the forced call is a provider-enforced report_verdict call
+        # (strict + tool_choice) — no free-text summary.
+        assert [t.name for t in summary_kwargs.get("tools") or []] == ["report_verdict"]
+        assert summary_kwargs.get("tool_choice") == "report_verdict"
+        assert summary_kwargs.get("strict") is True
         assert summary_kwargs.get("thinking") == "off"
         forced_notice = payloads[-1][-1]
         assert forced_notice["role"] == "user"
@@ -1707,8 +1792,13 @@ class TestToolLoop:
                            if t is not asyncio.current_task()]
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
+                # v2 G13: a failed loop sets the failure-path cooldown — the
+                # test expires it to drive the next iteration deterministically.
+                mgr.ensure_state(ROOM).cooldown_until = None
             joined = "\n".join(notice_texts(callbacks))
             assert "repeatedly" in joined, f"loud notice expected, got: {joined}"
+            assert mgr.ensure_state(ROOM).armed is False, \
+                "3 failed loops must disarm the watcher"
             # Fourth fire: disabled → no more provider calls.
             calls_before = mock_complete.await_count
             history.append({"role": "user", "content": "one more"})
@@ -1727,7 +1817,8 @@ class TestToolLoop:
         history = base_history()
         # pass 1 errors / pass 2 succeeds → streak reset / pass 3 errors /
         # pass 4 must still run.
-        seq = [RuntimeError("blip one"), "silent", RuntimeError("blip two"), "silent"]
+        seq = [RuntimeError("blip one"), verdict_response(),
+               RuntimeError("blip two"), verdict_response()]
         step = {"i": 0}
 
         async def sequenced(*args, **kwargs):
@@ -1735,11 +1826,15 @@ class TestToolLoop:
             step["i"] += 1
             if isinstance(item, Exception):
                 raise item
-            return silent_response()
+            return item  # v2: a success is ONE terminating verdict call
 
         with patch("openalph.spotter.complete", side_effect=sequenced):
             for i in range(4):
                 history.append({"role": "user", "content": "turn"})
+                if i:
+                    # v2 G13: expire the failure-path cooldown BEFORE the fire
+                    # (the previous failed loop armed it)
+                    mgr.ensure_state(ROOM).cooldown_until = None
                 mgr.maybe_fire(ROOM, history, None, callbacks)
                 assert await wait_until(lambda: step["i"] >= i + 1), \
                     f"pass {i + 1} must reach the provider"
@@ -1830,7 +1925,7 @@ class TestCancelRewind:
 
         async def capturing_complete(*args, **kwargs):
             after.append(list(kwargs["messages"]))
-            return silent_response()
+            return verdict_response()
 
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
             mgr.maybe_fire(ROOM, history, None, {})
@@ -1864,7 +1959,7 @@ class TestCoalescing:
             payloads.append(list(kwargs["messages"]))
             if len(payloads) == 1:
                 await unblock.wait()
-            return silent_response()
+            return verdict_response()
 
         history = [
             {"role": "user", "content": "entry-zero"},
@@ -2108,16 +2203,24 @@ class TestResetRoom:
         with patch("openalph.spotter.complete", side_effect=capturing_complete):
             mgr.maybe_fire(ROOM, base_history(), None, {})
             assert await wait_until(lambda: len(payloads) >= 1)
-            for _ in range(20):
-                await asyncio.sleep(0)
+            # v2: a silent text verdict runs the full cap→forced→degraded
+            # chain (many awaited calls) — reap the watch task DETERMINISTICALLY
+            # before reset, or its verdict event races the archive+truncate.
+            pending = [t for t in asyncio.all_tasks()
+                       if t is not asyncio.current_task()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             mgr.reset_room(ROOM)
             history = base_history() + [{"role": "user", "content": "post-reset turn"}]
+            pre_reset_calls = len(payloads)
             mgr.maybe_fire(ROOM, history, None, {})
-            assert await wait_until(lambda: len(payloads) >= 2)
+            assert await wait_until(lambda: len(payloads) >= pre_reset_calls + 1)
             for _ in range(20):
                 await asyncio.sleep(0)
 
-        fresh_messages = payloads[1]
+        # v2: the FIRST pass runs the full narration/cap chain (many calls);
+        # the fresh post-reset pass is the FIRST call AFTER those.
+        fresh_messages = payloads[pre_reset_calls]
         assert len(fresh_messages) == 1, \
             f"fresh watch must start a brand-new session, got {len(fresh_messages)}"
         content = fresh_messages[0]["content"]
@@ -2143,7 +2246,7 @@ class TestOperatorApi:
                 await asyncio.sleep(0)
         assert agent._spotter_inbox.get(ROOM)
         text = mgr.op_stop(ROOM)
-        assert "stopped" in text.lower()
+        assert "disarmed" in text.lower()
         assert mgr.drain_flags(ROOM) == [], "/spotter stop must pop the inbox"
         with patch("openalph.spotter.complete", new_callable=AsyncMock) as mock_complete:
             history = base_history() + [{"role": "user", "content": "later turn"}]
@@ -2186,7 +2289,7 @@ class TestOperatorApi:
         mgr, agent = make_manager(workspace="/tmp/test-spotter-units")
         mgr.op_stop(ROOM)
         text = mgr.op_start(ROOM)
-        assert "watching" in text.lower()
+        assert "armed" in text.lower()
         with patch("openalph.spotter.complete", new_callable=AsyncMock,
                    return_value=silent_response()) as mock_complete:
             mgr.maybe_fire(ROOM, base_history(), None, {})

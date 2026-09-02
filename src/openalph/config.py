@@ -171,8 +171,11 @@ class AgentConfig:
     # fails LOUD (ConfigError on bad type/value), the same discipline as
     # [model_vision]: a silently-dropped setting would be fail-open on a
     # setting that controls what leaves the process.
-    spotter_enabled: bool = True
-    spotter_model: str = "synglm53"
+    # v2 (G10, SB 2026-09-01): code default OFF — explicit arming only
+    # (config yes, or in-room /spotter start). Absent section = disarmed.
+    # Model default qwen38blackwell (G10 gate passed on sglang 2026-09-01).
+    spotter_enabled: bool = False
+    spotter_model: str = "qwen38blackwell"
     spotter_thinking: str = "off"
     spotter_max_iterations: int = 8
     spotter_disabled_rooms: list[str] = field(default_factory=list)
@@ -612,9 +615,11 @@ def load_config(path: Path) -> AgentConfig:
     # what leaves the process (an external model reads this agent's full
     # transcript), so a silently-dropped `enabled = false` or a mistyped
     # `disabled_rooms` would be fail-open on a confidentiality knob.
-    # Absent section → all defaults (spotter_enabled=True per D6 single knob).
-    spotter_enabled = True
-    spotter_model = "synglm53"
+    # Absent section → all defaults. v2 (G10, SB 2026-09-01): the CODE default
+    # is OFF — explicit arming only (config yes, or in-room /spotter start).
+    # Supersedes v1 D6's default-true.
+    spotter_enabled = False
+    spotter_model = "qwen38blackwell"
     spotter_thinking = "off"
     spotter_max_iterations = 8
     spotter_disabled_rooms: list[str] = []

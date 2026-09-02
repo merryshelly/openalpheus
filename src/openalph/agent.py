@@ -1165,6 +1165,17 @@ class Agent:
                                         "log_spotter_flag callback failed in %s",
                                         room_id, exc_info=True)
 
+                    # Spotter v2 (V1-C boundary firing): fire the watcher at the
+                    # tool-loop iteration top — AFTER the drains, BEFORE reminder
+                    # evaluation. Same sync fail-soft maybe_fire as turn
+                    # completion; coalescing is the only cadence throttle, so a
+                    # tight loop batches boundary segments into back-to-back
+                    # passes. This is what delivers flags MID-TURN (the actual
+                    # v2 product: course-correction while the watched agent
+                    # still works).
+                    self._fire_spotter_turn_completion(
+                        room_id, history, _turn_source, callbacks)
+
                     # Reminder evaluation at tool-loop boundary (after steering, before API call).
                     # Ordering: steering drains first, then reminders (operator outranks harness).
                     # R1-5: mirror turn-start durability gate — when production callbacks
