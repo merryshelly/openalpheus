@@ -654,6 +654,11 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 "max_iterations": {
                     "type": "integer",
                     "description": "Maximum tool-call iterations before the sub-agent stops (optional; default 100 — set lower for bounded tasks)"
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": ["off", "low", "medium", "high", "xhigh", "max"],
+                    "description": "Reasoning effort for the sub-agent (optional; default medium — override to run the sub hotter or turn reasoning off)"
                 }
             },
             "required": ["task"]
@@ -2405,6 +2410,10 @@ async def _execute_tool_inner(
             # used internally inside run_subagent's tool-call callbacks.
             parent_room_id=callbacks.get("room_id") if callbacks else None,
             callbacks=callbacks,
+            # kdsn.305.14: per-dispatch reasoning effort (optional; default
+            # medium in run_subagent). The sub path never consults config
+            # [agent] thinking — this param is the only lever.
+            effort=input.get("effort"),
         )
     elif name == "advisor":
         from .advisor import run_advisor

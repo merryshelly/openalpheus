@@ -28,6 +28,12 @@ logger = logging.getLogger("openalph.subagent")
 # (see execute_tool), so operator tuning of that key takes effect.
 MAX_ITERATIONS = 100
 
+# kdsn.305.14: the subagent tool's `effort` vocabulary — byte-parity with
+# config.py's valid_thinking (the same 6 levels the /effort command accepts).
+# config.py's valid_thinking is a function-local, so the sub path keeps its
+# own module constant.
+_EFFORT_LEVELS = ("off", "low", "medium", "high", "xhigh", "max")
+
 # Safety preamble loaded once at import time — shared across all subagent invocations.
 # This file contains hard safety constraints that every subagent must follow.
 _PREAMBLE_PATH = Path("/srv/openalph/shared/skills/subagent-preamble.md")
@@ -88,10 +94,10 @@ def _estimate_context_tokens(msgs: list[dict]) -> int:
     """Estimate token count from messages list (1 token ≈ 4 chars).
 
     Counts str content, list-content parts (vision blocks: string values
-    incl. base64 image data), and assistant tool_call INPUT string values.
-    The wave-2 audit (all 3 lineages) found str-only counting blinded the GC
-    trigger to exactly the heavy-content runs the tier exists to protect
-    (vision-heavy and write-heavy subs never crossed the threshold).
+    incl. base64 image data), assistant tool_call INPUT string values, and
+    assistant thinking-block text (kdsn.305.14: reasoning-heavy runs burn
+    exactly the context this estimate gates — the same blindness class the
+    wave-2 audit fixed for str-only content counting).
     """
     total_chars = 0
     for msg in msgs:
@@ -115,6 +121,11 @@ def _estimate_context_tokens(msgs: list[dict]) -> int:
                 for v in raw.values():
                     if isinstance(v, str):
                         total_chars += len(v)
+        # kdsn.305.14: count thinking chars — without this the auto threshold
+        # fires late exactly on reasoning-heavy runs.
+        for tb in msg.get("thinking") or []:
+            if isinstance(tb, dict) and isinstance(tb.get("thinking"), str):
+                total_chars += len(tb["thinking"])
     return total_chars // 4
 
 
@@ -131,6 +142,7 @@ async def run_subagent(
     call_id: str | None = None,
     parent_room_id: str | None = None,
     callbacks: dict | None = None,
+    effort: str | None = None,
 ) -> ToolResult:
     """Execute a multi-turn LLM call as a sub-agent.
 
@@ -164,10 +176,33 @@ async def run_subagent(
         parent_room_id: Optional parent Matrix room id, recorded in the flight
             recorder transcript header for cross-referencing only — never
             used for execution/dispatch decisions.
+        effort: Optional reasoning effort for the sub (kdsn.305.14). One of
+            _EFFORT_LEVELS; None (param omitted) defaults to "medium". The
+            sub path never consults config [agent] thinking — this param is
+            the only lever (ruling 1).
 
     Returns:
         ToolResult with the LLM's response content, or error description on failure
     """
+    # kdsn.305.14: validate effort FIRST — before the system prompt, ANY
+    # directory creation, or file I/O (A6 pins zero side effects on
+    # rejection). The bool guard is defensive-explicit (bool is an int
+    # subclass; house rule: bool is never a valid level) — the isinstance-str
+    # test that follows already rejects non-str inputs, so this guard is
+    # redundancy, not load-bearing.
+    if effort is not None and (isinstance(effort, bool)
+                               or not isinstance(effort, str)
+                               or effort not in _EFFORT_LEVELS):
+        return ToolResult(
+            is_error=True,
+            content=f"Invalid effort {effort!r} — must be one of: "
+                    "off, low, medium, high, xhigh, max",
+        )
+    # Default-to-medium by construction: config.thinking is bypassed
+    # entirely (ruling 1) — every complete() below carries an explicit
+    # thinking value, never None.
+    effective_effort = effort if effort is not None else "medium"
+
     # Build system prompt: safety preamble + custom/default
     system = _build_system_prompt(system_prompt)
 
@@ -240,6 +275,7 @@ async def run_subagent(
         "parent_room_id": parent_room_id,
         "parent_call_id": call_id,
         "task": task,
+        "effort": effective_effort,
         "ts_start": int(run_start),
     })
 
@@ -505,6 +541,8 @@ async def run_subagent(
                 messages=list(messages),
                 tools=tools_arg,
                 max_tokens=max_tokens,
+                # kdsn.305.14: always explicit — config.thinking bypassed.
+                thinking=effective_effort,
             )
             # Milestone: a real provider response came back.
             _milestone("provider_response")
@@ -527,6 +565,14 @@ async def run_subagent(
                     {"name": tc.name, "id": tc.id, "input": tc.input}
                     for tc in (response.tool_calls or [])
                 ],
+                # kdsn.305.14 ruling 3: the audit log records the FULL
+                # verbatim thinking (text + signature) — never truncated
+                # or summarized. Always emitted (empty list when the
+                # response carried no thinking).
+                "thinking": [
+                    {"thinking": tb.thinking, "signature": tb.signature}
+                    for tb in (response.thinking or [])
+                ],
             })
 
             # Text response — check for truncation before accepting
@@ -547,10 +593,19 @@ async def run_subagent(
                         "truncated_content_length": len(response.content),
                     })
                     # Preserve the truncated text and ask the model to continue
-                    messages.append({
+                    _trunc_msg = {
                         "role": "assistant",
                         "content": response.content,
-                    })
+                    }
+                    # kdsn.305.14: attach-when-present — the continuation
+                    # request must replay this turn's thinking for coherence
+                    # (no key at all when nothing was emitted; B2).
+                    if response.thinking:
+                        _trunc_msg["thinking"] = [
+                            {"thinking": tb.thinking, "signature": tb.signature}
+                            for tb in response.thinking
+                        ]
+                    messages.append(_trunc_msg)
                     messages.append({
                         "role": "user",
                         "content": (
@@ -592,11 +647,22 @@ async def run_subagent(
                 return ToolResult(content=response.content, is_error=False)
 
             # Tool calls — execute and loop
-            messages.append({
+            assistant_msg = {
                 "role": "assistant",
                 "content": response.content,
                 "tool_calls": response.tool_calls,
-            })
+            }
+            # kdsn.305.14: attach-when-present — carry the emitted
+            # thinking (text + signature) into the replayed message so the
+            # next iteration's wire request carries it. No key at all when
+            # the response emitted nothing (byte-shape unchanged for
+            # non-reasoning models; B2 guard).
+            if response.thinking:
+                assistant_msg["thinking"] = [
+                    {"thinking": tb.thinking, "signature": tb.signature}
+                    for tb in response.thinking
+                ]
+            messages.append(assistant_msg)
 
             # Import execute_tool here to avoid circular import
             from openalph.tools import execute_tool
@@ -760,6 +826,9 @@ async def run_subagent(
                 messages=list(messages),
                 tools=None,  # no tools — force text response
                 max_tokens=max_tokens,
+                # kdsn.305.14: breaker summary round trip carries the same
+                # effective effort (A8).
+                thinking=effective_effort,
             )
             # Milestone: the summary round trip is a real provider response too.
             _milestone("provider_response")
