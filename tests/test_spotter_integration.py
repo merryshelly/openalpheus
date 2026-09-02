@@ -587,7 +587,9 @@ class TestMatrixSlashCommands:
         assert notices, "expected a notice for /spotter status"
         assert any("synglm53" in n for n in notices), notices
         # Status must reflect the real manager, not a canned string.
-        assert any("off" in n.lower() or "watching" in n.lower() for n in notices), notices
+        # v2 G10: the states are armed / disarmed (not watching/stopped).
+        assert any("armed" in n.lower() or "disarmed" in n.lower()
+                   for n in notices), notices
 
     @pytest.mark.asyncio
     async def test_start_subcommand_notices_watching(self, tmp_path):
@@ -599,7 +601,7 @@ class TestMatrixSlashCommands:
         await bot._handle_room_message(make_room(), make_event(body="/spotter stop"))
         await bot._handle_room_message(make_room(), make_event(body="/spotter start"))
 
-        assert any("watching" in n.lower() for n in notices), notices
+        assert any("armed" in n.lower() for n in notices), notices
 
     @pytest.mark.asyncio
     async def test_stop_subcommand_notices_stopped(self, tmp_path):
@@ -609,7 +611,7 @@ class TestMatrixSlashCommands:
         bot.send_notice = AsyncMock(side_effect=lambda rid, text: notices.append(text))
 
         await bot._handle_room_message(make_room(), make_event(body="/spotter stop"))
-        assert any("stopped" in n.lower() for n in notices), notices
+        assert any("disarmed" in n.lower() for n in notices), notices
         # And the runtime stop actually gates. The main stream is patched too:
         # a real Agent carries a wired spotter (Ruling 1) so the turn must
         # complete without a live provider call; the assertion is that the

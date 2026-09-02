@@ -1165,6 +1165,17 @@ class Agent:
                                         "log_spotter_flag callback failed in %s",
                                         room_id, exc_info=True)
 
+                    # Spotter v2 (V1-C boundary firing): fire the watcher at the
+                    # tool-loop iteration top — AFTER the drains, BEFORE reminder
+                    # evaluation. Same sync fail-soft maybe_fire as turn
+                    # completion; coalescing is the only cadence throttle, so a
+                    # tight loop batches boundary segments into back-to-back
+                    # passes. This is what delivers flags MID-TURN (the actual
+                    # v2 product: course-correction while the watched agent
+                    # still works).
+                    self._fire_spotter_turn_completion(
+                        room_id, history, _turn_source, callbacks)
+
                     # Reminder evaluation at tool-loop boundary (after steering, before API call).
                     # Ordering: steering drains first, then reminders (operator outranks harness).
                     # R1-5: mirror turn-start durability gate — when production callbacks
@@ -1263,6 +1274,20 @@ class Agent:
                     # Pass tools=None if no tools discovered (backward compatibility)
                     tools_arg = self.tools if self.tools else None
 
+                    # Terminal tool (Stigmergy Decision 18, bead
+                    # workspace-e2uh.152): per-run state registered by the
+                    # caller (exec --submit-schema) on the agent BEFORE
+                    # handle_input — never a global, never cached across
+                    # runs. When present, the provider grammar-constrains
+                    # this turn's tool schemas (strict=True, kdsn.304) so
+                    # the terminal call's arguments are schema-faithful.
+                    _terminal_name = None
+                    _terminal_strict = False
+                    _tt = getattr(self, "_terminal_tool", None)
+                    if _tt is not None:
+                        _terminal_name = _tt[0]
+                        _terminal_strict = bool(_tt[1].config.get("strict"))
+
                     # Record start time for latency measurement
                     start_time = time.monotonic()
 
@@ -1296,6 +1321,7 @@ class Agent:
                         thinking=effective_thinking,
                         cache_ttl=cache_ttl,
                         room_id=room_id,
+                        strict=_terminal_strict,
                     ):
                         if event.type == "text":
                             accumulated_text += event.content
@@ -1346,6 +1372,7 @@ class Agent:
                             model=self.get_model(room_id),
                             thinking=effective_thinking,
                             room_id=room_id,
+                            strict=_terminal_strict,
                         )
 
                     # Post-stream degeneration backstop (kdsn.241.21): if the
@@ -1463,6 +1490,98 @@ class Agent:
                             await on_tool_intent(active_tool_calls, accumulated_text or response.content)
                         except Exception as e:
                             logger.warning("Tool intent callback failed: %s", e)
+
+                    # TERMINAL tool (Stigmergy Decision 18, bead
+                    # workspace-e2uh.152): a call to the run's registered
+                    # terminal tool is the episode's return value — there is
+                    # NO implementation to run. The check sits at the
+                    # tool-dispatch site: AFTER the assistant tool-call
+                    # message is appended and the intent fired (so the call
+                    # is provenanced exactly like a normal tool call —
+                    # counted, logged, on_tool_intent'd, and reported via
+                    # on_tool_call, which is how the exec-level tool_trace
+                    # picks it up) and BEFORE any tool execution. A tool
+                    # result is appended for every call in the batch so
+                    # history has no orphan tool_calls (RC1-consistent).
+                    # Then the turn ends CLEANLY — the text-return path
+                    # (final stop_reason recorded, spotter fires, return),
+                    # not an error. Iteration cap is unaffected: this is
+                    # inside the loop, so a run that burns all turns before
+                    # submitting still falls through to the cap sentinel +
+                    # forced summary (a relay deny never reaches this site —
+                    # it raises out of stream/complete).
+                    if _terminal_name is not None and any(
+                            tc.name == _terminal_name for tc in active_tool_calls):
+                        self._record_tool_calls(room_id, len(active_tool_calls))
+                        if room_id not in self._room_tool_counts:
+                            self._room_tool_counts[room_id] = {}
+                        for tc in active_tool_calls:
+                            self._room_tool_counts[room_id][tc.name] = (
+                                self._room_tool_counts[room_id].get(tc.name, 0) + 1
+                            )
+                            _tool_calls_this_turn[tc.name] = (
+                                _tool_calls_this_turn.get(tc.name, 0) + 1
+                            )
+                        _tt_logged = []
+                        for tc in active_tool_calls:
+                            _tt_logged.append({
+                                "name": tc.name,
+                                "input": tc.input,
+                                "is_error": False,
+                            })
+                        self._log_turn(
+                            room_id=room_id,
+                            model=self.get_model(room_id),
+                            input_tokens=usage.input_tokens,
+                            output_tokens=usage.output_tokens,
+                            tool_calls=_tt_logged,
+                            latency_ms=latency_ms,
+                            content_preview=accumulated_text or response.content,
+                            cache_read_tokens=usage.cache_read_tokens,
+                            cache_creation_tokens=usage.cache_creation_tokens,
+                            stop_reason=response.stop_reason,
+                        )
+                        if on_cache_status:
+                            try:
+                                await on_cache_status(usage, self.get_model(room_id))
+                            except Exception:
+                                logger.error("on_cache_status callback failed", exc_info=True)
+                        _tt_submit = None
+                        for tc in active_tool_calls:
+                            if tc.name == _terminal_name:
+                                # First terminal call in the batch wins; the
+                                # arguments dict IS the episode's return value.
+                                _tt_submit = tc.input
+                                _tt_result_content = "submitted"
+                            else:
+                                # Non-terminal calls in the same batch are
+                                # provenanced + closed (no orphan) but NOT
+                                # executed — the terminal call ends the turn.
+                                _tt_result_content = (
+                                    "not executed: turn ended by terminal tool")
+                            history.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": wrap_tool_result(
+                                    _tt_result_content, tc.name, tc.id),
+                                "is_error": False,
+                            })
+                            if on_tool_call:
+                                try:
+                                    await on_tool_call(
+                                        tc.id, tc.name, tc.input,
+                                        _tt_result_content, False,
+                                    )
+                                except Exception as e:
+                                    logger.warning("Tool call callback failed: %s", e)
+                        self._terminal_submit = _tt_submit
+                        self._last_stop_reason[room_id] = response.stop_reason
+                        # Spotter v1 (design §3): the turn is complete — same
+                        # sync, fail-soft, history-non-mutating maybe_fire as
+                        # the text-return path (RC1 holds).
+                        self._fire_spotter_turn_completion(
+                            room_id, history, _turn_source, callbacks)
+                        return accumulated_text or response.content
 
                     # Execute tool calls in parallel
                     tool_coros = []

@@ -452,6 +452,41 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "max_file_bytes": 5242880
         }
     },
+    "json_lint": {
+        "description": (
+            "Validate JSON or JSON Lines (JSONL) — read-only, never writes. "
+            "Provide exactly one of `path` (a file to check) or `text` (inline content). "
+            "format='jsonl' (default for *.jsonl paths) parses every non-blank line "
+            "independently and reports ALL defects with 1-based line numbers and "
+            "positions — run it BEFORE submitting station output (terminal tool "
+            "payloads, manifests) so a missing brace is fixed in-episode instead of "
+            "at the downstream validator gate. format='json' parses the whole "
+            "content and reports the parsed shape. Returns a bounded JSON verdict "
+            "(ok, parsed counts, line-precise errors, capped excerpts)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to lint (optional; exactly one of path/text required)"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Inline content to lint (optional; exactly one of path/text required)"
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["json", "jsonl"],
+                    "description": "Parse format (optional; default: jsonl for *.jsonl/*.ndjson paths, else json)"
+                }
+            }
+        },
+        "config": {
+            "max_content_bytes": 2097152,
+            "max_defects": 20
+        }
+    },
     "web_search": {
         "description": (
             "Search the web via Brave Search and return ranked results with title, URL, and snippet. "
@@ -622,6 +657,11 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                 "max_iterations": {
                     "type": "integer",
                     "description": "Maximum tool-call iterations before the sub-agent stops (optional; default 100 — set lower for bounded tasks)"
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": ["off", "low", "medium", "high", "xhigh", "max"],
+                    "description": "Reasoning effort for the sub-agent (optional; default medium — override to run the sub hotter or turn reasoning off)"
                 }
             },
             "required": ["task"]
@@ -2168,6 +2208,13 @@ async def _execute_tool_inner(
         # On successful patch, update read_registry with new mtime (keeps registry fresh)
         if not result.is_error:
             _update_read_registry(_resolved_path, callbacks)
+    elif name == "json_lint":
+        from .json_lint import run_json_lint
+        result = await run_json_lint(
+            path=input.get("path"),
+            text=input.get("text"),
+            format=input.get("format"),
+        )
     elif name == "grep":
         from .search import run_grep
         # R16: search tools require an explicit workspace — never silently
@@ -2366,6 +2413,10 @@ async def _execute_tool_inner(
             # used internally inside run_subagent's tool-call callbacks.
             parent_room_id=callbacks.get("room_id") if callbacks else None,
             callbacks=callbacks,
+            # kdsn.305.14: per-dispatch reasoning effort (optional; default
+            # medium in run_subagent). The sub path never consults config
+            # [agent] thinking — this param is the only lever.
+            effort=input.get("effort"),
         )
     elif name == "advisor":
         from .advisor import run_advisor

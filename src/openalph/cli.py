@@ -104,6 +104,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "system prompt, byte-faithful (no preamble). The "
                         "injection-defense footer is appended unless the "
                         "agent's config sets injection_defense = false.")
+    p.add_argument("--submit-schema", default=None,
+                   help="JSON Schema file (forced-tool shape: name/strict/"
+                        "description/input_schema) for a TERMINAL tool: the "
+                        "named tool is exposed for this run and a call to it "
+                        "ends the turn — its arguments become the result "
+                        "JSON line's top-level `result` field (additive). "
+                        "No call -> no `result` field (caller decides).")
 
     return parser.parse_args(argv)
 
@@ -612,6 +619,59 @@ def _resolve_exec_tools(names: list[str]) -> list:
     return defs
 
 
+def _exec_load_submit_schema(path: str):
+    """Load a --submit-schema file into (name, terminal ToolDef).
+
+    Stigmergy Decision 18 (bead workspace-e2uh.152): the station-contract
+    primitive. The file is a forced-tool-shaped JSON schema — the same
+    shape as a BUILTIN_TOOLS entry plus `strict`
+    ({"name", "strict", "description", "input_schema"}, e.g. stigmergy's
+    submit_validation) — because that is the shape the provider
+    grammar-constrains via _convert_tools_for_provider's `strict` path
+    (kdsn.304). The returned ToolDef carries a config the loop's terminal
+    check recognizes: `terminal=True` (never execute — capture and end
+    the turn) and `strict` (the schema's own value, honored per-call by
+    Agent.handle_input).
+
+    Fail-loud contract (same as --task-file / --system-prompt-file):
+    unreadable file, non-JSON, non-object JSON, missing/blank `name`,
+    or missing/non-object `input_schema` all raise (FileNotFoundError /
+    ValueError naming the path) and the caller maps them to stderr +
+    exit 1 BEFORE any model call — a bad schema burns nothing.
+    """
+    from openalph.tools import ToolDef
+
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Submit schema file not found: {path}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        # OSError: unreadable mid-read (is_file passed but read failed);
+        # ValueError: not JSON (json.JSONDecodeError subclasses it).
+        raise ValueError(f"Submit schema file is not valid JSON: {path}") from e
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Submit schema must be a JSON object with 'name' and "
+            f"'input_schema': {path}")
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"Submit schema missing 'name': {path}")
+    input_schema = data.get("input_schema")
+    if not isinstance(input_schema, dict):
+        raise ValueError(
+            f"Submit schema missing 'input_schema' object: {path}")
+    description = data.get("description")
+    if not isinstance(description, str) or not description:
+        description = ""
+    return name, ToolDef(
+        name=name,
+        description=description,
+        parameters=input_schema,
+        config={"terminal": True, "strict": bool(data.get("strict"))},
+    )
+
+
 def _exec_ceil_to_int(v) -> int:
     """Coerce a usage value to a non-negative int (zeros on failure)."""
     try:
@@ -943,6 +1003,17 @@ def cmd_exec(args):
         except (FileNotFoundError, OSError, ValueError) as e:
             _fail(str(e), 1)
 
+    # 5c. Optional terminal-tool schema (Stigmergy Decision 18, bead
+    # workspace-e2uh.152): a bad path/schema must fail loud BEFORE any
+    # model call (same contract as --task-file / --system-prompt-file),
+    # so it is read here, pre-construction.
+    terminal_tool = None
+    if args.submit_schema is not None:
+        try:
+            terminal_tool = _exec_load_submit_schema(args.submit_schema)
+        except (FileNotFoundError, OSError, ValueError) as e:
+            _fail(str(e), 1)
+
     # Room label (default _exec).
     try:
         room_id = _exec_sanitize_room(args.room)
@@ -955,6 +1026,22 @@ def cmd_exec(args):
     # this fully determines the tool set; discovery is bypassed by design).
     if resolved_tools is not None:
         agent.tools = resolved_tools
+
+    # --submit-schema (Stigmergy Decision 18, bead workspace-e2uh.152):
+    # expose the terminal tool to the model for this run. PER-RUN state —
+    # registered on the fresh agent here and never cached, so concurrent
+    # or repeated exec runs cannot leak one run's schema into another.
+    # Union with --tools: the terminal tool is APPENDED to whatever the
+    # agent already carries (resolved builtins, or nothing). The loop's
+    # tool-dispatch site (agent.py) recognizes the terminal config: a
+    # call to it is captured (no execution — there is no implementation),
+    # provenanced via on_tool_call, and ends the turn cleanly.
+    if terminal_tool is not None:
+        agent._terminal_tool = terminal_tool
+        agent._terminal_submit = None
+        if agent.tools is None:
+            agent.tools = []
+        agent.tools.append(terminal_tool[1])
 
     # --system-prompt-file: replace the agent's system prompt with the
     # artifact text, BYTE-FAITHFUL — exactly the file text, nothing
@@ -1020,6 +1107,22 @@ def cmd_exec(args):
         "tool_trace": tool_trace,
         "detail": detail,
     }
+    # Additive top-level `result` (Stigmergy Decision 18, bead
+    # workspace-e2uh.152): present ONLY when a terminal tool was registered
+    # for this run AND the model called it — then it is the captured
+    # arguments dict (the episode's return value, taken from
+    # agent._terminal_submit which the agent loop sets at the tool-dispatch
+    # site). No terminal tool, or the model ended without calling it
+    # (text-only stop, iteration cap, relay deny — a deny is NOT a terminal
+    # call), the field is ABSENT and the caller decides whether a missing
+    # result is a failure. Existing fields and exit codes are untouched.
+    if terminal_tool is not None:
+        try:
+            _submit = agent._terminal_submit
+        except AttributeError:
+            _submit = None
+        if isinstance(_submit, dict):
+            result["result"] = _submit
     print(json.dumps(result), flush=True)
 
     if status == "done":

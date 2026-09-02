@@ -576,7 +576,7 @@ class TestSubagentGcSeam:
         task = "x" * 800  # 200 tokens
         seen = []
 
-        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None, thinking=None):
             seen.append([dict(m) for m in messages])
             if len(seen) == 1:
                 return _tool_resp()
@@ -616,7 +616,7 @@ class TestSubagentGcSeam:
         task = "x" * 3200  # would fire if enabled
         seen = []
 
-        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None, thinking=None):
             seen.append([dict(m) for m in messages])
             return _text_resp("done")
 
@@ -638,7 +638,7 @@ class TestSubagentGcSeam:
         task = "x" * 3200  # 800 tokens >= threshold 765 on its own
         seen = []
 
-        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None, thinking=None):
             seen.append([dict(m) for m in messages])
             if len(seen) == 1:
                 return _tool_resp()
@@ -669,7 +669,7 @@ class TestSubagentGcSeam:
         config = _gc_config(tmp_path)
         seen = []
 
-        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None, thinking=None):
             seen.append([dict(m) for m in messages])
             return _text_resp("done")
 
@@ -689,7 +689,7 @@ class TestSubagentGcSeam:
         config = _gc_config(tmp_path, max_tokens=1000)  # window 1000 -> usable 0
         seen = []
 
-        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None, thinking=None):
             seen.append([dict(m) for m in messages])
             return _text_resp("done")
 
@@ -782,7 +782,7 @@ class TestAuditFixSeam:
         config = _gc_config(tmp_path)
         seen = []
 
-        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None, thinking=None):
             seen.append([dict(m) for m in messages])
             if len(seen) == 1:
                 return _tool_resp()
@@ -821,7 +821,7 @@ class TestAuditFixSeam:
                                "context": None})
         seen = []
 
-        async def fake_complete(config, system, messages, tools=None, max_tokens=None):
+        async def fake_complete(config, system, messages, tools=None, max_tokens=None, thinking=None):
             seen.append([dict(m) for m in messages])
             return _text_resp("done")
 
