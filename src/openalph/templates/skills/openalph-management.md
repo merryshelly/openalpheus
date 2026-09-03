@@ -152,6 +152,8 @@ Agent configs live at `/etc/openalph/agents/<name>.toml`. They are **operator-ma
 - Agents cannot read or write their own configs
 - All config changes require `sudo`
 
+**Headless/station configs (kdsn.320, 2026-09-03).** Configs that never run as a systemd unit (Stigmergy stations under `agents/stigmergy/`, the eval-harness eval agent under `agents/eval-harness/`; `retired/` subdirs hold decommissioned agents) live in per-project SUBDIRS of `/etc/openalph/agents/`, outside the top-level `*.toml` glob — the blast radius of `openalph list` / `start|stop|restart all`, non-recursive by design (a headless toml can never be crash-looped into a failed unit; a stray `systemctl start openalph@<headless>` fails fast at the unit's top-level-only `BindReadOnlyPaths`). Callers address them by path: `openalph exec --config <path>` (mutually exclusive with `--agent`, exactly one required; `--agent` name resolution stays top-level-only — the in-cage Stigmergy worker still uses `--agent stigmergy-worker` against its baked top-level toml). `openalph list --all` shows subdir configs (retired/ excluded, one level deep); default `list` output is unchanged.
+
 ### Config Structure
 
 ```toml
