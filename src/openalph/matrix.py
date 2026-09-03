@@ -1109,14 +1109,99 @@ class MatrixBot:
 
         Returns a ``(_tool_notice, _tool_intent)`` tuple suitable for passing
         to the agent's ``process`` call.  Both closures share a private
-        ``_subagent_start_times`` dict so that elapsed-time tracking works
+        ``_tool_start_times`` dict so that elapsed-time tracking works
         across the intent→notice lifecycle.
 
         This factory exists to eliminate the duplicated closure definitions
         that previously lived in both the heartbeat and streaming message
         code paths.
         """
-        _subagent_start_times: dict[str, float] = {}
+        _tool_start_times: dict[str, float] = {}
+
+        def _format_elapsed(start_ts) -> str:
+            """Shared elapsed suffix for dispatch→completion notices
+            (subagent branch + shell path, kdsn.319):
+            `` — {m}m{ss:02d}s`` when ≥60s, else `` — {s:.1f}s``.
+            Empty string when no start timestamp was recorded (restart
+            mid-loop, or a non-dispatched call) — no suffix, no crash.
+            """
+            if start_ts is None:
+                return ""
+            elapsed = time.monotonic() - start_ts
+            if elapsed >= 60:
+                mins, secs = divmod(int(elapsed), 60)
+                return f" — {mins}m{secs:02d}s"
+            return f" — {elapsed:.1f}s"
+
+        # kdsn.319: snapshot of the agent's live secret VALUES at factory
+        # time, for the value-based room-egress pass (parity with the
+        # tool-output seam's L1 redact_known_secrets layer).
+        try:
+            from openalph.tools import _collect_known_secrets as _cks
+            _known_secrets = _cks(getattr(self.agent, "config", None))
+        except Exception:
+            _known_secrets = set()
+
+        def _redact_for_room(text) -> str:
+            """kdsn.319: redact a tool-input string before it enters a
+            room-visible notice. Three layers, parity with the tool-output
+            redaction seam:
+              1. canonical shape pass (redact_credentials),
+              2. value pass over the agent's own live secrets
+                 (redact_known_secrets, factory-time snapshot),
+              3. egress-context pass masking credential slots the shape
+                 pass cannot recognise: case-insensitive Bearer, --token
+                 values, -u/--user and URL userinfo, secret-named env
+                 assignments (value masked, name kept).
+            Over-redaction at the room-egress seam is safe (a [REDACTED:…]
+            marker only hides context); a raw secret in the room is not.
+            """
+            import re
+            from openalph.tools.security import redact_credentials, redact_known_secrets
+            # kdsn.319 re-audit R1: hard input cap BEFORE any regex runs — the
+            # userinfo scan is superlinear on adversarial word-runs, and this
+            # runs on every tool-input string (e.g. file_write content). Every
+            # room sink (preview 120 / fold 4000 / furled dump) renders at most
+            # a few KB, so redacting beyond this window loses nothing visible.
+            s = str(text)
+            if len(s) > 65536:
+                s = s[:65536]
+            redacted, _ = redact_credentials(s)
+            if _known_secrets:
+                redacted, _ = redact_known_secrets(redacted, _known_secrets)
+            redacted = re.sub(r"(?i)\bbearer\s+\S+", "[REDACTED:bearer_token]", redacted)
+            redacted = re.sub(r"(?i)\bbasic\s+[A-Za-z0-9+/=]{8,}", "[REDACTED:basic_auth]", redacted)
+            redacted = re.sub(r"--token(?:\s*=\s*|\s+)\S+", "[REDACTED:token]", redacted)
+            redacted = re.sub(r"(?:(?<=-u )|(?<=--user ))\S+:\S+", "[REDACTED:userinfo]", redacted)
+            # Glued / equals forms: -uadmin:pass, --user=admin:pass
+            redacted = re.sub(r"(?<![\w-])-[uU]\S*:\S+", "[REDACTED:userinfo]", redacted)
+            redacted = re.sub(r"--user(?:\s*=\s*|\s+)\S+:\S+", "[REDACTED:userinfo]", redacted)
+            # URL userinfo. Scheme quantifier bounded (re-audit R1: unbounded
+            # \w+ scanning is quadratic on word-runs); 32 covers realistic
+            # word-only schemes.
+            redacted = re.sub(r"(\w{1,32}://)[^/\s:@]+:[^@\s]+@", r"\1[REDACTED:userinfo]@", redacted)
+            # Env assignment: secret word anywhere in the name; value masked
+            # (quoted values included), name kept for debuggability.
+            redacted = re.sub(
+                r"(?i)\b((?:export\s+)?[A-Za-z0-9_]*"
+                r"(?:SECRET|TOKEN|PASSWD|PASSWORD|PASS|KEY|CRED(?:ENTIAL)?S?)"
+                r"[A-Za-z0-9_]*)\s*=\s*(\"[^\"]*\"|\S+)",
+                r"\1=[REDACTED:env_secret]", redacted)
+            return redacted
+
+        def _redact_input_values(data):
+            """kdsn.319: run _redact_for_room over every string value in a
+            tool input and return a copy (the furled 'Full call' dump
+            renders input_data verbatim); non-string values pass through
+            unchanged.
+            """
+            if isinstance(data, str):
+                return _redact_for_room(data)
+            if isinstance(data, dict):
+                return {k: _redact_input_values(v) for k, v in data.items()}
+            if isinstance(data, list):
+                return [_redact_input_values(v) for v in data]
+            return data
 
         async def _tool_notice(call_id, name, input_data, result, is_error):
             # Show tool name + brief input context, but NEVER output
@@ -1134,13 +1219,17 @@ class MatrixBot:
                 for key in ("pattern", "path", "file_path", "command",
                             "query", "url", "task"):
                     if key in input_data:
-                        val = str(input_data[key])[:120]
+                        # kdsn.319: redact BEFORE the 120-char cap — a secret
+                        # past position 120 is still a secret, and capping
+                        # first can split a [REDACTED:…] marker. Applies to
+                        # every tool's detail field, not just shell.
+                        val = _redact_for_room(str(input_data[key]))[:120]
                         detail = f" `{val}`"
                         break
                 # grep's optional glob filter is meaningful context for the
                 # abbreviated line — append it after the pattern.
                 if name == "grep" and input_data.get("glob"):
-                    detail += f" (glob: `{str(input_data['glob'])[:60]}`)"
+                    detail += (f" (glob: `{_redact_for_room(str(input_data['glob']))[:60]}`)")
             # Refresh typing indicator — Matrix expires it after ~30s,
             # so long tool loops look dead without this.
             try:
@@ -1158,15 +1247,9 @@ class MatrixBot:
                 if is_error and len(result_preview) > 2000:
                     result_preview = result_preview[:2000] + "\n[truncated]"
                 # Calculate elapsed time if we have a start timestamp
-                elapsed_str = ""
-                start_ts = _subagent_start_times.pop(call_id, None)
-                if start_ts is not None:
-                    elapsed = time.monotonic() - start_ts
-                    if elapsed >= 60:
-                        mins, secs = divmod(int(elapsed), 60)
-                        elapsed_str = f" — {mins}m{secs:02d}s"
-                    else:
-                        elapsed_str = f" — {elapsed:.1f}s"
+                # (kdsn.319: shared _format_elapsed helper — the shell
+                # completion path renders the same format).
+                elapsed_str = _format_elapsed(_tool_start_times.pop(call_id, None))
                 summary_line = f"🤖 subagent ({model_info}) {status}{elapsed_str}"
                 html = f'<b>{summary_line}</b>'
                 # R8: html.escape (not raw mistune.html) — task/result previews
@@ -1315,8 +1398,16 @@ class MatrixBot:
                 # click-to-expand pattern, and now applied on SUCCESS too (not
                 # just errors). _furl_tool_call_detail carries the R8 escaping
                 # and post-redaction guarantees (see its docstring).
-                notice_body = f"🔧 {name}{detail} {status}"
-                detail_html = _furl_tool_call_detail(input_data, result, is_error)
+                # kdsn.319: shell completions carry the dispatch→completion
+                # elapsed (same format as subagent); only shell and subagent
+                # record start times, so other tools never get the suffix.
+                elapsed_str = ""
+                if name == "shell":
+                    elapsed_str = _format_elapsed(_tool_start_times.pop(call_id, None))
+                notice_body = f"🔧 {name}{detail} {status}{elapsed_str}"
+                # kdsn.319: the furled 'Full call' dump renders input_data
+                # verbatim — redact every string value first (same seam).
+                detail_html = _furl_tool_call_detail(_redact_input_values(input_data), result, is_error)
                 formatted_body = html_escape(notice_body) + detail_html
                 content_msg = {
                     "msgtype": "m.notice",
@@ -1360,7 +1451,7 @@ class MatrixBot:
             # Emit Matrix notice for subagent dispatch
             for tc in tool_calls:
                 if tc.name == "subagent" and isinstance(tc.input, dict):
-                    _subagent_start_times[tc.id] = time.monotonic()
+                    _tool_start_times[tc.id] = time.monotonic()
                     task_preview = tc.input.get("task", "")
                     model_info = tc.input.get("model", "default")
                     iters = tc.input.get("max_iterations", 200)
@@ -1414,6 +1505,42 @@ class MatrixBot:
                     if focus:
                         formatted += (f'\n<details><summary>🔮 full focus</summary>\n'
                                       f'{_escape_preserve_breaks(focus)}</details>')
+                    try:
+                        await self._room_send_with_retry(room_id, {
+                            "msgtype": "m.notice", "body": summary,
+                            "format": "org.matrix.custom.html",
+                            "formatted_body": formatted,
+                        })
+                    except Exception:
+                        pass
+                elif tc.name == "shell" and isinstance(tc.input, dict):
+                    # kdsn.319: dispatch-time notice for shell — a long shell
+                    # (sleep-poll, long build) otherwise produces zero
+                    # in-room signal until it lands; the typing indicator
+                    # expires after ~30s and the room reads as dead.
+                    _tool_start_times[tc.id] = time.monotonic()
+                    # Redact the FULL command before flattening/truncating:
+                    # capping first can split a [REDACTED:…] marker, and a
+                    # secret past position 120 is still a secret.
+                    redacted_cmd = _redact_for_room(str(tc.input.get("command") or ""))
+                    flat = redacted_cmd.replace("\n", " ").replace("\r", " ")
+                    # Head 120 chars — the preview identifies the call
+                    # (house convention: every other preview uses [:120]).
+                    summary = f"🔧 shell ▶ — {flat[:120]}" if flat else "🔧 shell ▶"
+                    formatted = f'<b>{html_escape(summary)}</b>'
+                    if redacted_cmd:
+                        # kdsn.257 parity: _escape_preserve_breaks (html_escape
+                        # + nl->br) — the full command is tool-influenced text
+                        # and must never pass raw HTML to the client.
+                        # kdsn.319 audit L1: cap the fold — an uncapped huge
+                        # command blows the Matrix PDU limit, the send fails
+                        # all 3 retries, and the dispatch notice is lost
+                        # entirely (the exact signal this feature exists for).
+                        fold = redacted_cmd
+                        if len(fold) > 4000:
+                            fold = fold[:4000] + "\n[truncated]"
+                        formatted += (f'\n<details><summary>🔧 full command</summary>\n'
+                                      f'{_escape_preserve_breaks(fold)}</details>')
                     try:
                         await self._room_send_with_retry(room_id, {
                             "msgtype": "m.notice", "body": summary,
