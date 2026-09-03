@@ -525,14 +525,14 @@ def cmd_showprompt(args):
         injection_defense = True
 
     # workspace-kdsn.305: CONTINUITY.md (the 8th operator file) is gated on
-    # [context] gc_enabled — pass the same flag the live agent passes
-    # (agent.py assembles with config.context.gc_enabled). A prompt inspector
-    # that ignores a prompt-affecting flag is worse than none (PHIL-1, same
-    # principle as injection_defense above). The fail-loud parser raises
-    # ConfigError on a bad [context] value rather than previewing a prompt
-    # the agent would refuse to build.
-    from openalph.config import _parse_context_gc_config
-    gc_enabled = _parse_context_gc_config(toml_data).gc_enabled
+    # [context] handoff_enabled — pass the same flag the live agent passes
+    # (agent.py assembles with config.context.handoff_enabled). A prompt
+    # inspector that ignores a prompt-affecting flag is worse than none
+    # (PHIL-1, same principle as injection_defense above). The fail-loud
+    # parser raises ConfigError on a bad [context] value rather than
+    # previewing a prompt the agent would refuse to build.
+    from openalph.config import _parse_context_handoff_config
+    gc_enabled = _parse_context_handoff_config(toml_data).handoff_enabled
 
     prompt = assemble_prompt(
         workspace,

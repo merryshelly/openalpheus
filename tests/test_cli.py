@@ -305,9 +305,10 @@ class TestMainDispatch:
 class TestShowpromptContinuityGate:
     """cmd_showprompt assembles the prompt the agent ACTUALLY receives.
 
-    agent.py passes gc_enabled=config.context.gc_enabled; the CLI preview
-    must do the same, or it silently omits the CONTINUITY.md section (the
-    8th operator file) and an operator checking the claim gets lied to.
+    agent.py passes gc_enabled=config.context.handoff_enabled; the CLI
+    preview must do the same, or it silently omits the CONTINUITY.md
+    section (the 8th operator file) and an operator checking the claim
+    gets lied to.
     """
 
     @staticmethod
@@ -324,32 +325,33 @@ class TestShowpromptContinuityGate:
         (config_dir / "t.toml").write_text(toml)
         return config_dir
 
-    def test_gc_enabled_shows_continuity(self, tmp_path, capsys, monkeypatch):
-        config_dir = self._make_agent(tmp_path, "gc_enabled = true")
+    def test_handoff_enabled_shows_continuity(self, tmp_path, capsys, monkeypatch):
+        config_dir = self._make_agent(tmp_path, "handoff_enabled = true")
         monkeypatch.setattr("openalph.cli.CONFIG_DIR", config_dir)
         from openalph.cli import cmd_showprompt
         cmd_showprompt(Namespace(agent="t"))
         assert "GC-CANARY-CONTINUITY-MARKER" in capsys.readouterr().out
 
     def test_default_context_shows_continuity(self, tmp_path, capsys, monkeypatch):
-        # Absent [context] section -> ContextGCConfig defaults (gc_enabled=True).
+        # Absent [context] section -> ContextHandoffConfig defaults
+        # (handoff_enabled=True).
         config_dir = self._make_agent(tmp_path, None)
         monkeypatch.setattr("openalph.cli.CONFIG_DIR", config_dir)
         from openalph.cli import cmd_showprompt
         cmd_showprompt(Namespace(agent="t"))
         assert "GC-CANARY-CONTINUITY-MARKER" in capsys.readouterr().out
 
-    def test_gc_disabled_hides_continuity(self, tmp_path, capsys, monkeypatch):
-        config_dir = self._make_agent(tmp_path, "gc_enabled = false")
+    def test_handoff_disabled_hides_continuity(self, tmp_path, capsys, monkeypatch):
+        config_dir = self._make_agent(tmp_path, "handoff_enabled = false")
         monkeypatch.setattr("openalph.cli.CONFIG_DIR", config_dir)
         from openalph.cli import cmd_showprompt
         cmd_showprompt(Namespace(agent="t"))
         assert "GC-CANARY-CONTINUITY-MARKER" not in capsys.readouterr().out
 
     def test_bad_context_value_fails_loud(self, tmp_path, monkeypatch):
-        # A mistyped gc_enabled must ConfigError in the preview too — never
-        # preview a prompt the agent would refuse to build.
-        config_dir = self._make_agent(tmp_path, 'gc_enabled = "no"')
+        # A mistyped handoff_enabled must ConfigError in the preview too —
+        # never preview a prompt the agent would refuse to build.
+        config_dir = self._make_agent(tmp_path, 'handoff_enabled = "no"')
         monkeypatch.setattr("openalph.cli.CONFIG_DIR", config_dir)
         from openalph.cli import cmd_showprompt
         from openalph.config import ConfigError

@@ -202,9 +202,9 @@ class Agent:
             model_aliases=config.model_aliases,
             injection_defense=config.injection_defense,
             # workspace-kdsn.305: the 8th operator file (CONTINUITY.md) is
-            # assembled only when context GC is on — gc_enabled=False (opt-out
-            # via [context]) appends nothing, ever.
-            gc_enabled=config.context.gc_enabled,
+            # assembled only when context handoff is on — handoff_enabled=False
+            # (opt-out via [context]) appends nothing, ever.
+            gc_enabled=config.context.handoff_enabled,
         )
         self._rooms: dict[str, list[dict]] = {}  # room_id → history
         self.uncached_input_tokens = 0
@@ -496,14 +496,14 @@ class Agent:
         re-estimates and proceeds), False when the caller must raise
         ContextOverflowError. Never raises itself.
 
-        Gated: gc_enabled, callback present, and this room's consecutive
+        Gated: handoff_enabled, callback present, and this room's consecutive
         FAILED-attempt strikes < _GC_HARD_STRIKE_LIMIT. On a failed/noop
         attempt the strike counter increments; at >= 3 attempts stop and
         raise as pre-GC (3-strike breaker). Any applied boundary resets the
         counter to 0 (in _gc_apply_boundary).
         """
         ctx = getattr(self.config, "context", None)
-        if ctx is None or not ctx.gc_enabled:
+        if ctx is None or not ctx.handoff_enabled:
             return False
         if (callbacks or {}).get("apply_gc_boundary") is None:
             return False
@@ -963,7 +963,7 @@ class Agent:
                 # for the ReminderState (D9 single-source `available`).
                 _gc_cfg = self.config.context
                 _gc_cb = (callbacks or {}).get("apply_gc_boundary")
-                if _gc_cfg.gc_enabled and _gc_cb is not None:
+                if _gc_cfg.handoff_enabled and _gc_cb is not None:
                     _gc_auto_threshold = int(available
                                              * _gc_cfg.auto_pct / 100)
                     _gc_auto_blocked = self._gc_auto_uncleared.get(room_id, False)
@@ -1065,14 +1065,14 @@ class Agent:
                         # D9: same expression as the overflow guard above.
                         available_tokens=available,
                         # kdsn.305 GC inputs (turn-start site only): warn
-                        # threshold from [context].warn_pct of the usable
+                        # threshold from [context].checkpoint_pct of the usable
                         # runway (0 when gc disabled -> engine silent), and
                         # the last boundary's post-boundary runway
                         # consumption fraction (kdsn.305.12 D5;
                         # 0.0 pre-boundary/restart -> engine silent).
                         gc_warn_threshold=(
-                            int(available * _gc_cfg.warn_pct / 100)
-                            if _gc_cfg.gc_enabled else 0),
+                            int(available * _gc_cfg.checkpoint_pct / 100)
+                            if _gc_cfg.handoff_enabled else 0),
                         gc_runway_fraction=self._gc_runway_cached(room_id),
                         completed_turns=_completed_turns,
                         turn_source=_turn_source,

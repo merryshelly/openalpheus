@@ -1,12 +1,7 @@
 """Message-list GC boundary transform tests (workspace-kdsn.305.4)."""
 
-import json as _json
 from copy import deepcopy
-from pathlib import Path as _Path
 
-import pytest as _pytest
-
-from openalph.config import AgentConfig as _AgentConfig, ContextGCConfig as _ContextGCConfig
 from openalph.context_gc import (
     SUB_SNAPSHOT_PREFIX,
     frame_sub_snapshot,
@@ -14,11 +9,6 @@ from openalph.context_gc import (
     tool_pointer,
 )
 from openalph.provider import ToolCall
-from openalph.provider import Response as _Response, Usage as _Usage
-from openalph.tools import ToolResult as _ToolResult
-from openalph.tools import subagent as _subagent_mod
-from openalph.tools.subagent import _estimate_context_tokens as _est
-from openalph.tools.subagent import run_subagent as _run_subagent
 
 
 def _tc_obj(call_id, name, input, extra_content=None):
@@ -493,6 +483,18 @@ class TestWave21TransformFixes:
 # Subagent GC seam (workspace-kdsn.305.4) — real-path tests over run_subagent
 # ============================================================================
 
+import json as _json
+from pathlib import Path as _Path
+
+import pytest as _pytest
+
+from openalph.config import AgentConfig as _AgentConfig, ContextHandoffConfig as _ContextHandoffConfig
+from openalph.provider import Response as _Response, Usage as _Usage
+from openalph.tools import ToolResult as _ToolResult
+from openalph.tools import subagent as _subagent_mod
+from openalph.tools.subagent import run_subagent as _run_subagent
+
+
 class _ProviderStub:
     key = "p"
     type = "openai"
@@ -515,7 +517,7 @@ def _gc_config(workspace, *, gc_enabled=True, model_max_tokens=262144,
         workspace=_Path(workspace),
         max_iterations=25,
         truncation_limit=50000,
-        context=_ContextGCConfig(gc_enabled=gc_enabled),
+        context=_ContextHandoffConfig(handoff_enabled=gc_enabled),
     )
 
 
@@ -701,6 +703,9 @@ class TestSubagentGcSeam:
 # ============================================================================
 # Wave-2 audit fixes (3-lineage reconciliation, 2026-08-31)
 # ============================================================================
+
+from openalph.tools.subagent import _estimate_context_tokens as _est
+
 
 class TestEstimateContextTokens:
     def test_str_only_unchanged(self):

@@ -73,22 +73,25 @@ class NotificationsConfig:
 
 
 @dataclass
-class ContextGCConfig:
-    """Context garbage-collection settings (workspace-kdsn.305, [context] section).
+class ContextHandoffConfig:
+    """Context handoff settings (workspace-kdsn.305, [context] section).
 
-    Tuning knobs for the unified context-boundary mechanism (context_gc.py):
-    the auto/hard boundary tiers, the gc-warn reminder threshold, the
-    durable-set re-injection budget, and the thinking-tail preservation
-    knobs (workspace-kdsn.305.13).  Absent [context] section → all defaults
-    (gc_enabled=True).  Parsing FAILS LOUD (ConfigError on bad type/range),
-    the same discipline as [model_vision] and [spotter]: these knobs govern
-    when context is reduced and what survives it, so a silently-dropped
-    setting would be fail-open on a data-loss surface.
+    Tuning knobs for the unified context-boundary / handoff mechanism
+    (context_gc.py): the auto/hard boundary tiers, the gc-warn checkpoint
+    reminder threshold, the durable-set re-injection budget, and the
+    thinking-tail preservation fields (workspace-kdsn.305.13 — the TOML
+    keys were retired at T0, kdsn.322; the fields survive one extra slice
+    because the carving machinery still reads them until T1 deletes it).
+    Absent [context] section → all defaults (handoff_enabled=True).
+    Parsing FAILS LOUD (ConfigError on bad type/range), the same discipline
+    as [model_vision] and [spotter]: these knobs govern when context is
+    reduced and what survives it, so a silently-dropped setting would be
+    fail-open on a data-loss surface.
     """
-    gc_enabled: bool = True
+    handoff_enabled: bool = True
     # Reminder/boundary tier thresholds — percentages of the usable runway
     # (available = window limit − max_tokens), strict (0, 100).
-    warn_pct: int = 75      # gc-warn reminder threshold
+    checkpoint_pct: int = 75    # gc-warn checkpoint reminder threshold
     auto_pct: int = 85      # turn-start auto boundary tier
     hard_pct: int = 92      # (reserved: hard tier is the send-time overflow guard)
     # Durable-set re-injection budget: max(window * pct, min_tokens) tokens
@@ -112,6 +115,9 @@ class ContextGCConfig:
     # retained verbatim instead of stripped — newest->oldest, contiguous,
     # capped at max_tokens (chars//4 estimates). 0 for either knob = full
     # strip, byte-identical to pre-.13 behavior.
+    # FIELDS ONLY (kdsn.322): the [context] TOML keys thinking_tail_turns /
+    # thinking_tail_max_tokens are rejected at T0 (no successor); these
+    # fields keep their defaults until T1 deletes the carving machinery.
     thinking_tail_turns: int = 8                  # >= 0
     thinking_tail_max_tokens: int = 32768         # >= 0
     # Workspace-relative glob patterns declaring additional durable path
@@ -163,10 +169,11 @@ class AgentConfig:
     # call sites poke it defensively via getattr(config, "skipped_providers", {}).
     skipped_providers: dict[str, str] = field(default_factory=dict)
     notifications: NotificationsConfig | None = None
-    # workspace-kdsn.305: context GC settings ([context] section). Default
+    # workspace-kdsn.305: context handoff settings ([context] section;
+    # kdsn.322 class/field rename — the legacy name is retired). Default
     # factory keeps every pre-305 AgentConfig(...) construction working
     # unchanged (absent [context] in TOML → same defaults the factory gives).
-    context: ContextGCConfig = field(default_factory=ContextGCConfig)
+    context: ContextHandoffConfig = field(default_factory=ContextHandoffConfig)
     # Spotter v1 (spotter-v1-design.md §1): an independent monitor that
     # watches this agent's live session, turn by turn. Optional [spotter]
     # TOML section; absent section → all defaults (enabled=True per D6
@@ -702,9 +709,9 @@ def load_config(path: Path) -> AgentConfig:
     # Parse optional [notifications] section (kdsn.292: ntfy degraded-start alert)
     notifications = _parse_notifications_config(toml_data)
 
-    # Parse optional [context] section (workspace-kdsn.305: context GC).
+    # Parse optional [context] section (workspace-kdsn.305: context handoff).
     # Absent → all defaults; present-but-invalid → ConfigError (fail-LOUD).
-    context = _parse_context_gc_config(toml_data)
+    context = _parse_context_handoff_config(toml_data)
 
     # Return resolved configuration
     return AgentConfig(
@@ -788,29 +795,54 @@ def _parse_notifications_config(toml_data: dict) -> NotificationsConfig | None:
     return NotificationsConfig(ntfy_url=ntfy_url, ntfy_token=ntfy_token)
 
 
-def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
+def _parse_context_handoff_config(toml_data: dict) -> ContextHandoffConfig:
     """Parse the optional [context] section (workspace-kdsn.305).
 
-    Absent section → all defaults (gc_enabled=True).  Present section with
-    ANY bad type or range RAISES ConfigError — fail-LOUD, mirroring the
-    [model_vision] precedent: these knobs control when context is reduced and
-    what survives, so a silently-dropped value would be fail-open on a
-    data-loss surface (a mistyped gc_enabled = "no" must not silently
-    disable GC; a pct of 150 must not silently cap a boundary tier).
+    Absent section → all defaults (handoff_enabled=True).  Present section
+    with ANY bad type or range RAISES ConfigError — fail-LOUD, mirroring
+    the [model_vision] precedent: these knobs control when context is
+    reduced and what survives, so a silently-dropped value would be
+    fail-open on a data-loss surface (a mistyped handoff_enabled = "no"
+    must not silently disable handoff; a pct of 150 must not silently cap
+    a boundary tier).
+
+    Legacy key steering (kdsn.322 hard epoch): the old spellings
+    `gc_enabled` / `warn_pct` and the removed thinking-tail keys are NEVER
+    honored — their presence, under any circumstances (even alongside the
+    new key), is a structural ConfigError that names the successor key (or
+    the removed key). A tuned knob silently reverting to its default is
+    exactly the fail-open this module forbids.
     """
     if "context" not in toml_data:
-        return ContextGCConfig()
+        return ContextHandoffConfig()
 
     section = toml_data["context"]
     if not isinstance(section, dict):
         raise ConfigError("[context] section must be a table")
 
+    # Hard epoch (kdsn.322): legacy spellings steer to the successor key —
+    # presence alone is the error, the value is never read.
+    for _legacy, _successor in (
+            ("gc_enabled", "handoff_enabled"),
+            ("warn_pct", "checkpoint_pct"),
+    ):
+        if _legacy in section:
+            raise ConfigError(
+                f"[context] {_legacy} was renamed to {_successor} "
+                "(hard epoch: legacy spellings are not honored)")
+    for _removed in ("thinking_tail_turns", "thinking_tail_max_tokens"):
+        if _removed in section:
+            raise ConfigError(
+                f"[context] {_removed} was removed with the thinking-tail "
+                "carving (hard epoch: the key is not honored and has no "
+                "successor)")
+
     # bool knob
-    gc_enabled = section.get("gc_enabled", True)
-    if not isinstance(gc_enabled, bool):
+    handoff_enabled = section.get("handoff_enabled", True)
+    if not isinstance(handoff_enabled, bool):
         raise ConfigError(
-            f"[context] gc_enabled must be a boolean, "
-            f"got {gc_enabled!r} ({type(gc_enabled).__name__})")
+            f"[context] handoff_enabled must be a boolean, "
+            f"got {handoff_enabled!r} ({type(handoff_enabled).__name__})")
 
     # pct knobs: strict (0, 100).  bool is an int subclass in Python —
     # reject it explicitly (same discipline as [spotter] max_iterations).
@@ -822,7 +854,7 @@ def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
                 f"100, got {v!r}")
         return v
 
-    warn_pct = _pct("warn_pct", 75)
+    checkpoint_pct = _pct("checkpoint_pct", 75)
     auto_pct = _pct("auto_pct", 85)
     hard_pct = _pct("hard_pct", 92)
 
@@ -883,36 +915,19 @@ def _parse_context_gc_config(toml_data: dict) -> ContextGCConfig:
             f"[context] turn_cooldown must be an integer >= 0, "
             f"got {turn_cooldown!r}")
 
-    # thinking-tail preservation (workspace-kdsn.305.13 T2): both >= 0;
-    # bool rejected explicitly (int subclass). 0 disables the tail
-    # (byte-identical legacy full strip).
-    thinking_tail_turns = section.get("thinking_tail_turns", 8)
-    if (isinstance(thinking_tail_turns, bool)
-            or not isinstance(thinking_tail_turns, int)
-            or thinking_tail_turns < 0):
-        raise ConfigError(
-            f"[context] thinking_tail_turns must be an integer >= 0, "
-            f"got {thinking_tail_turns!r}")
+    # thinking-tail preservation (workspace-kdsn.305.13 T2): the TOML keys
+    # were rejected above (kdsn.322); the dataclass fields keep their
+    # defaults (8 / 32768) until T1 deletes the carving machinery.
 
-    thinking_tail_max_tokens = section.get("thinking_tail_max_tokens", 32768)
-    if (isinstance(thinking_tail_max_tokens, bool)
-            or not isinstance(thinking_tail_max_tokens, int)
-            or thinking_tail_max_tokens < 0):
-        raise ConfigError(
-            f"[context] thinking_tail_max_tokens must be an integer >= 0, "
-            f"got {thinking_tail_max_tokens!r}")
-
-    return ContextGCConfig(
-        gc_enabled=gc_enabled,
-        warn_pct=warn_pct,
+    return ContextHandoffConfig(
+        handoff_enabled=handoff_enabled,
+        checkpoint_pct=checkpoint_pct,
         auto_pct=auto_pct,
         hard_pct=hard_pct,
         durable_budget_pct=durable_budget_pct,
         durable_budget_min_tokens=durable_budget_min_tokens,
         handoff_runway_pct=handoff_runway_pct,
         handoff_runway_min_tokens=handoff_runway_min_tokens,
-        thinking_tail_turns=thinking_tail_turns,
-        thinking_tail_max_tokens=thinking_tail_max_tokens,
         durable_paths=durable_paths,
         turn_cooldown=turn_cooldown,
     )

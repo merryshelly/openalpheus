@@ -379,10 +379,10 @@ def gc_thinking_tail_kwargs(config) -> dict:
     non-negative int — this is the "config absent / not yet loaded / mock"
     case. Two distinct absences both land at 0/0 (legacy render):
       - ``config.context`` missing (pre-.13 config, or a MagicMock agent
-        whose auto-attribute is not a real ContextGCConfig) → 0/0;
+        whose auto-attribute is not a real ContextHandoffConfig) → 0/0;
       - either field missing or non-int (a partial mock / a bool / a
         negative) → that field 0.
-    A real ContextGCConfig carries real ints, so this passes its values
+    A real ContextHandoffConfig carries real ints, so this passes its values
     through unchanged. The isinstance gate (not just getattr-with-default)
     is load-bearing: ``getattr(MagicMock, "thinking_tail_turns", 0)``
     returns a MagicMock, which would raise on ``> 0`` and, worse, be truthy
@@ -876,10 +876,11 @@ def apply_boundary_and_rebuild(
 
     THE shared application path — used by the callbacks-seam closure (agent
     loop auto/hard tiers + context_gc tool) and the /cache gc room command.
-    Config comes from ``agent.config.context`` (ContextGCConfig; defaults via
-    getattr for pre-305 mock configs). window for the durable budget is the
-    room model's context window. The thinking-tail knobs (workspace-
-    kdsn.305.13 T4a) are read from the same config (ContextGCConfig defaults
+    Config comes from ``agent.config.context`` (ContextHandoffConfig;
+    defaults via getattr for pre-305 mock configs). window for the durable
+    budget is the room model's context window. The thinking-tail knobs
+    (workspace-kdsn.305.13 T4a) are read from the same config
+    (ContextHandoffConfig defaults
     8/32768 when the fields are absent; FULL-STRIP 0/0 when the whole
     config is absent — pre-.13 mock agents keep the legacy render) and
     passed to BOTH apply_boundary (manifest + estimator) and the

@@ -86,7 +86,8 @@ class ReminderState:
     # Context GC (workspace-kdsn.305) — turn-start site only, both fields
     # computed by the agent from [context] config + the room's usable runway.
     # gc_warn_threshold: absolute token count at which the gc-warn reminder
-    # fires (int(available * warn_pct / 100)). Default 0 = unknown/disabled →
+    # fires (int(available * checkpoint_pct / 100)). Default 0 =
+    # unknown/disabled →
     # SILENT SKIP, the same fail-safe convention as available_tokens (fewer
     # nudges, never false urgency; also keeps existing constructions valid).
     gc_warn_threshold: int = 0

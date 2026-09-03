@@ -534,14 +534,14 @@ def build_callbacks(
     # silently (durability-gate discipline).
     if session_log is not None:
         async def _gc_apply_cb(_room_id, *, trigger, exclude_inflight=True):
-            # Opt-out is opt-out (audit): with context.gc_enabled=false the
-            # tool path must NOT apply boundaries either — the tiers and the
-            # operator command respect the flag; the seam did not.
+            # Opt-out is opt-out (audit): with context.handoff_enabled=false
+            # the tool path must NOT apply boundaries either — the tiers and
+            # the operator command respect the flag; the seam did not.
             _gc_cfg = getattr(agent.config, "context", None)
-            if _gc_cfg is None or not getattr(_gc_cfg, "gc_enabled", False):
+            if _gc_cfg is None or not getattr(_gc_cfg, "handoff_enabled", False):
                 return {
                     "applied": False,
-                    "noop_reason": "context.gc_enabled is false — GC disabled for this agent",
+                    "noop_reason": "context.handoff_enabled is false — GC disabled for this agent",
                     "manifest": None,
                     "over_budget": False,
                 }

@@ -11,7 +11,7 @@ Pinned contract (spec D1–D6):
     decoupled from durable-set size (over_budget).
   - Over-budget keeps full verbatim attachment; its only observable is the
     snapshot-header marker, reworded to informational text.
-  - ContextGCConfig: defaults durable 25.0/96000; new handoff_runway_pct /
+  - ContextHandoffConfig: defaults durable 25.0/96000; new handoff_runway_pct /
     handoff_runway_min_tokens (10.0 / 24000); fail-loud parse.
   - Reminder trigger gc-budget REMOVED; gc-runway added (≥90% of runway
     consumed post-boundary, once/session, turn_start only, reset re-arms).
@@ -520,7 +520,7 @@ class _StubAgent:
     def __init__(self, workspace, window, available, history_box):
         from types import SimpleNamespace
         ctx = SimpleNamespace(
-            gc_enabled=True, durable_paths=[],
+            handoff_enabled=True, durable_paths=[],
             durable_budget_pct=25.0, durable_budget_min_tokens=96000,
             handoff_runway_pct=10.0, handoff_runway_min_tokens=24000,
         )

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from openalph.config import AgentConfig, ContextGCConfig
+from openalph.config import AgentConfig, ContextHandoffConfig
 from openalph.provider import Response, ThinkingBlock, ToolCall, Usage
 from openalph.tools import BUILTIN_TOOLS, ToolDef, ToolResult, execute_tool
 from openalph.tools.subagent import _estimate_context_tokens, run_subagent
@@ -231,7 +231,7 @@ class TestThinkingReplay:
         """
         cfg = make_config(
             model_limits={"anthropic/claude-sonnet-4-20250514": 9000},
-            context=ContextGCConfig(thinking_tail_max_tokens=512),
+            context=ContextHandoffConfig(thinking_tail_max_tokens=512),
         )
         task = "T" * 1600
         old = tool_response(tool_id="tc_1", thinking=[think("OLDCOT" * 200, "s_old")])

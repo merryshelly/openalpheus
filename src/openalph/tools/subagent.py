@@ -308,9 +308,9 @@ async def run_subagent(
     #     threshold at or below zero would fire every iteration.
     _gc_cfg = getattr(config, "context", None)
     # Documented default is GC-on; production configs always carry the
-    # [context] dataclass default (gc_enabled=True), so the fallback here
-    # only matters for context-less config objects (test harnesses).
-    _gc_enabled = bool(getattr(_gc_cfg, "gc_enabled", True))
+    # [context] dataclass default (handoff_enabled=True), so the fallback
+    # here only matters for context-less config objects (test harnesses).
+    _gc_enabled = bool(getattr(_gc_cfg, "handoff_enabled", True))
     _gc_boundary_count = 0
     _gc_latched = False
     _gc_threshold = 0

@@ -115,8 +115,9 @@ def assemble_prompt(
     test_no_behavioural_text_beyond_operator_files) pins that a DEFAULT
     call adds only the mechanical `## Runtime` block — no behavioural
     section the operator did not place. The AGENT passes
-    gc_enabled=config.context.gc_enabled explicitly (ContextGCConfig
-    defaults to True), so agents get the continuity section by default;
+    gc_enabled=config.context.handoff_enabled explicitly
+    (ContextHandoffConfig defaults to True), so agents get the continuity
+    section by default;
     only direct default calls to this function are opt-in.
 
     Returns empty string if the workspace has no readable prompt files.

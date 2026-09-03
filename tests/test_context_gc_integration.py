@@ -1,7 +1,9 @@
 """Context GC — integration seams (workspace-kdsn.305.2, .3 + tools/matrix).
 
 The tests are the specification. Scope of this file:
-  - [context] TOML config parsing (Sub C: config.py)
+  - [context] TOML config parsing (Sub C: config.py) — superseded by
+    tests/test_context_handoff_config.py (kdsn.322 T0; the config-surface
+    pins moved there with the ContextHandoffConfig rename)
   - CONTINUITY.md prompt assembly, 8th operator file (Sub C: prompt.py + template)
   - gc-warn / gc-runway reminder triggers, coexist-with-reset (Sub C: reminders.py)
   - context_gc + set_active_project tools (Sub D: tools/__init__.py)
@@ -16,20 +18,16 @@ weaken assertions here.
 
 import asyncio
 import json
-import json as _json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from openalph.config import AgentConfig, ProviderConfig, ConfigError, load_config, ContextGCConfig, MatrixConfig
+from openalph.config import AgentConfig, ProviderConfig
 from openalph.session import SessionLog
-from openalph.tools import BUILTIN_TOOLS, execute_tool
+from openalph.tools import ToolResult, BUILTIN_TOOLS, execute_tool
 from openalph.reminders import ReminderEngine, ReminderState
 from openalph.prompt import assemble_prompt
-from openalph.agent import Agent, ContextOverflowError
-from openalph.matrix import MatrixBot
-from openalph.provider import Response, StreamEvent, ToolCall, Usage
 
 ROOM = "!gci:matrix.local"
 AGENT_ID = "@gci-agent:matrix.local"
@@ -75,80 +73,6 @@ def _state(**kw):
     )
     defaults.update(kw)
     return ReminderState(**defaults)
-
-
-def _toml(tmp_path, body):
-    p = tmp_path / "agent.toml"
-    p.write_text(body)
-    return load_config(p)
-
-
-BASE_TOML = '''
-[agent]
-name = "gc-agent"
-default_model = "anthropic/claude-sonnet-4-20250514"
-max_tokens = 8192
-
-[providers.anthropic]
-type = "anthropic"
-api_key = "sk-test"
-
-[workspace]
-path = "/tmp/test"
-'''
-
-
-# ============================================================================
-# [context] config section
-# ============================================================================
-
-class TestConfigContextSection:
-    def test_absent_section_full_defaults(self, tmp_path):
-        cfg = _toml(tmp_path, BASE_TOML)
-        c = cfg.context
-        assert c.gc_enabled is True
-        assert c.warn_pct == 75
-        assert c.auto_pct == 85
-        assert c.hard_pct == 92
-        assert c.durable_budget_pct == 25.0
-        assert c.durable_budget_min_tokens == 96000
-        # kdsn.305.12 D3: runway-gated handoff thresholds
-        assert c.handoff_runway_pct == 10.0
-        assert c.handoff_runway_min_tokens == 24000
-        assert c.durable_paths == []
-        assert c.turn_cooldown == 3
-
-    def test_overrides(self, tmp_path):
-        body = BASE_TOML + '''
-[context]
-gc_enabled = false
-warn_pct = 70
-auto_pct = 80
-hard_pct = 90
-durable_budget_pct = 20.0
-durable_budget_min_tokens = 24000
-durable_paths = ["skills/*.md"]
-turn_cooldown = 5
-'''
-        c = _toml(tmp_path, body).context
-        assert c.gc_enabled is False
-        assert c.warn_pct == 70 and c.auto_pct == 80 and c.hard_pct == 90
-        assert c.durable_budget_pct == 20.0
-        assert c.durable_budget_min_tokens == 24000
-        assert c.durable_paths == ["skills/*.md"]
-        assert c.turn_cooldown == 5
-
-    def test_invalid_type_fails_loud(self, tmp_path):
-        with pytest.raises(ConfigError):
-            _toml(tmp_path, BASE_TOML + '[context]\ngc_enabled = "yes"\n')
-
-    def test_pct_out_of_range_fails_loud(self, tmp_path):
-        with pytest.raises(ConfigError):
-            _toml(tmp_path, BASE_TOML + "[context]\nauto_pct = 150\n")
-
-    def test_negative_budget_fails_loud(self, tmp_path):
-        with pytest.raises(ConfigError):
-            _toml(tmp_path, BASE_TOML + "[context]\ndurable_budget_min_tokens = -1\n")
 
 
 # ============================================================================
@@ -494,6 +418,18 @@ class TestMatrixCommands:
 # invisible to every seam-mocked test (tool-management, "the one lesson").
 # ============================================================================
 
+import asyncio
+import json as _json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from openalph.agent import Agent, ContextOverflowError
+from openalph.config import AgentConfig, ContextHandoffConfig, MatrixConfig, ProviderConfig
+from openalph.matrix import MatrixBot
+from openalph.session import SessionLog
+from openalph.provider import Response, StreamEvent, ToolCall, Usage
+
 GC_ROOM = "!gcloop:matrix.local"
 AGENT_ID = "@gci-agent:matrix.local"
 
@@ -667,9 +603,9 @@ class TestGCAutoTierRealPath:
         assert any("DONE" in s for s in sent)
 
     def test_auto_tier_optout_no_boundary_when_gc_disabled(self, tmp_path):
-        """gc_enabled=False: same crossing seed, NO boundary, outputs intact."""
+        """handoff_enabled=False: same crossing seed, NO boundary, outputs intact."""
         bot, agent = _gc_real_bot(tmp_path, model_max_tokens=150000)
-        agent.config.context = ContextGCConfig(gc_enabled=False)
+        agent.config.context = ContextHandoffConfig(handoff_enabled=False)
         _seed_room(bot)
         h_before = agent.history(GC_ROOM)
         ident_before = id(h_before)

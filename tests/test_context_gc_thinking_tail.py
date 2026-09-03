@@ -141,15 +141,12 @@ class TestThinkingTailConfig:
         assert c.thinking_tail_turns == 8
         assert c.thinking_tail_max_tokens == 32768
 
-    def test_overrides(self, tmp_path):
-        body = BASE_TOML + '''
-[context]
-thinking_tail_turns = 3
-thinking_tail_max_tokens = 12000
-'''
-        c = _toml(tmp_path, body).context
-        assert c.thinking_tail_turns == 3
-        assert c.thinking_tail_max_tokens == 12000
+    # NOTE (kdsn.322 T0): the [context] TOML keys thinking_tail_turns /
+    # thinking_tail_max_tokens are retired — their presence now raises
+    # ConfigError (steering, pinned in test_context_handoff_config.py). The
+    # dataclass FIELDS survive until T1 deletes the carving machinery;
+    # test_invalid_fails_loud below still holds (the keys are rejected,
+    # which is a ConfigError for any value, including bad types).
 
     @pytest.mark.parametrize("line", [
         "thinking_tail_turns = -1",
@@ -460,7 +457,7 @@ class _StubAgent:
     def __init__(self, workspace, window, available, history_box, tail_turns):
         from types import SimpleNamespace
         ctx = SimpleNamespace(
-            gc_enabled=True, durable_paths=[],
+            handoff_enabled=True, durable_paths=[],
             durable_budget_pct=25.0, durable_budget_min_tokens=96000,
             handoff_runway_pct=10.0, handoff_runway_min_tokens=24000,
             thinking_tail_turns=tail_turns, thinking_tail_max_tokens=32768,
@@ -527,22 +524,15 @@ class TestTailKwargsHelper:
         assert kw == {"thinking_tail_turns": 8,
                       "thinking_tail_max_tokens": 32768}
 
-    def test_real_config_overrides_pass_through(self, tmp_path):
-        from openalph.context_gc import gc_thinking_tail_kwargs
-        cfg = _toml(tmp_path, BASE_TOML + '''
-[context]
-thinking_tail_turns = 2
-thinking_tail_max_tokens = 4000
-''')
-        kw = gc_thinking_tail_kwargs(cfg)
-        assert kw == {"thinking_tail_turns": 2,
-                      "thinking_tail_max_tokens": 4000}
+    # NOTE (kdsn.322 T0): test_real_config_overrides_pass_through is
+    # superseded — the [context] TOML keys were retired (ConfigError
+    # steering, pinned in test_context_handoff_config.py).
 
     def test_mock_and_absent_config_fail_closed(self, tmp_path):
         from types import SimpleNamespace
         from unittest.mock import MagicMock
         from openalph.context_gc import gc_thinking_tail_kwargs
-        # Full MagicMock agent config: NOT a real ContextGCConfig → 0/0.
+        # Full MagicMock agent config: NOT a real ContextHandoffConfig → 0/0.
         assert gc_thinking_tail_kwargs(MagicMock()) == {
             "thinking_tail_turns": 0, "thinking_tail_max_tokens": 0}
         # Context section absent entirely → 0/0.

@@ -471,7 +471,7 @@ class MatrixBot:
                 # this default instead of silently resurrecting expunged
                 # content after a restart.
                 gc_default=getattr(config, "context", None) is not None
-                and config.context.gc_enabled,
+                and config.context.handoff_enabled,
             )
             self.heartbeat = HeartbeatManager(
                 config_path=Path(workspace) / "heartbeats.json",
@@ -3332,7 +3332,7 @@ class MatrixBot:
                 # message, legacy rebuild (byte-equivalent behavior to the
                 # old /cache toolstrip).
                 if self.session_log:
-                    if self.agent.config.context.gc_enabled:
+                    if self.agent.config.context.handoff_enabled:
                         outcome = apply_boundary_and_rebuild(
                             self.agent, self.session_log, room_id,
                             trigger="manual", exclude_inflight=False)

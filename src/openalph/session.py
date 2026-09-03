@@ -58,7 +58,8 @@ class SessionLog:
                 without an explicit ``gc_enabled`` kwarg (audit: restart
                 hydration / status / CLI call sites omitted the flag,
                 resurrecting expunged content and superseded snapshots after
-                every restart). Wired from ``config.context.gc_enabled`` by
+                every restart). Wired from ``config.context.handoff_enabled``
+                by
                 the transports; tests construct with the default (legacy).
         """
         self.workspace = Path(workspace)
