@@ -65,7 +65,6 @@ from openalph.config import AgentConfig
 from openalph.provider import (
     ProviderError,
     ProviderUnavailableError,
-    Response,
     complete,
     resolve_model_checked,
 )

@@ -835,7 +835,7 @@ class TestAuditFixSeam:
         # Structural: the seam must sit BEFORE the vision drain in the loop
         # (freshly-drained images land post-boundary and survive, instead of
         # being expunged before the model ever saw them).
-        src = open("/opt/openalph/src/openalph/tools/subagent.py").read()
+        src = (_Path(__file__).resolve().parent.parent / "src" / "openalph" / "tools" / "subagent.py").read_text()
         seam_pos = src.index("GC auto tier (kdsn.305.4): apply a message-list boundary")
         drain_pos = src.index("# Drain the per-sub vision inbox at the TOP")
         assert seam_pos < drain_pos

@@ -28,8 +28,8 @@ import dataclasses
 import json
 import logging
 
-from openalph.config import AgentConfig, resolve_model
-from openalph.provider import complete, ProviderError, compute_cost
+from openalph.config import AgentConfig
+from openalph.provider import complete, compute_cost
 from openalph.tools import ToolResult
 from openalph.tools.security import redact_credentials
 

@@ -702,7 +702,7 @@ class TestAntiFlapUnitTemplate:
     installs inherit bounded-restart behavior (fleet drop-in deployed
     separately as an ops artifact)."""
 
-    UNIT = Path("/opt/openalph/src/openalph/data/openalph@.service")
+    UNIT = Path(__file__).resolve().parent.parent / "src" / "openalph" / "data" / "openalph@.service"
 
     def test_template_has_start_limits_in_unit_section(self):
         import configparser

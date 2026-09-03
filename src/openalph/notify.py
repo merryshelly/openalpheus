@@ -15,7 +15,6 @@ Two surfaces, one composer:
 """
 
 import logging
-import urllib.request
 from urllib.request import Request, urlopen  # urlopen module-level so the
 # acceptance suite (and ops smoke tests) can monkeypatch openalph.notify.urlopen
 
