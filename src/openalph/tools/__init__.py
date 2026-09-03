@@ -2002,6 +2002,7 @@ async def execute_tool(
     agent_config: Any,
     tools: list[ToolDef] | None = None,
     callbacks: dict | None = None,
+    tool_executors: dict[str, Any] | None = None,
 ) -> ToolResult:
     """Validate name/params against BUILTIN_TOOLS, dispatch to the tool's
     executor module, then redact credentials from the result before
@@ -2019,6 +2020,15 @@ async def execute_tool(
         input: Tool input parameters
         tool_config: Tool-specific configuration
         agent_config: Agent configuration (for sub-agents, etc.)
+        tool_executors: Optional per-tool executor override map (workspace-
+            kdsn.317): {tool name: async callable invoked as
+            ``await executor(name=..., input=..., tool_config=...,
+            agent_config=...)`` returning a ToolResult}. When present with an
+            entry for the incoming tool name, the executor REPLACES the
+            built-in branch — branch-local normalization and read-registry
+            bookkeeping do not apply, but the R9 redaction tail still covers
+            the bridged result. None (default) → byte-identical built-in
+            dispatch.
         
     Returns:
         ToolResult with content and error status
@@ -2041,6 +2051,7 @@ async def execute_tool(
         agent_config=agent_config,
         tools=tools,
         callbacks=callbacks,
+        tool_executors=tool_executors,
     )
 
     # Redact credentials from tool output — applies to EVERY return path
@@ -2091,6 +2102,7 @@ async def _execute_tool_inner(
     agent_config: Any,
     tools: list[ToolDef] | None = None,
     callbacks: dict | None = None,
+    tool_executors: dict[str, Any] | None = None,
 ) -> ToolResult:
     """Dispatch body moved out of execute_tool (R9). Every return here —
     early (unknown tool / missing param / guard refusal) or from a tool's
@@ -2164,6 +2176,27 @@ async def _execute_tool_inner(
             _resolved_path = str(Path(input["path"]).resolve())
         except Exception:
             _resolved_path = input["path"]
+
+    # Per-tool executor override seam (workspace-kdsn.317): consult AFTER all
+    # generic blocks above — name validation, required-param validation,
+    # GC-sentinel refusal, input copy, workspace path-join normalization, and
+    # resolved-path computation — and BEFORE the built-in if/elif chain. An
+    # executor registered for the incoming tool NAME replaces the built-in
+    # branch wholesale: branch-local normalization (e.g. the shell cwd
+    # default) and read-registry bookkeeping (_update_read_registry) belong
+    # to the built-in branches and do NOT apply — they are the executor's
+    # responsibility. The R9 redaction tail in execute_tool still covers this
+    # return path like every other. Unknown-tool / missing-param / GC-sentinel
+    # refusals above fire first, so an executor never sees marker inputs,
+    # unknown names, or invalid params.
+    if tool_executors is not None and name in tool_executors:
+        executor = tool_executors[name]
+        return await executor(
+            name=name,
+            input=input,
+            tool_config=tool_config,
+            agent_config=agent_config,
+        )
 
     if name == "shell":
         from .shell import run_shell
@@ -2483,6 +2516,10 @@ async def _execute_tool_inner(
             # medium in run_subagent). The sub path never consults config
             # [agent] thinking — this param is the only lever.
             effort=input.get("effort"),
+            # workspace-kdsn.317: A9 subagent inheritance — ALWAYS forwarded
+            # explicitly (the map when present, None when absent) so a sub's
+            # tool calls route through the parent-provided executors.
+            tool_executors=tool_executors,
         )
     elif name == "advisor":
         from .advisor import run_advisor

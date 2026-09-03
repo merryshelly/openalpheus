@@ -143,6 +143,7 @@ async def run_subagent(
     parent_room_id: str | None = None,
     callbacks: dict | None = None,
     effort: str | None = None,
+    tool_executors: dict | None = None,
 ) -> ToolResult:
     """Execute a multi-turn LLM call as a sub-agent.
 
@@ -180,6 +181,10 @@ async def run_subagent(
             _EFFORT_LEVELS; None (param omitted) defaults to "medium". The
             sub path never consults config [agent] thinking — this param is
             the only lever (ruling 1).
+        tool_executors: Optional per-tool executor override map
+            (workspace-kdsn.317), forwarded into this sub's internal
+            execute_tool calls — a sub inherits the parent's bridge
+            automatically (A9). None (default) → plain local execution.
 
     Returns:
         ToolResult with the LLM's response content, or error description on failure
@@ -693,6 +698,11 @@ async def run_subagent(
                         "vision_deposit": _sub_vision_deposit,
                         "active_model": config.default_model,
                     },
+                    # workspace-kdsn.317: A9 — subs inherit the parent's
+                    # per-tool executor bridge. Passed only when present so
+                    # no-map subs keep the byte-identical legacy call shape.
+                    **({"tool_executors": tool_executors}
+                       if tool_executors is not None else {}),
                 ))
 
             results = await asyncio.gather(*tool_coros)

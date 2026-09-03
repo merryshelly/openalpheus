@@ -174,8 +174,26 @@ def _keepalive_is_hit(read: int | None, write: int | None) -> bool:
 class Agent:
     """A single-conversation agent backed by an LLM provider."""
 
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: AgentConfig, tool_executors: dict | None = None):
         self.config = config
+        # Per-tool executor override map (workspace-kdsn.317): {tool name:
+        # async callable} used by the execute_tool dispatch below to redirect
+        # individual tool executions (e.g. shell into a task container)
+        # without monkey-patching. Stored DEFENSIVELY — later mutation of the
+        # caller's dict must not affect this agent. Default None → every
+        # built-in branch runs exactly as before (byte-identical path).
+        if tool_executors is not None:
+            if not isinstance(tool_executors, dict):
+                raise ValueError(
+                    "tool_executors must be a dict mapping tool name -> "
+                    "async callable, or None")
+            for _tx_name, _tx_fn in tool_executors.items():
+                if not callable(_tx_fn):
+                    raise ValueError(
+                        f"tool_executors[{_tx_name!r}] must be a callable "
+                        f"(got {type(_tx_fn).__name__})")
+            tool_executors = dict(tool_executors)
+        self.tool_executors = tool_executors
         # Build the system prompt once at init — it won't change mid-conversation.
         # This reads workspace files (SOUL.md, OPERATOR.md, etc.) and builds a
         # skills index, all determined by the workspace directory in config.
@@ -1891,6 +1909,13 @@ class Agent:
                         tc_callbacks.setdefault(
                             "vision_deposit",
                             functools.partial(self._vision_deposit, room_id))
+                        # workspace-kdsn.317: per-tool executor bridge.
+                        # Passed only when the agent carries a map — no-map
+                        # agents keep the byte-identical legacy call shape
+                        # (several test doubles pin the legacy signature
+                        # exactly and must keep working).
+                        _tx_exec = ({"tool_executors": self.tool_executors}
+                                    if self.tool_executors is not None else {})
                         tool_coros.append(execute_tool(
                             name=tc.name,
                             input=tc.input,
@@ -1898,6 +1923,7 @@ class Agent:
                             agent_config=self.config,
                             tools=_turn_tools,
                             callbacks=tc_callbacks,
+                            **_tx_exec,
                         ))
 
                     _ka_task, _ka_stop = self._maybe_arm_cache_keepalive(
