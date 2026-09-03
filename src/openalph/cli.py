@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from openalph.config import CONFIG_DIR, load_agent_config, ConfigError
+from openalph.config import CONFIG_DIR, load_agent_config, load_config, ConfigError
 from openalph.admin import create_agent
 
 logger = logging.getLogger("openalph")
@@ -22,6 +22,27 @@ def list_agents() -> list[str]:
     if not CONFIG_DIR.exists():
         return []
     return sorted(p.stem for p in CONFIG_DIR.glob("*.toml"))
+
+
+def list_headless_agents() -> list[str]:
+    """Return sorted 'subdir/name' strings for *.toml files in DIRECT
+    subdirectories of CONFIG_DIR (headless/station configs, kdsn.320).
+
+    Only one level deep (deeper nesting is ignored); the 'retired'
+    subdir (the agent-retirement convention) is skipped — dead agents
+    are not headless configs. These are visible via `list --all` but
+    never enter list_agents() (the start/stop/restart 'all' blast
+    radius stays top-level-only).
+    """
+    if not CONFIG_DIR.exists():
+        return []
+    names = []
+    for subdir in sorted(CONFIG_DIR.iterdir()):
+        if not subdir.is_dir() or subdir.name == "retired":
+            continue
+        for p in subdir.glob("*.toml"):
+            names.append(f"{subdir.name}/{p.stem}")
+    return sorted(names)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -42,7 +63,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("agent", nargs="?", default=None)
 
     # list
-    sub.add_parser("list")
+    p = sub.add_parser("list")
+    p.add_argument("--all", action="store_true",
+                   help="Also list headless/station configs from CONFIG_DIR subdirs")
 
     # logs
     p = sub.add_parser("logs")
@@ -86,7 +109,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     # handle_input, and EXACTLY ONE JSON line on stdout (everything else —
     # including all logging — goes to stderr).
     p = sub.add_parser("exec", help="Run one headless agent turn and emit one JSON result line")
-    p.add_argument("--agent", required=True, help="Agent name (config in CONFIG_DIR)")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--agent",
+                   help="Agent name, top-level config in CONFIG_DIR (systemd agents only)")
+    g.add_argument("--config",
+                   help="Explicit path to an agent TOML (headless/station configs "
+                        "in CONFIG_DIR subdirs)")
     p.add_argument("--task-file", required=True,
                    help="Path to the task prompt file, or - for stdin")
     p.add_argument("--model", default=None,
@@ -188,6 +216,13 @@ def cmd_list(args):
     else:
         for agent in agents:
             print(agent)
+    if getattr(args, "all", False):
+        headless = list_headless_agents()
+        if headless:
+            print()
+            print("# headless/station configs (excluded from start/stop/restart 'all'):")
+            for name in headless:
+                print(name)
 
 
 def cmd_logs(args):
@@ -974,7 +1009,14 @@ def cmd_exec(args):
 
     # 1. Config (fail loud, exit 1, stderr).
     try:
-        config = load_agent_config(args.agent)
+        if args.config is not None:
+            # kdsn.320: explicit path (headless/station configs live in
+            # CONFIG_DIR subdirs, outside the name resolver's blast
+            # radius). Passed as-given — CWD resolution is the loader's
+            # job, not the CLI's.
+            config = load_config(Path(args.config))
+        else:
+            config = load_agent_config(args.agent)
     except ConfigError as e:
         _fail(f"Config error: {e}", 1)
 
