@@ -29,11 +29,6 @@ def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=N
     return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
 
 
-def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
-    from openalph.config import ProviderConfig
-    return ProviderConfig(key=key, type=type, api_key=api_key, base_url=base_url, quirks=quirks or [])
-
-
 def make_config(workspace=None, **kwargs):
     defaults = dict(
         name="test-agent",

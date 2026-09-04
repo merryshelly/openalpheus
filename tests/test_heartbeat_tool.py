@@ -894,30 +894,6 @@ class TestR1StartFromOwnTurnInPlace:
         assert result.is_error is False, result.content
         hb.start.assert_awaited_once_with(ROOM_ID, 1800, None)
 
-    @pytest.mark.asyncio
-    async def test_start_from_other_turn_still_replaces(self):
-        """R1 contract guard: in_own_loop False (start issued from a NORMAL
-        turn while the timer happens to be running) still delegates to the
-        manager — T23 replace semantics are untouched by the policy."""
-        hb, um = _fake_hb()
-        hb.status.return_value = [_entry()]
-        cb = _callbacks(hb, um)
-        result = await _run({"action": "start", "interval": "30m"}, cb)
-        assert result.is_error is False, result.content
-        hb.start.assert_awaited_once_with(ROOM_ID, 1800, None)
-
-    @pytest.mark.asyncio
-    async def test_in_own_loop_probe_failure_falls_through_never_raises(self):
-        """R1 robustness: a manager whose probe raises must not crash the
-        turn — the own-turn check is advisory and wraps its probe; the
-        ordinary start path then applies."""
-        hb, um = _fake_hb()
-        hb.in_own_loop.side_effect = RuntimeError("probe boom")
-        cb = _callbacks(hb, um)
-        result = await _run({"action": "start", "interval": "30m"}, cb)
-        assert result.is_error is False, result.content
-        hb.start.assert_awaited_once_with(ROOM_ID, 1800, None)
-
 
 class TestR4MissingRoomId:
     """R4: room scoping reads callbacks.get("room_id") — a missing key is
