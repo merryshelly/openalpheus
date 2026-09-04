@@ -105,9 +105,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                      help="Tool-result preview character limit (default 200, 0=unlimited)")
 
     # exec — one-shot headless turn (Stigmergy worker driver, bead workspace-e2uh.149).
-    # No Matrix, no SessionLog, no chat loop: a fresh Agent, a single
-    # handle_input, and EXACTLY ONE JSON line on stdout (everything else —
-    # including all logging — goes to stderr).
+    # No Matrix, no chat loop: a fresh Agent, a single handle_input, and
+    # EXACTLY ONE JSON line on stdout (everything else — including all
+    # logging — goes to stderr). Since kdsn.322 T3 the turn is durable:
+    # cage-local SessionLog + full callbacks (see the module section
+    # above).
     p = sub.add_parser("exec", help="Run one headless agent turn and emit one JSON result line")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--agent",
@@ -127,6 +129,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Comma-separated builtin tool names (bypasses workspace discovery)")
     p.add_argument("--room", default=None,
                    help="Room label for history isolation (default: _exec)")
+    p.add_argument("--project", default=None,
+                   help="Active project name (memory/projects/<name>/ must "
+                        "exist): declared in the cage SessionLog before the "
+                        "turn so the handoff machinery frames the durable "
+                        "package from it (validated before any inference)")
     p.add_argument("--system-prompt-file", default=None,
                    help="Path to a prompt artifact delivered as the agent's "
                         "system prompt, byte-faithful (no preamble). The "
@@ -562,14 +569,19 @@ def cmd_showprompt(args):
 # exec — one-shot headless turn (Stigmergy worker driver, bead .149)
 # ---------------------------------------------------------------------------
 #
-# Design invariants (bead149-build-spec.md §3):
+# Design invariants (bead149-build-spec.md §3; kdsn.322 T3, spec §3.5):
 #   * EXACTLY ONE json.dumps line on stdout. Every log line, warning, tool
 #     notice, and error message goes to stderr. The Stigmergy driver parses
 #     the raw stdout as one JSON object — any stray byte breaks
 #     classification, so stdout discipline is load-bearing.
-#   * No SessionLog, no HeadlessSinks, no chat plumbing: a fresh Agent, a
-#     single handle_input, then post-turn introspection (usage, iteration
-#     cap sentinel, stop_reason, tool trace).
+#   * Cage-local SessionLog + full callbacks (kdsn.322 T3 — the P1 fix):
+#     the old "no SessionLog, no HeadlessSinks, no chat plumbing" invariant
+#     is RETIRED. exec turns are durable (reminders, boundary markers, and
+#     user/assistant/tool entries append as the turn runs) and the full
+#     build_callbacks dict reaches handle_input (apply_handoff_boundary
+#     seam, set_active_project, log_reminder). HeadlessSinks keep notices
+#     on stderr. The SessionLog is append-only, NEVER rehydrated (spec
+#     §3.5.5: durability substrate, not a resume mechanism).
 #   * --model / --max-turns are config-level replacements done BEFORE Agent
 #     construction (run_subagent's `replace(config, default_model=model)`
 #     pattern).
@@ -1020,6 +1032,22 @@ def cmd_exec(args):
     except ConfigError as e:
         _fail(f"Config error: {e}", 1)
 
+    # 1b. --project validation (kdsn.322 T3, spec §3.5): BEFORE any
+    # inference — a bad name or a missing project directory fails loud
+    # (exit 1, stderr, empty stdout) and never burns an Agent build or a
+    # model call.
+    project_name = None
+    if args.project is not None:
+        from openalph.handoff import project_valid_name
+        if not project_valid_name(args.project):
+            _fail(f"invalid --project name {args.project!r} — use a bare "
+                  "directory name (no paths, no dots-prefix)", 1)
+        _proj_dir = (Path(config.workspace) / "memory" / "projects"
+                     / args.project)
+        if not _proj_dir.is_dir():
+            _fail(f"project directory does not exist: {_proj_dir}", 1)
+        project_name = args.project
+
     # 2. Tool resolution (bypass discover_tools; unknown -> exit 1).
     if args.tools:
         names = [n.strip() for n in args.tools.split(",") if n.strip()]
@@ -1112,18 +1140,62 @@ def cmd_exec(args):
     # only when non-empty) is how the stations harvest them. No env, no
     # path, no JSONL parsing — per-process by construction.
     filed_sink: list = []
-    # Wired into handle_input ONLY when file_ticket is in this run's
-    # toolset (resolved builtins, or the terminal-tool union): a plain
-    # exec with no tools keeps passing no callbacks at all (the
-    # no-chat-plumbing invariant), while consumers that opt into the filing
-    # channel (--tools file_ticket: the station critics today, in-cage
-    # workers once the driver lists it) get the per-run sink.
     _file_ticket_enabled = any(
         getattr(t, "name", None) == "file_ticket" for t in (agent.tools or [])
     )
-    _run_callbacks = (
-        {"filed_proposals_sink": filed_sink} if _file_ticket_enabled else None
+
+    # Cage-local SessionLog (kdsn.322 T3, spec §3.5 — the P1 fix): exec
+    # turns are durable. Reminders, boundary markers, and the turn's
+    # user/assistant/tool entries append to the cage JSONL as the turn
+    # runs (the _process_cli_line pattern, minus the stdin loop).
+    #
+    # Append-only, NEVER rehydrated (spec §3.5.5): a pre-existing file is
+    # durability substrate, not a resume source — exec is a fresh turn,
+    # and the model must never see pre-exec traffic.
+    from openalph.callbacks import HeadlessSinks, build_callbacks
+    from openalph.handoff import ACTIVE_PROJECT_EVENT
+    from openalph.session import SessionLog, persist_assistant_turn
+    from openalph.tools import escape_system_reminder_tags
+
+    uid = (getattr(config, "user_id", None)
+           or (config.matrix.user_id if config.matrix else "cli"))
+    session_log = SessionLog(
+        config.workspace, uid,
+        handoff_default=config.context.handoff_enabled)
+    if not session_log.read(room_id):
+        # NEW session: the session_start marker (the _setup_cli_session
+        # new-session shape). An EXISTING file gets no marker — from here
+        # on this is append-only.
+        session_log.append(
+            role="system", sender=uid, room=room_id,
+            event="session_start", room_name=room_id,
+            detail="exec session started",
+        )
+
+    # --project happy path: declare the active project BEFORE the turn —
+    # the set_active_project JSONL shape, verbatim — so the boundary
+    # machinery (which reads the room's entries at application time)
+    # frames the durable package from the declared project.
+    if project_name is not None:
+        session_log.append(
+            role="system", sender=uid, room=room_id,
+            event=ACTIVE_PROJECT_EVENT, detail=project_name,
+        )
+
+    # Full callbacks (kdsn.322 T3, spec §3.5): the "no chat plumbing"
+    # invariant (callbacks=None) is RETIRED — reminders, the
+    # apply_handoff_boundary seam, and set_active_project all live on
+    # exec now. HeadlessSinks keep every notice on stderr (the stdout
+    # contract is untouched). The filing channel UNION holds: when
+    # file_ticket is in this run's toolset the builder dict ALSO carries
+    # the per-run filed_proposals_sink (no builder key is dropped).
+    sinks = HeadlessSinks(session_log=session_log, agent_user_id=uid)
+    _run_callbacks = build_callbacks(
+        agent, room_id, sinks,
+        turn_source=None, session_log=session_log, room_name=room_id,
     )
+    if _file_ticket_enabled:
+        _run_callbacks["filed_proposals_sink"] = filed_sink
 
     # --system-prompt-file: replace the agent's system prompt with the
     # artifact text, BYTE-FAITHFUL — exactly the file text, nothing
@@ -1139,7 +1211,37 @@ def cmd_exec(args):
         agent.system_prompt = system_prompt_override + footer
 
     # Tool trace capture (names + is_error only, bounded).
-    tool_trace, on_tool_call = _exec_collect_tool_trace()
+    tool_trace, _on_tool_trace = _exec_collect_tool_trace()
+
+    # Turn persistence (kdsn.322 T3): the user task hits the JSONL
+    # BEFORE handle_input (crash-atomic turn start — the
+    # _process_cli_line append-then-call order, minus the stdin loop),
+    # and the same (escaped) message is hydrated into the fresh room's
+    # in-memory history so handle_input runs with append_user=False —
+    # exactly the gated-room contract: the caller wrote the message to
+    # JSONL AND hydrated history, so handle_input must not double-append
+    # (a post-boundary re-append would resurrect the pre-boundary task
+    # the full strip just dropped).
+    session_log.append(
+        role="user", sender="operator", room=room_id, content=task,
+    )
+    agent.history(room_id).append(
+        {"role": "user", "content": escape_system_reminder_tags(task)})
+
+    async def _on_tool_call(call_id, name, input_data, result, is_error):
+        # 1. The Stigmergy driver contract (unchanged): the bounded trace.
+        await _on_tool_trace(call_id, name, input_data, result, is_error)
+        # 2. Durability: the tool result persists to the cage SessionLog
+        # (the JSONL half of _process_cli_line's _tool_notice — exec
+        # keeps no stderr tool notice; the driver owns that channel).
+        session_log.append(
+            role="tool", sender=uid, room=room_id,
+            call_id=call_id, name=name, output=result, is_error=is_error,
+        )
+
+    async def _on_tool_intent(tool_calls, content_text):
+        persist_assistant_turn(agent, session_log, room_id,
+                               content=content_text, tool_calls=tool_calls)
 
     content = None
     status = "done"
@@ -1148,12 +1250,17 @@ def cmd_exec(args):
     detail = ""
 
     async def _run():
-        return await agent.handle_input(
+        content = await agent.handle_input(
             task, room_id,
-            on_tool_call=on_tool_call,
+            on_tool_call=_on_tool_call,
+            on_tool_intent=_on_tool_intent,
             thinking=thinking,
             callbacks=_run_callbacks,
+            append_user=False,
         )
+        # Terminal assistant turn (the _process_cli_line pattern).
+        persist_assistant_turn(agent, session_log, room_id, content=content)
+        return content
 
     try:
         content = asyncio.run(_run())

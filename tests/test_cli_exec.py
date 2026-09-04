@@ -254,7 +254,7 @@ class TestExecHappyPath:
         agent.handle_input.assert_awaited_once()
         assert agent.handle_input.call_args[0][0] == body
 
-    def test_handle_input_called_with_room_id_and_no_callbacks(self, tmp_path):
+    def test_handle_input_called_with_room_id_and_full_callbacks(self, tmp_path):
         config = make_config(tmp_path)
         agent = make_agent_stub()
         task = tmp_path / "p.md"
@@ -266,9 +266,15 @@ class TestExecHappyPath:
         kw = agent.handle_input.call_args.kwargs
         # default room label is `_exec`
         assert agent.handle_input.call_args.args[1] == "_exec"
-        # no chat plumbing leaks in
-        assert kw.get("on_tool_intent") is None
-        assert kw.get("callbacks") is None
+        # kdsn.322 T3: the "no chat plumbing" invariant (callbacks=None) is
+        # RETIRED — the FULL builder dict reaches handle_input (reminders,
+        # the apply_handoff_boundary seam, and set_active_project live on
+        # exec), and the durability on_tool_intent closure is wired too.
+        cb = kw.get("callbacks")
+        assert isinstance(cb, dict)
+        assert cb.get("room_id") == "_exec"
+        assert callable(cb.get("log_reminder"))
+        assert kw.get("on_tool_intent") is not None
 
     def test_room_flag_used(self, tmp_path):
         config = make_config(tmp_path)
