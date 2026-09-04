@@ -201,7 +201,8 @@ class TestChatCommands:
 class TestChatMessages:
     def test_sends_to_agent(self, chat_env):
         run_chat(["hello world"], chat_env)
-        chat_env["agent"].handle_input.assert_called_once(); assert chat_env["agent"].handle_input.call_args[0] == ("hello world", "_cli")
+        chat_env["agent"].handle_input.assert_called_once()
+        assert chat_env["agent"].handle_input.call_args[0] == ("hello world", "_cli")
 
     def test_response_on_stdout(self, chat_env):
         stdout, stderr = run_chat(["hello"], chat_env)
@@ -270,11 +271,13 @@ class TestChatSession:
     def test_custom_room_id(self, chat_env):
         args = make_args(room="debug-room")
         run_chat(["hello"], chat_env, args=args)
-        chat_env["agent"].handle_input.assert_called_once(); assert chat_env["agent"].handle_input.call_args[0] == ("hello", "debug-room")
+        chat_env["agent"].handle_input.assert_called_once()
+        assert chat_env["agent"].handle_input.call_args[0] == ("hello", "debug-room")
 
     def test_default_room_id(self, chat_env):
         run_chat(["hello"], chat_env)
-        chat_env["agent"].handle_input.assert_called_once(); assert chat_env["agent"].handle_input.call_args[0] == ("hello", "_cli")
+        chat_env["agent"].handle_input.assert_called_once()
+        assert chat_env["agent"].handle_input.call_args[0] == ("hello", "_cli")
 
 
 # ---------------------------------------------------------------------------

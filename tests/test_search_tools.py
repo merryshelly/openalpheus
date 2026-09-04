@@ -209,8 +209,10 @@ class TestGrepOrderingAndBounds:
     @pytest.mark.asyncio
     async def test_mtime_desc_path_asc_ordering(self, tmp_path):
         """Deterministic order: mtime desc, path asc tiebreak (V3, design §6)."""
-        old = tmp_path / "old.txt"; old.write_text("needle\n")
-        new = tmp_path / "new.txt"; new.write_text("needle\n")
+        old = tmp_path / "old.txt"
+        old.write_text("needle\n")
+        new = tmp_path / "new.txt"
+        new.write_text("needle\n")
         # old has an older mtime than new
         os.utime(old, (1_000_000, 1_000_000))
         os.utime(new, (2_000_000, 2_000_000))
@@ -222,8 +224,10 @@ class TestGrepOrderingAndBounds:
     @pytest.mark.asyncio
     async def test_path_asc_tiebreak_same_mtime(self, tmp_path):
         """Equal mtime → path ascending tiebreak (V3)."""
-        a = tmp_path / "aaa.txt"; a.write_text("needle\n")
-        b = tmp_path / "bbb.txt"; b.write_text("needle\n")
+        a = tmp_path / "aaa.txt"
+        a.write_text("needle\n")
+        b = tmp_path / "bbb.txt"
+        b.write_text("needle\n")
         os.utime(a, (5_000_000, 5_000_000))
         os.utime(b, (5_000_000, 5_000_000))
         res = await _grep(tmp_path, "needle")
@@ -352,8 +356,10 @@ class TestGlob:
     @pytest.mark.asyncio
     async def test_mtime_desc_sort(self, tmp_path):
         """glob sorts mtime desc, path asc tiebreak (§7, V3)."""
-        old = tmp_path / "old.md"; old.write_text("x\n")
-        new = tmp_path / "new.md"; new.write_text("y\n")
+        old = tmp_path / "old.md"
+        old.write_text("x\n")
+        new = tmp_path / "new.md"
+        new.write_text("y\n")
         os.utime(old, (1_000_000, 1_000_000))
         os.utime(new, (2_000_000, 2_000_000))
         res = await _glob(tmp_path, "*.md")
