@@ -28,6 +28,12 @@ Ladder arithmetic in the fixtures: model_max_tokens=1000, max_tokens=100
 → available 900; checkpoint 75% = 675; auto 85% = 765; hard 92% = 828.
 The MID task (~1200 chars ≈ 300 tokens + minimal system) crosses NEITHER —
 clean baseline. The BIG task (~8000 chars ≈ 2000 tokens) crosses both.
+
+Fixture hermeticity (kdsn.322 T5 follow-up): make_config writes a MINIMAL
+workspace CONTINUITY.md, so the system-prompt base is fixture-controlled —
+the packaged template's size (fleet prompt file #8, ~900 tokens since the
+2026-09-03 handoff rewrite) no longer shifts the ladder arithmetic. Re-aim
+tuned windows ONLY from the fixture base (footer + minimal file).
 """
 
 import json
@@ -52,6 +58,14 @@ def make_config(tmp_path, *, model_max_tokens=100000, max_tokens=8192,
                 max_iterations=20):
     provider = ProviderConfig(key="p", type="openai", api_key="sk-test",
                               base_url="http://127.0.0.1:18081")
+    # Hermetic prompt base: pin a minimal CONTINUITY.md so the packaged
+    # template (whose byte size is fleet prompt surface, not fixture
+    # contract) never shifts the ladder arithmetic these tests tune against.
+    ws = Path(tmp_path)
+    (ws / "CONTINUITY.md").write_text(
+        "# CONTINUITY.md\n\n"
+        "Checkpoint discipline: maintain progress.md and durable-set.toml — "
+        "they are the only carryover across a handoff boundary.\n")
     return AgentConfig(
         name="exec-agent",
         default_model="p/model",
@@ -183,10 +197,10 @@ def read_log(config, room="_exec"):
 class TestExecBoundaryFire:
     def test_big_task_crossing_auto_tier_writes_marker_and_snapshot(
             self, tmp_path):
-        # window 2000: the frozen empty-workspace system prompt is 1,156
-        # tokens — window 1000 (runway 900) can never fit it, boundary or
-        # not. available 1900; auto 85% = 1615; the 8000-char task (~2000
-        # tok) + system crosses it; post-boundary render fits.
+        # window 2000: the post-boundary render needs room — window 1000
+        # (runway 900) is too tight with the snapshot + task in play.
+        # available 1900; auto 85% = 1615; the 8000-char task (~2000
+        # tok) + fixture base crosses it; post-boundary render fits.
         config = make_config(tmp_path, model_max_tokens=2000, max_tokens=100)
         big_task = "x" * 8000  # ~2000 tokens > auto 765
         rec = _StreamRecorder(final_text="done")
@@ -399,12 +413,13 @@ class TestStdoutContract:
 class TestReminderDurability:
     def test_checkpoint_reminder_persisted(self, tmp_path):
         # MID ladder window: crosses checkpoint but NOT auto in the FULL
-        # estimate (base overhead ≈1170 tokens on the empty-workspace fixture
-        # + task chars/4). model_max_tokens=3000, max_tokens=100 → available
-        # 2900; checkpoint 75% = 2175; auto 85% = 2465. Task 4400 chars
-        # ≈ 1100 tokens → total ≈ 2270: in [2175, 2465) and under the window.
+        # estimate (fixture base ≈610 tokens — security footer + the minimal
+        # CONTINUITY.md from make_config — + task chars/4).
+        # model_max_tokens=3000, max_tokens=100 → available 2900;
+        # checkpoint 75% = 2175; auto 85% = 2465. Task 6800 chars
+        # ≈ 1700 tokens → total ≈ 2310: in [2175, 2465) and under the window.
         config = make_config(tmp_path, model_max_tokens=3000, max_tokens=100)
-        mid_task = "c" * 4400
+        mid_task = "c" * 6800
         rec = _StreamRecorder(final_text="done")
         out, err, code = run_exec_real(
             ["--task-file", _task_file(tmp_path, mid_task)],
