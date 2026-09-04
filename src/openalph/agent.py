@@ -1020,20 +1020,37 @@ class Agent:
                 # for the ReminderState (D9 single-source `available`).
                 _gc_cfg = self.config.context
                 _gc_cb = (callbacks or {}).get("apply_handoff_boundary")
+                _gc_turn_start_applied = False
                 if _gc_cfg.handoff_enabled and _gc_cb is not None:
                     _gc_auto_threshold = int(available
                                              * _gc_cfg.auto_pct / 100)
                     _gc_auto_blocked = self._gc_auto_uncleared.get(room_id, False)
                     if context_tokens >= _gc_auto_threshold and not _gc_auto_blocked:
+                        # kdsn.322.15 (SB ruling b): exclude_inflight follows
+                        # append_user. Transports that let handle_input do the
+                        # live append (ungated Matrix, interactive CLI) have
+                        # the just-persisted message as the LAST JSONL entry;
+                        # protecting it keeps it above the boundary so live
+                        # and rebuild agree — the operator's question is never
+                        # silently swallowed at the boundary moment.
+                        # append_user=False paths (gated rooms, exec) keep the
+                        # pinned strip: the message is carried in full inside
+                        # the snapshot (T3(b)).
                         if await self._gc_apply_boundary(
                                 room_id, callbacks,
-                                trigger="auto", exclude_inflight=False):
-                            # D12: re-estimate INCLUSIVELY — the user message
-                            # is not in history yet (append_user), so the
-                            # re-estimate must add its content_tokens back in,
-                            # exactly as the guard's initial estimate does.
+                                trigger="auto", exclude_inflight=append_user):
+                            _gc_turn_start_applied = True
+                            # D12 re-estimate, kdsn.322.15: when the boundary
+                            # protected the pending message, it is already IN
+                            # the rebuilt history — adding content_tokens
+                            # again would double-count. When it was stripped
+                            # (append_user=False) the estimate excludes it by
+                            # design; when no boundary fired this block is
+                            # skipped entirely.
                             context_tokens = self._estimate_context_tokens(room_id) + (
-                                content_tokens if append_user else 0
+                                content_tokens
+                                if (append_user and not _gc_turn_start_applied)
+                                else 0
                             )
                             # Churn guard (audit): did this boundary actually
                             # clear the threshold? A failed clear latches the
@@ -1047,7 +1064,10 @@ class Agent:
                 if context_tokens > available:
                     raise ContextOverflowError(context_tokens, limit)
 
-                if append_user:
+                # kdsn.322.15: after a turn-start boundary applied with the
+                # pending message protected, the rebuild already carries it
+                # (above the boundary) - a live re-append would duplicate it.
+                if append_user and not _gc_turn_start_applied:
                     # R2-A: Escape user-origin <system-reminder> tags in context
                     # to prevent spoofing.  JSONL stores raw text (audit fidelity);
                     # escaping is context-only (mirrors /timesense, /steer).

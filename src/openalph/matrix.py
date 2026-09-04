@@ -50,7 +50,12 @@ from openalph.mention import mentions_me, is_gated, strip_mention
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
 from openalph.tools import escape_system_reminder_tags, truncate_result
-from openalph.callbacks import build_callbacks, build_context_status, MatrixSinks
+from openalph.callbacks import (
+    build_callbacks,
+    build_context_status,
+    render_handoff_notice,
+    MatrixSinks,
+)
 import openalph.schedule as schedule
 
 # Constants for media handling
@@ -236,23 +241,12 @@ def _handoff_boundary_state(entries):
 
 
 def _handoff_confirm_text(outcome, trigger):
-    """Operator-facing confirmation for an APPLIED boundary."""
-    manifest = outcome.get("manifest") or {}
-    durable = manifest.get("durable") or {}
-    used = durable.get("used_tokens", 0)
-    budget = durable.get("budget_tokens", 0)
-    files = durable.get("files") or []
-    over = (" — over reinjection budget (informational)"
-            if outcome.get("over_budget") else "")
-    return (
-        f"✅ Handoff boundary {manifest.get('boundary_index', '?')} applied "
-        f"(trigger: {trigger}). "
-        f"Full strip: all pre-boundary content dropped; "
-        f"{len(files)} durable file(s) re-injected. "
-        f"Tokens {manifest.get('tokens_before', 0)} → "
-        f"{manifest.get('tokens_after_est', 0)} (est.). "
-        f"Durable budget {used}/{budget} tokens{over}."
-    )
+    """Operator-facing confirmation for an APPLIED boundary.
+
+    kdsn.322.14: delegates to the ONE shared renderer — the slash path and
+    the tool/auto path must never drift again.
+    """
+    return render_handoff_notice(trigger, outcome)
 
 
 def _furl_tool_call_detail(input_data, result, is_error: bool) -> str:
@@ -459,12 +453,15 @@ class MatrixBot:
         if workspace:
             self.session_log = SessionLog(
                 workspace, config.user_id,
-                # Audit: hydration/status/CLI renders must honor the
-                # GC flag — build_context without the kwarg now follows
-                # this default instead of silently resurrecting expunged
-                # content after a restart.
-                handoff_default=getattr(config, "context", None) is not None
-                and config.context.handoff_enabled,
+                # kdsn.322.13: wire from the AGENT's config. `config` here
+                # is the MatrixConfig (cli.py passes config.matrix), which
+                # has no .context field — the old getattr returned None and
+                # handoff_default was ALWAYS False, so /status, restart
+                # hydration, and gated-room hydration rendered full
+                # pre-boundary history fleet-wide (canary finding).
+                handoff_default=bool(
+                    getattr(agent.config, "context", None) is not None
+                    and agent.config.context.handoff_enabled),
             )
             self.heartbeat = HeartbeatManager(
                 config_path=Path(workspace) / "heartbeats.json",

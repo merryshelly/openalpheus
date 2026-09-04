@@ -1827,16 +1827,23 @@ async def _execute_context_handoff(input: dict, callbacks: dict | None) -> "Tool
     files = durable.get("files") or []
     used = durable.get("used_tokens", 0)
     budget = durable.get("budget_tokens", 0)
-    flag = " — over reinjection budget (informational)" if outcome.get("over_budget") else ""
-    # Plain ints (no thousands separators): the boundary index and the
-    # post-boundary token estimate are what the operator greps for.
+    flag = " — over reinsertion budget" if outcome.get("over_budget") else ""
+    # kdsn.322.14: unified accounting — tokens_after is MEASURED (composite:
+    # system prompt + tool defs + snapshot + tail); tokens_dropped is the
+    # render-only figure. Legacy manifests fall back to the runway figure.
+    _ta = manifest.get("tokens_after")
+    if _ta is None:
+        _ta = (manifest.get("runway") or {}).get("tokens_after", 0)
+    _td = manifest.get("tokens_dropped")
+    dropped_seg = (f" Dropped ~{_td:,} tok." if _td is not None else "")
     return ToolResult(
         content=(
             f"Context handoff boundary {manifest.get('boundary_index', '?')} "
             f"applied (trigger=tool). Full strip: all pre-boundary content "
-            f"dropped; {len(files)} durable file(s) re-injected. "
-            f"Tokens {manifest.get('tokens_before', 0)} -> "
-            f"{manifest.get('tokens_after_est', 0)} (est.). "
+            f"dropped; {len(files)} durable file(s) reinserted. "
+            f"Context ~{manifest.get('tokens_before', 0):,} -> "
+            f"~{_ta:,} tok (system prompt + tool defs included)."
+            f"{dropped_seg} "
             f"Durable budget {used}/{budget} tokens{flag}."
         ),
         is_error=False,

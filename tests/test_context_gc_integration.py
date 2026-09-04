@@ -219,7 +219,12 @@ class TestHandoffTool:
             execute_tool("context_handoff", {}, None,
                          {"room_id": ROOM, "apply_handoff_boundary": cb}))
         assert not res.is_error
-        assert "12" in res.content and "40000" in res.content
+        # kdsn.322.14: the tool result carries the COMPOSITE before-figure
+        # (system prompt + tool defs + render) and the MEASURED after —
+        # the old pinned-after (40000) was the retired tokens_after_est=0
+        # era's estimate figure.
+        assert "12" in res.content and "~90,000" in res.content
+        assert "reinserted" in res.content and "(est.)" not in res.content
         cb.assert_awaited_once()
         assert cb.call_args.kwargs.get("trigger", cb.call_args.args[-1] if cb.call_args.args else None) in (None, "tool")
 
@@ -551,7 +556,7 @@ class TestSlashAuditFixes:
             "spec 3.1 vocabulary: the slash path emits 'slash'")
         sent = "\n".join(c.get("body", "")
                          for c in self._send_contents(bot))
-        assert "(trigger: slash)" in sent, (
+        assert "applied (slash)" in sent, (
             "the operator confirmation names the spec trigger")
 
     def test_churn_guard_rearm_only_on_cleared(self, tmp_path):
@@ -715,6 +720,14 @@ def _big_outputs(history, size):
 
 
 def _run_turn(bot):
+    # Production shape (kdsn.322.15): _inject_heartbeat persists the
+    # directive to the JSONL BEFORE the turn runs — the turn-start tier
+    # protects the pending input, so the directive must be the last JSONL
+    # entry, as it always is in production. Driving _run_heartbeat_turn
+    # bare leaves no pending entry and the protection would land on the
+    # last seed entry instead (fixture artifact, not production shape).
+    bot.session_log.append(role="user", sender=AGENT_ID, room=GC_ROOM,
+                           content="[Automated heartbeat]")
     return asyncio.run(
         bot._run_heartbeat_turn(GC_ROOM, "[Automated heartbeat]",
                                 turn_source="heartbeat"))

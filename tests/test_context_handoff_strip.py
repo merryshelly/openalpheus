@@ -457,9 +457,13 @@ class TestManifestShape:
         append_all(log, _scene_entries())
         res = _apply(log, tmp_path)
         mf = res["manifest"]
+        # kdsn.322.14 (§9 amendment): tokens_after_est RETIRED — replaced by
+        # the MEASURED composite tokens_after (system prompt + tool defs +
+        # snapshot + tail) plus tokens_dropped (render-only figure).
         assert set(mf.keys()) == {
             "ts", "boundary_index", "trigger", "tokens_before",
-            "tokens_after_est", "durable", "runway", "checkpoint", "errors",
+            "tokens_after", "tokens_dropped",
+            "durable", "runway", "checkpoint", "errors",
         }, f"manifest shape drifted: {sorted(mf.keys())}"
         assert set(mf["durable"].keys()) == {
             "project", "files", "budget_tokens", "used_tokens", "over_budget"}
@@ -471,8 +475,11 @@ class TestManifestShape:
         assert mf["durable"]["project"] == "proj"
         assert isinstance(mf["durable"]["files"], list)
         assert mf["tokens_before"] > 0
-        assert mf["tokens_after_est"] == 0, (
-            "full strip: the expunged span contributes nothing to after")
+        assert mf["tokens_after"] > 0, (
+            "tokens_after is MEASURED post-boundary — never the retired 0")
+        assert mf["tokens_dropped"] <= mf["tokens_before"], (
+            "dropped is render-only; before adds the sp/tool-defs constant "
+            "(equality when the stub carries no prompt/tools)")
         assert mf["runway"]["tokens_after"] > 0  # snapshot + tail composite
 
     def test_checkpoint_status_none_without_reminder(self, tmp_path):

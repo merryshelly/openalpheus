@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+import html
 import logging
 import sys
 
@@ -412,33 +413,88 @@ def build_context_status(agent, room_id, *, room_name=None, session_log=None, he
 # build_callbacks — headless
 # ---------------------------------------------------------------------------
 
-def _handoff_notice_text(trigger: str, outcome: dict) -> str:
-    """One-line §3.4 visibility notice for an APPLIED handoff boundary.
+# kdsn.322.14: fold cap for the reinserted progress.md — past this the fold
+# truncates with a pointer to the on-disk file. The snapshot in the JSONL
+# remains the complete audit record regardless.
+_PROGRESS_FOLD_CAP_CHARS = 16_000
 
-    Compact and deterministic-ish: boundary index + trigger + tokens
-    before->after + durable project/budget when present + checkpoint
-    status. Display-only — the JSONL marker is the audit record.
+
+def render_handoff_notice(trigger: str, outcome: dict) -> str:
+    """Operator-facing notice for an APPLIED handoff boundary (§3.4).
+
+    THE shared renderer — every applied-boundary path (tool, auto, hard,
+    slash) routes through this; kdsn.322.14 killed the two-renderer drift.
+    Line 1 is the headline (the Matrix sink renders it as the collapsed
+    <details> summary); everything after is the fold.
+
+    Format (SB-ruled 2026-09-04): composite before→after tokens — the SAME
+    accounting as /status (system prompt + tool defs + render), with the
+    after-number MEASURED (snapshot + surviving tail), never the retired
+    pinned-0; checkpoint as the bare status value (no definitional gloss);
+    the reinserted file list; and the FROZEN progress.md below the fold.
+    Insert-language throughout — never "inject". Display-only: the JSONL
+    marker is the audit record.
     """
     manifest = outcome.get("manifest") or {}
     durable = manifest.get("durable") or {}
-    used = durable.get("used_tokens", 0)
-    budget = durable.get("budget_tokens", 0)
+    runway = manifest.get("runway") or {}
+    ckpt = manifest.get("checkpoint")
+    ck = ckpt.get("status", "unknown") if isinstance(ckpt, dict) else "unknown"
     project = durable.get("project")
-    checkpoint = manifest.get("checkpoint")
-    ckpt = (checkpoint.get("status", "unknown")
-            if isinstance(checkpoint, dict) else "unknown")
-    line = (
-        f"🧹 Handoff boundary {manifest.get('boundary_index', '?')} applied "
-        f"(trigger={trigger}): tokens {manifest.get('tokens_before', 0)} -> "
-        f"{manifest.get('tokens_after_est', 0)} (est.)"
-    )
+    tb = manifest.get("tokens_before")
+    ta = manifest.get("tokens_after")
+    if ta is None:
+        # Legacy manifest (pre-kdsn.322.14): fall back to the message-side
+        # runway figure rather than showing nothing.
+        ta = runway.get("tokens_after")
+    dropped = manifest.get("tokens_dropped")
+    files = durable.get("files") or []
+
+    head = f"🪢 Handoff boundary applied ({trigger})"
+    if tb is not None and ta is not None:
+        head += f" — context ~{tb:,} → ~{ta:,} tok"
+    elif tb is not None:
+        head += f" — context ~{tb:,} tok"
     if project:
-        line += f" · project={project}"
-    line += f" · budget {used}/{budget}"
-    if outcome.get("over_budget"):
-        line += " (over — informational)"
-    line += f" · checkpoint={ckpt}"
-    return line
+        head += f" · project: {project}"
+    head += f" · checkpoint: {ck}"
+    if files:
+        names = []
+        for f in files:
+            base = str(f.get("path", "?")).rsplit("/", 1)[-1]
+            if base not in names:
+                names.append(base)
+        head += f" · reinserted {len(files)} files: {', '.join(names)}"
+
+    fold = []
+    bits = []
+    if dropped is not None:
+        bits.append(f"dropped: ~{dropped:,} tok")
+    if durable:
+        bits.append(f"durable budget: "
+                    f"{durable.get('used_tokens', 0):,} / "
+                    f"{durable.get('budget_tokens', 0):,}")
+        if durable.get("over_budget") or outcome.get("over_budget"):
+            bits.append("over")
+    if bits:
+        fold.append(" · ".join(bits))
+    fold.append(f"boundary index: {manifest.get('boundary_index', '?')} "
+                f"(session JSONL marker — audit ref)")
+    errs = manifest.get("errors") or []
+    fold.append(f"errors: {len(errs)}" if errs else "errors: none")
+    progress = outcome.get("progress_md")
+    if progress:
+        text = html.escape(str(progress))
+        if len(text) > _PROGRESS_FOLD_CAP_CHARS:
+            removed = len(text) - _PROGRESS_FOLD_CAP_CHARS
+            pointer = (f"memory/projects/{project}/progress.md"
+                       if project else "the project progress.md")
+            text = (text[:_PROGRESS_FOLD_CAP_CHARS] +
+                    f"\n[truncated: {removed} chars removed — full text: "
+                    f"{pointer}]")
+        fold.append("── progress.md as reinserted (frozen at boundary) ──")
+        fold.append(text)
+    return head + "\n" + "\n".join(fold)
 
 
 def build_callbacks(
@@ -623,7 +679,7 @@ def build_callbacks(
             if isinstance(outcome, dict) and outcome.get("applied"):
                 try:
                     await sinks.send_notice(
-                        _room_id, _handoff_notice_text(trigger, outcome))
+                        _room_id, render_handoff_notice(trigger, outcome))
                 except Exception:
                     logger.warning(
                         "handoff visibility notice failed for %s (fail-soft)",

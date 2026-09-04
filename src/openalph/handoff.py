@@ -385,8 +385,7 @@ def _post_boundary_tail_tokens(entries: list[dict], boundary_index: int) -> int:
     boundary_index — the in-flight tail that stays after the boundary when
     exclude_inflight; empty for a settled turn).
 
-    The runway composite needs it because ``tokens_after_est`` is 0 under the
-    full strip (the expunged span contributes nothing). Entries the module
+    The runway composite is message-side (snapshot + tail). Entries the module
     never reads are counted by their content via the shared
     ``_entry_content_chars`` helper; anything garbled (non-dict entry,
     non-string/str-part-list content) contributes 0 — the estimator is
@@ -401,15 +400,27 @@ def _post_boundary_tail_tokens(entries: list[dict], boundary_index: int) -> int:
     return total // 4
 
 
-def _strip_tokens_before(entries: list[dict], boundary_index: int) -> int:
-    """Full-strip ``tokens_before``: chars//4 over all pre-boundary
-    renderable content (positions < boundary_index).
+# kdsn.322.14: wire-overhead constants for the render accounting — kept in
+# sync with agent.py's estimator (importing agent here would cycle:
+# agent -> session -> handoff). Drift is pinned by
+# test_handoff_manifest_numbers, which computes expectations from agent's
+# values.
+_TOOL_CALL_OVERHEAD_CHARS = 80
+_TOOL_RESULT_OVERHEAD_CHARS = 80
 
-    The expunged span contributes NOTHING to tokens_after_est under the full
-    strip (that is 0 by contract); tokens_before is the operator-visible
-    "what was dropped" figure. Counts user/assistant TEXT content (str or
-    part-list) and tool outputs (the ``output`` field on JSONL tool entries,
-    the ``content`` field on message-list tool dicts). Deterministic; never
+
+def _strip_tokens_before(entries: list[dict], boundary_index: int) -> int:
+    """Full-strip ``tokens_dropped``: chars//4 over all pre-boundary
+    renderable content (positions < boundary_index) — the operator-visible
+    "what the strip bought" figure, WITHOUT the system-prompt/tool-defs
+    constant (see the composite ``tokens_before`` in
+    apply_boundary_and_rebuild).
+
+    Counts user/assistant TEXT content (str or part-list), tool outputs
+    (the ``output`` field on JSONL tool entries, the ``content`` field on
+    message-list tool dicts), thinking + signature blocks, tool-call
+    payloads, and tool-result wire overheads — everything the full strip
+    expunges. Deterministic; never
     raises.
     """
     total = 0
@@ -419,10 +430,31 @@ def _strip_tokens_before(entries: list[dict], boundary_index: int) -> int:
         entry = entries[position]
         if not isinstance(entry, dict):
             continue
-        total += _entry_content_chars(entry.get("content"))
         if entry.get("role") == "tool":
             output = entry.get("output", entry.get("content", ""))
             total += len(output) if isinstance(output, str) else 0
+            # kdsn.322.14: tool-result wire overhead (mirrors the estimator
+            # in agent.py; constants duplicated here — agent.py must not be
+            # imported from handoff (session -> handoff cycle). Drift is
+            # pinned by test_handoff_manifest_numbers, which imports the
+            # agent constants for its expected-value arithmetic.
+            total += _TOOL_RESULT_OVERHEAD_CHARS
+            continue
+        total += _entry_content_chars(entry.get("content"))
+        # kdsn.322.14: thinking + signatures + tool-call payloads are part
+        # of the pre-boundary render too — the full strip expunges them.
+        # JSONL entries may carry thinking as a plain string (transport
+        # shape) or as the structured block list (message shape) — take
+        # both; anything else contributes 0 (never raises).
+        th = entry.get("thinking")
+        if isinstance(th, str):
+            total += len(th)
+        elif isinstance(th, list):
+            for tb in th:
+                if isinstance(tb, dict):
+                    total += len(tb.get("thinking", "")) + len(tb.get("signature", ""))
+        for tc in entry.get("tool_calls") or []:
+            total += len(str(tc.get("input", tc))) + _TOOL_CALL_OVERHEAD_CHARS
     return total // 4
 
 
@@ -524,8 +556,7 @@ def _no_project_fallback_body(boundary_index: int, tokens_before: int) -> str:
         "Project: none\n"
         "No handoff package was declared for this session. Your workspace is "
         "memory: read your workspace, memory/, and beads before acting.\n"
-        f"manifest: boundary={boundary_index} tokens_before={tokens_before} "
-        "tokens_after_est=0\n"
+        f"manifest: boundary={boundary_index} tokens_before={tokens_before}\n"
     )
 
 
@@ -704,6 +735,8 @@ def apply_boundary(
     trigger: str,
     exclude_inflight: bool = False,
     config_paths: list[str] | None = None,
+    system_prompt_chars: int = 0,
+    tool_defs_chars: int = 0,
     window: int,
     budget_pct: float,
     budget_min: int,
@@ -728,22 +761,24 @@ def apply_boundary(
 
     Appends, in order:
       1. system entry event=HANDOFF_EVENT, entry_index=<index>, detail=json
-         manifest: {ts, boundary_index, trigger, tokens_before,
-         tokens_after_est, durable: {project, files: [{path, reason, origin,
+         manifest: {ts, boundary_index, trigger, tokens_before (COMPOSITE:
+         system prompt + tool defs + pre-boundary render), tokens_after
+         (MEASURED composite post-boundary), tokens_dropped (render-only
+         pre-boundary), durable: {project, files: [{path, reason, origin,
          chars}], budget_tokens, used_tokens, over_budget}, runway:
-         {available, tokens_after, runway_after, threshold_tokens,
-         handoff_advised}, checkpoint: {status, fired_ts, project_mtime},
-         errors} — NO "classes" key (the carving class tally is dead).
-         runway.tokens_after is the POST-BOUNDARY RENDER estimate
-         (0 + framed-snapshot bytes//4 + post-boundary tail chars//4);
-         tokens_after_est is 0 under the full strip (the expunged span
-         contributes nothing).
+         {available, tokens_after (message-side), runway_after,
+         threshold_tokens, handoff_advised}, checkpoint: {status, fired_ts,
+         project_mtime}, errors} — NO "classes" key (the carving class
+         tally is dead).
+         runway.tokens_after is the MESSAGE-SIDE POST-BOUNDARY estimate
+         (framed-snapshot bytes//4 + post-boundary tail chars//4) — the
+         ladder's own arithmetic, unchanged (kdsn.322.14).
       2. user entry source=HANDOFF_SNAPSHOT_SOURCE with the snapshot body
          (frame_snapshot when a project is declared; the §3.2 fallback body
          when no project).
 
     Runway-gated forced handoff: available = window − max_tokens (None → 0);
-    tokens_after = 0 + framed-snapshot bytes//4 + post-boundary tail chars//4;
+    runway tokens_after = framed-snapshot bytes//4 + post-boundary tail chars//4;
     runway_after = available − tokens_after; threshold = max(window *
     handoff_pct / 100, handoff_min), handoff_advised = runway_after <
     threshold (strict < — equality does NOT fire). The forced-handoff
@@ -790,11 +825,21 @@ def apply_boundary(
     budget_tokens = durable_budget_tokens(window, budget_pct, budget_min)
     used_tokens = resolution["used_tokens"]
     over_budget = used_tokens > budget_tokens
-    # Full-strip estimator: tokens_before = all pre-boundary renderable
-    # content chars//4; tokens_after_est = 0 (the expunged span contributes
-    # nothing).
-    tokens_before = _strip_tokens_before(entries, boundary_index)
-    tokens_after_est = 0
+    # kdsn.322.14 — unified accounting (SB ruling 2026-09-04: the notice
+    # and /status must share one arithmetic). tokens_before = COMPOSITE:
+    # system prompt + tool defs + full pre-boundary render (content, tool
+    # outputs, thinking, signatures, wire overheads — the same inputs
+    # agent._estimate_context_tokens weighs). tokens_dropped = the
+    # render-only figure (what the strip bought), kept as its own key.
+    # tokens_after is MEASURED post-boundary: composite constant + framed
+    # snapshot + surviving tail — computable BEFORE the marker append (the
+    # snapshot body is already composed here) and frozen into the manifest
+    # as the audit record. The pinned tokens_after_est=0 contract is
+    # retired (spec §9 amendment); legacy manifests carrying it render
+    # fail-soft.
+    _constant_tokens = (system_prompt_chars + tool_defs_chars) // 4
+    tokens_dropped = _strip_tokens_before(entries, boundary_index)
+    tokens_before = _constant_tokens + tokens_dropped
 
     # Runway-gated handoff: the handoff decision is about POST-BOUNDARY
     # runway, never about durable-set size. The composite tokens_after is the
@@ -812,9 +857,12 @@ def apply_boundary(
                                   budget_tokens, frozen_at=ts)
     else:
         snapshot = _no_project_fallback_body(boundary_index, tokens_before)
-    tokens_after = tokens_after_est + len(snapshot) // 4 \
+    # Runway block keeps its MESSAGE-SIDE composite (snapshot + tail, no
+    # sp/tool-defs constant) — ladder arithmetic must not drift.
+    runway_tokens_after = len(snapshot) // 4 \
         + _post_boundary_tail_tokens(entries, boundary_index)
-    runway_after = available - tokens_after
+    tokens_after = _constant_tokens + runway_tokens_after
+    runway_after = available - runway_tokens_after
     threshold_tokens = max(int(int(window) * handoff_pct / 100), int(handoff_min))
     handoff_advised = runway_after < threshold_tokens
 
@@ -826,7 +874,8 @@ def apply_boundary(
         "boundary_index": boundary_index,
         "trigger": trigger,
         "tokens_before": tokens_before,
-        "tokens_after_est": tokens_after_est,
+        "tokens_after": tokens_after,
+        "tokens_dropped": tokens_dropped,
         "durable": {
             "project": project,
             "files": [
@@ -844,7 +893,7 @@ def apply_boundary(
         },
         "runway": {
             "available": available,
-            "tokens_after": tokens_after,
+            "tokens_after": runway_tokens_after,
             "runway_after": runway_after,
             "threshold_tokens": threshold_tokens,
             "handoff_advised": handoff_advised,
@@ -930,6 +979,14 @@ def apply_boundary(
         "over_budget": over_budget,
         "forced_handoff": forced_handoff,
         "handoff_advised": handoff_advised,
+        # kdsn.322.14: the FROZEN progress.md text (what the agent actually
+        # received in the snapshot) — the operator notice fold renders this,
+        # never a live disk read. None when no project is declared.
+        "progress_md": (
+            next((f["text"] for f in resolution["files"]
+                  if f.get("path", "").endswith("progress.md")), None)
+            if project is not None else None
+        ),
     }
 
 
@@ -1008,6 +1065,8 @@ def apply_boundary_and_rebuild(
             trigger=trigger,
             exclude_inflight=exclude_inflight,
             config_paths=list(durable_paths),
+            system_prompt_chars=len(getattr(agent, "system_prompt", "") or ""),
+            tool_defs_chars=int(getattr(agent, "_tool_defs_chars", 0) or 0),
             window=window,
             budget_pct=budget_pct,
             budget_min=budget_min,
