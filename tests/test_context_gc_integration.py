@@ -402,6 +402,104 @@ class TestMatrixCommands:
         entries = bot.session_log.read(ROOM)
         assert any(e.get("event") == "active_project" and e.get("detail") == "bar"
                    for e in entries)
+
+
+# ============================================================================
+# audit-fix (kdsn.322.9): /cache slash surface behavior pins
+# ============================================================================
+
+class TestSlashAuditFixes:
+    def _bot(self, tmp_path):
+        """Same real MatrixBot shell as TestMatrixCommands._bot."""
+        from openalph.matrix import MatrixBot
+        from openalph.agent import Agent
+        from openalph.config import MatrixConfig
+
+        ws = tmp_path
+        (ws / "skills").mkdir(exist_ok=True)
+        config = _cfg(ws)
+        agent = Agent(config)
+        mcfg = MatrixConfig(
+            homeserver="https://matrix.local", user_id=AGENT_ID,
+            device_id="TEST", password="p", access_token=None,
+            context_reserve=16384, sync_timeout=30000,
+            retry_base=1, retry_max=10,
+        )
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = mcfg
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(return_value=MagicMock(event_id="$r1"))
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = set()
+        bot._room_effort = {}
+        bot._room_cache_ttl = {}
+        bot._room_timesense = {}
+        bot._halted_rooms = set()
+        bot._background_tasks = set()
+        bot._session_locks = {}
+        bot.session_log = SessionLog(ws, AGENT_ID)
+        bot.heartbeat = None
+        bot.umbral = None
+        bot._degraded_provider_notice = {}
+        return bot, agent
+
+    def _seeded_room(self, bot, agent):
+        log = bot.session_log
+        for e in [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+            {"role": "tool", "call_id": "c1", "name": "shell",
+             "output": "o" * 4000},
+        ]:
+            log.append(room=ROOM, sender=AGENT_ID, **e)
+        agent._rooms[ROOM] = list(agent.history(ROOM)) or []
+        agent.history(ROOM).extend(log.build_context(ROOM))
+        return log
+
+    @staticmethod
+    def _send_contents(bot):
+        out = []
+        for c in bot.client.room_send.call_args_list:
+            content = c.kwargs.get("content")
+            if content is None and len(c.args) >= 3:
+                content = c.args[2]
+            content = content or {}
+            if content.get("msgtype") in ("m.text", "m.notice"):
+                out.append(content)
+        return out
+
+    def test_handoff_flag_off_emits_notice_and_applies_nothing(self, tmp_path):
+        """audit-fix (kdsn.322.9): the flag-off legacy toolstrip branch was a
+        zombie — under the hard epoch a toolstrip marker is ignored by
+        build_context, so NOTHING would be stripped while the legacy message
+        told the operator it was. The branch must emit a notice and apply
+        NOTHING: no marker append, no legacy rebuild."""
+        from openalph.config import ContextHandoffConfig
+
+        bot, agent = self._bot(tmp_path)
+        agent.config.context = ContextHandoffConfig(handoff_enabled=False)
+        log = self._seeded_room(bot, agent)
+        n_before = len(log.read(ROOM))
+        history_before = list(agent.history(ROOM))
+        room = MagicMock()
+        room.room_id = ROOM
+        asyncio.new_event_loop().run_until_complete(
+            bot._handle_room_message(room, _event("/cache handoff")))
+        entries = log.read(ROOM)
+        assert not any(e.get("event") == "toolstrip" for e in entries), (
+            "hard epoch: a legacy toolstrip marker must NOT be appended — "
+            "build_context ignores it, so the strip would be a lie")
+        assert not any(e.get("event") == "handoff_boundary" for e in entries)
+        assert len(entries) == n_before, "flag-off branch applies NOTHING"
+        assert list(agent.history(ROOM)) == history_before, (
+            "no legacy history rebuild on the flag-off path")
+        sent = "\n".join(c.get("body", "") for c in self._send_contents(bot))
+        assert "handoff is disabled" in sent
+        assert "hard epoch" in sent
+
 # ============================================================================
 # Real-path agent-loop pinning (workspace-kdsn.305.2, authored post-305 build).
 # Canonical pattern per tests/test_guidance_integration.py: REAL Agent + REAL

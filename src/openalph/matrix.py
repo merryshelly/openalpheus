@@ -3305,10 +3305,9 @@ class MatrixBot:
                 # break (kdsn.322; renamed from /cache gc, which before
                 # that was /cache toolstrip — both names retired).
                 # Flag-on: full handoff boundary (manifest + durable
-                # snapshot + full-strip history rebuild). Flag-off: the
-                # legacy toolstrip behavior (bare strip marker, legacy
-                # message, legacy rebuild) — retained for handoff-disabled
-                # agents.
+                # snapshot + full-strip history rebuild). Flag-off: a
+                # notice only — nothing applied (the legacy toolstrip
+                # behavior was retired with the hard epoch; kdsn.322.9).
                 if self.session_log:
                     if self.agent.config.context.handoff_enabled:
                         outcome = apply_boundary_and_rebuild(
@@ -3347,40 +3346,18 @@ class MatrixBot:
                                 f"{outcome.get('noop_reason') or 'no-op'}",
                             )
                     else:
-                        # Flag OFF — legacy toolstrip path (behavior + message
-                        # byte-equivalent to the pre-handoff /cache toolstrip).
-                        entries = self.session_log.read(room_id)
-                        entry_count = len(entries)
-                        # Compute what will be stripped
-                        # Respect existing strip boundary
-                        existing_markers = [
-                            e.get("entry_index", 0) for e in entries
-                            if e.get("role") == "system" and e.get("event") == "toolstrip"
-                        ]
-                        existing_boundary = max(existing_markers) if existing_markers else -1
-                        new_count = 0
-                        new_chars = 0
-                        for i, e in enumerate(entries):
-                            if e.get("role") == "tool" and i > existing_boundary:
-                                new_count += 1
-                                new_chars += len(e.get("output", ""))
-                        # Append the marker
-                        self.session_log.append(
-                            role="system",
-                            sender=event.sender,
-                            room=room_id,
-                            event_id=None,
-                            event="toolstrip",
-                            entry_index=entry_count,
-                        )
-                        # Refresh in-memory history to reflect the strip
-                        history = self.agent.history(room_id)
-                        history.clear()
-                        history.extend(self.session_log.build_context(
-                            room_id))
-                        msg = f"Toolstrip applied. Stripped {new_count} tool results (~{new_chars:,} chars) from context."
-                        msg += "\n⚠️ Previously loaded skills were stripped — re-read any skills needed for ongoing work."
-                        await self.send(room_id, msg)
+                        # audit-fix (kdsn.322.9): the legacy toolstrip path
+                        # was a ZOMBIE — under the hard epoch a toolstrip
+                        # marker is ignored by build_context, so nothing
+                        # would be stripped while the legacy message told
+                        # the operator it was. Emit a notice and apply
+                        # NOTHING: no marker append, no legacy rebuild.
+                        await self.send_notice(
+                            room_id,
+                            "handoff is disabled for this agent "
+                            "(context.handoff_enabled = false) — no "
+                            "boundary applied; legacy toolstrip markers "
+                            "are retired (hard epoch).")
                 else:
                     await self.send(room_id, "⚠️ No session log available.")
                 return
