@@ -30,11 +30,38 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from openalph.tools import BUILTIN_TOOLS
 from openalph.tools.file_ticket import run_file_ticket
 
+
+# ---------------------------------------------------------------------------
+# Hermetic-suite fixture (bead workspace-e2uh.188): the in-cage environment
+# legitimately carries FILE_TICKET_TRANSPORT (the worker driver points it at
+# /work/.stigmergy/filed-tickets.json; the tier-1 checker cage inherits the
+# same worker env — checks.py env=worker_env()). Every test in THIS module
+# must be hermetic against that ambient: the tool writes BOTH sinks whenever
+# the transport resolves, so a single non-isolated filing here would append
+# fixture entries to the PRODUCTION transport (the contexthandoff01
+# pollution — real filings buried, harvest dropped the file). Tests that
+# need a transport set their own via monkeypatch.setenv in the test body,
+# which runs after this fixture's deletion. Regressed by
+# test_suite_never_mutates_ambient_production_transport (below).
+@pytest.fixture(autouse=True)
+def _isolate_filing_transport_env(monkeypatch):
+    for _var in (
+        "FILE_TICKET_TRANSPORT",
+        "FILE_TICKET_MAX_FILINGS",
+        "FILE_TICKET_MAX_BYTES",
+    ):
+        monkeypatch.delenv(_var, raising=False)
 
 def file_ticket(**kwargs):
     """Direct-handler helper (mirrors test_tool_json_lint.lint)."""
@@ -414,3 +441,79 @@ def test_transport_created_owner_only(tmp_path: Path, monkeypatch):
     r = file_ticket(title="T", description="D", callbacks=None)
     assert not r.is_error
     assert (transport.stat().st_mode & 0o777) == 0o600
+
+# ---------------------------------------------------------------------------
+# Hermetic suite: the file_ticket tests must never touch an ambient transport
+# (bead workspace-e2uh.188 — the contexthandoff01 pollution incident)
+# ---------------------------------------------------------------------------
+
+def test_suite_never_mutates_ambient_production_transport(tmp_path: Path):
+    """Regression (contexthandoff01 T0, 2026-09-03): this suite runs
+    IN-CAGE with FILE_TICKET_TRANSPORT legitimately set in the ambient env
+    (the worker driver points it at /work/.stigmergy/filed-tickets.json; the
+    tier-1 checker cage inherits the same env). The sink-path tests above
+    never delenv'd it — the tool writes BOTH sinks whenever the transport
+    resolves — so every in-cage suite run appended byte-identical fixture
+    entries to the production transport, burying the worker's REAL filings
+    (harvest then dropped the whole file: 5 attempts' diagnostics lost).
+
+    Contract: running THIS MODULE with a pre-existing production transport
+    in the ambient env must leave that file byte-identical. The module's
+    autouse fixture neutralizes the ambient FILE_TICKET_* vars for every
+    test; tests that need a transport set their own (monkeypatch.setenv in
+    the test body wins over fixture-time deletion).
+
+    Proved-red by construction: before the fixture existed, the child run
+    polluted the sentinel (real fixture entries, byte-identity broken).
+    """
+    sentinel = tmp_path / "filed-tickets.json"
+    sentinel.write_text('{"title": "SENTINEL", "description": "pre-existing"}\n')
+    before = sentinel.read_bytes()
+
+    import openalph
+
+    src_root = str(Path(openalph.__file__).resolve().parents[1])
+    child_env = {
+        **os.environ,
+        "FILE_TICKET_TRANSPORT": str(sentinel),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    child_env["PYTHONPATH"] = (
+        src_root + os.pathsep + child_env["PYTHONPATH"]
+        if child_env.get("PYTHONPATH")
+        else src_root
+    )
+
+    repo_root = Path(__file__).resolve().parents[1]
+    node_id = (
+        "tests/test_tool_file_ticket.py::"
+        "test_suite_never_mutates_ambient_production_transport"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "pytest",
+            "tests/test_tool_file_ticket.py",
+            "-q", "-p", "no:cacheprovider",
+            "--deselect", node_id,
+        ],
+        cwd=str(repo_root),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    # The child suite itself must be GREEN — a collection error or an
+    # unrelated failure would make the byte-identity assertion vacuous.
+    assert proc.returncode == 0, (
+        f"child suite not green (rc={proc.returncode})\n"
+        f"stdout tail:\n{proc.stdout[-2000:]}\nstderr tail:\n{proc.stderr[-1000:]}"
+    )
+    passed = re.findall(r"(\d+) passed", proc.stdout)
+    assert passed and int(passed[-1]) > 0, (
+        f"child ran no tests? summary: {proc.stdout[-500:]}"
+    )
+    # The load-bearing assertion: ambient transport byte-identical.
+    assert sentinel.read_bytes() == before, (
+        "the suite polluted an ambient production transport "
+        f"(sentinel now: {sentinel.read_text()[:300]!r})"
+    )
