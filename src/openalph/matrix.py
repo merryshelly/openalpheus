@@ -3333,14 +3333,15 @@ class MatrixBot:
                             # bookkeeping — engine reset, hard-tier strikes,
                             # runway-fraction cache, churn-guard re-arm — must
                             # be driven here through the SAME seam the
-                            # callback consumer uses (Agent._note_gc_boundary_applied).
-                            # Without it the gc-runway reminder would keep
-                            # evaluating the STALE pre-boundary runway.
+                            # callback consumer uses
+                            # (Agent._note_handoff_boundary_applied).
+                            # Without it the handoff-runway reminder would
+                            # keep evaluating the STALE pre-boundary runway.
                             # Fail-soft: a mock/legacy agent without the seam
                             # (or a malformed outcome) must never break the
                             # operator command.
                             _note = getattr(self.agent,
-                                            "_note_gc_boundary_applied", None)
+                                            "_note_handoff_boundary_applied", None)
                             if callable(_note):
                                 try:
                                     _note(room_id, outcome)

@@ -5,7 +5,8 @@ The tests are the specification. Scope of this file:
     tests/test_context_handoff_config.py (kdsn.322 T0; the config-surface
     pins moved there with the ContextHandoffConfig rename)
   - CONTINUITY.md prompt assembly, 8th operator file (Sub C: prompt.py + template)
-  - gc-warn / gc-runway reminder triggers, coexist-with-reset (Sub C: reminders.py)
+  - handoff-checkpoint / handoff-runway reminder triggers,
+    coexist-with-reset (Sub C: reminders.py)
   - context_gc + set_active_project tools (Sub D: tools/__init__.py)
   - /cache gc + /cache status + /project matrix commands (Sub D: matrix.py)
 
@@ -111,76 +112,68 @@ class TestContinuityPrompt:
 
 
 # ============================================================================
-# gc-warn / gc-runway reminder triggers (coexist-with-reset)
+# handoff-checkpoint / handoff-runway reminder triggers (coexist-with-reset)
 # ============================================================================
 
 class TestGCTriggers:
     def _eng(self, tmp_path):
         return ReminderEngine(_cfg(tmp_path))
 
-    def test_gc_warn_fires_at_threshold_turn_start(self, tmp_path):
+    def test_handoff_checkpoint_fires_at_threshold_turn_start(self, tmp_path):
         eng = self._eng(tmp_path)
         st = _state(context_tokens=USABLE_262K, context_limit=WINDOW_262K,
-                    gc_warn_threshold=int(USABLE_262K * 0.75))
+                    checkpoint_threshold=int(USABLE_262K * 0.75))
         out = eng.evaluate(st)
-        warns = [r for r in out if r.trigger == "gc-warn"]
+        warns = [r for r in out if r.trigger == "handoff-checkpoint"]
         assert len(warns) == 1
         assert "durable-set" in warns[0].text
-        assert "continuity" in warns[0].text.lower()
+        assert "checkpoint" in warns[0].text.lower()
 
-    def test_gc_warn_silent_below_threshold(self, tmp_path):
+    def test_handoff_checkpoint_silent_below_threshold(self, tmp_path):
         eng = self._eng(tmp_path)
-        st = _state(context_tokens=10000, gc_warn_threshold=int(USABLE_262K * 0.75))
-        assert [r for r in eng.evaluate(st) if r.trigger == "gc-warn"] == []
+        st = _state(context_tokens=10000, checkpoint_threshold=int(USABLE_262K * 0.75))
+        assert [r for r in eng.evaluate(st) if r.trigger == "handoff-checkpoint"] == []
 
-    def test_gc_warn_silent_when_unknown(self, tmp_path):
+    def test_handoff_checkpoint_silent_when_unknown(self, tmp_path):
         eng = self._eng(tmp_path)
-        st = _state(context_tokens=999999, gc_warn_threshold=0)
-        assert [r for r in eng.evaluate(st) if r.trigger == "gc-warn"] == []
+        st = _state(context_tokens=999999, checkpoint_threshold=0)
+        assert [r for r in eng.evaluate(st) if r.trigger == "handoff-checkpoint"] == []
 
-    def test_gc_warn_once_per_session(self, tmp_path):
+    def test_handoff_checkpoint_once_per_cycle(self, tmp_path):
         eng = self._eng(tmp_path)
-        st = _state(context_tokens=USABLE_262K, gc_warn_threshold=1000)
+        st = _state(context_tokens=USABLE_262K, checkpoint_threshold=1000)
         assert eng.evaluate(st)
-        assert [r for r in eng.evaluate(st) if r.trigger == "gc-warn"] == []
+        assert [r for r in eng.evaluate(st) if r.trigger == "handoff-checkpoint"] == []
 
-    def test_gc_warn_tool_mention_gated(self, tmp_path):
-        eng = self._eng(tmp_path)
-        st_with = _state(context_tokens=USABLE_262K, gc_warn_threshold=1000,
-                         enabled_tools={"context_gc"})
-        assert "context_gc" in eng.evaluate(st_with)[0].text
-        eng2 = self._eng(tmp_path)
-        st_without = _state(context_tokens=USABLE_262K, gc_warn_threshold=1000)
-        assert "context_gc" not in eng2.evaluate(st_without)[0].text
-
-    def test_gc_warn_turn_start_only(self, tmp_path):
-        eng = self._eng(tmp_path)
-        st = _state(context_tokens=USABLE_262K, gc_warn_threshold=1000,
-                    evaluation_point="tool_loop_boundary")
-        assert [r for r in eng.evaluate(st) if r.trigger == "gc-warn"] == []
-
-    # kdsn.305.12 D5: the gc-budget trigger (durable-set usage >= 50% of
-    # budget) is REMOVED — replaced by gc-runway (post-boundary runway
-    # consumption >= 90%, once/session). The two tests below are deleted
-    # as fully subsumed by the red suite
-    # (tests/test_context_gc_runway_handoff.py TestGCRunwayReminder).
+    # kdsn.305.12 D5: the durable-budget trigger (durable-set usage >= 50%
+    # of budget) is REMOVED — replaced by handoff-runway (post-boundary
+    # runway consumption >= 90%, once/session); subsumed by the red suite.
+    #
+    # kdsn.322 deletions (behavior retired, not renamed):
+    #  - the enabled-tools-gated tool-mention note in the directive text is
+    #    DELETED (spec §4 feedback item 4 — the directive is a fixed
+    #    template that names no tool);
+    #  - the turn_start-only pin is DELETED (spec §3.3 — the checkpoint
+    #    tier now evaluates at BOTH evaluation points; dual-point firing is
+    #    pinned by tests/test_context_handoff_checkpoint.py).
 
     def test_triggers_rehydrate(self, tmp_path):
         eng = self._eng(tmp_path)
         eng.rehydrate([
-            {"role": "user", "source": "reminder", "trigger": "gc-warn",
+            {"role": "user", "source": "reminder",
+             "trigger": "handoff-checkpoint",
              "content": f"{TAG_OPEN}\nfinal durable-set\n{TAG_OPEN.replace('<', '</')}"},
         ])
-        st = _state(context_tokens=USABLE_262K, gc_warn_threshold=1000)
-        assert [r for r in eng.evaluate(st) if r.trigger == "gc-warn"] == []
+        st = _state(context_tokens=USABLE_262K, checkpoint_threshold=1000)
+        assert [r for r in eng.evaluate(st) if r.trigger == "handoff-checkpoint"] == []
 
     def test_reset_rearms_both(self, tmp_path):
         eng = self._eng(tmp_path)
-        eng.evaluate(_state(context_tokens=USABLE_262K, gc_warn_threshold=1000,
-                            gc_runway_fraction=0.95))
+        eng.evaluate(_state(context_tokens=USABLE_262K, checkpoint_threshold=1000,
+                            handoff_runway_fraction=0.95))
         eng.reset()
-        assert eng.evaluate(_state(context_tokens=USABLE_262K, gc_warn_threshold=1000))
-        assert eng.evaluate(_state(gc_runway_fraction=0.95))
+        assert eng.evaluate(_state(context_tokens=USABLE_262K, checkpoint_threshold=1000))
+        assert eng.evaluate(_state(handoff_runway_fraction=0.95))
 
 
 # ============================================================================

@@ -255,14 +255,15 @@ class Agent:
         # iteration into ONE framed user message. Agent-owned (moved off
         # MatrixBot) so heartbeat/umbral/CLI turns stage + inject too.
         self._vision_inbox: dict[str, list[str]] = {}
-        # Context GC (workspace-kdsn.305): per-room hard-tier strike counter
-        # (consecutive FAILED boundary attempts at the send-time overflow
-        # guard; >= _GC_HARD_STRIKE_LIMIT -> raise as today) and the last
-        # applied boundary's post-boundary runway consumption fraction
-        # (gc-runway reminder input, kdsn.305.12 D5 — replaces the retired
-        # durable-budget fraction). Both in-memory only: the fraction cache
-        # starts empty after restart -> 0.0 -> gc-runway silent (fail-safe,
-        # acceptable v1).
+        # Context handoff (workspace-kdsn.322, supersedes kdsn.305):
+        # per-room hard-tier strike counter (consecutive FAILED boundary
+        # attempts at the send-time overflow guard; >=
+        # _GC_HARD_STRIKE_LIMIT -> raise as today) and the last applied
+        # boundary's post-boundary runway consumption fraction
+        # (handoff-runway reminder input, kdsn.305.12 D5 — replaces the
+        # retired durable-budget fraction). Both in-memory only: the
+        # fraction cache starts empty after restart -> 0.0 ->
+        # handoff-runway silent (fail-safe, acceptable v1).
         # The turn-start auto tier + hard tier consume the transport-wired
         # callbacks["apply_handoff_boundary"] seam (contract: async callable
         # (room_id, *, trigger, exclude_inflight=True) -> {"applied",
@@ -406,7 +407,8 @@ class Agent:
           - callback absent (headless/CLI) -> False, silently;
           - callback raises -> log a warning, return False (a failed GC must
             NEVER kill a turn — the turn proceeds exactly as if GC were off);
-          - applied=True -> record the outcome via _note_gc_boundary_applied
+          - applied=True -> record the outcome via
+            _note_handoff_boundary_applied
             (the single applied-boundary bookkeeping seam, shared with the
             matrix /cache gc operator path: ReminderEngine reset, hard-tier
             strikes to 0, runway-fraction cache refresh, churn-guard re-arm).
@@ -429,10 +431,10 @@ class Agent:
             return False
         # APPLIED: the callback has already appended the JSONL entries and
         # rebuilt the in-memory history in place.
-        self._note_gc_boundary_applied(room_id, res)
+        self._note_handoff_boundary_applied(room_id, res)
         return True
 
-    def _note_gc_boundary_applied(self, room_id: str, res: dict) -> None:
+    def _note_handoff_boundary_applied(self, room_id: str, res: dict) -> None:
         """Record the APPLIED-boundary consequences on this agent (kdsn.305.12).
 
         THE single place that consumes an applied boundary's outcome
@@ -444,7 +446,7 @@ class Agent:
           - hard-tier fail-strikes reset to 0 (ANY applied boundary clears
             them);
           - runway-fraction cache refresh (tokens_after / available from the
-            manifest "runway" block) — feeds the gc-runway reminder;
+            manifest "runway" block) — feeds the handoff-runway reminder;
           - auto-tier churn-guard re-arm (a boundary never proven
             unproductive re-arms the auto tier).
         Called from BOTH boundary-consumption seams: the callback consumer
@@ -455,18 +457,18 @@ class Agent:
         """
         self._engine_for(room_id).reset()
         self._gc_fail_strikes[room_id] = 0
-        self._gc_last_runway[room_id] = self._gc_runway_fraction(res.get("manifest"))
+        self._gc_last_runway[room_id] = self._handoff_runway_fraction(res.get("manifest"))
         # An APPLIED boundary that was never proven unproductive re-arms the
         # auto tier (the churn guard only latches on evidence of failure).
         self._gc_auto_uncleared.pop(room_id, None)
 
-    def _gc_runway_fraction(self, manifest: object) -> float:
+    def _handoff_runway_fraction(self, manifest: object) -> float:
         """Post-boundary runway consumption fraction (kdsn.305.12 D5).
 
         tokens_after / available from the manifest's "runway" block — the
         same composite the boundary applier used to gate the handoff.
         Fail-soft: a missing/corrupt runway block, non-numeric values, or a
-        zero-or-negative available all yield 0.0 (gc-runway stays silent —
+        zero-or-negative available all yield 0.0 (handoff-runway stays silent —
         never false urgency from a corrupt manifest).
         """
         if not isinstance(manifest, dict):
@@ -1064,16 +1066,17 @@ class Agent:
                         context_limit=limit,
                         # D9: same expression as the overflow guard above.
                         available_tokens=available,
-                        # kdsn.305 GC inputs (turn-start site only): warn
-                        # threshold from [context].checkpoint_pct of the usable
-                        # runway (0 when gc disabled -> engine silent), and
-                        # the last boundary's post-boundary runway
-                        # consumption fraction (kdsn.305.12 D5;
-                        # 0.0 pre-boundary/restart -> engine silent).
-                        gc_warn_threshold=(
+                        # kdsn.322 handoff inputs (turn-start site only):
+                        # checkpoint threshold from [context].checkpoint_pct
+                        # of the usable runway (0 when handoff disabled ->
+                        # engine silent), and the last boundary's
+                        # post-boundary runway consumption fraction
+                        # (kdsn.305.12 D5; 0.0 pre-boundary/restart ->
+                        # engine silent).
+                        checkpoint_threshold=(
                             int(available * _gc_cfg.checkpoint_pct / 100)
                             if _gc_cfg.handoff_enabled else 0),
-                        gc_runway_fraction=self._gc_runway_cached(room_id),
+                        handoff_runway_fraction=self._gc_runway_cached(room_id),
                         completed_turns=_completed_turns,
                         turn_source=_turn_source,
                         tool_calls_this_turn=_tool_calls_this_turn,
@@ -1253,12 +1256,13 @@ class Agent:
                             tool_calls_session=dict(self._room_tool_counts.get(room_id, {})),
                             todo_list=list(_TODO_STATE.get(room_id, [])),  # R1-3
                             enabled_tools=_enabled_tools,
-                            # kdsn.305: the GC triggers are turn_start-only;
-                            # this site flows the default 0 threshold (the
-                            # fraction is passed for completeness — the engine
-                            # predicates on evaluation_point and ignores it
-                            # here).
-                            gc_runway_fraction=self._gc_runway_cached(room_id),
+                            # kdsn.322: handoff inputs at the boundary site —
+                            # the checkpoint threshold flows the dataclass
+                            # default 0 (it is computed at the turn-start
+                            # site, so the checkpoint trigger stays silent
+                            # here) and handoff-runway is turn_start-only;
+                            # the fraction is passed for completeness.
+                            handoff_runway_fraction=self._gc_runway_cached(room_id),
                         )
                         _boundary_reminders = self._engine_for(room_id).evaluate(_boundary_state)
                         for _rem in _boundary_reminders:

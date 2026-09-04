@@ -83,21 +83,22 @@ class ReminderState:
     # skips (fail-safe direction: fewer nudges, never false urgency; also keeps
     # existing ReminderState constructions valid).
     available_tokens: int = 0
-    # Context GC (workspace-kdsn.305) — turn-start site only, both fields
-    # computed by the agent from [context] config + the room's usable runway.
-    # gc_warn_threshold: absolute token count at which the gc-warn reminder
-    # fires (int(available * checkpoint_pct / 100)). Default 0 =
-    # unknown/disabled →
-    # SILENT SKIP, the same fail-safe convention as available_tokens (fewer
-    # nudges, never false urgency; also keeps existing constructions valid).
-    gc_warn_threshold: int = 0
-    # gc_runway_fraction: post-boundary runway consumption
+    # Context handoff (workspace-kdsn.322, supersedes kdsn.305) —
+    # turn-start site only, both fields computed by the agent from
+    # [context] config + the room's usable runway.
+    # checkpoint_threshold: absolute token count at which the
+    # handoff-checkpoint reminder fires (int(available * checkpoint_pct /
+    # 100)). Default 0 = unknown/disabled → SILENT SKIP, the same fail-safe
+    # convention as available_tokens (fewer nudges, never false urgency;
+    # also keeps existing constructions valid).
+    checkpoint_threshold: int = 0
+    # handoff_runway_fraction: post-boundary runway consumption
     # (tokens_after / available, 0.0–1.0+) from the last applied boundary's
-    # manifest "runway" block (kdsn.305.12 D5 — replaces gc_budget_fraction;
-    # the durable budget is informational-only and no longer feeds a
-    # trigger). Default 0.0 = no boundary seen yet (in-memory only; restarts
-    # empty) → gc-runway silent.
-    gc_runway_fraction: float = 0.0
+    # manifest "runway" block (kdsn.305.12 D5 — replaces the retired
+    # durable-budget fraction; the durable budget is informational-only and
+    # no longer feeds a trigger). Default 0.0 = no boundary seen yet
+    # (in-memory only; restarts empty) → handoff-runway silent.
+    handoff_runway_fraction: float = 0.0
 
 
 @dataclass
@@ -130,11 +131,14 @@ class ReminderEngine:
         self._t3_fired: bool = False        # T3: once per session
         self._t5_fired: bool = False        # T5: once per session
         self._t6_fired: bool = False        # T6: once per session
-        # Context GC (kdsn.305): session-scoped fired-state for the two GC
-        # triggers (once-per-session latches, re-armed by reset() and
-        # rehydrated from JSONL like every other trigger).
-        self._gc_warn_fired: bool = False   # gc-warn: once per session
-        self._gc_runway_fired: bool = False # gc-runway: once per session
+        # Context handoff (kdsn.322, supersedes kdsn.305): fired-state for
+        # the two handoff triggers, rehydrated from JSONL like every other
+        # trigger.  _checkpoint_fired is once per BOUNDARY CYCLE — reset()
+        # is the applied-boundary re-arm seam, and reset_turn() deliberately
+        # leaves the latch alone (per-cycle, not per-turn).  _runway_fired
+        # is once per session.
+        self._checkpoint_fired: bool = False  # handoff-checkpoint
+        self._runway_fired: bool = False      # handoff-runway
         # Context nudge ladder (replaces the single-shot T2 _t2_fired bool):
         # _ladder_fired — monotonic highest tier fired this session+model
         # (D1: single latch, never fire a tier ≤ one already fired; D3: no
@@ -259,61 +263,70 @@ class ReminderEngine:
                     text=_LADDER_TEXT[fired_tier].format(remaining=remaining),
                 ))
 
-        # Context GC — gc-warn (workspace-kdsn.305).  turn_start ONLY (the
-        # agent applies the auto boundary tier at turn start; mid-loop
-        # warnings would dilute the nudge ladder and can't be acted on
-        # between tool calls).  Predicate: gc_warn_threshold > 0 (0 =
-        # unknown/disabled → silent skip, the available_tokens convention)
-        # AND context has crossed it; once per session (rehydratable via
-        # source='reminder' trigger='gc-warn' entries, reset() re-arms).
-        # Text teaches the continuity artifacts and — per audit R1-6 — names
-        # the context_gc tool ONLY when the tool is actually enabled for
-        # this room (enabling is transport-wired, so a headless room must
-        # never be steered to a tool it cannot call).
-        if (state.evaluation_point == "turn_start"
-                and not self._gc_warn_fired
-                and state.gc_warn_threshold > 0
-                and state.context_tokens >= state.gc_warn_threshold):
-            self._gc_warn_fired = True
-            if "context_gc" in state.enabled_tools:
-                gc_tool_note = " Use the context_gc tool to apply a boundary."
-            else:
-                gc_tool_note = ""
+        # Context handoff — handoff-checkpoint (kdsn.322 spec §3.2/§3.3,
+        # supersedes the legacy warning trigger).  Fires at BOTH evaluation
+        # points (turn_start AND tool_loop_boundary — spec §3.3 ratifies
+        # dual-point evaluation for the checkpoint tier; the old
+        # turn_start-only gate was a corrected blind spot for long single
+        # turns).  Predicate: checkpoint_threshold > 0 (0 = unknown/disabled
+        # → silent skip, the available_tokens convention) AND context has
+        # crossed it.  Once per BOUNDARY CYCLE: latched after firing;
+        # reset_turn() does NOT clear it (per-cycle, not per-turn), and the
+        # applied-boundary seam's whole-engine reset() re-arms it for the
+        # next cycle.  Rehydratable via source='reminder'
+        # trigger='handoff-checkpoint' entries (hard epoch: only the new id
+        # latches — a legacy entry must not consume the cycle budget).
+        # Text is the spec §3.2 fixed template — it names NO tool (the old
+        # enabled_tools-gated tool-note seam is deleted: the registry
+        # renames the tool at T4, so a tool-name note here would be a dead
+        # key the spec explicitly retires).
+        if (not self._checkpoint_fired
+                and state.checkpoint_threshold > 0
+                and state.context_tokens >= state.checkpoint_threshold):
+            self._checkpoint_fired = True
             results.append(Reminder(
-                trigger="gc-warn",
+                trigger="handoff-checkpoint",
                 text=(
-                    "Context has crossed the GC warning threshold — finalize "
-                    "your continuity artifacts now: update progress.md and "
-                    "the durable-set.toml so the next garbage-collection "
-                    f"boundary re-injects current state.{gc_tool_note}"
+                    "Context-handoff checkpoint (threshold reached). Before "
+                    "the boundary applies: (1) if no project is declared for "
+                    "this session, call set_active_project (scaffold "
+                    "memory/projects/<project>/ first if needed); (2) "
+                    "update memory/projects/<project>/progress.md — State "
+                    "(verified claims only), Decisions (why), Next; (3) "
+                    "update durable-set.toml — only files a post-boundary "
+                    "session must re-read. At the auto threshold ALL "
+                    "pre-boundary context is removed; progress.md + "
+                    "durable-set are the only carryover. Spend your next "
+                    "actions on checkpointing, not new work."
                 ),
             ))
 
-        # Context GC — gc-runway (kdsn.305.12 D5, replaces the retired
-        # gc-budget trigger).  turn_start ONLY, once per session.  Predicate
-        # (integer test, audited kdsn.305.12 R6): the runway fraction is
-        # scaled to an integer PERCENT and compared to the 90 threshold —
-        # ``int(fraction * 100) >= 90``.  This is an integer comparison at
-        # the percent level (no float-vs-0.9 boundary test), but note the
-        # ``int()`` truncates: any fraction in [0.90, 0.91) — e.g. 0.905 —
-        # also fires, and the printed percentage is the truncated integer.
-        # 0.0 = no boundary seen yet (in-memory cache, empty after restart)
-        # → silent skip.  This PLANS FOR a handoff, it does not force one:
-        # the durable snapshot + post-boundary residue nearly exhausts the
-        # runway, so the next turn may not finish.  States the integer
-        # percentage so the agent can size the urgency.
+        # Context handoff — handoff-runway (kdsn.322 rename of the
+        # kdsn.305.12 D5 runway trigger, which replaced the retired
+        # durable-budget trigger).  turn_start ONLY, once per session.
+        #  Predicate UNCHANGED (integer test, audited kdsn.305.12 R6): the
+        #  runway fraction is scaled to an integer PERCENT and compared to
+        #  the 90 threshold — ``int(fraction * 100) >= 90``.  Integer
+        #  comparison at the percent level (no float-vs-0.9 boundary test),
+        #  but note ``int()`` truncates: any fraction in [0.90, 0.91) —
+        #  e.g. 0.905 — also fires, and the printed percentage is the
+        #  truncated integer.  0.0 = no boundary seen yet (in-memory cache,
+        #  empty after restart) → silent skip.  This PLANS FOR a handoff, it
+        #  does not force one: the durable snapshot + post-boundary residue
+        #  nearly exhausts the runway, so the next turn may not finish.
+        #  States the integer percentage so the agent can size the urgency.
         if (state.evaluation_point == "turn_start"
-                and not self._gc_runway_fired
-                and state.gc_runway_fraction >= 0
-                and int(state.gc_runway_fraction * 100) >= 90):
-            self._gc_runway_fired = True
+                and not self._runway_fired
+                and state.handoff_runway_fraction >= 0
+                and int(state.handoff_runway_fraction * 100) >= 90):
+            self._runway_fired = True
             results.append(Reminder(
-                trigger="gc-runway",
+                trigger="handoff-runway",
                 text=(
-                    f"Context is {int(state.gc_runway_fraction * 100)}% durable "
-                    "snapshot + post-boundary residue after the last GC "
-                    "boundary — runway is nearly consumed. Plan a handoff "
-                    "before the next turn."
+                    f"Context is {int(state.handoff_runway_fraction * 100)}% "
+                    "durable snapshot + post-boundary residue after the "
+                    "last handoff boundary — runway is nearly consumed. "
+                    "Plan a handoff before the next turn."
                 ),
             ))
 
@@ -441,13 +454,18 @@ class ReminderEngine:
                 self._t5_fired = True
             elif trigger == "advisor-salience":
                 self._t6_fired = True
-            elif trigger == "gc-warn":
-                # Once-per-session latch (kdsn.305): a persisted gc-warn entry
-                # means it already fired this session — do not re-ping.
-                self._gc_warn_fired = True
-            elif trigger == "gc-runway":
-                # Same once-per-session latch (kdsn.305.12 D5).
-                self._gc_runway_fired = True
+            elif trigger == "handoff-checkpoint":
+                # Once-per-cycle latch (kdsn.322): a persisted
+                # handoff-checkpoint entry means it already fired in the
+                # current boundary cycle — do not re-ping.  Hard epoch:
+                # legacy trigger ids have NO branch here on purpose — an
+                # unknown trigger is simply not latched, so a pre-migration
+                # session still gets its checkpoint warning under the new
+                # mechanism.
+                self._checkpoint_fired = True
+            elif trigger == "handoff-runway":
+                # Same once-per-session latch (kdsn.305.12 D5, renamed).
+                self._runway_fired = True
             elif trigger == "session-orient" and entry.get("detail") is not None:
                 # kdsn.298: restore the model-keyed orientation flag from the
                 # persisted detail. Last-wins in JSONL order (the final entry
@@ -465,8 +483,11 @@ class ReminderEngine:
         self._t3_fired = False
         self._t5_fired = False
         self._t6_fired = False
-        self._gc_warn_fired = False   # kdsn.305: re-arm both GC triggers
-        self._gc_runway_fired = False
+        # kdsn.322: re-arm both handoff triggers (reset() is the
+        # applied-boundary re-arm seam for the once-per-cycle checkpoint
+        # latch).
+        self._checkpoint_fired = False
+        self._runway_fired = False
         self._t4_fired_this_turn = False
         # Ladder re-arm (D7): umbral = new session, all tiers re-arm.
         self._ladder_fired = 0

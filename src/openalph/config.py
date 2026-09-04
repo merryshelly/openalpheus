@@ -77,7 +77,7 @@ class ContextHandoffConfig:
     """Context handoff settings (workspace-kdsn.305, [context] section).
 
     Tuning knobs for the unified context-boundary / handoff mechanism
-    (context_gc.py): the auto/hard boundary tiers, the gc-warn checkpoint
+    (context_gc.py): the auto/hard boundary tiers, the handoff-checkpoint
     reminder threshold, the durable-set re-injection budget, and the
     thinking-tail preservation fields (workspace-kdsn.305.13 — the TOML
     keys were retired at T0, kdsn.322; the fields survive one extra slice
@@ -91,7 +91,7 @@ class ContextHandoffConfig:
     handoff_enabled: bool = True
     # Reminder/boundary tier thresholds — percentages of the usable runway
     # (available = window limit − max_tokens), strict (0, 100).
-    checkpoint_pct: int = 75    # gc-warn checkpoint reminder threshold
+    checkpoint_pct: int = 75    # handoff-checkpoint reminder threshold
     auto_pct: int = 85      # turn-start auto boundary tier
     hard_pct: int = 92      # (reserved: hard tier is the send-time overflow guard)
     # Durable-set re-injection budget: max(window * pct, min_tokens) tokens
