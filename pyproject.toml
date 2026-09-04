@@ -70,5 +70,7 @@ extend-exclude = ["src/openalph/vendor"]
 # Default ruff ruleset (E4/E7/E9 + pyflakes F) -- the baseline these findings
 # were triaged against. Whitespace (W), isort (I), and line-length (E501) are
 # NOT enabled yet; enabling them is a separate cleanup pass, not a silent
-# expansion of scope. Test files still carry findings (tracked separately).
+# expansion of scope. Full tree is clean under this ruleset (kdsn.326,
+# 2026-09-03) and tests/test_lint_clean.py ratchets 'ruff check .' to exit 0
+# in the suite; W/I/E501 enablement remains a separate decision.
 select = ["E4", "E7", "E9", "F"]
