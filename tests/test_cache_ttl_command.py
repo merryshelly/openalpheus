@@ -1,7 +1,10 @@
 """Tests for /cache TTL command — room-scoped 1-hour cache TTL toggle."""
 
 import pytest
-from openalph.provider import _build_anthropic_kwargs
+from openalph.provider import _build_anthropic_kwargs, Response, StreamEvent, Usage
+from unittest.mock import patch
+from openalph.agent import Agent
+from openalph.config import AgentConfig, ProviderConfig
 
 
 class TestBuildAnthropicKwargsCacheTTL:
@@ -71,12 +74,6 @@ class TestBuildAnthropicKwargsCacheTTL:
         assert msg_cc == {"type": "ephemeral", "ttl": "1h"}
         # System should also have ttl
         assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-
-
-from unittest.mock import patch
-from openalph.agent import Agent
-from openalph.config import AgentConfig, ProviderConfig
-from openalph.provider import Response, Usage, StreamEvent
 
 
 def _make_config(workspace):

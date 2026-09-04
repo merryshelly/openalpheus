@@ -16,16 +16,20 @@ weaken assertions here.
 
 import asyncio
 import json
+import json as _json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openalph.config import AgentConfig, ProviderConfig, ConfigError, load_config
+from openalph.config import AgentConfig, ProviderConfig, ConfigError, load_config, ContextGCConfig, MatrixConfig
 from openalph.session import SessionLog
 from openalph.tools import BUILTIN_TOOLS, execute_tool
 from openalph.reminders import ReminderEngine, ReminderState
 from openalph.prompt import assemble_prompt
+from openalph.agent import Agent, ContextOverflowError
+from openalph.matrix import MatrixBot
+from openalph.provider import Response, StreamEvent, ToolCall, Usage
 
 ROOM = "!gci:matrix.local"
 AGENT_ID = "@gci-agent:matrix.local"
@@ -489,18 +493,6 @@ class TestMatrixCommands:
 # missed an unawaited coroutine at the in-loop hard tier — the wiring bug was
 # invisible to every seam-mocked test (tool-management, "the one lesson").
 # ============================================================================
-
-import asyncio
-import json as _json
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
-
-from openalph.agent import Agent, ContextOverflowError
-from openalph.config import AgentConfig, ContextGCConfig, MatrixConfig, ProviderConfig
-from openalph.matrix import MatrixBot
-from openalph.session import SessionLog
-from openalph.provider import Response, StreamEvent, ToolCall, Usage
 
 GC_ROOM = "!gcloop:matrix.local"
 AGENT_ID = "@gci-agent:matrix.local"

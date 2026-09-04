@@ -1,4 +1,3 @@
-import asyncio
 """Tests for gap-fill pagination in _activate_room.
 
 Verifies that gap-fill pages backward through Matrix messages until it finds
@@ -6,6 +5,7 @@ overlap with known session history, respects the GAP_FILL_MAX cap, and handles
 edge cases cleanly.
 """
 
+import asyncio
 import pytest
 import logging
 from unittest.mock import AsyncMock, MagicMock

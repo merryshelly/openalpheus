@@ -466,9 +466,6 @@ class TestSetupSharedDirWrapper:
 # step8, which guards on `id oa-<name>` and requires --force.
 # ===========================================================================
 
-from openalph.admin import Operation, execute_plan, plan_create_agent
-
-
 class TestNewAgentDoesNotClobber:
 
     def test_existing_file_is_not_overwritten(self, tmp_path):

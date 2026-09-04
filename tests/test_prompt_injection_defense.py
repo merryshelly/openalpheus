@@ -7,7 +7,10 @@ assemble_prompt() appends a hardcoded injection defense section that:
 - Appears after workspace files and skills index
 """
 
-from openalph.prompt import assemble_prompt, INJECTION_DEFENSE
+import pathlib
+
+import openalph.templates
+from openalph.prompt import assemble_prompt, INJECTION_DEFENSE, SECURITY_FOOTER_FILENAME
 
 
 class TestInjectionDefensePresent:
@@ -94,15 +97,6 @@ class TestInjectionDefenseConstant:
 # the source. The text may well be desirable; shipping it as an immutable
 # string is what made the claim untrue.
 # ===========================================================================
-
-import pathlib
-
-import openalph.templates
-from openalph.prompt import (
-    INJECTION_DEFENSE,
-    SECURITY_FOOTER_FILENAME,
-    assemble_prompt,
-)
 
 TEMPLATE_FOOTER = (
     pathlib.Path(openalph.templates.__file__).parent / SECURITY_FOOTER_FILENAME
