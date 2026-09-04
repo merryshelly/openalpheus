@@ -252,8 +252,8 @@ class TestOnTextDelta:
 
         # First stream: no text → no done=True for that iteration
         # Second stream: text + done=True
-        text_calls = [c for c in cb.call_args_list if c.kwargs.get("done") is not True
-                      or c == call("", done=True)]
+        [c for c in cb.call_args_list if c.kwargs.get("done") is not True
+         or c == call("", done=True)]
         done_calls = [c for c in cb.call_args_list if c == call("", done=True)]
         assert len(done_calls) == 1  # Only from the second stream
         assert result == "Files listed."

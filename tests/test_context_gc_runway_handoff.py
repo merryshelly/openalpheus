@@ -323,7 +323,7 @@ class TestRunwayHandoffSemantics:
         block shape unchanged."""
         log = _log(tmp_path)
         _append_all(log, _entries())
-        self_equiv = _apply(log, tmp_path, window=300_000, max_tokens=48_000)
+        _apply(log, tmp_path, window=300_000, max_tokens=48_000)
         m = json.loads(log.read(ROOM)[5]["detail"])
         rw = m["runway"]
         assert rw["available"] == 300_000 - 48_000

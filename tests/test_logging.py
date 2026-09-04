@@ -395,8 +395,8 @@ class TestToolCallLogging:
         """Tool calls within a turn are captured in the log entry."""
         config = make_agent_config(tmp_path)
         tc = make_tool_call("shell", {"command": "date"}, "tc_1")
-        tool_response = make_response(content="", input_tokens=100, output_tokens=50, tool_calls=[tc])
-        final_response = make_response(content="It's Monday.", input_tokens=200, output_tokens=100)
+        make_response(content="", input_tokens=100, output_tokens=50, tool_calls=[tc])
+        make_response(content="It's Monday.", input_tokens=200, output_tokens=100)
         tool_result = make_tool_result("Mon Mar 8 20:00:00 EDT 2026")
 
         call_count = 0
@@ -461,8 +461,8 @@ class TestToolCallLogging:
         """Tool call errors are recorded in the log entry."""
         config = make_agent_config(tmp_path)
         tc = make_tool_call("shell", {"command": "bad-cmd"}, "tc_err")
-        tool_response = make_response(content="", input_tokens=100, output_tokens=50, tool_calls=[tc])
-        final_response = make_response(content="That command failed.", input_tokens=200, output_tokens=100)
+        make_response(content="", input_tokens=100, output_tokens=50, tool_calls=[tc])
+        make_response(content="That command failed.", input_tokens=200, output_tokens=100)
         tool_result = make_tool_result("command not found", is_error=True)
 
         call_count = 0

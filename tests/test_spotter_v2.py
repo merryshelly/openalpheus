@@ -684,7 +684,7 @@ class TestErrorStreakLoopUnit:
 class TestExhaustionWindowFix:
     def test_resolve_window_uses_spotter_model_string(self, tmp_path):
         mgr, cfg, ag = make_manager(tmp_path, config=make_config(tmp_path, spotter_model="qwen38blackwell"))
-        st = mgr.ensure_state("!r:1")
+        mgr.ensure_state("!r:1")
         mgr._resolve_window("!r:1")
         assert ag._window_calls == ["qwen38blackwell"]
 

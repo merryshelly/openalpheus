@@ -381,7 +381,7 @@ class TestIndexerRobustness:
         conn = init_db(tmp_path / "idx.db", dimensions=4)
         indexer = MemoryIndexer(conn, _make_embedder_mock(), "test-model")
 
-        stats = await indexer.index_all([tmp_path])  # must not raise
+        await indexer.index_all([tmp_path])  # must not raise
 
         paths = [row[0] for row in conn.execute("SELECT DISTINCT path FROM chunks")]
         assert any("good.md" in p for p in paths)
@@ -395,7 +395,7 @@ class TestIndexerRobustness:
         conn = init_db(tmp_path / "idx.db", dimensions=4)  # no load_vec_extension
         indexer = MemoryIndexer(conn, _make_embedder_mock(), "test-model")
 
-        stats = await indexer.index_all([tmp_path])  # must not raise
+        await indexer.index_all([tmp_path])  # must not raise
 
         n = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         assert n >= 1

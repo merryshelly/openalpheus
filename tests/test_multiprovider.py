@@ -918,7 +918,7 @@ class TestSubagentMultiProvider:
             mock_get.return_value = mock_client
 
             from openalph.tools.subagent import run_subagent
-            result = await run_subagent(
+            await run_subagent(
                 task="Do something",
                 config=config,
             )

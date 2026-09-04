@@ -608,7 +608,7 @@ class TestDrainInjectInLoop:
             mock_stream.side_effect = fake_stream
             mock_exec.return_value = ToolResult(content="ok", is_error=False)
 
-            result = await agent.handle_input(
+            await agent.handle_input(
                 "do work",
                 room_id=ROOM_A,
                 drain_steering=counting_drain,
@@ -841,8 +841,6 @@ class TestDrainInjectInLoop:
                 usage=Usage(input_tokens=10, output_tokens=5),
                 stop_reason="end_turn",
             )
-
-            summary_calls = [0]
 
             async def fake_stream(*args, **kwargs):
                 iteration_count[0] += 1
@@ -1094,7 +1092,7 @@ class TestNotices:
         )
 
         delivered_notices = []
-        original_send_notice = bot.send_notice if hasattr(bot, 'send_notice') else None
+        bot.send_notice if hasattr(bot, 'send_notice') else None
 
         async def capture_notice(rid, text):
             delivered_notices.append(text)

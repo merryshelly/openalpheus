@@ -258,7 +258,7 @@ class TestParallelExecution:
 
         with patch("openalph.agent.stream", side_effect=make_stream_responses(responses)):
             with patch("openalph.agent.execute_tool", side_effect=mock_execute):
-                result = await agent.handle_input("Run two commands")
+                await agent.handle_input("Run two commands")
 
         assert call_count == 2
 
@@ -325,7 +325,7 @@ class TestToolErrors:
                 new_callable=AsyncMock,
                 return_value=ToolResult(content="command not found", is_error=True),
             ):
-                result = await agent.handle_input("Run bad command")
+                await agent.handle_input("Run bad command")
 
         # Error should be in the tool result message
         second_call_messages = mock_complete.call_args_list[1].kwargs["messages"]
@@ -595,7 +595,7 @@ class TestNoToolsBackwardCompat:
             await agent.handle_input("Hello")
 
         # Turn 2
-        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses_turn2)) as mock_stream:
+        with patch("openalph.agent.stream", side_effect=make_stream_responses(responses_turn2)):
             with patch(
                 "openalph.agent.execute_tool",
                 new_callable=AsyncMock,
@@ -789,7 +789,7 @@ class TestCallbackErrorResilience:
         async def exploding_intent(tool_calls, content):
             raise RuntimeError("intent callback boom")
 
-        with patch("openalph.agent.stream", side_effect=make_stream_responses([tool_resp, text_resp])) as mock_complete, \
+        with patch("openalph.agent.stream", side_effect=make_stream_responses([tool_resp, text_resp])), \
              patch("openalph.agent.execute_tool", new_callable=AsyncMock) as mock_exec:
             mock_exec.return_value = ToolResult(content="file contents", is_error=False)
 
@@ -811,7 +811,7 @@ class TestCallbackErrorResilience:
         async def exploding_call(*args, **kwargs):
             raise RuntimeError("call callback boom")
 
-        with patch("openalph.agent.stream", side_effect=make_stream_responses([tool_resp, text_resp])) as mock_complete, \
+        with patch("openalph.agent.stream", side_effect=make_stream_responses([tool_resp, text_resp])), \
              patch("openalph.agent.execute_tool", new_callable=AsyncMock) as mock_exec:
             mock_exec.return_value = ToolResult(content="file contents", is_error=False)
 

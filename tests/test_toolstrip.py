@@ -473,7 +473,7 @@ class TestToolstripContextEstimate:
         """Context token estimate decreases after toolstrip is applied."""
         from openalph.config import AgentConfig, ProviderConfig
 
-        config = AgentConfig(
+        AgentConfig(
             name="test",
             default_model="anthropic/claude-sonnet-4-20250514",
             max_tokens=8192,

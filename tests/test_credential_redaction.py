@@ -691,7 +691,7 @@ class TestRedactionCallback:
                     return_value=ToolResult(
                         content="key=sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
                     )):
-            result = await execute_tool(
+            await execute_tool(
                 name="shell",
                 input={"command": "op read key"},
                 tool_config={"default_timeout": 30, "max_output": 50000},

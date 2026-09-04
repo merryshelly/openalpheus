@@ -489,7 +489,7 @@ async def test_agent_dispatch_passes_tool_executors(tmp_path):
     from openalph.agent import Agent
 
     rec = make_recorder(result=ToolResult(content="bridged-ok", is_error=False))
-    agent = Agent(make_agent_config(tmp_path / "ws"), tool_executors={"shell": rec})
+    Agent(make_agent_config(tmp_path / "ws"), tool_executors={"shell": rec})
     scripted = [
         tool_use_response([ToolCall(id="t1", name="shell", input={"command": "echo hi"})]),
         text_response("done"),

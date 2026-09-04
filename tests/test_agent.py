@@ -242,7 +242,7 @@ class TestContextOverflowPreAppend:
         big_message = "z" * 2000  # would push well over
 
         with pytest.raises(ContextOverflowError):
-            with patch("openalph.agent.stream") as mock:
+            with patch("openalph.agent.stream"):
                 await agent.handle_input(big_message)
 
         # The big message must NOT be in history
@@ -500,7 +500,7 @@ class TestToolCallLimitSummary:
 
         with patch("openalph.agent.stream", _mock_stream), \
              patch("openalph.agent.execute_tool", return_value=tool_result):
-            result = await agent.handle_input(
+            await agent.handle_input(
                 "Do work", "_default", on_text_delta=_on_text_delta
             )
 

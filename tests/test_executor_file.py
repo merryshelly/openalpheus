@@ -158,7 +158,7 @@ class TestWriteFile:
     async def test_utf8_content(self, tmp_path):
         """UTF-8 content is written correctly."""
         f = tmp_path / "unicode.txt"
-        result = await write_file(str(f), "héllo wörld 🐈‍⬛")
+        await write_file(str(f), "héllo wörld 🐈‍⬛")
         assert f.read_text() == "héllo wörld 🐈‍⬛"
 
 

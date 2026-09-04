@@ -266,7 +266,7 @@ class TestSubagentLogFile:
         with patch("openalph.tools.subagent.complete", side_effect=mock_complete):
             with patch("openalph.tools.execute_tool", new_callable=AsyncMock,
                        return_value=ToolResult(content="ok")):
-                result = await run_subagent("looping task", config, tools=make_tools(),
+                await run_subagent("looping task", config, tools=make_tools(),
                                            max_iterations=3)
 
         log_dir = tmp_path / "logs" / "subagents"

@@ -136,7 +136,7 @@ def _cp(results):
 # ============================================================================
 
 def test_T_boundary_60(tmp_path):
-    eng = _engine(tmp_path)
+    _engine(tmp_path)
     for point in ("turn_start", "tool_loop_boundary"):
         eng2 = _engine(tmp_path)
         # Below the 60% cross-multiplication: 119999*100 < 60*200000 (12000000)

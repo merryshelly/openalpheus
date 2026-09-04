@@ -285,7 +285,7 @@ class TestRestartPersistence:
             await agent1.handle_input("turn 2", room)
 
         # Persist per-turn usage to JSONL (as the serializer would)
-        lu1 = agent1._last_turn_usage.get(room)  # last recorded, but we need both
+        agent1._last_turn_usage.get(room)  # last recorded, but we need both
         # Manually build session log entries with usage that matches what agent1 accumulated
         # Turn 1 usage
         sl.append(

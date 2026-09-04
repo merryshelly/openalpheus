@@ -209,8 +209,8 @@ class TestThinkingBlockDelivery:
         await bot._process_message(room, event, "Think")
 
         # Should have sent a thinking message with <details> HTML
-        all_sends = (bot._room_send_with_retry.call_args_list +
-                     [call(room.room_id, c) for c in []])
+        (bot._room_send_with_retry.call_args_list +
+         [call(room.room_id, c) for c in []])
         found_thinking = False
         for c in bot._room_send_with_retry.call_args_list:
             content = c[0][1] if len(c[0]) > 1 else {}

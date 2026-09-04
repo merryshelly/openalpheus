@@ -515,7 +515,7 @@ class TestCommsSinksProtocol:
         """MatrixSinks structurally satisfies CommsSinks (has all required methods)."""
         from openalph.callbacks import CommsSinks, MatrixSinks
         # Structural check: MatrixSinks must have all the protocol's methods
-        protocol_methods = {
+        {
             attr for attr in dir(CommsSinks)
             if not attr.startswith("_") and callable(getattr(CommsSinks, attr, None))
         }

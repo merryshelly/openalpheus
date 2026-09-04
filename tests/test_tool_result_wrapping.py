@@ -353,7 +353,7 @@ class TestSubagentWrapping:
             new_callable=AsyncMock,
             return_value=ToolResult(content="Thu Mar 13 12:00:00 EDT 2026"),
         ):
-            result = await run_subagent("What day is it?", config, tools=tools)
+            await run_subagent("What day is it?", config, tools=tools)
 
         # Second complete() call should have wrapped tool result
         second_call_msgs = mock_complete.call_args_list[1].kwargs["messages"]

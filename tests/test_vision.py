@@ -313,7 +313,7 @@ class TestMediaTagRegex:
 
     def test_parses_no_space_after_colon(self):
         """Regex handles minor whitespace variations."""
-        m = MEDIA_TAG_RE.search("[media:media/abc/f.jpg (image/png, 1 KB)]")
+        MEDIA_TAG_RE.search("[media:media/abc/f.jpg (image/png, 1 KB)]")
         # Allow either match or no match — the implementation defines the contract
         # As long as the standard format matches, edge cases are implementation-defined
 

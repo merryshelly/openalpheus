@@ -448,7 +448,6 @@ class TestGuidanceWiring:
 
         room_id = "!ordering-test:matrix.local"
         user_msg = "Please help me with this task"
-        reminder_content = None
         captured_messages = []
 
         async def _mock_stream(config, system, messages, **kwargs):

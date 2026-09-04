@@ -208,7 +208,7 @@ api_key_cmd = "exit 1"
 path = "{tmp_path / 'workspace'}"
 """)
         with caplog.at_level(logging.WARNING, logger="openalph.config"):
-            config = load_config(config_path)
+            load_config(config_path)
 
         # Must mention which provider failed
         warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
@@ -235,7 +235,7 @@ api_key_cmd = "exit 1"
 path = "{tmp_path / 'workspace'}"
 """)
         with caplog.at_level(logging.INFO, logger="openalph.config"):
-            config = load_config(config_path)
+            load_config(config_path)
 
         info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
         # Should log which providers loaded successfully

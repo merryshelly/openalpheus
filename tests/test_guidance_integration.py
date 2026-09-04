@@ -260,7 +260,7 @@ class TestR1_2_RoomIdInCallbacks:
         """R1-2: todo_write in turn 1 persists to turn 2 (same room), isolated across rooms."""
         bot, agent = _make_bot_with_real_agent(tmp_path)
         cb_a = bot._build_agent_callbacks(ROOM_A, None)
-        cb_b = bot._build_agent_callbacks(ROOM_B, None)
+        bot._build_agent_callbacks(ROOM_B, None)
 
         from openalph.tools import execute_tool
         # Write todo in room A
@@ -284,7 +284,7 @@ class TestR1_2_RoomIdInCallbacks:
             "Room B must not see Room A's todos"
 
         # Turn 2 in room A: todo still there (same room_id key)
-        cb_a2 = bot._build_agent_callbacks(ROOM_A, None)
+        bot._build_agent_callbacks(ROOM_A, None)
         assert _TODO_STATE.get(ROOM_A) == [{"content": "Task A", "status": "in_progress"}], \
             "Todo must persist across turns with stable room_id key"
 
@@ -1105,7 +1105,6 @@ class TestR2_D_RetryCallbacks:
 
         # Track handle_input calls and their callbacks arg
         call_records = []
-        original_handle = agent.handle_input
 
         async def _tracking_handle(text, room_id, **kwargs):
             call_records.append(kwargs.get("callbacks"))

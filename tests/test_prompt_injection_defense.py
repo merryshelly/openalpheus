@@ -58,7 +58,7 @@ class TestInjectionDefenseContent:
 
     def test_warns_about_instruction_injection(self, tmp_path):
         """Defense text warns about instructions embedded in tool output."""
-        prompt = assemble_prompt(tmp_path)
+        assemble_prompt(tmp_path)
         defense = INJECTION_DEFENSE.lower()
         assert "instruction" in defense or "ignore" in defense
 

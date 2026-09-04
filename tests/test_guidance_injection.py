@@ -424,9 +424,7 @@ class TestSubstrateA:
                      tool_calls_this_turn={}, todo_list=[])
         # Fire T1 three times — third should be suppressed
         for _ in range(3):
-            results = eng.evaluate(_state(**base))
-        t1_count = sum(1 for r in [eng]  # placeholder; actual counting below
-                       if False)
+            eng.evaluate(_state(**base))
         # Re-approach: accumulate across evaluations
         eng2 = _engine(tmp_path)
         t1_fires = 0
@@ -885,8 +883,7 @@ class TestTodoWriteC:
 
     def test_C22_activeform_optional(self, tmp_path):
         """§10.C case 22: activeForm is optional and accepted."""
-        config = _cfg(tmp_path)
-        result = execute_tool  # placeholder check
+        _cfg(tmp_path)
         assert "todo_write" in BUILTIN_TOOLS, "todo_write must exist"
         schema = BUILTIN_TOOLS["todo_write"]["parameters"]
         item_props = schema["properties"]["todos"]["items"]["properties"]
@@ -904,7 +901,7 @@ class TestTodoWriteC:
         config = _cfg(tmp_path)
         cb_parent = {"room_id": ROOM}
         cb_sub = {}  # sub-agent has no room_id, separate state
-        r1 = await execute_tool(name="todo_write",
+        await execute_tool(name="todo_write",
                                 input={"todos": [{"content": "Parent", "status": "pending"}]},
                                 tool_config={}, agent_config=config, callbacks=cb_parent)
         r2 = await execute_tool(name="todo_write",

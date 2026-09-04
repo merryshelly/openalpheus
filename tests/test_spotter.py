@@ -1239,7 +1239,6 @@ class TestWatchPassVerdicts:
             for _ in range(20):
                 await asyncio.sleep(0)
 
-        first_delta = payloads[0][-1]["content"]
         second_call_messages = payloads[1]
         # v2 persistent session at pass 2's call: [delta, verdict pair, delta2]
         assert len(second_call_messages) == 4

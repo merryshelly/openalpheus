@@ -312,7 +312,7 @@ class TestCommands:
 
         # Should post a status message
         bot.client.room_send.assert_awaited_once()
-        sent_content = bot.client.room_send.call_args.kwargs.get("content") or bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else None
+        bot.client.room_send.call_args.kwargs.get("content") or bot.client.room_send.call_args[0][2] if len(bot.client.room_send.call_args[0]) > 2 else None
         # Should NOT go through agent.handle_input
         agent.handle_input.assert_not_called()
 
