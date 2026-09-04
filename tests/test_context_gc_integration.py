@@ -500,6 +500,31 @@ class TestSlashAuditFixes:
         assert "handoff is disabled" in sent
         assert "hard epoch" in sent
 
+    def test_cache_gc_returns_error_usage_response(self, tmp_path):
+        """audit-fix (kdsn.322.9, spec 3.4): /cache gc returns an is_error
+        usage response naming the deprecation and steering to /cache
+        handoff — the established error shape for slash errors (an
+        m.text reply via self.send, like the other usage errors), not a
+        bare m.notice. NO boundary of any kind is applied."""
+        bot, agent = self._bot(tmp_path)
+        log = self._seeded_room(bot, agent)
+        n_before = len(log.read(ROOM))
+        room = MagicMock()
+        room.room_id = ROOM
+        asyncio.new_event_loop().run_until_complete(
+            bot._handle_room_message(room, _event("/cache gc")))
+        dep = [c for c in self._send_contents(bot)
+               if "deprecated" in c.get("body", "")]
+        assert dep, "the deprecation response must reach the room"
+        body = dep[0].get("body", "")
+        assert "/cache handoff" in body, "steers to the new command"
+        assert dep[0].get("msgtype") == "m.text", (
+            "is_error usage responses are operator replies (m.text), not "
+            "bare notices")
+        entries = log.read(ROOM)
+        assert len(entries) == n_before, "no boundary is applied"
+        assert not any(e.get("event") in ("handoff_boundary", "toolstrip")
+                       for e in entries)
 # ============================================================================
 # Real-path agent-loop pinning (workspace-kdsn.305.2, authored post-305 build).
 # Canonical pattern per tests/test_guidance_integration.py: REAL Agent + REAL

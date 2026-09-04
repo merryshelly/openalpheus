@@ -3291,10 +3291,13 @@ class MatrixBot:
             value = parts[1].strip().lower()
             if value == "gc":
                 # kdsn.322: the context-handoff rework retired /cache gc —
-                # the boundary command is /cache handoff now. Steer to the
-                # new spelling; NO boundary is applied on the deprecated
-                # one.
-                await self.send_notice(
+                # the boundary command is /cache handoff now.
+                # audit-fix (kdsn.322.9, spec §3.4): the deprecation is an
+                # is_error usage response — the established error shape for
+                # slash errors (an m.text operator reply via self.send,
+                # like the other usage errors), not a bare notice. NO
+                # boundary is applied on the deprecated one.
+                await self.send(
                     room_id,
                     "⚠️ /cache gc is deprecated — use /cache handoff "
                     "(the context-handoff rework, kdsn.322).",
