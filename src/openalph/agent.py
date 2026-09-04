@@ -458,9 +458,23 @@ class Agent:
         self._engine_for(room_id).reset()
         self._gc_fail_strikes[room_id] = 0
         self._gc_last_runway[room_id] = self._handoff_runway_fraction(res.get("manifest"))
-        # An APPLIED boundary that was never proven unproductive re-arms the
-        # auto tier (the churn guard only latches on evidence of failure).
-        self._gc_auto_uncleared.pop(room_id, None)
+        # An APPLIED boundary re-arms the auto tier ONLY if it cleared the
+        # auto threshold (audit kdsn.322.9: the unconditional pop let a
+        # mid-turn hard/tool/slash boundary re-arm a churn-latched auto tier
+        # whose wedge state persists — one boundary + snapshot per turn,
+        # unbounded JSONL growth). Same arithmetic as the auto tier:
+        # post-boundary inclusive estimate < auto threshold. Fail-soft — on
+        # any estimation failure the pre-existing latch state stands.
+        try:
+            _limit = self._resolve_model_limit(room_id)
+            _available = self._effective_available(_limit)
+            _threshold = int(_available
+                             * self.config.context.auto_pct / 100)
+            if self._estimate_context_tokens(room_id) < _threshold:
+                self._gc_auto_uncleared.pop(room_id, None)
+        except Exception as e:  # fail-soft: the latch state stands
+            logger.debug("churn-guard re-arm check failed for %s: %s",
+                         room_id, e)
 
     def _handoff_runway_fraction(self, manifest: object) -> float:
         """Post-boundary runway consumption fraction (kdsn.305.12 D5).

@@ -297,7 +297,21 @@ class ReminderEngine:
                     "session must re-read. At the auto threshold ALL "
                     "pre-boundary context is removed; progress.md + "
                     "durable-set are the only carryover. Spend your next "
-                    "actions on checkpointing, not new work."
+                    "actions on checkpointing, not new work.\n"
+                    "Isolated cage (no template mounts)? Reproduce these "
+                    "skeletons.\n"
+                    "progress.md:\n"
+                    "# <project> — Continuity\n"
+                    "## State\n(what exists and works now; every claim "
+                    "carries its verifying command + expected output)\n"
+                    "## Decisions\n(what was decided and why)\n"
+                    "## Next\n(immediate next steps, bead refs)\n"
+                    "durable-set.toml:\n"
+                    "[[entries]]\n"
+                    "path = \"memory/projects/<project>/<file>\"\n"
+                    "reason = \"why a post-boundary session must re-read it\"\n"
+                    "(progress.md and durable-set.toml are auto-injected — "
+                    "do not list them.)"
                 ),
             ))
 

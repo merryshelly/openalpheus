@@ -134,6 +134,12 @@ class TestCheckpointTrigger:
         for needle in ("set_active_project", "progress.md", "durable-set.toml"):
             assert needle in text, f"directive must steer to {needle!r}"
         assert "memory/projects/" in text, "directive must name the scaffold path"
+        # spec §3.2 "Template availability" (SB-ratified): cages have no /srv
+        # mount — "the inline skeleton is the guarantee". The directive must
+        # EMBED condensed skeletons for both artifacts.
+        for needle in ("## State", "## Decisions", "## Next",
+                       "[[entries]]", "path =", "reason =", "auto-injected"):
+            assert needle in text, f"directive must embed the skeleton piece {needle!r}"
         # the old tool-note seam is DELETED (spec §4 feedback item 4)
         assert "context_gc" not in text
         assert "context_handoff" not in text, (

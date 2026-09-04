@@ -308,9 +308,12 @@ async def run_subagent(
     #     threshold at or below zero would fire every iteration.
     _gc_cfg = getattr(config, "context", None)
     # Documented default is GC-on; production configs always carry the
-    # [context] dataclass default (handoff_enabled=True), so the fallback
-    # here only matters for context-less config objects (test harnesses).
-    _gc_enabled = bool(getattr(_gc_cfg, "handoff_enabled", True))
+    # [context] dataclass default (handoff_enabled=True). For context-less
+    # config objects (test harnesses) we fail CLOSED — the same fallback as
+    # the driver (handoff.py) and the callbacks seam: a mock config must not
+    # get a stripping sub loop while the parent loop has boundaries disabled
+    # (audit: kill-switch fallback asymmetry, kdsn.322.9).
+    _gc_enabled = bool(getattr(_gc_cfg, "handoff_enabled", False))
     _gc_boundary_count = 0
     _gc_latched = False
     _gc_threshold = 0

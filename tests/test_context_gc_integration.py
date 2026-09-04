@@ -548,6 +548,41 @@ class TestSlashAuditFixes:
                          for c in self._send_contents(bot))
         assert "(trigger: slash)" in sent, (
             "the operator confirmation names the spec trigger")
+
+    def test_churn_guard_rearm_only_on_cleared(self, tmp_path):
+        """audit-fix (kdsn.322.9): the applied-boundary seam must re-arm the
+        auto tier's churn latch ONLY when the boundary actually cleared the
+        auto threshold. The unconditional pop let a mid-turn hard/tool/slash
+        boundary re-arm a latched auto tier whose wedge state (durable
+        package >= threshold) persists — one boundary + snapshot per turn,
+        unbounded JSONL growth."""
+        bot, agent = self._bot(tmp_path)
+        room = ROOM
+        agent.config.model_max_tokens = 8000
+        agent.config.max_tokens = 100
+        # Threshold must sit BETWEEN the empty-history base (system prompt +
+        # tool defs — real context the boundary cannot strip) and base plus
+        # the seeded message: base < threshold < base + message.
+        base = agent._estimate_context_tokens(room)
+        available = agent._effective_available(8000)
+        agent.config.context.auto_pct = min(
+            99.0, (base + 500) * 100.0 / available)
+        # Wedge state: latch set, live history above the auto threshold.
+        agent._gc_auto_uncleared[room] = True
+        agent.history(room).append({"role": "user", "content": "x" * 4000})
+        agent._note_handoff_boundary_applied(
+            room, {"applied": True, "manifest": None})
+        assert agent._gc_auto_uncleared.get(room) is True, (
+            "a boundary that did NOT clear the auto threshold must leave "
+            "the churn latch set (re-arm only on cleared)")
+        # A later boundary that clears the threshold re-arms the tier.
+        agent.history(room).clear()
+        agent._note_handoff_boundary_applied(
+            room, {"applied": True, "manifest": None})
+        assert not agent._gc_auto_uncleared.get(room), (
+            "a boundary that cleared the auto threshold must re-arm the "
+            "auto tier (pop the churn latch)")
+
 # ============================================================================
 # Real-path agent-loop pinning (workspace-kdsn.305.2, authored post-305 build).
 # Canonical pattern per tests/test_guidance_integration.py: REAL Agent + REAL
