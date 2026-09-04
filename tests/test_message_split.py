@@ -260,7 +260,7 @@ class TestFenceRepair(unittest.TestCase):
             content = chunk.replace("\n\n[\u2026continued]", "").replace("[\u2026continued]\n\n", "")
             # Should not contain standalone ``` (repair artifacts)
             lines = content.split("\n")
-            fence_lines = [l for l in lines if l.strip() == "```"]
+            fence_lines = [line for line in lines if line.strip() == "```"]
             self.assertEqual(len(fence_lines), 0,
                              f"Should have no fence artifacts:\n{chunk}")
 

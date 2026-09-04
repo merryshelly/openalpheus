@@ -366,7 +366,7 @@ class TestTermination:
         assert executed == []  # sibling NOT executed (G2 terminate-and-ignore)
         assert st.passes == 1
         assert st.last_status == "flag"
-        led = [json.loads(l) for l in
+        led = [json.loads(line) for line in
                (tmp_path / "sessions/spotters/r_1.ledger.jsonl").read_text().splitlines()]
         flag_events = [e for e in led if e["event"] == "flag"]
         assert flag_events and flag_events[0].get("siblings_ignored") == 1
@@ -462,7 +462,7 @@ class TestTermination:
         await _drain()
         st = mgr.ensure_state("!r:1")
         assert st.last_status == "parse_error"
-        led = [json.loads(l) for l in
+        led = [json.loads(line) for line in
                (tmp_path / "sessions/spotters/r_1.ledger.jsonl").read_text().splitlines()]
         assert led[-1]["event"] == "pass" and led[-1]["status"] == "parse_error"
 
@@ -755,7 +755,7 @@ class TestContextGCInheritance:
         assert any(m.get("role") == "assistant" and m.get("tool_calls")
                    for m in st.messages)
         # transcript gained a gc_boundary manifest (JSONL append-only)
-        events = [json.loads(l) for l in
+        events = [json.loads(line) for line in
                   (tmp_path / "sessions/spotters/r_1.jsonl").read_text().splitlines()]
         assert any(e.get("event") == "gc_boundary" for e in events)
 
@@ -924,7 +924,7 @@ class TestTelemetry:
         mgr.op_start("!r:1")
         mgr.maybe_fire("!r:1", hist, None, {})
         await _drain()
-        led = [json.loads(l) for l in
+        led = [json.loads(line) for line in
                (tmp_path / "sessions/spotters/r_1.ledger.jsonl").read_text().splitlines()]
         ev = led[-1]
         for field_ in ("fallback", "forced", "siblings_ignored", "narration_turns"):
@@ -939,7 +939,7 @@ class TestTelemetry:
         mgr.op_start("!r:1")
         mgr.maybe_fire("!r:1", hist, None, {})
         await _drain()
-        led = [json.loads(l) for l in
+        led = [json.loads(line) for line in
                (tmp_path / "sessions/spotters/r_1.ledger.jsonl").read_text().splitlines()]
         flag_ev = [e for e in led if e["event"] == "flag"][0]
         assert flag_ev["wrapper_type"] == "tool-call"

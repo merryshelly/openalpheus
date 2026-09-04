@@ -349,8 +349,8 @@ class TestStopReasonLogging:
     def _read_turn_log(self, config):
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         log_file = Path(config.workspace) / "logs" / f"{config.name}-{date_str}.jsonl"
-        lines = [l for l in log_file.read_text().splitlines() if l.strip()]
-        return [json.loads(l) for l in lines]
+        lines = [line for line in log_file.read_text().splitlines() if line.strip()]
+        return [json.loads(line) for line in lines]
 
     @pytest.mark.asyncio
     async def test_stop_reason_logged_for_text_turn(self, tmp_path):

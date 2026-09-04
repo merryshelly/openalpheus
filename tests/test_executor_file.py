@@ -52,7 +52,7 @@ class TestReadFile:
         f = tmp_path / "test.txt"
         f.write_text("line1\nline2\nline3\nline4\n")
         result = await read_file(str(f), limit=2)
-        lines = [l for l in result.content.strip().split("\n") if l]
+        lines = [line for line in result.content.strip().split("\n") if line]
         assert len(lines) == 2
 
     @pytest.mark.asyncio

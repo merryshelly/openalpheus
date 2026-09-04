@@ -405,7 +405,7 @@ class TestMessageFormat:
             await asyncio.gather(*bot._background_tasks)
 
         message = agent.handle_input.call_args[0][0]
-        lines = [l for l in message.strip().split("\n") if l.strip()]
+        lines = [line for line in message.strip().split("\n") if line.strip()]
         # Should only be the bracket-tag line, no caption
         assert len(lines) == 1
 

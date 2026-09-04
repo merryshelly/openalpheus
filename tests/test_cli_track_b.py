@@ -174,7 +174,7 @@ class TestConfigurableTruncation:
         await _process_cli_line(
             agent, sl, {}, "_cli", config, "run", truncate_limit=50)
         captured = capsys.readouterr()
-        notice_line = [l for l in captured.err.split('\n') if '🔧' in l]
+        notice_line = [line for line in captured.err.split('\n') if '🔧' in line]
         assert len(notice_line) > 0
         preview = notice_line[0].split("(ok) ")[-1] if "(ok) " in notice_line[0] else ""
         assert len(preview) <= 51

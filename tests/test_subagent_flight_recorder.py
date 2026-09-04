@@ -101,7 +101,7 @@ def _metrics_dir(workspace):
 
 
 def _read_jsonl(path):
-    return [json.loads(l) for l in path.read_text().strip().splitlines()]
+    return [json.loads(line) for line in path.read_text().strip().splitlines()]
 
 
 # =============================================================================

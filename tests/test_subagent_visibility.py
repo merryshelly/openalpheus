@@ -103,7 +103,7 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         # Last entry should be a summary
         summary = lines[-1]
@@ -129,10 +129,10 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         # Should have: iteration 0, iteration 1, summary
-        iteration_entries = [l for l in lines if l["event"] == "iteration"]
+        iteration_entries = [line for line in lines if line["event"] == "iteration"]
         assert len(iteration_entries) == 2
         assert iteration_entries[0]["iteration"] == 0
         assert iteration_entries[1]["iteration"] == 1
@@ -161,9 +161,9 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
-        iteration_entry = [l for l in lines if l["event"] == "iteration"][0]
+        iteration_entry = [line for line in lines if line["event"] == "iteration"][0]
         assert set(iteration_entry["tools_called"]) == {"shell", "file_read"}
 
     @pytest.mark.asyncio
@@ -182,9 +182,9 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
-        iteration_entry = [l for l in lines if l["event"] == "iteration"][0]
+        iteration_entry = [line for line in lines if line["event"] == "iteration"][0]
         assert iteration_entry["errors"] == 1
 
     @pytest.mark.asyncio
@@ -197,7 +197,7 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         summary = lines[-1]
         assert summary["uncached_input_tokens"] == 150
@@ -220,7 +220,7 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         summary = lines[-1]
         assert summary["total_tool_calls"] == 2
@@ -239,7 +239,7 @@ class TestSubagentLogFile:
         log_files = list(log_dir.glob("*.jsonl"))
         assert len(log_files) == 1
 
-        lines = [json.loads(l) for l in log_files[0].read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_files[0].read_text().strip().splitlines()]
         summary = lines[-1]
         assert summary["event"] == "summary"
         assert summary["status"] == "error"
@@ -271,7 +271,7 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         summary = lines[-1]
         assert summary["event"] == "summary"
@@ -303,7 +303,7 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         summary = lines[-1]
         assert summary["model"] == "openrouter/kimi-k2.5"
@@ -324,9 +324,9 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
-        iteration_entry = [l for l in lines if l["event"] == "iteration"][0]
+        iteration_entry = [line for line in lines if line["event"] == "iteration"][0]
         assert "context_tokens" in iteration_entry
         assert iteration_entry["context_tokens"] > 0
 
@@ -347,14 +347,14 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         summary = lines[-1]
         assert "peak_context_tokens" in summary
         assert summary["peak_context_tokens"] > 0
 
         # Peak should be >= the last iteration's context tokens
-        iterations = [l for l in lines if l["event"] == "iteration"]
+        iterations = [line for line in lines if line["event"] == "iteration"]
         assert summary["peak_context_tokens"] >= iterations[-1]["context_tokens"]
 
     @pytest.mark.asyncio
@@ -374,9 +374,9 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
-        iterations = [l for l in lines if l["event"] == "iteration"]
+        iterations = [line for line in lines if line["event"] == "iteration"]
         assert len(iterations) == 2
         # Second iteration should have more context than first
         assert iterations[1]["context_tokens"] > iterations[0]["context_tokens"]
@@ -391,7 +391,7 @@ class TestSubagentLogFile:
 
         log_dir = tmp_path / "logs" / "subagents"
         log_file = list(log_dir.glob("*.jsonl"))[0]
-        lines = [json.loads(l) for l in log_file.read_text().strip().splitlines()]
+        lines = [json.loads(line) for line in log_file.read_text().strip().splitlines()]
 
         summary = lines[-1]
         assert summary["task"] == "Build the widget factory"
