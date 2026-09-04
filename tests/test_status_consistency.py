@@ -297,27 +297,3 @@ class TestStatusConsistency:
             f"{cs['context_remaining']} != {cs['context_max']} - {cs['context_tokens']}"
         )
 
-    def test_toolstrip_reduces_count(self, tmp_path):
-        """Sanity: count WITH toolstrip marker < count WITHOUT it.
-
-        Proves the consistency test exercises toolstrip-awareness (not trivially true).
-        """
-        with patch("openalph.agent.assemble_prompt", return_value="system prompt"):
-            agent = Agent(make_agent_config(tmp_path))
-
-        sl = SessionLog(workspace=tmp_path, agent_user_id=AGENT_USER)
-        strip_idx = _build_session(tmp_path, sl)
-
-        # Count WITHOUT strip
-        count_before = agent._estimate_context_tokens(ROOM, history=sl.build_context(ROOM))
-
-        # Apply toolstrip
-        _append_toolstrip(sl, strip_idx)
-
-        # Count WITH strip
-        count_after = agent._estimate_context_tokens(ROOM, history=sl.build_context(ROOM))
-
-        assert count_after < count_before, (
-            f"Toolstrip should reduce context count: "
-            f"before={count_before}, after={count_after}"
-        )

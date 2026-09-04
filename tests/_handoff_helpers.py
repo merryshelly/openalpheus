@@ -80,3 +80,72 @@ def scan_src_for_tokens(tokens, suffix=".py"):
                         (str(p.relative_to(SRC_ROOT)), i, line.strip()))
                     break
     return hits
+
+
+# ---------------------------------------------------------------------------
+# Session/entry builders shared by the strip + checkpoint + toolslash suites
+# (compact port of the kdsn.305 suites' builder style)
+# ---------------------------------------------------------------------------
+
+ROOM = "!handoff:matrix.local"
+AGENT_ID = "@handoff-agent:matrix.local"
+
+
+def user(content, source=None, **kw):
+    d = {"role": "user", "content": content}
+    if source is not None:
+        d["source"] = source
+    d.update(kw)
+    return d
+
+
+def assistant(content="", tool_calls=None, thinking=None, **kw):
+    d = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        d["tool_calls"] = tool_calls
+    if thinking is not None:
+        d["thinking"] = thinking
+    d.update(kw)
+    return d
+
+
+def tc(call_id, name, input=None):
+    return {"call_id": call_id, "name": name,
+            "input": input if input is not None else {}}
+
+
+def tool(call_id, name, output, is_error=False, **kw):
+    d = {"role": "tool", "call_id": call_id, "name": name,
+         "output": output}
+    if is_error:
+        d["is_error"] = True
+    d.update(kw)
+    return d
+
+
+def make_log(tmp_path, handoff_default=True):
+    """SessionLog wired for the handoff render (kwarg renamed at T1)."""
+    from openalph.session import SessionLog
+    return SessionLog(tmp_path, AGENT_ID, handoff_default=handoff_default)
+
+
+def append_all(log, entries, room=ROOM):
+    for e in entries:
+        role = e["role"]
+        kw = {k: v for k, v in e.items() if k not in ("role",)}
+        log.append(role=role, sender=AGENT_ID, room=room, **kw)
+
+
+def marker(log, event, entry_index, detail=None, room=ROOM):
+    """Append a boundary-style system marker (old or new event name)."""
+    kw = {"event": event, "entry_index": entry_index}
+    if detail is not None:
+        kw["detail"] = detail
+    log.append(role="system", sender=AGENT_ID, room=room, **kw)
+
+
+def parse_ts(ts):
+    """Parse a session ts ("...Z" ISO 8601 UTC) to an epoch float."""
+    from datetime import datetime, timezone
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc).timestamp()

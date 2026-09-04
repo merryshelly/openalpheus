@@ -204,7 +204,7 @@ class TestGCTool:
         res = asyncio.new_event_loop().run_until_complete(
             execute_tool("context_gc", {}, None,
                          {"room_id": "__sub__",
-                          "apply_gc_boundary": AsyncMock(return_value={})}))
+                          "apply_handoff_boundary": AsyncMock(return_value={})}))
         assert res.is_error and "subagent" in res.content.lower()
 
     def test_success_returns_summary(self):
@@ -219,7 +219,7 @@ class TestGCTool:
                                      "manifest": manifest, "over_budget": False})
         res = asyncio.new_event_loop().run_until_complete(
             execute_tool("context_gc", {}, None,
-                         {"room_id": ROOM, "apply_gc_boundary": cb}))
+                         {"room_id": ROOM, "apply_handoff_boundary": cb}))
         assert not res.is_error
         assert "12" in res.content and "40000" in res.content
         cb.assert_awaited_once()
@@ -231,7 +231,7 @@ class TestGCTool:
                                      "manifest": None, "over_budget": False})
         res = asyncio.new_event_loop().run_until_complete(
             execute_tool("context_gc", {}, None,
-                         {"room_id": ROOM, "apply_gc_boundary": cb}))
+                         {"room_id": ROOM, "apply_handoff_boundary": cb}))
         assert res.is_error
         assert "cooldown" in res.content
 
@@ -369,8 +369,8 @@ class TestMatrixCommands:
             bot._handle_room_message(room, _event("/cache gc")))
 
         entries = log.read(ROOM)
-        assert any(e.get("event") == "gc_boundary" for e in entries)
-        assert any(e.get("source") == "gc_snapshot" for e in entries)
+        assert any(e.get("event") == "handoff_boundary" for e in entries)
+        assert any(e.get("source") == "handoff_snapshot" for e in entries)
         assert id(agent.history(ROOM)) == ident_before, \
             "in-memory history must be rebuilt IN PLACE (same object identity)"
         sent = "\n".join(self._send_texts(bot))
@@ -381,16 +381,16 @@ class TestMatrixCommands:
         log = bot.session_log
         log.append(room=ROOM, sender=AGENT_ID, role="user", content="q")
         log.append(room=ROOM, sender=AGENT_ID, role="system",
-                   event="gc_boundary", entry_index=1, detail=json.dumps({
+                   event="handoff_boundary", entry_index=1, detail=json.dumps({
                        "ts": "T", "boundary_index": 1, "trigger": "manual",
-                       "classes": {}, "tokens_before": 10, "tokens_after_est": 5,
+                       "tokens_before": 10, "tokens_after_est": 0,
                        "durable": {}, "errors": []}))
         room = MagicMock()
         room.room_id = ROOM
         asyncio.new_event_loop().run_until_complete(
             bot._handle_room_message(room, _event("/cache")))
         sent = "\n".join(self._send_texts(bot))
-        assert "GC boundary" in sent and "1" in sent
+        assert "boundary" in sent and "1" in sent
 
     def test_project_set_and_status(self, tmp_path):
         bot, agent = self._bot(tmp_path)
@@ -583,15 +583,19 @@ class TestGCAutoTierRealPath:
             _run_turn(bot)
 
         marks = [e for e in bot.session_log.read(GC_ROOM)
-                 if e.get("role") == "system" and e.get("event") == "gc_boundary"]
+                 if e.get("role") == "system" and e.get("event") == "handoff_boundary"]
         assert len(marks) == 1
         assert _json.loads(marks[0]["detail"])["trigger"] == "auto"
         assert id(agent.history(GC_ROOM)) == ident_before, \
             "history must be rebuilt IN PLACE (same object identity)"
         h_after = agent.history(GC_ROOM)
         assert _big_outputs(h_after, 60000) == 0
-        assert any("expunged at GC boundary" in str(m.get("content", ""))
+        # Full strip (kdsn.322): pre-boundary bulk DROPPED wholesale, the
+        # snapshot is the only carryover, no pointer placeholders exist.
+        assert any("durable context snapshot" in str(m.get("content", ""))
                    for m in h_after)
+        assert not any("expunged" in str(m.get("content", ""))
+                       for m in h_after)
         # turn completed: second stream call happened, its text was delivered
         assert state.get("stream_calls", 0) >= 2
         sent = []
@@ -612,7 +616,7 @@ class TestGCAutoTierRealPath:
         state = {}
         with patch("openalph.agent.stream", _gc_stream(state)):
             _run_turn(bot)
-        assert not any(e.get("event") == "gc_boundary"
+        assert not any(e.get("event") == "handoff_boundary"
                        for e in bot.session_log.read(GC_ROOM))
         assert id(agent.history(GC_ROOM)) == ident_before
         assert _big_outputs(agent.history(GC_ROOM), 60000) >= 6, \
@@ -646,7 +650,7 @@ class TestGCHardTierRealPath:
             _run_turn(bot)
 
         marks = [e for e in bot.session_log.read(GC_ROOM)
-                 if e.get("role") == "system" and e.get("event") == "gc_boundary"]
+                 if e.get("role") == "system" and e.get("event") == "handoff_boundary"]
         assert marks, "in-loop guard trip must apply a hard boundary"
         assert _json.loads(marks[-1]["detail"])["trigger"] == "hard"
         assert state.get("stream_calls", 0) >= 2, "turn must continue to completion"
@@ -654,8 +658,12 @@ class TestGCHardTierRealPath:
         assert len(payloads) >= 2
         second_texts = [str(m.get("content", "")) for m in payloads[1]
                         if isinstance(m.get("content"), str)]
-        assert any("expunged at GC boundary" in t for t in second_texts), \
-            "the continued turn must see the pointer-ized history"
+        # Full strip: the continued turn carries the snapshot, not the
+        # pointer-ized bulk (no placeholders) and not the huge in-loop result.
+        assert any("durable context snapshot" in t2 for t2 in second_texts), \
+            "the continued turn must see the handoff snapshot"
+        assert not any("expunged" in t2 for t2 in second_texts)
+        assert not any("y" * 1000 in t2 for t2 in second_texts)
 
     def test_hard_tier_three_strikes_then_raises(self, tmp_path):
         bot, agent = self._trip_setup(tmp_path)
@@ -714,5 +722,5 @@ class TestGCHardTierRealPath:
         assert agent._gc_fail_strikes.get(GC_ROOM, 0) == 0, \
             "an applied boundary (any trigger) must reset the strike counter"
         marks = [e for e in bot.session_log.read(GC_ROOM)
-                 if e.get("role") == "system" and e.get("event") == "gc_boundary"]
+                 if e.get("role") == "system" and e.get("event") == "handoff_boundary"]
         assert _json.loads(marks[-1]["detail"])["trigger"] in ("auto", "hard")

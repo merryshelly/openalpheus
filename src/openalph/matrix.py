@@ -36,12 +36,10 @@ from nio import (
 )
 
 from openalph.agent import ContextOverflowError as AgentOverflowError
-from openalph.context_gc import (
-    GC_EVENT,
-    LEGACY_EVENT,
+from openalph.handoff import (
+    HANDOFF_EVENT,
     ACTIVE_PROJECT_EVENT,
     apply_boundary_and_rebuild,
-    gc_thinking_tail_kwargs,
     project_echo_text,
     read_active_project,
 )
@@ -199,16 +197,17 @@ def _escape_capped(text: str, raw_cap: int, esc_cap: int) -> str:
 # context_gc.apply_boundary (the ONLY boundary writer).
 
 def _gc_boundary_state(entries):
-    """(index, trigger) of the LATEST boundary marker (gc_boundary AND legacy
-    toolstrip kinds) in raw JSONL entries; (None, None) when there is none.
+    """(index, trigger) of the LATEST handoff boundary marker in raw JSONL
+    entries; (None, None) when there is none.
 
-    The trigger is read from the gc_boundary manifest (detail JSON); legacy
-    toolstrip markers (which carry no detail) surface as "toolstrip".
+    The trigger is read from the handoff_boundary manifest (detail JSON).
+    Hard epoch: legacy gc_boundary/toolstrip markers are NOT handoff
+    boundaries and are not counted here.
     """
     best = -1
     trigger = None
     for entry in entries:
-        if entry.get("role") != "system" or entry.get("event") not in (GC_EVENT, LEGACY_EVENT):
+        if entry.get("role") != "system" or entry.get("event") != HANDOFF_EVENT:
             continue
         try:
             idx = int(entry.get("entry_index", -1))
@@ -216,20 +215,17 @@ def _gc_boundary_state(entries):
             idx = -1
         if idx > best:
             best = idx
-            if entry.get("event") == GC_EVENT:
-                trigger = None
-                detail = entry.get("detail")
-                if isinstance(detail, str):
-                    try:
-                        manifest = json.loads(detail)
-                        if isinstance(manifest, dict) and isinstance(manifest.get("trigger"), str):
-                            trigger = manifest["trigger"]
-                    except json.JSONDecodeError:
-                        trigger = None
-                if trigger is None:
-                    trigger = "unknown"
-            else:
-                trigger = "toolstrip"
+            trigger = None
+            detail = entry.get("detail")
+            if isinstance(detail, str):
+                try:
+                    manifest = json.loads(detail)
+                    if isinstance(manifest, dict) and isinstance(manifest.get("trigger"), str):
+                        trigger = manifest["trigger"]
+                except json.JSONDecodeError:
+                    trigger = None
+            if trigger is None:
+                trigger = "unknown"
     if best < 0:
         return None, None
     return best, trigger
@@ -242,20 +238,17 @@ def _gc_boundary_state(entries):
 def _gc_confirm_text(outcome, trigger):
     """Operator-facing confirmation for an APPLIED boundary."""
     manifest = outcome.get("manifest") or {}
-    classes = manifest.get("classes") or {}
     durable = manifest.get("durable") or {}
     used = durable.get("used_tokens", 0)
     budget = durable.get("budget_tokens", 0)
+    files = durable.get("files") or []
     over = (" — over reinjection budget (informational)"
             if outcome.get("over_budget") else "")
     return (
-        f"✅ GC boundary {manifest.get('boundary_index', '?')} applied "
+        f"✅ Handoff boundary {manifest.get('boundary_index', '?')} applied "
         f"(trigger: {trigger}). "
-        f"Stripped pre-boundary: "
-        f"tools={classes.get('tools', 0)}, "
-        f"thinking={classes.get('thinking', 0)}, "
-        f"inputs={classes.get('inputs', 0)}, "
-        f"media={classes.get('media', 0)}. "
+        f"Full strip: all pre-boundary content dropped; "
+        f"{len(files)} durable file(s) re-injected. "
         f"Tokens {manifest.get('tokens_before', 0)} → "
         f"{manifest.get('tokens_after_est', 0)} (est.). "
         f"Durable budget {used}/{budget} tokens{over}."
@@ -470,7 +463,7 @@ class MatrixBot:
                 # GC flag — build_context without the kwarg now follows
                 # this default instead of silently resurrecting expunged
                 # content after a restart.
-                gc_default=getattr(config, "context", None) is not None
+                handoff_default=getattr(config, "context", None) is not None
                 and config.context.handoff_enabled,
             )
             self.heartbeat = HeartbeatManager(
@@ -2148,9 +2141,8 @@ class MatrixBot:
                 # Restore context from session log
                 history = self.agent.history(room_id)
                 history.clear()
-                _tt_kw = gc_thinking_tail_kwargs(self.agent.config)
                 history.extend(session_log.build_context(
-                    room_id, **_tt_kw))
+                    room_id))
                 self.agent.restore_usage(room_id, session_log.usage_totals(room_id))
 
                 # R1-4: Rehydrate per-room reminder engine fired-state from JSONL
@@ -2365,9 +2357,8 @@ class MatrixBot:
             if gated and room_id in self._active_rooms and self.session_log:
                 history = self.agent.history(room_id)
                 history.clear()
-                _tt_kw = gc_thinking_tail_kwargs(self.agent.config)
                 history.extend(self.session_log.build_context(
-                    room_id, **_tt_kw))
+                    room_id))
                 logger.info("Hydrated context for %s: %d entries", room_id, len(history))
                 user_already_in_history = True
             # --- End mention gating ---
@@ -2727,8 +2718,7 @@ class MatrixBot:
                     _sh = None
                     if getattr(self, 'session_log', None):
                         _sh = self.session_log.build_context(
-                            room_id, **gc_thinking_tail_kwargs(
-                                self.agent.config))
+                            room_id)
                     _status = self.agent.status(room_id, history=_sh)
                     _pct = _status.get("context_pct", 0)
                     if _pct >= 80:
@@ -3177,7 +3167,7 @@ class MatrixBot:
             _status_history = None
             if getattr(self, 'session_log', None):
                 _status_history = self.session_log.build_context(
-                    room_id, **gc_thinking_tail_kwargs(self.agent.config))
+                    room_id)
             status = self.agent.status(room_id, history=_status_history)
             ctx = status['context_tokens']
             ctx_max = status['context_max']
@@ -3396,9 +3386,8 @@ class MatrixBot:
                         # Refresh in-memory history to reflect the strip
                         history = self.agent.history(room_id)
                         history.clear()
-                        _tt_kw = gc_thinking_tail_kwargs(self.agent.config)
                         history.extend(self.session_log.build_context(
-                            room_id, **_tt_kw))
+                            room_id))
                         msg = f"Toolstrip applied. Stripped {new_count} tool results (~{new_chars:,} chars) from context."
                         msg += "\n⚠️ Previously loaded skills were stripped — re-read any skills needed for ongoing work."
                         await self.send(room_id, msg)

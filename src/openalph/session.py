@@ -17,17 +17,10 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openalph.context_gc import (
-    GC_EVENT,
-    MEDIA_TAG_RE,
-    _marker_indexes,
-    GC_SNAPSHOT_SOURCE,
-    LEGACY_EVENT,
+from openalph.handoff import (
+    HANDOFF_EVENT,
+    HANDOFF_SNAPSHOT_SOURCE,
     current_boundary_index,
-    strip_thinking_entry,
-    thinking_tail_indices,
-    tool_pointer,
-    legacy_tool_placeholder,
 )
 from openalph.provider import ToolCall
 from openalph.spotter import frame_spotter_flag
@@ -48,23 +41,23 @@ class SessionLog:
     """
 
     def __init__(self, workspace: str | Path, agent_user_id: str,
-                 *, gc_default: bool = False):
+                 *, handoff_default: bool = False):
         """Initialize session log.
 
         Args:
             workspace: Agent workspace directory (sessions/ created inside it)
             agent_user_id: Matrix user ID of the agent (e.g. @watson:matrix.local)
-            gc_default: Default GC render mode for build_context when called
-                without an explicit ``gc_enabled`` kwarg (audit: restart
-                hydration / status / CLI call sites omitted the flag,
-                resurrecting expunged content and superseded snapshots after
-                every restart). Wired from ``config.context.handoff_enabled``
-                by
-                the transports; tests construct with the default (legacy).
+            handoff_default: Default handoff render mode for build_context
+                when called without an explicit ``handoff_enabled`` kwarg
+                (audit: restart hydration / status / CLI call sites omitted
+                the flag, resurrecting pre-boundary content after every
+                restart). Wired from ``config.context.handoff_enabled`` by the
+                transports; tests construct with the default (legacy full
+                render).
         """
         self.workspace = Path(workspace)
         self.agent_user_id = agent_user_id
-        self.gc_default = gc_default
+        self.handoff_default = handoff_default
         self._sessions_dir = self.workspace / "sessions"
 
     def _room_id_safe(self, room_id: str) -> str:
@@ -314,10 +307,8 @@ class SessionLog:
 
     def build_context(
         self, room_id: str, *, skip_system: bool = True,
-        gc_enabled: bool | None = None,
-        gc_preserve_trailing: bool = False,
-        thinking_tail_turns: int = 0,
-        thinking_tail_max_tokens: int = 0,
+        handoff_enabled: bool | None = None,
+        preserve_trailing: bool = False,
     ) -> list[dict]:
         """Build LLM conversation context from JSONL entries.
 
@@ -330,100 +321,73 @@ class SessionLog:
         Args:
             room_id: Matrix room ID
             skip_system: If True (default), exclude system entries.
-            gc_enabled: Unified GC boundary transform (workspace-kdsn.305).
-                When False (default) rendering is byte-identical to the
-                legacy toolstrip behavior.  When True, every entry at a
-                JSONL position below the current boundary index (both GC
-                and legacy markers, see context_gc.current_boundary_index)
-                is reduced by the uniform rule: thinking dropped
-                (thought-only assistant entries deleted atomically), tool
-                outputs replaced by pointer-bearing placeholders, media
-                attachments expunged to a placeholder string, and
-                superseded gc_snapshot entries dropped wholesale.  Entries
-                at or above the boundary render exactly as today; a
-                gc_snapshot entry at or above the boundary renders verbatim
-                (already framed and escaped at freeze time — never
-                re-framed).  JSONL entries are NEVER modified; all
-                reduction happens here at render time.
-            thinking_tail_turns / thinking_tail_max_tokens:
-                thinking-tail preservation (workspace-kdsn.305.13 T1/T4).
-                DEFAULT ZERO = FULL STRIP — byte-identical to pre-.13
-                renders for any caller that does not pass them.  When both
-                are non-zero AND gc_enabled with an active boundary, the
-                ``thinking_tail_indices`` selection (newest->oldest,
-                contiguous, chars//4 ceiling) names the pre-boundary
-                assistant positions whose thinking is retained VERBATIM
-                instead of stripped; every other transform for those
-                entries (tool-result pointer, media, orphan repair, …) is
-                unchanged — only the thinking-strip is skipped.  Config
-                values are passed explicitly by the production call sites
-                (the agent render paths and context_gc.apply_boundary_
-                and_rebuild); nothing changes for existing callers.
+            handoff_enabled: Context-handoff full-strip transform
+                (kdsn.322).  When False (default) rendering is the full
+                verbatim render.  When True, every entry at a JSONL position
+                below the current boundary index (handoff_boundary markers
+                only — hard epoch: legacy gc_boundary/toolstrip markers are
+                NOT boundaries, so a pre-migration session renders its full
+                history verbatim) is DROPPED WHOLESALE: no pointer
+                placeholders, no media-expunge strings, no thinking-strip —
+                nothing pre-boundary survives.  Entries at or above the
+                boundary render exactly as today; a handoff_snapshot entry at
+                or above the boundary renders verbatim (already framed and
+                escaped at freeze time — never re-framed).  JSONL entries are
+                NEVER modified; all stripping happens here at render time.
+            preserve_trailing: mid-turn rebuild flag (the live tool loop) —
+                scopes the orphan-recovery pass so the in-flight assistant
+                pair survives until its result lands.
 
         Returns:
             List of message dicts ready for the LLM.
         """
-        if gc_enabled is None:
-            gc_enabled = self.gc_default
+        if handoff_enabled is None:
+            handoff_enabled = self.handoff_default
         entries = self.read(room_id)
         context = []
         # JSONL source position of each rendered message — parallel to
         # ``context``; scopes the post-pass orphan recovery to pre-boundary
-        # entries when the GC transform is active.
+        # entries when the handoff transform is active.
         msg_entry_idx = []
 
-        # Boundary discovery: max entry_index over ALL boundary markers
-        # (GC + legacy toolstrip), or -1 when none.  Entries at JSONL
-        # positions < boundary are reduced (uniform rule when gc_enabled,
-        # legacy stripping otherwise); positions >= boundary are untouched.
+        # Boundary discovery: max entry_index over handoff boundary markers,
+        # or -1 when none.  Hard epoch: legacy gc_boundary/toolstrip markers
+        # are NOT handoff boundaries, so a pre-migration session renders its
+        # full history verbatim (boundary_index stays -1, nothing is dropped).
         boundary_index = current_boundary_index(entries)
-        # All marker indexes (ascending) — a pre-boundary tool result was
-        # expunged by the FIRST boundary above it; its pointer must carry
-        # THAT id, not the newest boundary (wave-2.1 A1, wonmun canary).
-        _marker_list = _marker_indexes(entries) if gc_enabled else []
-        # Thinking-tail retention (workspace-kdsn.305.13 T1): computed ONCE
-        # per render, only when the tail can actually apply (gc_enabled +
-        # active boundary + both knobs non-zero).  Positions whose thinking
-        # is retained VERBATIM (pre-boundary span); empty = legacy full
-        # strip.  session.py renders by enumerate position, so the set keys
-        # onto entry_idx directly.
-        retained_tail = (
-            thinking_tail_indices(
-                entries, boundary_index,
-                thinking_tail_turns, thinking_tail_max_tokens)
-            if (gc_enabled and boundary_index >= 0
-                and thinking_tail_turns > 0 and thinking_tail_max_tokens > 0)
-            else frozenset()
-        )
-        if gc_enabled and boundary_index >= 0:
-            # Crash-atomicity tripwire (audit): a marker without its
+        if handoff_enabled and boundary_index >= 0:
+            # Crash-atomicity tripwire (audit): a handoff marker without its
             # following snapshot entry means the process died mid-sequence —
-            # the durable set is absent from every render until the next
+            # the handoff package is absent from every render until the next
             # boundary. LOUD log; render semantics unchanged.
             _marker_pos = max(
                 (i for i, e in enumerate(entries)
                  if e.get("role") == "system"
-                 and e.get("event") in (GC_EVENT, LEGACY_EVENT)
+                 and e.get("event") == HANDOFF_EVENT
                  and e.get("entry_index") == boundary_index),
                 default=None,
             )
             if _marker_pos is not None and not any(
-                e.get("source") == GC_SNAPSHOT_SOURCE
+                e.get("source") == HANDOFF_SNAPSHOT_SOURCE
                 for e in entries[_marker_pos + 1:]
             ):
                 logger.warning(
-                    "gc_boundary %d has no following snapshot entry — a "
+                    "handoff boundary %d has no following snapshot entry — a "
                     "previous boundary application died mid-sequence; the "
-                    "durable set is missing from renders until the next "
+                    "handoff package is missing from renders until the next "
                     "boundary", boundary_index,
                 )
 
-        # Pre-boundary call_id -> (name, input) map, harvested from the
-        # pre-boundary assistant rehydration below (no second scan).  The
-        # uniform transform needs it to format tool-result pointers.
-        pre_boundary_calls: dict = {}
-
         for entry_idx, entry in enumerate(entries):
+            # Full strip (kdsn.322 T1): EVERYTHING at a JSONL position below
+            # the boundary is dropped wholesale — user, assistant (incl.
+            # thought-only), tool, old snapshots, reminders, system markers.
+            # No placeholder strings, no pointer generation, no media expunge,
+            # no thinking-strip: nothing pre-boundary survives to render.
+            # With no handoff marker, boundary_index is -1 and nothing is
+            # dropped (full verbatim render — the hard epoch).
+            if handoff_enabled and boundary_index >= 0 and entry_idx < boundary_index:
+                continue
             role = entry.get("role")
 
             if role == "system":
@@ -437,65 +401,31 @@ class SessionLog:
             if role == "user":
                 _source = entry.get("source")
                 _user_content = entry.get("content", "")
-                # Superseded snapshot (uniform transform): a gc_snapshot
-                # entry strictly below the current boundary was superseded
-                # by a later boundary's snapshot — dropped entirely (never
-                # placeholder-ized).  Legacy mode renders these
-                # verbatim-as-stored, as today.
-                if gc_enabled and _source == GC_SNAPSHOT_SOURCE and entry_idx < boundary_index:
-                    continue
-                # Steering notes: prepend framing prefix in context (JSONL stores original).
-                # Mirrors the timesense precedent: framing is context-only, not stored.
-                if _source == "steer":
-                    _user_content = f"[Operator steering — mid-turn guidance]: {_user_content}"
-                elif _source == "spotter":
-                    # Spotter advisories (design §9): JSONL stores the RAW FLAG
-                    # block (audit fidelity); the advisory frame is context-only.
-                    # frame_spotter_flag escapes the model-origin payload
-                    # internally, so live (agent.py loop-top drain) and rebuilt
-                    # (this branch) advisory bytes are identical.
-                    _user_content = frame_spotter_flag(_user_content)
-                elif _source not in ("reminder", "steer", GC_SNAPSHOT_SOURCE):
-                    # R2-A: Escape user-origin &lt;system-reminder&gt; tags in context
-                    # to prevent spoofing.  Reminder entries (source="reminder")
-                    # are trusted harness content replayed verbatim.  JSONL stores
-                    # raw user text; escaping is context-only (audit fidelity).
-                    if isinstance(_user_content, str):
-                        _user_content = escape_system_reminder_tags(_user_content)
-                # GC snapshot at or above the boundary renders VERBATIM as
-                # a user message: content was already framed and escaped at
-                # freeze time — do not re-frame, re-escape, or apply
+                # Handoff snapshot at or above the boundary renders VERBATIM
+                # as a user message: content was already framed and escaped
+                # at freeze time — never re-frame, re-escape, or apply
                 # steer/spotter framing.
-                _render_snapshot = (
-                    gc_enabled
-                    and _source == GC_SNAPSHOT_SOURCE
+                _is_snapshot = (
+                    handoff_enabled
+                    and _source == HANDOFF_SNAPSHOT_SOURCE
                     and entry_idx >= boundary_index
                 )
-                # Uniform transform: pre-boundary media attachments are
-                # expunged to a pointer placeholder (image bytes are gone
-                # from context; the model is told how to recover).
-                _is_media_string = (
-                    isinstance(_user_content, str)
-                    and MEDIA_TAG_RE.search(_user_content) is not None
-                )
-                if (
-                    not _render_snapshot
-                    and gc_enabled
-                    and entry_idx < boundary_index
-                    and (
-                        isinstance(_user_content, (list, tuple))
-                        or _is_media_string
-                    )
-                ):
-                    # Uniform transform: media attachments — whether the
-                    # in-memory expanded list form or the JSONL-persisted
-                    # [media:] tag-string form (wave-2.1, wonmun A7) — are
-                    # expunged to a pointer placeholder.
-                    _user_content = (
-                        f"[expunged at GC boundary {boundary_index}: "
-                        "media attachment — re-share or re-generate the "
-                        "image if needed]"
-                    )
+                if not _is_snapshot:
+                    if _source == "steer":
+                        # Steering notes: framing is context-only, not stored.
+                        _user_content = f"[Operator steering — mid-turn guidance]: {_user_content}"
+                    elif _source == "spotter":
+                        # Spotter advisories (design §9): the advisory frame is
+                        # context-only; frame_spotter_flag escapes the payload.
+                        _user_content = frame_spotter_flag(_user_content)
+                    elif _source not in ("reminder", "steer", "spotter",
+                                         HANDOFF_SNAPSHOT_SOURCE):
+                        # R2-A: escape user-origin reminder tags in context.
+                        # Reminder/steer/spotter entries are trusted harness
+                        # content replayed verbatim (JSONL stores raw user
+                        # text; escaping is context-only — audit fidelity).
+                        if isinstance(_user_content, str):
+                            _user_content = escape_system_reminder_tags(_user_content)
                 context.append({
                     "role": "user",
                     "content": _user_content,
@@ -503,37 +433,19 @@ class SessionLog:
                 msg_entry_idx.append(entry_idx)
 
             elif role == "assistant":
-                # Uniform transform: drop pre-boundary thinking; a
-                # thought-only turn (no content, no tool_calls) is deleted
-                # atomically — never leave an empty shell.
-                # Thinking-tail (workspace-kdsn.305.13 T1): entries at a
-                # retained position keep their "thinking" into the rendered
-                # msg (the msg["thinking"] assignment below sees
-                # entry["thinking"]); everything else about that entry's
-                # processing is UNCHANGED (tool-result pointer, pairing
-                # harvest, media, orphan repair all still apply — inputs
-                # render verbatim, 37ch).  The
-                # retained set only ever contains eligible entries (content
-                # or tool_calls present), so a retained entry is never
-                # deleted here and no empty shell can result.
-                if (gc_enabled and entry_idx < boundary_index
-                        and entry_idx not in retained_tail):
-                    _stripped_entry = strip_thinking_entry(entry)
-                    if _stripped_entry is None:
-                        continue
-                    entry = _stripped_entry
+                # Post-boundary assistant renders exactly as today: ToolCall
+                # rehydration + thinking passthrough. (Pre-boundary
+                # assistants were dropped wholesale above — no thinking-strip
+                # is needed; nothing survives to strip.)
                 msg: dict = {
                     "role": "assistant",
                     "content": entry.get("content", ""),
                 }
                 if entry.get("tool_calls"):
-                    # Rehydrate dicts back to ToolCall objects so the
-                    # provider serialisation path (tc.id, tc.name, tc.input)
-                    # works unchanged.  Pre-boundary inputs render VERBATIM
-                    # (raw input, any length) — input compaction retired
-                    # (workspace-37ch); the harvest below is unchanged and
-                    # feeds the tool-RESULT pointer formatting.
-                    tool_calls = [
+                    # Rehydrate dicts back to ToolCall objects so the provider
+                    # serialisation path (tc.id, tc.name, tc.input) works
+                    # unchanged.
+                    msg["tool_calls"] = [
                         ToolCall(
                             id=tc.get("call_id") or tc.get("id", ""),
                             name=tc.get("name", ""),
@@ -542,57 +454,18 @@ class SessionLog:
                         )
                         for tc in entry["tool_calls"]
                     ]
-                    if boundary_index >= 0 and entry_idx < boundary_index:
-                        # Harvest (name, RAW input) for pointer formatting —
-                        # the same pass, no second scan.  Pointer idents must
-                        # cite the original input even though the render is
-                        # now verbatim.
-                        for tc in entry["tool_calls"]:
-                            raw_input = tc.get("input", {})
-                            _cid = tc.get("call_id") or tc.get("id", "")
-                            if _cid:
-                                pre_boundary_calls[_cid] = (
-                                    tc.get("name", ""),
-                                    raw_input if isinstance(raw_input, dict) else None,
-                                )
-                    msg["tool_calls"] = tool_calls
                 if entry.get("thinking"):
                     msg["thinking"] = entry["thinking"]
                 context.append(msg)
                 msg_entry_idx.append(entry_idx)
 
             elif role == "tool":
-                # Map call_id → tool_call_id to match agent.py format.
-                # Before the strip boundary, replace full output with a
-                # lightweight placeholder (JSONL is never touched).
-                # Legacy mode: legacy "[stripped: ...]" placeholder.  GC
-                # mode: pointer-bearing placeholder carrying the original
-                # call's identifying param (no matching pre-boundary call →
-                # generic pointer from the tool entry's own name).
-                if boundary_index >= 0 and entry_idx < boundary_index:
-                    original_output = entry.get("output", "")
-                    name = entry.get("name", "tool")
-                    n = len(original_output) if isinstance(original_output, str) else 0
-                    if gc_enabled:
-                        call_id = entry.get("call_id")
-                        _call_name, _call_params = (
-                            pre_boundary_calls.get(call_id, (name, None))
-                            if call_id
-                            else (name, None)
-                        )
-                        _exp_b = min(
-                            (m for m in _marker_list if m > entry_idx),
-                            default=boundary_index,
-                        )
-                        output = tool_pointer(_exp_b, _call_name, _call_params, n)
-                    else:
-                        output = legacy_tool_placeholder(name, n)
-                else:
-                    output = entry.get("output", "")
+                # Post-boundary tool renders its full output verbatim
+                # (pre-boundary tools were dropped wholesale above).
                 tool_entry = {
                     "role": "tool",
                     "tool_call_id": entry.get("call_id"),
-                    "content": output,
+                    "content": entry.get("output", ""),
                 }
                 if entry.get("is_error"):
                     tool_entry["is_error"] = True
@@ -605,24 +478,24 @@ class SessionLog:
         # this to the API causes errors (tool_use requires tool_result).
         # Full-scan approach to handle orphans anywhere, not just at the tail.
         #
-        # GC transform scoping: with gc_enabled and an active boundary, the
-        # pass covers only PRE-boundary assistant messages.  A post-boundary
-        # assistant with tool_calls and no results is, by contract, a live
-        # in-flight turn (apply_boundary exclude_inflight deliberately pulls
-        # it back in) and must survive intact — the crash case and the
-        # in-flight case are indistinguishable at render time, and the
-        # in-flight ruling wins.
-        # (Audit revision: the pass runs FULL-SCAN in gc mode too — a
+        # Handoff transform scoping: with handoff_enabled and an active
+        # boundary, the pass covers only PRE-boundary assistant messages.  A
+        # post-boundary assistant with tool_calls and no results is, by
+        # contract, a live in-flight turn (apply_boundary exclude_inflight
+        # deliberately pulls it back in) and must survive intact — the crash
+        # case and the in-flight case are indistinguishable at render time,
+        # and the in-flight ruling wins.
+        # (Audit revision: the pass runs FULL-SCAN in handoff mode too — a
         # trailing unresolved assistant at render time is a crash orphan,
         # and pre-boundary scoping bricked rooms on exactly the crash case
         # the pass exists to repair. EXCEPTION: the mid-turn rebuild
-        # (context_gc tool path, gc_preserve_trailing=True) — the loop is
-        # LIVE and its in-flight assistant must survive until its result
-        # lands; scope then excludes the trailing unresolved pair.
-        # call_id collisions across a boundary are handled by the pairing
-        # scan below, same as legacy.)
+        # (handoff tool path, preserve_trailing=True) — the loop is LIVE and
+        # its in-flight assistant must survive until its result lands; scope
+        # then excludes the trailing unresolved pair. call_id collisions
+        # across a boundary are handled by the pairing scan below, same as
+        # legacy.)
         _orphan_scope = None
-        if gc_enabled and gc_preserve_trailing:
+        if handoff_enabled and preserve_trailing:
             for _pi in range(len(msg_entry_idx) - 1, -1, -1):
                 _pm = context[_pi]
                 if _pm.get("role") == "assistant" and _pm.get("tool_calls"):

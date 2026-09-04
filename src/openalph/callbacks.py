@@ -16,11 +16,10 @@ import sys
 import mistune
 
 from openalph.reminders import Reminder
-from openalph.context_gc import (
+from openalph.handoff import (
     ACTIVE_PROJECT_EVENT,
     apply_boundary_and_rebuild,
     current_boundary_index,
-    gc_thinking_tail_kwargs,
     project_echo_text,
     project_valid_name,
     read_active_project,
@@ -315,11 +314,9 @@ def build_context_status(agent, room_id, *, room_name=None, session_log=None, he
     and room identity for the given room ID. Sync-safe: calls only sync
     methods on agent, session_log, heartbeat, umbral.
     """
-    # Thinking-tail preservation (workspace-kdsn.305.13 T4): the config
-    # knobs flow into the render; fail-closed to full strip (0/0,
-    # byte-identical legacy) when the config lacks them.
-    _hist = session_log.build_context(
-        room_id, **gc_thinking_tail_kwargs(agent.config)) if session_log else None
+    # Full strip (kdsn.322 T1): build_context no longer takes thinking-tail
+    # kwargs; the handoff render is driven by the room's boundary markers.
+    _hist = session_log.build_context(room_id) if session_log else None
     status_data = agent.status(room_id, history=_hist)
 
     # Session age
@@ -626,10 +623,10 @@ def build_callbacks(
                 "text": project_echo_text(workspace, project),
             }
 
-        _callbacks["apply_gc_boundary"] = _gc_apply_cb
+        _callbacks["apply_handoff_boundary"] = _gc_apply_cb
         _callbacks["set_active_project"] = _gc_set_project_cb
     else:
-        _callbacks["apply_gc_boundary"] = None
+        _callbacks["apply_handoff_boundary"] = None
         _callbacks["set_active_project"] = None
 
     return _callbacks

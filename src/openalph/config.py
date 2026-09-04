@@ -110,16 +110,6 @@ class ContextHandoffConfig:
     # on the same fail-loud discipline as the tier knobs; min >= 0.
     handoff_runway_pct: float = 10.0              # 0 < pct < 100
     handoff_runway_min_tokens: int = 24000        # >= 0
-    # Thinking-tail preservation (workspace-kdsn.305.13 T2): at a boundary,
-    # the N most recent ELIGIBLE pre-boundary assistant thinking blocks are
-    # retained verbatim instead of stripped — newest->oldest, contiguous,
-    # capped at max_tokens (chars//4 estimates). 0 for either knob = full
-    # strip, byte-identical to pre-.13 behavior.
-    # FIELDS ONLY (kdsn.322): the [context] TOML keys thinking_tail_turns /
-    # thinking_tail_max_tokens are rejected at T0 (no successor); these
-    # fields keep their defaults until T1 deletes the carving machinery.
-    thinking_tail_turns: int = 8                  # >= 0
-    thinking_tail_max_tokens: int = 32768         # >= 0
     # Workspace-relative glob patterns declaring additional durable path
     # classes re-injected at every boundary (e.g. ["skills/*.md"]).
     durable_paths: list[str] = field(default_factory=list)
@@ -387,8 +377,8 @@ def load_config(path: Path) -> AgentConfig:
     # max_continuations defaults to 1 (kdsn.315 P3): the per-turn budget of
     # continuation attempts on a non-empty length-stop. bool is an int
     # subclass in Python — reject it explicitly. 0 restores legacy behavior
-    # (truncated text kept as-is, no continuation). Fail-loud like
-    # thinking_tail_max_tokens: silently dropping a bad knob would leave the
+    # (truncated text kept as-is, no continuation). Fail-loud like every
+    # other budget knob: silently dropping a bad knob would leave the
     # operator believing a budget they do not have.
     max_continuations = agent_section.get("max_continuations", 1)
     if (isinstance(max_continuations, bool)
@@ -830,12 +820,23 @@ def _parse_context_handoff_config(toml_data: dict) -> ContextHandoffConfig:
             raise ConfigError(
                 f"[context] {_legacy} was renamed to {_successor} "
                 "(hard epoch: legacy spellings are not honored)")
-    for _removed in ("thinking_tail_turns", "thinking_tail_max_tokens"):
-        if _removed in section:
+    # Generic hard epoch (kdsn.322): any [context] key outside the known set
+    # is rejected fail-loud. The removed thinking-tail keys (and any future
+    # unknown key) land here — no literal spelling of a removed key survives
+    # in this module (the strip suite pins the old spellings absent from
+    # src). Runs after the legacy-redirect loop so gc_enabled/warn_pct keep
+    # their successor-named steering message.
+    _known_context_keys = frozenset({
+        "handoff_enabled", "checkpoint_pct", "auto_pct", "hard_pct",
+        "durable_budget_pct", "durable_budget_min_tokens",
+        "handoff_runway_pct", "handoff_runway_min_tokens",
+        "durable_paths", "turn_cooldown",
+    })
+    for _key in section:
+        if _key not in _known_context_keys:
             raise ConfigError(
-                f"[context] {_removed} was removed with the thinking-tail "
-                "carving (hard epoch: the key is not honored and has no "
-                "successor)")
+                f"[context] unknown key {_key!r} (hard epoch: unknown "
+                "[context] keys are not honored)")
 
     # bool knob
     handoff_enabled = section.get("handoff_enabled", True)
@@ -914,10 +915,6 @@ def _parse_context_handoff_config(toml_data: dict) -> ContextHandoffConfig:
         raise ConfigError(
             f"[context] turn_cooldown must be an integer >= 0, "
             f"got {turn_cooldown!r}")
-
-    # thinking-tail preservation (workspace-kdsn.305.13 T2): the TOML keys
-    # were rejected above (kdsn.322); the dataclass fields keep their
-    # defaults (8 / 32768) until T1 deletes the carving machinery.
 
     return ContextHandoffConfig(
         handoff_enabled=handoff_enabled,

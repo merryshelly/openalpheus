@@ -17,7 +17,7 @@ from pathlib import Path
 from openalph.provider import complete, compute_cost
 from openalph.tools import ToolDef, ToolResult, truncate_result, wrap_tool_result
 from openalph.config import AgentConfig
-from openalph.context_gc import apply_boundary_to_messages, gc_thinking_tail_kwargs
+from openalph.handoff import apply_handoff_to_messages
 
 logger = logging.getLogger("openalph.subagent")
 
@@ -288,7 +288,7 @@ async def run_subagent(
     #
     # Sub contexts are in-process message lists (no JSONL, no render pass), so
     # the wave-1 session.py render transform cannot serve them. Instead the
-    # pure message-list transform (context_gc.apply_boundary_to_messages)
+    # pure message-list transform (openalph.handoff.apply_handoff_to_messages)
     # runs at the TOP of each iteration (turn-start auto tier; the loop is
     # between turns, so no in-flight pair exists) when the char-estimated
     # context reaches the auto threshold. Invariants:
@@ -468,12 +468,11 @@ async def run_subagent(
             if _gc_enabled and not _gc_latched:
                 _gc_est = _estimate_context_tokens(messages)
                 if _gc_est >= _gc_threshold:
-                    _gc_outcome = apply_boundary_to_messages(
+                    _gc_outcome = apply_handoff_to_messages(
                         messages,
                         boundary_index=len(messages),
                         task_text=task,
                         trigger="auto",
-                        **gc_thinking_tail_kwargs(config),
                     )
                     messages = _gc_outcome["messages"]
                     _gc_boundary_count += 1
@@ -488,13 +487,16 @@ async def run_subagent(
                         "event": "gc_boundary",
                         "iteration": iteration,
                         "boundary": _gc_boundary_count,
-                        "classes": _mf["classes"],
                         "tokens_before": _mf["tokens_before"],
                         "tokens_after_est": _mf["tokens_after_est"],
+                        "messages_before": _mf["messages_before"],
+                        "messages_after": _mf["messages_after"],
                     })
                     logger.info(
-                        "subagent GC boundary %d at iteration %d: %s",
-                        _gc_boundary_count, iteration, _mf["classes"],
+                        "subagent handoff boundary %d at iteration %d: "
+                        "tokens_before=%d tokens_after_est=%d",
+                        _gc_boundary_count, iteration,
+                        _mf["tokens_before"], _mf["tokens_after_est"],
                     )
                     _gc_post = _estimate_context_tokens(messages)
                     if _gc_post >= _gc_threshold:
@@ -784,12 +786,11 @@ async def run_subagent(
         if _gc_enabled:
             _gc_est = _estimate_context_tokens(messages)
             if _gc_est >= _gc_threshold:
-                _gc_outcome = apply_boundary_to_messages(
+                _gc_outcome = apply_handoff_to_messages(
                     messages,
                     boundary_index=len(messages),
                     task_text=task,
                     trigger="breaker",
-                    **gc_thinking_tail_kwargs(config),
                 )
                 messages = _gc_outcome["messages"]
                 _gc_boundary_count += 1
@@ -804,13 +805,16 @@ async def run_subagent(
                     "event": "gc_boundary",
                     "iteration": iteration_limit,
                     "boundary": _gc_boundary_count,
-                    "classes": _mf["classes"],
                     "tokens_before": _mf["tokens_before"],
                     "tokens_after_est": _mf["tokens_after_est"],
+                    "messages_before": _mf["messages_before"],
+                    "messages_after": _mf["messages_after"],
                 })
                 logger.info(
-                    "subagent GC boundary %d at breaker: %s",
-                    _gc_boundary_count, _mf["classes"],
+                    "subagent handoff boundary %d at breaker: "
+                    "tokens_before=%d tokens_after_est=%d",
+                    _gc_boundary_count,
+                    _mf["tokens_before"], _mf["tokens_after_est"],
                 )
 
         elapsed = time.time() - run_start

@@ -20,16 +20,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # GC placeholder sentry (workspace-3ejn.2, 2026-09-01 crit)
 # ---------------------------------------------------------------------------
-# The render transforms (session.build_context;
-# context_gc.apply_boundary_to_messages) replace pre-boundary tool I/O with
-# these bracketed markers. After a boundary, local models (qwen38-27b
+# The render transforms (session.build_context; the deleted-in-kdsn.322
+# message-list carving transform) used to replace pre-boundary tool I/O with
+# these bracketed markers — the session render still emits them for LEGACY
+# sessions (hard epoch renders old markers verbatim). After a boundary, local models (qwen38-27b
 # observed) regurgitate the syntax as their OWN tool-call payload values
 # (calibrated size estimates — generation, not copy), and the transform-free
 # dispatch path executes them literally. The sentry refuses such values at
 # the trust boundary. WHOLE-VALUE MATCH ONLY — a substring inside a
 # legitimate payload must never trip it. If marker wording is ever changed,
-# keep these patterns in sync with the generators (context_gc.
-# legacy_tool_placeholder / tool_pointer; session.py media-expunge string).
+# keep these patterns in sync with whatever still emits them (the generator
+# modules were deleted in the kdsn.322 handoff rework; legacy session bytes
+# remain the living source of these marker forms).
 # The "[stripped: N chars]" family (line 1 of the regex) has no live
 # generator anymore — input compaction was deleted in workspace-37ch; the
 # pattern is KEPT deliberately: legacy pre-37ch contexts still carry those
@@ -1744,7 +1746,7 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
       - missing callbacks / no room id → transport-unavailable steering.
       - sub-agent sentinel room ("__sub__") → refused (subagents manage their
         own context).
-      - missing/None apply_gc_boundary callback → steering to the operator
+      - missing/None apply_handoff_boundary callback → steering to the operator
         ``/cache gc`` command.
       - callback exception → caught and sanitized (type name only).
 
@@ -1767,7 +1769,7 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
         )
 
     # R3: the sub-agent sentinel refusal is checked BEFORE the transport
-    # guard — sub tool-call callbacks carry no "apply_gc_boundary" key, so
+    # guard — sub tool-call callbacks carry no "apply_handoff_boundary" key, so
     # the sub-specific refusal must not be masked by the generic steering.
     if room_id == "__sub__":
         return ToolResult(
@@ -1779,7 +1781,7 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
             is_error=True,
         )
 
-    apply_cb = callbacks.get("apply_gc_boundary") if callbacks else None
+    apply_cb = callbacks.get("apply_handoff_boundary") if callbacks else None
     if apply_cb is None:
         return ToolResult(
             content=(
@@ -1794,7 +1796,7 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
         outcome = await apply_cb(room_id, trigger="tool", exclude_inflight=True)
     except Exception as e:
         logger.warning(
-            "context_gc: apply_gc_boundary raised %s in %s",
+            "context_gc: apply_handoff_boundary raised %s in %s",
             type(e).__name__, room_id, exc_info=True,
         )
         return ToolResult(

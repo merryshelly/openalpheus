@@ -103,7 +103,7 @@ _EXPECTED_CALLBACK_KEYS = frozenset({
     "heartbeat",
     "umbral",
     # context-GC (workspace-kdsn.305): boundary application + project declaration
-    "apply_gc_boundary",
+    "apply_handoff_boundary",
     "set_active_project",
 })
 

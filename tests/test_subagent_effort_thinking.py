@@ -222,43 +222,6 @@ class TestThinkingReplay:
         assert len(asst) == 2
 
     @pytest.mark.asyncio
-    async def test_B5_gc_retention_alive_in_subs(self):
-        """Boundary in a sub retains the newest thinking and strips older (tail knobs).
-
-        Window 9000 / max_tokens 8000 → usable 1000 → auto threshold 850 est-tokens.
-        Two 1200-char thinking turns cross it at iteration-2 top; tail budget 512
-        tokens (2048 chars) retains NEWCOT, strips OLDCOT. Task echo survives.
-        """
-        cfg = make_config(
-            model_limits={"anthropic/claude-sonnet-4-20250514": 9000},
-            context=ContextHandoffConfig(thinking_tail_max_tokens=512),
-        )
-        task = "T" * 1600
-        old = tool_response(tool_id="tc_1", thinking=[think("OLDCOT" * 200, "s_old")])
-        new = tool_response(tool_id="tc_2", thinking=[think("NEWCOT" * 200, "s_new")])
-        side = [old, new, text_response("done")]
-        with patch(COMPLETE_PATH, new_callable=AsyncMock, side_effect=side) as mc:
-            result = await run_subagent(task, cfg, call_id="gctest", max_tokens=8000)
-        assert result.is_error is False
-        # the boundary fired (third call happened after a boundary)
-        assert mc.call_count == 3
-        final_msgs = mc.call_args_list[2].kwargs["messages"]
-        # Targeted extraction — thinking fields only (never blob-serialize a
-        # message list carrying ToolCall objects).
-        thinking_blob = "".join(
-            tb.get("thinking", "")
-            for m in final_msgs for tb in (m.get("thinking") or [])
-        )
-        assert "NEWCOT" in thinking_blob, "newest thinking must survive the boundary"
-        assert "OLDCOT" not in thinking_blob, \
-            "older thinking beyond the tail budget must be stripped"
-        # task echo is durable content — never reduced
-        assert any(m["role"] == "user" and m.get("content") == task for m in final_msgs)
-
-
-# ---------------------------------------------------------------- C: estimator
-
-class TestEstimatorCountsThinking:
 
     def test_C1_thinking_chars_counted(self):
         base_msg = {"role": "assistant", "content": "x", "tool_calls": []}

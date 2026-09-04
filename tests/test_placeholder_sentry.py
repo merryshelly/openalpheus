@@ -314,30 +314,6 @@ class TestS7Nested:
 # ============================================================================
 
 class TestS8GeneratorSync:
-    def test_regex_matches_live_generators(self):
-        from openalph.context_gc import (
-            legacy_tool_placeholder, tool_pointer)
-        from openalph.tools import _GC_PLACEHOLDER_RE
-        for marker in (
-                # The legacy input placeholder generator (context_gc.
-                # legacy_input_placeholder) was DELETED in workspace-37ch —
-                # input compaction is gone; family 1 ("[stripped: N chars]")
-                # is covered for legacy render bytes only, pinned by literal
-                # (MARKER_INPUT) plus T4 in test_input_passthrough_37ch.py.
-                "[stripped: 4760 chars]",
-                legacy_tool_placeholder("file_read", 2043),
-                tool_pointer(304, "shell", {"command": "x"}, 4760),
-                tool_pointer(304, "tool", None, 0),
-        ):
-            assert _GC_PLACEHOLDER_RE.match(marker.strip()), \
-                f"sentry does not cover generator output: {marker!r}"
-
-    def test_regex_matches_media_expunge_literal(self):
-        from openalph.tools import _GC_PLACEHOLDER_RE
-        marker = ("[expunged at GC boundary 304: media attachment "
-                  "\u2014 re-share or re-generate the image if needed]")
-        assert _GC_PLACEHOLDER_RE.match(marker.strip())
-
     @pytest.mark.asyncio
     async def test_real_agent_clean_call_untouched(self, tmp_path):
         """Positive control: a normal tool call passes the boundary unchanged."""

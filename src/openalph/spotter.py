@@ -657,13 +657,20 @@ def _canonical_verdict_for_rebuild(ev: dict) -> str:
     return _UNPARSED_VERDICT_TEXT
 
 
-def _reduced_tool_pointer(messages: list[dict], index: int, boundary: int) -> str:
+def _delta_tool_ref(messages: list[dict], index: int, boundary: int) -> str:
     """Platform-format pointer placeholder for a reduced tool result (G15).
 
-    Byte-compatible with context_gc.tool_pointer; the tool name/params come
-    from the paired assistant tool_calls message.
+    Byte-compatible with the historical platform pointer format (its
+    generator module was deleted in the kdsn.322 handoff rework — spotter
+    owns its own copy of the byte format now; legacy sessions still carry
+    these markers, and spotter's delta reductions stay consistent with
+    them). The tool name/params come from the paired assistant tool_calls
+    message.
     """
-    from openalph.context_gc import tool_pointer
+    import re as _re
+
+    from openalph.tools import escape_system_reminder_tags
+
     m = messages[index]
     call_id = m.get("tool_call_id")
     name, params = None, None
@@ -675,8 +682,25 @@ def _reduced_tool_pointer(messages: list[dict], index: int, boundary: int) -> st
         if name is not None:
             break
     original = m.get("content") or ""
-    return tool_pointer(boundary_index=boundary, name=name or "unknown",
-                        params=params, n_chars=len(original))
+    ident = ""
+    if isinstance(params, dict):
+        key = {"file_read": "path", "file_write": "path", "file_edit": "path",
+               "file_patch": "path", "glob": "pattern", "grep": "pattern",
+               "web_fetch": "url", "web_fetch_js": "url", "shell": "command",
+               "memory_search": "query"}.get(name or "")
+        value = params.get(key) if key else None
+        if not (isinstance(value, str) and value):
+            value = next((v for v in params.values()
+                          if isinstance(v, str) and v), None)
+        if value:
+            ident = _re.sub(r"\s+", " ", value).strip()[:80]
+            ident = escape_system_reminder_tags(ident)
+    if not ident:
+        ident = "result"
+    return (
+        f"[expunged at GC boundary {boundary}: {name or 'unknown'} {ident} "
+        f"({len(original)} chars) — re-run the tool if the result is needed]"
+    )
 
 
 def _reduce_tool_results(messages: list[dict], boundary: int) -> int:
@@ -691,7 +715,7 @@ def _reduce_tool_results(messages: list[dict], boundary: int) -> int:
         m = messages[i]
         if m.get("role") != "tool":
             continue
-        m["content"] = _reduced_tool_pointer(messages, i, boundary)
+        m["content"] = _delta_tool_ref(messages, i, boundary)
         reduced += 1
     return reduced
 
@@ -968,10 +992,12 @@ class SpotterManager:
                                     "content": _canonical_verdict_for_rebuild(ev)})
                 rebuilt.extend(pending)
                 pending = []
-            elif kind == "gc_boundary":
+            elif kind in ("gc_boundary", "handoff_boundary"):
                 # The boundary was applied to COMMITTED messages only, so
                 # reduce the rebuilt prefix now (manifest's message count is
-                # the authoritative boundary).
+                # the authoritative boundary). Both event kinds watched:
+                # legacy sessions carry gc_boundary; the handoff rework
+                # (kdsn.322) emits handoff_boundary.
                 boundary = int(ev.get("boundary_messages", 0))
                 _reduce_tool_results(rebuilt, boundary)
             # exhausted / reset / meta: no message impact

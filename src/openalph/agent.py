@@ -264,7 +264,7 @@ class Agent:
         # starts empty after restart -> 0.0 -> gc-runway silent (fail-safe,
         # acceptable v1).
         # The turn-start auto tier + hard tier consume the transport-wired
-        # callbacks["apply_gc_boundary"] seam (contract: async callable
+        # callbacks["apply_handoff_boundary"] seam (contract: async callable
         # (room_id, *, trigger, exclude_inflight=True) -> {"applied",
         # "noop_reason", "manifest", "over_budget"}; on applied=True it has
         # ALREADY appended the JSONL entries AND rebuilt the room's
@@ -383,7 +383,7 @@ class Agent:
     # --- Context GC boundary consumption (workspace-kdsn.305) --------------
     # The agent owns the CHECKS (auto tier at turn start, hard tier at the
     # send-time overflow guard); the transport (MatrixBot) owns the WIRING —
-    # it injects callbacks["apply_gc_boundary"] into the per-turn callback
+    # it injects callbacks["apply_handoff_boundary"] into the per-turn callback
     # dict. Every turn path (interactive/heartbeat/umbral/CLI) flows through
     # handle_input, so the hooks below cover all seams; headless/CLI turns
     # simply never carry the callback and skip silently (fail-safe).
@@ -395,7 +395,7 @@ class Agent:
 
     async def _gc_apply_boundary(self, room_id: str, callbacks: dict | None, *,
                                  trigger: str, exclude_inflight: bool) -> bool:
-        """Consume the transport-wired apply_gc_boundary callback (kdsn.305).
+        """Consume the transport-wired apply_handoff_boundary callback (kdsn.305).
 
         Returns True when the boundary APPLIED (the callback has already
         appended the JSONL manifest + snapshot entries and rebuilt the room's
@@ -413,7 +413,7 @@ class Agent:
           - applied=False (noop) -> strikes are the CALLER's concern (hard
             tier only); auto tier simply skips.
         """
-        cb = (callbacks or {}).get("apply_gc_boundary")
+        cb = (callbacks or {}).get("apply_handoff_boundary")
         if cb is None:
             return False
         try:
@@ -505,7 +505,7 @@ class Agent:
         ctx = getattr(self.config, "context", None)
         if ctx is None or not ctx.handoff_enabled:
             return False
-        if (callbacks or {}).get("apply_gc_boundary") is None:
+        if (callbacks or {}).get("apply_handoff_boundary") is None:
             return False
         strikes = self._gc_fail_strikes.get(room_id, 0)
         if strikes >= self._GC_HARD_STRIKE_LIMIT:
@@ -962,7 +962,7 @@ class Agent:
                 # rebuilt in place, so re-estimate for the guard below and
                 # for the ReminderState (D9 single-source `available`).
                 _gc_cfg = self.config.context
-                _gc_cb = (callbacks or {}).get("apply_gc_boundary")
+                _gc_cb = (callbacks or {}).get("apply_handoff_boundary")
                 if _gc_cfg.handoff_enabled and _gc_cb is not None:
                     _gc_auto_threshold = int(available
                                              * _gc_cfg.auto_pct / 100)

@@ -181,6 +181,16 @@ class TestLegacyKeySteering:
             err = e
         assert err is not None, "legacy key must raise ConfigError (structural)"
 
+    def test_unknown_key_rejected_fail_loud(self, tmp_path):
+        # T1 deviation accepted (flagged for SB): unknown [context] keys are
+        # REJECTED, not silently ignored — a typo'd handoff_enabled would
+        # otherwise silently revert to the default (fail-open on a
+        # data-loss knob, the exact hole the module discipline forbids).
+        # Zero fleet impact (no live config carries [context]); rollback
+        # note: older code + newer config fails loud naming the key.
+        expect_context_error(tmp_path, "[context]\nhandoff_enable = true\n",
+                             needle="handoff_enable")
+
 
 # ===========================================================================
 # Fail-loud types preserved (new spellings)
