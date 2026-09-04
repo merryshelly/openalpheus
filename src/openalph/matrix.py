@@ -188,15 +188,15 @@ def _escape_capped(text: str, raw_cap: int, esc_cap: int) -> str:
     return cut + "\n[truncated]"
 
 
-# --- Context GC command helpers (workspace-kdsn.305.1) ---------------------
+# --- Context handoff command helpers (workspace-kdsn.305.1) ----------------
 #
-# Shared by the /cache status line, the /cache gc subcommand, the
-# apply_gc_boundary tool callback, and the /project operator command so the
-# flag-off (legacy toolstrip) and flag-on (GC boundary) surfaces read state
-# identically. All readers are pure JSONL scans; writers go through
-# context_gc.apply_boundary (the ONLY boundary writer).
+# Shared by the /cache status line, the /cache handoff subcommand, the
+# apply_handoff_boundary tool callback, and the /project operator command so
+# every surface reads state identically. All readers are pure JSONL scans;
+# writers go through handoff.apply_boundary_and_rebuild (the ONLY boundary
+# writer).
 
-def _gc_boundary_state(entries):
+def _handoff_boundary_state(entries):
     """(index, trigger) of the LATEST handoff boundary marker in raw JSONL
     entries; (None, None) when there is none.
 
@@ -235,7 +235,7 @@ def _gc_boundary_state(entries):
 
 
 
-def _gc_confirm_text(outcome, trigger):
+def _handoff_confirm_text(outcome, trigger):
     """Operator-facing confirmation for an APPLIED boundary."""
     manifest = outcome.get("manifest") or {}
     durable = manifest.get("durable") or {}
@@ -1563,7 +1563,7 @@ class MatrixBot:
             self._advisor_results = {}
         if not hasattr(self, '_subagent_results'):
             self._subagent_results = {}
-        # kdsn.305.1: the GC tool callbacks (apply_gc_boundary,
+        # kdsn.305.1: the boundary tool callbacks (apply_handoff_boundary,
         # set_active_project) are built at THE construction seam —
         # callbacks.build_callbacks — so every transport (Matrix live,
         # heartbeat/umbral, headless CLI) carries identical wiring. This
@@ -3208,15 +3208,6 @@ class MatrixBot:
                 f"| **Cache TTL** | {_cache_ttl} |",
                 f"| **Timesense** | {'on' if getattr(self, '_room_timesense', {}).get(room_id) else 'off'} |",
             ]
-            # Add strippable stats if session log available
-            if getattr(self, 'session_log', None):
-                try:
-                    s_count, s_chars = self.session_log.strippable_stats(room_id)
-                    if s_count > 0:
-                        s_tokens = s_chars // 4
-                        lines.append(f"| **Strippable** | {s_count} tool results, ~{s_tokens:,} tokens |")
-                except Exception:
-                    pass
             await self.send(room_id, "\n".join(lines))
             return
 
@@ -3283,44 +3274,41 @@ class MatrixBot:
         if body.startswith("/cache"):
             parts = body.split(None, 1)
             if len(parts) < 2:
-                # Show current cache status: TTL + toolstrip state
+                # Show current cache status: TTL + handoff boundary state
                 current = self._room_cache_ttl.get(room_id)
                 ttl_line = f"Cache TTL: **{current}** (override)" if current else "Cache TTL: **1h** (default)"
-                strip_line = "Toolstrip: none"
+                # kdsn.305.1: the boundary state line — latest handoff
+                # boundary index + trigger over handoff_boundary system
+                # entries (legacy markers are NOT handoff boundaries).
+                handoff_line = "Handoff boundary: none"
                 if self.session_log:
-                    entries = self.session_log.read(room_id)
-                    strip_markers = [
-                        e.get("entry_index", 0) for e in entries
-                        if e.get("role") == "system" and e.get("event") == "toolstrip"
-                    ]
-                    if strip_markers:
-                        boundary = max(strip_markers)
-                        # Count what was stripped
-                        stripped_count = sum(
-                            1 for i, e in enumerate(entries)
-                            if e.get("role") == "tool" and i < boundary
-                        )
-                        strip_line = f"Toolstrip: active at entry {boundary} ({stripped_count} tool results stripped)"
-                # kdsn.305.1: extend the strip line with the GC boundary state
-                # (latest boundary index + trigger over gc_boundary system
-                # entries; legacy toolstrip markers count as boundaries too).
-                gc_line = "GC boundary: none"
-                if self.session_log:
-                    _gc_entries = self.session_log.read(room_id)
-                    _gc_idx, _gc_trigger = _gc_boundary_state(_gc_entries)
-                    if _gc_idx is not None:
-                        gc_line = f"GC boundary: {_gc_idx} ({_gc_trigger})"
-                await self.send(room_id, f"{ttl_line}\n{strip_line}\n{gc_line}")
+                    _entries = self.session_log.read(room_id)
+                    _idx, _trigger = _handoff_boundary_state(_entries)
+                    if _idx is not None:
+                        handoff_line = f"Handoff boundary: {_idx} ({_trigger})"
+                await self.send(room_id, f"{ttl_line}\n{handoff_line}")
                 return
             value = parts[1].strip().lower()
             if value == "gc":
-                # /cache gc — apply a GC boundary at a clean break
-                # (renamed from `/cache toolstrip`; the toolstrip name is
-                # retired). Flag-on: full GC boundary (manifest + durable
-                # snapshot + GC-aware history rebuild). Flag-off: EXACTLY the
-                # legacy toolstrip behavior — bare strip marker, legacy
-                # message, legacy rebuild (byte-equivalent behavior to the
-                # old /cache toolstrip).
+                # kdsn.322: the context-handoff rework retired /cache gc —
+                # the boundary command is /cache handoff now. Steer to the
+                # new spelling; NO boundary is applied on the deprecated
+                # one.
+                await self.send_notice(
+                    room_id,
+                    "⚠️ /cache gc is deprecated — use /cache handoff "
+                    "(the context-handoff rework, kdsn.322).",
+                )
+                return
+            if value == "handoff":
+                # /cache handoff — apply a handoff boundary at a clean
+                # break (kdsn.322; renamed from /cache gc, which before
+                # that was /cache toolstrip — both names retired).
+                # Flag-on: full handoff boundary (manifest + durable
+                # snapshot + full-strip history rebuild). Flag-off: the
+                # legacy toolstrip behavior (bare strip marker, legacy
+                # message, legacy rebuild) — retained for handoff-disabled
+                # agents.
                 if self.session_log:
                     if self.agent.config.context.handoff_enabled:
                         outcome = apply_boundary_and_rebuild(
@@ -3328,8 +3316,9 @@ class MatrixBot:
                             trigger="manual", exclude_inflight=False)
                         if outcome.get("applied"):
                             # kdsn.305.12 R3: this operator path applies the
-                            # boundary DIRECTLY (not via the apply_gc_boundary
-                            # callback), so the agent's applied-boundary
+                            # boundary DIRECTLY (not via the
+                            # apply_handoff_boundary callback), so the
+                            # agent's applied-boundary
                             # bookkeeping — engine reset, hard-tier strikes,
                             # runway-fraction cache, churn-guard re-arm — must
                             # be driven here through the SAME seam the
@@ -3347,19 +3336,19 @@ class MatrixBot:
                                     _note(room_id, outcome)
                                 except Exception:
                                     logger.warning(
-                                        "gc /cache: applied-boundary note "
-                                        "failed for %s (fail-soft)",
+                                        "handoff /cache: applied-boundary "
+                                        "note failed for %s (fail-soft)",
                                         room_id, exc_info=True)
-                            await self.send_notice(room_id, _gc_confirm_text(outcome, "manual"))
+                            await self.send_notice(room_id, _handoff_confirm_text(outcome, "manual"))
                         else:
                             await self.send_notice(
                                 room_id,
-                                f"⚠️ GC boundary not applied — "
+                                f"⚠️ Handoff boundary not applied — "
                                 f"{outcome.get('noop_reason') or 'no-op'}",
                             )
                     else:
                         # Flag OFF — legacy toolstrip path (behavior + message
-                        # byte-equivalent to the pre-GC /cache toolstrip).
+                        # byte-equivalent to the pre-handoff /cache toolstrip).
                         entries = self.session_log.read(room_id)
                         entry_count = len(entries)
                         # Compute what will be stripped

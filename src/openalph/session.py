@@ -217,28 +217,6 @@ class SessionLog:
         if path.exists():
             path.write_text("")
 
-    def strippable_stats(self, room_id: str) -> tuple[int, int]:
-        """Count tool results not yet covered by a toolstrip marker.
-
-        Returns:
-            (count, total_chars) of tool result entries that would be
-            affected by a new /cache toolstrip command.
-        """
-        entries = self.read(room_id)
-
-        # Find the current strip boundary (max entry_index from any
-        # context-boundary marker — GC or legacy toolstrip), or -1 if none.
-        strip_boundary = current_boundary_index(entries)
-
-        count = 0
-        total_chars = 0
-        for entry_idx, entry in enumerate(entries):
-            if entry.get("role") == "tool" and entry_idx > strip_boundary:
-                count += 1
-                total_chars += len(entry.get("output", ""))
-
-        return count, total_chars
-
     def usage_totals(self, room_id: str) -> dict:
         """Sum per-turn `usage` fields across assistant entries -> per-room counters.
         Returns zeros if no usage present. Maps:

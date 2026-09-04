@@ -7,8 +7,8 @@ The tests are the specification. Scope of this file:
   - CONTINUITY.md prompt assembly, 8th operator file (Sub C: prompt.py + template)
   - handoff-checkpoint / handoff-runway reminder triggers,
     coexist-with-reset (Sub C: reminders.py)
-  - context_gc + set_active_project tools (Sub D: tools/__init__.py)
-  - /cache gc + /cache status + /project matrix commands (Sub D: matrix.py)
+  - context_handoff + set_active_project tools (Sub D: tools/__init__.py)
+  - /cache handoff + /cache status + /project matrix commands (Sub D: matrix.py)
 
 Sub-agent implementors NEVER modify this file. They MAY append new test
 classes for the real-path agent-loop tests named in their brief (turn-start
@@ -177,25 +177,25 @@ class TestGCTriggers:
 
 
 # ============================================================================
-# context_gc + set_active_project tools
+# context_handoff + set_active_project tools
 # ============================================================================
 
-class TestGCTool:
+class TestHandoffTool:
     def test_registered(self):
-        assert "context_gc" in BUILTIN_TOOLS
-        schema = BUILTIN_TOOLS["context_gc"]["parameters"]
+        assert "context_handoff" in BUILTIN_TOOLS
+        schema = BUILTIN_TOOLS["context_handoff"]["parameters"]
         assert schema["type"] == "object"
         assert not schema.get("required")
 
     def test_missing_callback_steers_to_slash(self):
         res = asyncio.new_event_loop().run_until_complete(
-            execute_tool("context_gc", {}, None, {"room_id": ROOM}))
+            execute_tool("context_handoff", {}, None, {"room_id": ROOM}))
         # headless/no-wiring: clean is_error, names the operator command
-        assert res.is_error and "/cache gc" in res.content
+        assert res.is_error and "/cache handoff" in res.content
 
     def test_sub_sentinel_refused(self):
         res = asyncio.new_event_loop().run_until_complete(
-            execute_tool("context_gc", {}, None,
+            execute_tool("context_handoff", {}, None,
                          {"room_id": "__sub__",
                           "apply_handoff_boundary": AsyncMock(return_value={})}))
         assert res.is_error and "subagent" in res.content.lower()
@@ -211,7 +211,7 @@ class TestGCTool:
         cb = AsyncMock(return_value={"applied": True, "noop_reason": None,
                                      "manifest": manifest, "over_budget": False})
         res = asyncio.new_event_loop().run_until_complete(
-            execute_tool("context_gc", {}, None,
+            execute_tool("context_handoff", {}, None,
                          {"room_id": ROOM, "apply_handoff_boundary": cb}))
         assert not res.is_error
         assert "12" in res.content and "40000" in res.content
@@ -223,7 +223,7 @@ class TestGCTool:
                                      "noop_reason": "cooldown: 1 of 3 turns since last boundary",
                                      "manifest": None, "over_budget": False})
         res = asyncio.new_event_loop().run_until_complete(
-            execute_tool("context_gc", {}, None,
+            execute_tool("context_handoff", {}, None,
                          {"room_id": ROOM, "apply_handoff_boundary": cb}))
         assert res.is_error
         assert "cooldown" in res.content
@@ -273,7 +273,7 @@ class TestSetActiveProjectTool:
 
 
 # ============================================================================
-# Matrix commands: /cache gc, /cache status, /project
+# Matrix commands: /cache handoff, /cache status, /project
 # ============================================================================
 
 def _event(body):
@@ -341,7 +341,7 @@ class TestMatrixCommands:
                 out.append(content.get("body", ""))
         return out
 
-    def test_cache_gc_applies_boundary_and_rebuilds_in_place(self, tmp_path):
+    def test_cache_handoff_applies_boundary_and_rebuilds_in_place(self, tmp_path):
         bot, agent = self._bot(tmp_path)
         log = bot.session_log
         for e in [
@@ -359,7 +359,7 @@ class TestMatrixCommands:
         room = MagicMock()
         room.room_id = ROOM
         asyncio.new_event_loop().run_until_complete(
-            bot._handle_room_message(room, _event("/cache gc")))
+            bot._handle_room_message(room, _event("/cache handoff")))
 
         entries = log.read(ROOM)
         assert any(e.get("event") == "handoff_boundary" for e in entries)

@@ -412,6 +412,35 @@ def build_context_status(agent, room_id, *, room_name=None, session_log=None, he
 # build_callbacks — headless
 # ---------------------------------------------------------------------------
 
+def _handoff_notice_text(trigger: str, outcome: dict) -> str:
+    """One-line §3.4 visibility notice for an APPLIED handoff boundary.
+
+    Compact and deterministic-ish: boundary index + trigger + tokens
+    before->after + durable project/budget when present + checkpoint
+    status. Display-only — the JSONL marker is the audit record.
+    """
+    manifest = outcome.get("manifest") or {}
+    durable = manifest.get("durable") or {}
+    used = durable.get("used_tokens", 0)
+    budget = durable.get("budget_tokens", 0)
+    project = durable.get("project")
+    checkpoint = manifest.get("checkpoint")
+    ckpt = (checkpoint.get("status", "unknown")
+            if isinstance(checkpoint, dict) else "unknown")
+    line = (
+        f"🧹 Handoff boundary {manifest.get('boundary_index', '?')} applied "
+        f"(trigger={trigger}): tokens {manifest.get('tokens_before', 0)} -> "
+        f"{manifest.get('tokens_after_est', 0)} (est.)"
+    )
+    if project:
+        line += f" · project={project}"
+    line += f" · budget {used}/{budget}"
+    if outcome.get("over_budget"):
+        line += " (over — informational)"
+    line += f" · checkpoint={ckpt}"
+    return line
+
+
 def build_callbacks(
     agent,
     room_id,
@@ -538,7 +567,7 @@ def build_callbacks(
             if _gc_cfg is None or not getattr(_gc_cfg, "handoff_enabled", False):
                 return {
                     "applied": False,
-                    "noop_reason": "context.handoff_enabled is false — GC disabled for this agent",
+                    "noop_reason": "context.handoff_enabled is false — handoff disabled for this agent",
                     "manifest": None,
                     "over_budget": False,
                 }
@@ -553,7 +582,8 @@ def build_callbacks(
                     "over_budget": False,
                 }
             # Turn cooldown — TOOL-TRIGGERED boundaries only. Operator
-            # commands (/cache gc) and the loop's auto/hard tiers bypass it.
+            # commands (/cache handoff) and the loop's auto/hard tiers
+            # bypass it.
             # Count by list POSITION: SessionLog.append only writes
             # entry_index on marker events, never on assistant entries.
             # Post-boundary positions start at `boundary`; no boundary (-1)
@@ -576,7 +606,7 @@ def build_callbacks(
                         "manifest": None,
                         "over_budget": False,
                     }
-            return apply_boundary_and_rebuild(
+            outcome = apply_boundary_and_rebuild(
                 agent, session_log, _room_id,
                 trigger=trigger, exclude_inflight=exclude_inflight,
                 # Tool path = LIVE turn: the rebuild must preserve the
@@ -584,6 +614,21 @@ def build_callbacks(
                 # strip the live pair and orphan its result mid-loop).
                 live_turn=exclude_inflight,
             )
+            # §3.4 operator visibility: a collapsed room notice on EVERY
+            # applied boundary (auto / hard / tool through this seam; the
+            # /cache handoff operator path sends its own confirmation).
+            # No-op outcomes carry NO notice — the caller surfaces the
+            # noop_reason. Fail-soft: a notice failure must never break the
+            # boundary application.
+            if isinstance(outcome, dict) and outcome.get("applied"):
+                try:
+                    await sinks.send_notice(
+                        _room_id, _handoff_notice_text(trigger, outcome))
+                except Exception:
+                    logger.warning(
+                        "handoff visibility notice failed for %s (fail-soft)",
+                        _room_id, exc_info=True)
+            return outcome
 
         async def _gc_set_project_cb(project):
             entries = session_log.read(room_id)

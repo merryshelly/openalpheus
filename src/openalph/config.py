@@ -77,7 +77,7 @@ class ContextHandoffConfig:
     """Context handoff settings (workspace-kdsn.305, [context] section).
 
     Tuning knobs for the unified context-boundary / handoff mechanism
-    (context_gc.py): the auto/hard boundary tiers, the handoff-checkpoint
+    (handoff.py): the auto/hard boundary tiers, the handoff-checkpoint
     reminder threshold, the durable-set re-injection budget, and the
     thinking-tail preservation fields (workspace-kdsn.305.13 — the TOML
     keys were retired at T0, kdsn.322; the fields survive one extra slice
@@ -95,7 +95,7 @@ class ContextHandoffConfig:
     auto_pct: int = 85      # turn-start auto boundary tier
     hard_pct: int = 92      # (reserved: hard tier is the send-time overflow guard)
     # Durable-set re-injection budget: max(window * pct, min_tokens) tokens
-    # (see context_gc.durable_budget_tokens). INFORMATIONAL marker threshold
+    # (see handoff.durable_budget_tokens). INFORMATIONAL marker threshold
     # ONLY (kdsn.305.12 D2): over-budget is demoted to the snapshot-header
     # marker — it is NOT a cap, the full durable set is attached verbatim
     # regardless, and it never forces a handoff. Generous on purpose: the

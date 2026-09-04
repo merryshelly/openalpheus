@@ -450,9 +450,9 @@ class Agent:
           - auto-tier churn-guard re-arm (a boundary never proven
             unproductive re-arms the auto tier).
         Called from BOTH boundary-consumption seams: the callback consumer
-        (``_gc_apply_boundary`` — auto/hard tiers + context_gc tool) and the
-        matrix ``/cache gc`` operator path (which applies the boundary
-        directly and must not leave the runway cache stale).
+        (``_gc_apply_boundary`` — auto/hard tiers + context_handoff tool) and
+        the matrix ``/cache handoff`` operator path (which applies the
+        boundary directly and must not leave the runway cache stale).
         Fail-soft: a malformed outcome must never break the caller.
         """
         self._engine_for(room_id).reset()

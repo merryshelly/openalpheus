@@ -942,25 +942,25 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "max_upload_bytes": 20971520
         }
     },
-    "context_gc": {
+    "context_handoff": {
         "description": (
-            "Apply a GC context boundary NOW, at a clean break: everything before the "
-            "boundary is reduced (tool outputs -> pointers, thinking dropped, durable "
-            "set re-attached as a frozen snapshot) and the prompt cache is flushed "
-            "from the edit point. "
+            "Apply a context handoff boundary NOW, at a clean break: everything "
+            "pre-boundary is stripped from render; the declared project's "
+            "handoff package (progress.md + durable-set snapshot) is the only "
+            "carryover and the prompt cache is flushed from the edit point. "
             "IMPORTANT: prefer calling this right after the harness warns you "
-            "(handoff-checkpoint reminder) or at a natural milestone; NEVER call it repeatedly — "
-            "each boundary flushes the prompt cache from the edit point and a turn "
-            "cooldown applies between boundaries. "
-            "IMPORTANT: no parameters — the room is resolved from the session context, "
-            "never from input. Not for sub-agents (subagents manage their own context). "
-            "WHEN NOT TO USE: mid-tool-loop on state you still need verbatim (the "
-            "pointer names what to re-run), or before any handoff-checkpoint with no milestone "
-            "reached — the boundary buys nothing yet. "
-            "The result reports the boundary index, per-class stripped counts, "
-            "tokens before -> after, and durable budget used/budget (with an "
-            "informational note when the durable set exceeds its budget — the "
-            "budget is an informational marker, not a cap)."
+            "(handoff-checkpoint reminder) or at a natural milestone; NEVER "
+            "call it repeatedly — each boundary flushes the prompt cache from "
+            "the edit point and a turn cooldown applies between boundaries. "
+            "IMPORTANT: no parameters — the room is resolved from the session "
+            "context, never from input. Not for sub-agents (subagents manage "
+            "their own context). WHEN NOT TO USE: mid-tool-loop on state you "
+            "still need verbatim, or before any handoff-checkpoint with no "
+            "milestone reached — the boundary buys nothing yet. The result "
+            "reports the boundary index, tokens before -> after, and the "
+            "durable budget used/budget (with an informational note when the "
+            "durable set exceeds its budget — the budget is an informational "
+            "marker, not a cap)."
         ),
         "parameters": {
             "type": "object",
@@ -1734,26 +1734,28 @@ async def _execute_heartbeat_tool(input: dict, callbacks: dict | None) -> "ToolR
     )
 
 
-async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResult":
-    """Execute the built-in context_gc tool (workspace-kdsn.305.2).
+async def _execute_context_handoff(input: dict, callbacks: dict | None) -> "ToolResult":
+    """Execute the built-in context_handoff tool (kdsn.322, spec §3.4).
 
-    Applies a GC context boundary NOW at a clean break in the owning room.
-    Room scoping ALWAYS comes from ``callbacks["room_id"]`` — never from any
-    input key (the tool has NO parameters).
+    Applies a context handoff boundary NOW at a clean break in the owning
+    room: everything pre-boundary is stripped from render and the durable
+    set is the only carryover. Room scoping ALWAYS comes from
+    ``callbacks["room_id"]`` — never from any input key (the tool has NO
+    parameters).
 
     Guards (all return ``ToolResult(is_error=True)`` without mutating state,
     never raising):
       - missing callbacks / no room id → transport-unavailable steering.
       - sub-agent sentinel room ("__sub__") → refused (subagents manage their
         own context).
-      - missing/None apply_handoff_boundary callback → steering to the operator
-        ``/cache gc`` command.
+      - missing/None apply_handoff_boundary callback → steering to the
+        operator ``/cache handoff`` command.
       - callback exception → caught and sanitized (type name only).
 
-    On success the result summarizes the boundary: index, per-class stripped
-    counts, tokens before -> after, and durable budget used/budget (OVER
-    BUDGET flagged loudly). On a no-op (cooldown / monotonicity refusal) the
-    callback's noop_reason is surfaced verbatim as an error.
+    On success the result summarizes the boundary: index, tokens before ->
+    after, and durable budget used/budget (OVER BUDGET flagged loudly). On a
+    no-op (cooldown / monotonicity refusal) the callback's noop_reason is
+    surfaced verbatim as an error.
     """
     # R4: never bare-subscript the room id. A malformed caller must get
     # steering, not a KeyError escaping the tool and killing the turn.
@@ -1761,9 +1763,10 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
     if room_id is None:
         return ToolResult(
             content=(
-                "Context GC tool unavailable: no room-scoped session context "
-                "(callbacks carry no \"room_id\"); GC boundaries are "
-                "per-room and cannot be applied without a room context."
+                "Context handoff tool unavailable: no room-scoped session "
+                "context (callbacks carry no \"room_id\"); handoff "
+                "boundaries are per-room and cannot be applied without a "
+                "room context."
             ),
             is_error=True,
         )
@@ -1774,9 +1777,9 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
     if room_id == "__sub__":
         return ToolResult(
             content=(
-                "Sub-agents cannot apply GC boundaries — subagents manage "
-                "their own context; only the owning room session may flush "
-                "its prompt cache boundary."
+                "Sub-agents cannot apply context handoff boundaries — "
+                "subagents manage their own context; only the owning room "
+                "session may flush its prompt cache boundary."
             ),
             is_error=True,
         )
@@ -1785,9 +1788,10 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
     if apply_cb is None:
         return ToolResult(
             content=(
-                "GC boundaries are managed in Matrix rooms via the operator "
-                "`/cache gc` command — the context_gc tool is unavailable on "
-                "this interface (no boundary callback wired)."
+                "Handoff boundaries are managed in Matrix rooms via the "
+                "operator `/cache handoff` command — the context_handoff "
+                "tool is unavailable on this interface (no boundary "
+                "callback wired)."
             ),
             is_error=True,
         )
@@ -1796,18 +1800,18 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
         outcome = await apply_cb(room_id, trigger="tool", exclude_inflight=True)
     except Exception as e:
         logger.warning(
-            "context_gc: apply_handoff_boundary raised %s in %s",
+            "context_handoff: apply_handoff_boundary raised %s in %s",
             type(e).__name__, room_id, exc_info=True,
         )
         return ToolResult(
-            content=f"GC boundary application failed: {type(e).__name__}.",
+            content=f"Handoff boundary application failed: {type(e).__name__}.",
             is_error=True,
         )
 
     if not isinstance(outcome, dict):
         return ToolResult(
             content=(
-                "GC boundary callback returned a malformed result "
+                "Handoff boundary callback returned a malformed result "
                 f"({type(outcome).__name__}); nothing was applied."
             ),
             is_error=True,
@@ -1819,12 +1823,8 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
         return ToolResult(content=reason, is_error=True)
 
     manifest = outcome.get("manifest") or {}
-    classes = manifest.get("classes") or {}
     durable = manifest.get("durable") or {}
-    stripped = ", ".join(
-        f"{cls}={classes.get(cls, 0)}"
-        for cls in ("tools", "thinking", "inputs", "media")
-    )
+    files = durable.get("files") or []
     used = durable.get("used_tokens", 0)
     budget = durable.get("budget_tokens", 0)
     flag = " — over reinjection budget (informational)" if outcome.get("over_budget") else ""
@@ -1832,8 +1832,9 @@ async def _execute_context_gc(input: dict, callbacks: dict | None) -> "ToolResul
     # post-boundary token estimate are what the operator greps for.
     return ToolResult(
         content=(
-            f"GC boundary {manifest.get('boundary_index', '?')} applied "
-            f"(trigger=tool). Stripped pre-boundary: {stripped}. "
+            f"Context handoff boundary {manifest.get('boundary_index', '?')} "
+            f"applied (trigger=tool). Full strip: all pre-boundary content "
+            f"dropped; {len(files)} durable file(s) re-injected. "
             f"Tokens {manifest.get('tokens_before', 0)} -> "
             f"{manifest.get('tokens_after_est', 0)} (est.). "
             f"Durable budget {used}/{budget} tokens{flag}."
@@ -2574,8 +2575,8 @@ async def _execute_tool_inner(
         result = await _execute_todo_write(input, callbacks)
     elif name == "heartbeat":
         result = await _execute_heartbeat_tool(input, callbacks)
-    elif name == "context_gc":
-        result = await _execute_context_gc(input, callbacks)
+    elif name == "context_handoff":
+        result = await _execute_context_handoff(input, callbacks)
     elif name == "set_active_project":
         result = await _execute_set_active_project(input, callbacks)
     else:
