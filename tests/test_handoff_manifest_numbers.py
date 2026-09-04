@@ -175,6 +175,38 @@ class TestCompositeManifestNumbers:
             agent, log, ROOM, trigger="tool", exclude_inflight=False)
         assert "tokens_after_est" not in res["manifest"]
 
+    def test_tokens_before_counts_only_rendered_span(self, tmp_path):
+        """SB canary bug (2026-09-04, ~104,597 inflation): tokens_before/
+        tokens_dropped must count only the RENDERED pre-boundary span —
+        entries below the PREVIOUS boundary are already dead (stripped,
+        never rendered). The figure must not grow with every boundary."""
+        agent = _agent_stub(tmp_path)
+        log = _make_log(tmp_path)
+        # bulk that dies at boundary 1
+        log.append(role="user", content="D" * 8000, room=ROOM,
+                   sender="@op:matrix.local")
+        res1 = m.apply_boundary_and_rebuild(
+            agent, log, ROOM, trigger="tool", exclude_inflight=False)
+        assert res1["applied"] is True
+        # fresh, small content above boundary 1, then boundary 2
+        log.append(role="user", content="L" * 400, room=ROOM,
+                   sender="@op:matrix.local")
+        res2 = m.apply_boundary_and_rebuild(
+            agent, log, ROOM, trigger="tool", exclude_inflight=False)
+        assert res2["applied"] is True
+        mf2 = res2["manifest"]
+        # the 8000-char bulk is DEAD — it must not appear in the figures
+        assert mf2["tokens_dropped"] < 400, (
+            f"tokens_dropped counted dead pre-boundary content: "
+            f"{mf2['tokens_dropped']} (rendered span is ~200 tok)")
+        constant = (len(agent.system_prompt) + agent._tool_defs_chars) // 4
+        assert mf2["tokens_before"] == constant + mf2["tokens_dropped"], (
+            f"tokens_before must be constant + rendered-dropped: "
+            f"{mf2['tokens_before']} != {constant} + {mf2['tokens_dropped']}")
+        # and the rendered span IS counted: the new 400-char entry (~100)
+        # + the old snapshot (~60) must dominate the figure
+        assert mf2["tokens_dropped"] >= 100
+
     def test_runway_block_arithmetic_unchanged(self, tmp_path):
         """The runway block keeps its message-side composite (snapshot +
         tail, NO sp/tool defs) — ladder semantics must not drift."""

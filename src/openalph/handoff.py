@@ -434,12 +434,19 @@ def _entry_render_chars(entry: dict) -> int:
     return total
 
 
-def _strip_tokens_before(entries: list[dict], boundary_index: int) -> int:
-    """Full-strip ``tokens_dropped``: chars//4 over all pre-boundary
-    renderable content (positions < boundary_index) — the operator-visible
-    "what the strip bought" figure, WITHOUT the system-prompt/tool-defs
-    constant (see the composite ``tokens_before`` in
-    apply_boundary_and_rebuild).
+def _strip_tokens_before(entries: list[dict], boundary_index: int,
+                         floor: int = 0) -> int:
+    """Full-strip ``tokens_dropped``: chars//4 over the RENDERED pre-boundary
+    span (positions from ``floor`` — the PREVIOUS boundary's first-kept
+    position — up to ``boundary_index``) — the operator-visible "what THIS
+    strip bought" figure, WITHOUT the system-prompt/tool-defs constant (see
+    the composite ``tokens_before`` in apply_boundary_and_rebuild).
+
+    kdsn.322.14 canary fix (SB, 2026-09-04): counting from position 0 made
+    the figure swallow every earlier DEAD span — content already stripped by
+    previous boundaries never rendered, so each boundary's "before" inflated
+    monotonically with the room's boundary count. The floor matches
+    build_context's own render floor (current_boundary_index).
 
     Counts user/assistant TEXT content (str or part-list), tool outputs
     (the ``output`` field on JSONL tool entries, the ``content`` field on
@@ -451,7 +458,7 @@ def _strip_tokens_before(entries: list[dict], boundary_index: int) -> int:
     total = 0
     # min() guard: boundary_index is the next-append position (len+1) — one
     # past the last real entry for a settled turn.
-    for position in range(min(boundary_index, len(entries))):
+    for position in range(max(floor, 0), min(boundary_index, len(entries))):
         total += _entry_render_chars(entries[position])
     return total // 4
 
@@ -836,7 +843,8 @@ def apply_boundary(
     # retired (spec §9 amendment); legacy manifests carrying it render
     # fail-soft.
     _constant_tokens = (system_prompt_chars + tool_defs_chars) // 4
-    tokens_dropped = _strip_tokens_before(entries, boundary_index)
+    tokens_dropped = _strip_tokens_before(entries, boundary_index,
+                                          floor=max(current, 0))
     tokens_before = _constant_tokens + tokens_dropped
 
     # Runway-gated handoff: the handoff decision is about POST-BOUNDARY
