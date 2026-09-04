@@ -1628,6 +1628,91 @@ class MatrixBot:
 
         return _drain_steering
 
+    def _make_thinking_sink(self, room_id: str, on_progress=None):
+        """Build the per-turn thinking-display closure (kdsn.328).
+
+        ONE construction seam shared by _process_message and
+        _run_heartbeat_turn so the live and synthetic turn paths cannot
+        drift (mirrors the _make_steering_drain pattern from kdsn.311).
+        Returns the tuple ``(thinking_delta, flush_pending)``:
+
+        * ``thinking_delta(text, done)`` buffers thinking chunks; the first
+          chunk of each segment emits the one-time "💭 Thinking…" notice +
+          typing, and the done signal does a fallback flush so
+          thinking-only turns still deliver their details block (no-op when
+          a text-delta flush already fired).
+        * ``flush_pending()`` delivers the buffered segment as the furled
+          💭 Thinking <details> block. Idempotent — a no-op when the buffer
+          is empty, so it is safe to call repeatedly. Each flush clears the
+          buffer and resets the one-time-notice latch for the next
+          tool-loop iteration. The send is fail-soft: a transient Matrix
+          error logs a warning and never aborts the turn.
+
+        ``on_progress`` is the stall-watchdog liveness hook; the
+        heartbeat/umbral path runs inside the timer-loop task with no
+        watchdog and passes None.
+        """
+        _buffer: list = []
+        _notified = False
+
+        async def _flush_pending() -> None:
+            nonlocal _notified
+            if not _buffer:
+                return  # idempotent — safe to call repeatedly
+            full_thinking = "".join(_buffer)
+            _buffer.clear()  # reset for next tool-loop iteration
+            _notified = False  # reset for next tool-loop iteration
+            if not full_thinking.strip():
+                return
+            # Truncate thinking to avoid M_TOO_LARGE on Matrix PDU limit.
+            # HTML rendering roughly doubles size; cap raw text at MAX_MESSAGE_CHARS
+            # to keep formatted message well under 65535 bytes.
+            # Full thinking is preserved in session JSONL.
+            if len(full_thinking) > self.MAX_MESSAGE_CHARS:
+                full_thinking = (
+                    full_thinking[:self.MAX_MESSAGE_CHARS]
+                    + "\n\n[truncated — full thinking in session JSONL]"
+                )
+            html = (
+                '<details>\n<summary>💭 Thinking</summary>\n'
+                f'{mistune.html(full_thinking)}'
+                '</details>'
+            )
+            content = {
+                "msgtype": "m.notice",
+                "body": f"💭 Thinking\n\n{full_thinking}",
+                "format": "org.matrix.custom.html",
+                "formatted_body": html,
+                "openalph.thinking": True,
+            }
+            try:
+                await self._room_send_with_retry(room_id, content)
+            except Exception as exc:
+                logger.warning(
+                    "Thinking details send failed in %s: %s", room_id, exc,
+                )
+
+        async def _thinking_delta(text: str, done: bool):
+            nonlocal _notified
+            if on_progress is not None:
+                on_progress()
+            if not done:
+                _buffer.append(text)
+                # Send a one-time notice on first thinking chunk
+                if not _notified:
+                    _notified = True
+                    try:
+                        await self.send_notice(room_id, "💭 Thinking…")
+                        await self._set_typing(room_id, True)
+                    except Exception:
+                        pass
+            else:
+                # Fallback flush — covers thinking-only turns (tool-call
+                # iterations); no-op when a text-delta flush already fired.
+                await _flush_pending()
+
+        return _thinking_delta, _flush_pending
+
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
         """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
 
@@ -1658,47 +1743,12 @@ class MatrixBot:
             # Room effort override maps to the API `thinking` level.
             _effort_override = getattr(self, '_room_effort', {}).get(room_id)
             _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
-            _thinking_buffer = []
-            _thinking_done = False
-            _thinking_notified = False
-
-            async def _thinking_delta(text: str, done: bool):
-                nonlocal _thinking_done, _thinking_notified
-                if not done:
-                    _thinking_buffer.append(text)
-                    # Send a one-time notice on first thinking chunk
-                    if not _thinking_notified:
-                        _thinking_notified = True
-                        try:
-                            await self.send_notice(room_id, "💭 Thinking…")
-                            await self._set_typing(room_id, True)
-                        except Exception:
-                            pass
-                else:
-                    _thinking_done = True
-                    _thinking_notified = False  # reset for next tool-loop iteration
-                    # Send thinking as <details> block
-                    full_thinking = "".join(_thinking_buffer)
-                    _thinking_buffer.clear()  # reset for next tool-loop iteration
-                    if full_thinking.strip():
-                        if len(full_thinking) > self.MAX_MESSAGE_CHARS:
-                            full_thinking = (
-                                full_thinking[:self.MAX_MESSAGE_CHARS]
-                                + "\n\n[truncated — full thinking in session JSONL]"
-                            )
-                        html = (
-                            '<details>\n<summary>💭 Thinking</summary>\n'
-                            f'{mistune.html(full_thinking)}'
-                            '</details>'
-                        )
-                        thinking_content = {
-                            "msgtype": "m.notice",
-                            "body": f"💭 Thinking\n\n{full_thinking}",
-                            "format": "org.matrix.custom.html",
-                            "formatted_body": html,
-                            "openalph.thinking": True,
-                        }
-                        await self._room_send_with_retry(room_id, thinking_content)
+            # kdsn.328: thinking display via the ONE shared seam (same as the
+            # live path). No on_progress — the timer-loop task has no
+            # watchdog. No text-flush hook either: the bulk response is sent
+            # after handle_input returns, so details-before-answer ordering
+            # is already correct here.
+            _thinking_delta, _ = self._make_thinking_sink(room_id)
 
             async def _cache_status(usage, model_str):
                 """Emit in-room notice on significant prompt cache miss if provider opted in."""
@@ -2506,56 +2556,19 @@ class MatrixBot:
 
                 # Set up streaming delivery
                 streaming = StreamingDelivery(self, room_id)
-                _thinking_buffer = []
-                _thinking_done = False
-                _thinking_notified = False
+                # kdsn.328: thinking display via the ONE shared seam (same as
+                # the heartbeat path). _text_delta flushes pending thinking
+                # before pushing content so the furled block precedes the
+                # streamed answer in the room timeline.
+                _thinking_delta, _flush_thinking = self._make_thinking_sink(room_id, on_progress=_turn_progress)
 
                 async def _text_delta(text: str, done: bool):
                     _turn_progress()
+                    # Flush pending thinking BEFORE content lands: the furled block must
+                    # precede the streamed answer in the room timeline (mobile clients
+                    # render <details> unfurled — reasoning above, answer last). kdsn.328
+                    await _flush_thinking()
                     await streaming.push(text, done=done)
-
-                async def _thinking_delta(text: str, done: bool):
-                    nonlocal _thinking_done, _thinking_notified
-                    _turn_progress()
-                    if not done:
-                        _thinking_buffer.append(text)
-                        # Send a one-time notice on first thinking chunk
-                        if not _thinking_notified:
-                            _thinking_notified = True
-                            try:
-                                await self.send_notice(room_id, "💭 Thinking…")
-                                await self._set_typing(room_id, True)
-                            except Exception:
-                                pass
-                    else:
-                        _thinking_done = True
-                        _thinking_notified = False  # reset for next tool-loop iteration
-                        # Send thinking as <details> block
-                        full_thinking = "".join(_thinking_buffer)
-                        _thinking_buffer.clear()  # reset for next tool-loop iteration
-                        if full_thinking.strip():
-                            # Truncate thinking to avoid M_TOO_LARGE on Matrix PDU limit.
-                            # HTML rendering roughly doubles size; cap raw text at MAX_MESSAGE_CHARS
-                            # to keep formatted message well under 65535 bytes.
-                            # Full thinking is preserved in session JSONL.
-                            if len(full_thinking) > self.MAX_MESSAGE_CHARS:
-                                full_thinking = (
-                                    full_thinking[:self.MAX_MESSAGE_CHARS]
-                                    + "\n\n[truncated — full thinking in session JSONL]"
-                                )
-                            html = (
-                                '<details>\n<summary>💭 Thinking</summary>\n'
-                                f'{mistune.html(full_thinking)}'
-                                '</details>'
-                            )
-                            content = {
-                                "msgtype": "m.notice",
-                                "body": f"💭 Thinking\n\n{full_thinking}",
-                                "format": "org.matrix.custom.html",
-                                "formatted_body": html,
-                                "openalph.thinking": True,
-                            }
-                            await self._room_send_with_retry(room_id, content)
 
                 async def _cache_status(usage, model_str):
                     """Emit in-room notice on significant prompt cache miss if provider opted in."""
