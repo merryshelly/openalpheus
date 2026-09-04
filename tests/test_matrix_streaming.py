@@ -305,4 +305,4 @@ class TestStreamingErrors:
         typing_calls = bot.client.room_typing.call_args_list
         if typing_calls:
             last_typing = typing_calls[-1]
-            assert last_typing[0][1] == False or last_typing[1].get("typing_state") == False
+            assert last_typing[0][1] is False or last_typing[1].get("typing_state") is False
