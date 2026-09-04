@@ -13,9 +13,7 @@ paths, returncode is set and the finally is a no-op.
 
 import asyncio
 import os
-import signal
 import pytest
-from pathlib import Path
 
 from openalph.tools.shell import run_shell
 

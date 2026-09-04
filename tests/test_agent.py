@@ -9,8 +9,7 @@ Interface contract:
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch
-from pathlib import Path
+from unittest.mock import patch
 from openalph.agent import Agent
 from openalph.config import AgentConfig
 from openalph.provider import Response, Usage, StreamEvent
@@ -22,7 +21,6 @@ def make_provider(key="default", type="anthropic", api_key="sk-test", base_url=N
 
 
 def make_config(workspace, **kwargs):
-    from openalph.config import ProviderConfig
     defaults = dict(
         name="test",
         default_model="anthropic/claude-sonnet-4-20250514",

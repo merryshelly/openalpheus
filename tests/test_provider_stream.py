@@ -31,9 +31,7 @@ from openalph.provider import (
     stream,
     complete,
     Response,
-    Usage,
     ToolCall,
-    ThinkingBlock,
     ProviderError,
     _DEGEN_CHAR_THRESHOLD,
     _DEGEN_WARNING,
@@ -1428,7 +1426,7 @@ class TestSessionAffinity:
     @pytest.mark.asyncio
     async def test_affinity_is_32_lowercase_hex(self):
         """The affinity value is 32 chars of lowercase hex."""
-        from openalph.provider import SALT, stream
+        from openalph.provider import stream
 
         fw_config = make_config(
             providers={"fireworks": make_provider(
@@ -1464,7 +1462,7 @@ class TestSessionAffinity:
     @pytest.mark.asyncio
     async def test_affinity_deterministic(self):
         """Same room_id yields the same affinity across two stream() drives."""
-        from openalph.provider import SALT, stream
+        from openalph.provider import stream
 
         fw_config = make_config(
             providers={"fireworks": make_provider(
@@ -1503,7 +1501,7 @@ class TestSessionAffinity:
     @pytest.mark.asyncio
     async def test_affinity_differs_by_room(self):
         """Different room_ids yield different affinity values."""
-        from openalph.provider import SALT, stream
+        from openalph.provider import stream
 
         fw_config = make_config(
             providers={"fireworks": make_provider(

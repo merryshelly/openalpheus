@@ -11,7 +11,7 @@ Architecture:
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from pathlib import Path
 
 from openalph.tools import ToolResult, execute_tool, BUILTIN_TOOLS

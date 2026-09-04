@@ -5,7 +5,6 @@ the actual formatting, parsing, error handling, and truncation logic.
 """
 
 import inspect
-import json
 import re
 
 import httpx
@@ -19,7 +18,7 @@ from openalph.tools.web import (
     _budgeted_window_text,
     MAX_RESPONSE_BYTES,
 )
-from openalph.tools import ToolResult, execute_tool, truncate_result
+from openalph.tools import execute_tool, truncate_result
 
 
 def mock_httpx_response(status_code=200, json_data=None, text="", content=None):
@@ -337,7 +336,6 @@ class TestWebFetch:
         big_first_chunk = b"X" * MAX_RESPONSE_BYTES
         overflow_chunk = b"Y" * 512
 
-        import httpx as _httpx
 
         resp = MagicMock()
         resp.status_code = 200

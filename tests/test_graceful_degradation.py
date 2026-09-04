@@ -15,8 +15,7 @@ Acceptance criteria:
 
 import logging
 import pytest
-from pathlib import Path
-from openalph.config import load_config, ConfigError, resolve_model
+from openalph.config import load_config, resolve_model
 
 
 def _write_config(tmp_path, toml_content):

@@ -19,15 +19,13 @@ imports exist in this suite → copy per convention, never modify an existing
 test file).
 """
 
-import html
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from openalph.agent import Agent
 from openalph.config import AgentConfig, ProviderConfig, MatrixConfig
-from openalph.provider import Response, Usage, StreamEvent, ToolCall
+from openalph.provider import Response, Usage, ToolCall
 from openalph.matrix import MatrixBot
 from openalph.tools import ToolResult, wrap_tool_result
 from openalph.tools.security import redact_credentials as _redact

@@ -19,16 +19,14 @@ All tests gate on `run_advisor is not None` → clean FAILED lines, not collecti
 ERRORs. Helpers stay import-safe so the file always COLLECTS.
 """
 
-import asyncio
 import html
 import pytest
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from openalph.agent import Agent
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.provider import Response, Usage, StreamEvent, ToolCall, ThinkingBlock
-from openalph.tools import ToolResult, _TODO_STATE, BUILTIN_TOOLS
+from openalph.provider import Response, Usage, StreamEvent, ToolCall
+from openalph.tools import _TODO_STATE
 from openalph.session import SessionLog
 from openalph.matrix import MatrixBot
 

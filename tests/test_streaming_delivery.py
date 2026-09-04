@@ -20,10 +20,8 @@ Contract:
     Cursor indicator (▍) present during streaming, absent on finalize.
 """
 
-import time
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, call
-from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 from openalph.matrix import StreamingDelivery, MatrixBot
 

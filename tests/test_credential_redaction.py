@@ -15,8 +15,7 @@ is only redacted once, as anthropic_api_key).
 
 import pytest
 import logging
-from unittest.mock import AsyncMock, patch, MagicMock
-from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from openalph.tools.security import (
     redact_credentials,

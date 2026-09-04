@@ -10,10 +10,7 @@ Architecture:
     agent.py    — status() includes strippable stats
 """
 
-import json
-import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, AsyncMock, patch
 
 from openalph.session import SessionLog
 
@@ -474,7 +471,6 @@ class TestToolstripContextEstimate:
 
     def test_status_context_smaller_after_toolstrip(self, tmp_path):
         """Context token estimate decreases after toolstrip is applied."""
-        from openalph.agent import Agent
         from openalph.config import AgentConfig, ProviderConfig
 
         config = AgentConfig(

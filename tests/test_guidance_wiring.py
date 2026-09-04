@@ -8,7 +8,6 @@ Follows test_realtime_steering.py conventions: MatrixBot via __new__ bypass,
 mocked nio client, mocked Agent with AsyncMock handle_input.
 """
 
-import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -425,12 +424,9 @@ class TestGuidanceWiring:
         history; the reminder must follow it in both history and wire payload.
         Uses a real Agent with mocked stream so we can inspect message order.
         """
-        import sys
-        import types
         from pathlib import Path
         from openalph.agent import Agent
         from openalph.config import AgentConfig, ProviderConfig
-        from openalph.reminders import ReminderEngine, Reminder
         from openalph.provider import StreamEvent, Response, Usage
 
         # Build a minimal agent config with reminders enabled

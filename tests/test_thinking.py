@@ -11,7 +11,6 @@ Covers:
     - Session persistence with thinking blocks
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
@@ -19,7 +18,6 @@ from openalph.config import AgentConfig, ProviderConfig, load_config
 from openalph.provider import (
     complete,
     Response,
-    Usage,
     ThinkingBlock,
     ToolCall,
     _supports_adaptive_thinking,

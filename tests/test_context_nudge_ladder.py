@@ -26,9 +26,7 @@ live in the migrated wave-1 tests, not here.
 """
 
 import asyncio
-import inspect
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 # ---------------------------------------------------------------------------
 # Guard imports — the ladder does not exist yet; base modules should load.

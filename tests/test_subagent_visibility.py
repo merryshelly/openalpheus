@@ -13,13 +13,11 @@ Two features:
 """
 
 import json
-import os
-import time
 import pytest
 from pathlib import Path
-from unittest.mock import patch, AsyncMock, MagicMock, ANY
+from unittest.mock import patch, AsyncMock
 
-from openalph.tools.subagent import run_subagent, MAX_ITERATIONS
+from openalph.tools.subagent import run_subagent
 from openalph.tools import ToolDef, ToolResult
 from openalph.config import AgentConfig, ProviderConfig
 from openalph.provider import Response, Usage, ToolCall

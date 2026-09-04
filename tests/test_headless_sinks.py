@@ -9,11 +9,8 @@ RED until:
   - MatrixBot._persist_assistant_turn delegates to the shared function
 """
 
-import asyncio
-import json
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from openalph.session import SessionLog
 
@@ -155,7 +152,7 @@ class TestHeadlessSinks:
 
     def test_satisfies_comms_sinks_protocol(self):
         """HeadlessSinks has all 7 CommsSinks methods (7th: log_vision_injection, kdsn.279)."""
-        from openalph.callbacks import HeadlessSinks, CommsSinks
+        from openalph.callbacks import HeadlessSinks
         expected = {"send_notice", "log_reminder", "send_media",
                     "on_redaction", "on_keepalive_miss", "on_degenerate",
                     "log_vision_injection"}

@@ -8,12 +8,9 @@ interactive loop. Tests mock builtins.input() to simulate user input and
 redirect stdout/stderr to capture output routing.
 """
 
-import asyncio
-import sys
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 

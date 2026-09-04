@@ -4,9 +4,7 @@ C: Per-room usage counters in agent.py (isolation, reset, usage_totals, restart 
 A: Assistant-turn serializer in matrix.py (thinking + usage persisted; convergence test)
 """
 
-import json
 import pytest
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -787,7 +785,7 @@ class TestSummaryFailureDoesNotPersistStaleUsage:
         from openalph.agent import Agent
         from openalph.session import SessionLog
         from openalph.matrix import MatrixBot
-        from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
+        from openalph.config import MatrixConfig
 
         room = "!summaryfix2:matrix.local"
         AGENT_USER_LOCAL = "@bot2:matrix.local"

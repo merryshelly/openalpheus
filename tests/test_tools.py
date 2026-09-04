@@ -11,7 +11,6 @@ ToolError: raised for configuration/discovery errors
 """
 
 import pytest
-from pathlib import Path
 from openalph.tools import (
     discover_tools,
     tool_schemas,

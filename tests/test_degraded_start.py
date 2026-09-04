@@ -26,7 +26,6 @@ sleep/timeout waits; no network).
 """
 
 import asyncio
-import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 

@@ -12,11 +12,9 @@ FileInfo: path (str), mtime (float)
 IndexStats: files_scanned (int), files_indexed (int), chunks_created (int), files_removed (int)
 """
 
-import sqlite3
 import pytest
 import os
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 from openalph.memory.indexer import MemoryIndexer, FileInfo, IndexStats
 from openalph.memory.schema import init_db
 

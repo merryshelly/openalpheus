@@ -1,7 +1,7 @@
 """Tests for cancel-awaits-task-completion fix (Code Review #10)."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

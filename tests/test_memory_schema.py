@@ -12,8 +12,6 @@ load_vec_extension attempts to load sqlite-vec and returns True/False.
 """
 
 import sqlite3
-import pytest
-from pathlib import Path
 from openalph.memory.schema import init_db, load_vec_extension
 
 

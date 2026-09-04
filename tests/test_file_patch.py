@@ -16,13 +16,12 @@ anywhere in this suite, so copying follows the existing convention and
 avoids modifying an existing test file (FORBIDDEN).
 """
 
-import os
 from pathlib import Path
 
 import pytest
 
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.tools import execute_tool, ToolResult, BUILTIN_TOOLS
+from openalph.tools import execute_tool, BUILTIN_TOOLS
 
 
 # --- Helpers (copied from test_guidance_integration.py convention) ---------

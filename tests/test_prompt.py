@@ -10,8 +10,6 @@ Only known files are included — no arbitrary .md files.
 File order: SOUL.md, OPERATOR.md, SAFETY.md, OPERATIONS.md, ENVIRONMENT.md, WAKE.md
 """
 
-import pytest
-from pathlib import Path
 from openalph.prompt import assemble_prompt
 
 

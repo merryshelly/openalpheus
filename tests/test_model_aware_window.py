@@ -7,7 +7,6 @@ Three groups:
 """
 
 import logging
-import pytest
 
 from openalph.agent import Agent
 from openalph.config import AgentConfig, ProviderConfig

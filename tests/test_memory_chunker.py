@@ -13,7 +13,6 @@ Chunking strategy:
        windows with 200-char overlap.
 """
 
-import pytest
 from openalph.memory.chunker import chunk_file, Chunk
 
 

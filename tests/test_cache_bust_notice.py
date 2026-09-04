@@ -6,12 +6,10 @@ Covers:
 - Transport callback logic: provider opt-in/opt-out gating
 """
 
-import asyncio
 import pytest
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openalph.config import AgentConfig, ProviderConfig, load_config, ConfigError
+from openalph.config import AgentConfig, ProviderConfig, load_config
 from openalph.provider import Usage, Response, StreamEvent
 
 

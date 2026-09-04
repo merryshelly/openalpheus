@@ -9,11 +9,9 @@ RED until cli.py is refactored to extract testable functions:
 And openalph/data/bip39-english.txt exists.
 """
 
-import asyncio
-import json
 import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from openalph.session import SessionLog
 from openalph.config import AgentConfig, ProviderConfig

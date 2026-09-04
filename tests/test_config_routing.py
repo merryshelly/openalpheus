@@ -1,8 +1,6 @@
 """Tests for provider routing configuration."""
 
-import pytest
-from pathlib import Path
-from openalph.config import load_config, ConfigError
+from openalph.config import load_config
 
 
 class TestRoutingConfig:

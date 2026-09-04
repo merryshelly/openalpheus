@@ -11,7 +11,6 @@ Fix: replace the unconditional 0.3 with roster-driven per-model sampling
 profiles. Default now OMITS penalties (was 0.3). GLM/Kimi are pinned to omit,
 independent of whatever the default becomes.
 """
-import pytest
 
 from openalph.provider import (
     _build_anthropic_kwargs,

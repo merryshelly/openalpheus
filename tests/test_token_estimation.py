@@ -1,7 +1,6 @@
 """Tests for token estimation accuracy improvements in agent._estimate_context_tokens."""
 
 import json
-import pytest
 
 from openalph.agent import Agent, _TOOL_CALL_OVERHEAD_CHARS, _TOOL_RESULT_OVERHEAD_CHARS
 from openalph.config import AgentConfig, ProviderConfig

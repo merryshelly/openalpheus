@@ -15,12 +15,10 @@ Design spec: memory/projects/openalph/specs/cli-firstclass-and-matrix-decoupling
 """
 
 import asyncio
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from pathlib import Path
 
 from openalph.matrix import MatrixBot
-from openalph.config import MatrixConfig, AgentConfig, ProviderConfig
+from openalph.config import MatrixConfig
 
 
 # ---------------------------------------------------------------------------

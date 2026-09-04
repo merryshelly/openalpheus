@@ -8,7 +8,6 @@ Minimum interval enforcement is tested separately from timer mechanics.
 import asyncio
 import json
 import pytest
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 from openalph.umbral import UmbralManager

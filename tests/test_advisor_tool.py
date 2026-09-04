@@ -27,8 +27,7 @@ suite uniformly red now and the 2045/1-skip accounting clean.
 
 import asyncio
 import pytest
-from pathlib import Path
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 
 try:
     from openalph.tools.advisor import render_transcript, run_advisor

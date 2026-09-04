@@ -19,10 +19,8 @@ Contract:
     When no callbacks provided, behavior is identical to previous implementation.
 """
 
-import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, call
-from pathlib import Path
+from unittest.mock import AsyncMock, patch, call
 
 from openalph.agent import Agent, ContextOverflowError
 from openalph.config import AgentConfig, ProviderConfig

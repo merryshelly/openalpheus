@@ -23,7 +23,7 @@ import pytest
 
 from openalph.config import AgentConfig, ProviderConfig, ConfigError, load_config
 from openalph.session import SessionLog
-from openalph.tools import ToolResult, BUILTIN_TOOLS, execute_tool
+from openalph.tools import BUILTIN_TOOLS, execute_tool
 from openalph.reminders import ReminderEngine, ReminderState
 from openalph.prompt import assemble_prompt
 

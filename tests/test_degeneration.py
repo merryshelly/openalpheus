@@ -1,5 +1,4 @@
 """Tests for degeneration detection in provider.py."""
-import pytest
 from openalph.provider import (
     _detect_and_truncate_degeneration,
     _DEGEN_CHAR_THRESHOLD,

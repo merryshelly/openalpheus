@@ -10,7 +10,6 @@ Extends the existing provider adapter with:
 Provider converts normalized message history to/from native format on each call.
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path

@@ -30,8 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.provider import Usage
-from openalph.tools import execute_tool, ToolResult
+from openalph.tools import execute_tool
 from openalph.tools import search as search_mod
 from openalph.tools import validate as validate_mod
 import openalph.provider as provider_mod

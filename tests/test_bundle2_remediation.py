@@ -50,9 +50,8 @@ from openalph.agent import Agent
 from openalph.config import AgentConfig, ProviderConfig, MatrixConfig
 from openalph.matrix import MatrixBot
 from openalph.provider import ToolCall
-from openalph.tools import execute_tool, ToolResult, BUILTIN_TOOLS
+from openalph.tools import execute_tool
 from openalph.tools import search as search_mod
-from openalph.tools.security import redact_credentials as _redact
 
 
 # ===========================================================================

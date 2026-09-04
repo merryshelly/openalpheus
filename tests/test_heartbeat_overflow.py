@@ -8,7 +8,6 @@ Generic exceptions should NOT trigger auto-stop.
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openalph.heartbeat import HeartbeatManager
 from openalph.matrix import MatrixBot
 from openalph.config import AgentConfig, MatrixConfig
 from openalph.agent import ContextOverflowError

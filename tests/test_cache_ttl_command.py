@@ -73,8 +73,7 @@ class TestBuildAnthropicKwargsCacheTTL:
         assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
-from pathlib import Path
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import patch
 from openalph.agent import Agent
 from openalph.config import AgentConfig, ProviderConfig
 from openalph.provider import Response, Usage, StreamEvent

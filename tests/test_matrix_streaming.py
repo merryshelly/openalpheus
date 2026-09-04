@@ -10,10 +10,9 @@ Contract:
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock, call
-from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
-from openalph.matrix import MatrixBot, StreamingDelivery
+from openalph.matrix import MatrixBot
 from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
 from openalph.agent import Agent
 

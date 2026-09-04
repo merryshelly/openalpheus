@@ -7,8 +7,6 @@ assemble_prompt() appends a hardcoded injection defense section that:
 - Appears after workspace files and skills index
 """
 
-import pytest
-from pathlib import Path
 from openalph.prompt import assemble_prompt, INJECTION_DEFENSE
 
 

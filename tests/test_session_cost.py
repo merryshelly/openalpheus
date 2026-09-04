@@ -1062,7 +1062,7 @@ class TestFireworksMissingCachedRate:
     pre-/post-build (patch.dict adds the 'fireworks' key if absent)."""
 
     def test_missing_cached_rate_full_rate(self):
-        from openalph.provider import compute_cost, Usage, _MODEL_PRICING
+        from openalph.provider import compute_cost, Usage
         from openalph import provider
         with patch.dict(provider._MODEL_PRICING,
                         {"fireworks": {"sizetier-test":

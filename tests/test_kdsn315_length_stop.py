@@ -18,16 +18,14 @@ P4  Empty-text thinking-retry (agent.py) becomes live on openai-compat via P1
 Loop tests use an OPENAI-type provider so the vocabulary fix is what's proven.
 """
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from openalph.agent import Agent
 from openalph.config import AgentConfig, ConfigError, ProviderConfig
 from openalph.provider import (
-    StreamEvent, Response, Usage, ToolCall, ThinkingBlock,
-    _normalize_stop_reason, _parse_openai_response,
+    StreamEvent, Response, Usage, ToolCall, _normalize_stop_reason, _parse_openai_response,
 )
 from openalph.tools import ToolDef, ToolResult
 

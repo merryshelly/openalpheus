@@ -11,7 +11,7 @@ Requires matrix-nio mocking since we don't connect to a real server in tests.
 
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 from openalph.matrix import MatrixBot
 from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
@@ -143,7 +143,6 @@ class TestLogin:
     @pytest.mark.asyncio
     async def test_login_failure_raises(self):
         """MatrixBot raises RuntimeError when password login returns a non-LoginResponse."""
-        from nio import LoginResponse
         config = make_matrix_config(password="bad-password", access_token=None)
         agent = MagicMock()
 
@@ -346,7 +345,7 @@ class TestCommands:
     @pytest.mark.asyncio
     async def test_status_shows_turns_after_room_activation(self):
         """/status reflects turns loaded from session_log, not the empty default."""
-        from unittest.mock import MagicMock, AsyncMock
+        from unittest.mock import MagicMock
 
         config = make_matrix_config(user_id="@merry:matrix.local")
         agent = MagicMock()

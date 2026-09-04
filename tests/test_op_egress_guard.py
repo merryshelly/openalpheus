@@ -47,7 +47,6 @@ RED honesty:
     disk at the time the test file is first deployed (see remediation-report-r2.md).
 """
 
-import logging
 
 import pytest
 

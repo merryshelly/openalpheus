@@ -14,10 +14,7 @@ Style follows test_memory_indexer.py: init_db + load_vec_extension, fake embedde
 with async embed/embed_batch, FileInfo fixture pattern.
 """
 
-import asyncio
 import os
-import struct
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

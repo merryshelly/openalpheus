@@ -20,9 +20,8 @@ import dataclasses
 import logging
 import pytest
 import base64
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
-from openalph.config import AgentConfig, ConfigError, MatrixConfig, ProviderConfig
+from unittest.mock import patch
+from openalph.config import AgentConfig, ConfigError, ProviderConfig
 from openalph.agent import Agent, _build_user_content, VISION_MIME_TYPES, MEDIA_TAG_RE
 from openalph.provider import (
     Response,

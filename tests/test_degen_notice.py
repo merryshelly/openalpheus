@@ -26,10 +26,9 @@ import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openalph.config import AgentConfig, ProviderConfig, ConfigError
+from openalph.config import AgentConfig, ProviderConfig
 from openalph.provider import stream, StreamEvent, Response, Usage
 from openalph.agent import Agent
-from openalph.tools import ToolDef
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +346,6 @@ class TestMatrixNotice:
     async def test_callbacks_include_on_degenerate(self):
         """The callbacks dict from _build_agent_callbacks has an on_degenerate key."""
         from openalph.matrix import MatrixBot
-        from openalph.config import MatrixConfig
 
         bot = MatrixBot.__new__(MatrixBot)
         bot.config = MagicMock()

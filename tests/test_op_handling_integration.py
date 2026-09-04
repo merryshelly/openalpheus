@@ -31,7 +31,6 @@ Helpers are copied from test_guidance_integration.py /
 test_file_search_integration.py (no cross-test-module imports in this suite).
 """
 
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -41,7 +40,7 @@ from openalph.config import AgentConfig, ProviderConfig, MatrixConfig
 from openalph.provider import Response, Usage, StreamEvent, ToolCall
 from openalph.matrix import MatrixBot
 from openalph.session import SessionLog
-from openalph.tools import ToolResult, execute_tool
+from openalph.tools import execute_tool
 
 
 ROOM = "!op-integ:matrix.local"

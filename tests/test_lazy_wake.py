@@ -12,11 +12,11 @@ Architecture invariant: room = session = context = persistence.
 
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock
 from pathlib import Path
 
 from openalph.matrix import MatrixBot
-from openalph.agent import Agent, ContextOverflowError as AgentOverflowError
+from openalph.agent import ContextOverflowError as AgentOverflowError
 from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
 
 
@@ -594,7 +594,7 @@ class TestHistoryPagination:
         # Each call returns 100 messages with a truthy end token (simulates infinite pages)
         def make_infinite_page():
             page = MagicMock()
-            page.chunk = [make_room_message("@sb:local", f"msg", f"$evt") for _ in range(100)]
+            page.chunk = [make_room_message("@sb:local", "msg", "$evt") for _ in range(100)]
             page.end = "infinite_token"
             return page
 

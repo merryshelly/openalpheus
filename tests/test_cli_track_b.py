@@ -4,11 +4,9 @@ Design spec: memory/projects/openalph/specs/cli-firstclass-and-matrix-decoupling
 Bead: workspace-kdsn.230 (emergency-CLI UX + launch robustness)
 """
 
-import asyncio
 import os
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from openalph.config import AgentConfig, ProviderConfig
 

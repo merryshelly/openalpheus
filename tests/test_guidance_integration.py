@@ -9,8 +9,6 @@ This file pinpoints each R1/R2 fix, using the real path that the audit
 found was never tested.
 """
 
-import asyncio
-import math
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch

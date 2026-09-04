@@ -7,8 +7,6 @@ Interface contract:
 """
 
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, patch, MagicMock
 from openalph.tools import BUILTIN_TOOLS, discover_tools, ToolResult
 
 

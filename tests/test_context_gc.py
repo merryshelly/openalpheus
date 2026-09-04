@@ -13,7 +13,6 @@ live in tests/test_context_gc_integration.py.
 """
 
 import json
-from pathlib import Path
 
 import pytest
 

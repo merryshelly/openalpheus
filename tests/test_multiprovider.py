@@ -18,7 +18,6 @@ Interface contracts:
     Agent.switch_model(model_str, room_id) -> str | None (error message)
 """
 
-import json
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -30,7 +29,7 @@ from openalph.config import (
     load_config,
     resolve_model,
 )
-from openalph.provider import Response, ToolCall, Usage
+from openalph.provider import Response, Usage
 
 
 # ---------------------------------------------------------------------------

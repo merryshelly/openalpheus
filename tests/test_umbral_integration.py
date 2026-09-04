@@ -9,13 +9,9 @@ and test_heartbeat_overflow.py.
 """
 
 import asyncio
-import json
 import pytest
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openalph.umbral import UmbralManager
-from openalph.heartbeat import HeartbeatManager
 from openalph.matrix import MatrixBot
 from openalph.session import SessionLog
 from openalph.config import AgentConfig, MatrixConfig, ProviderConfig

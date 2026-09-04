@@ -6,10 +6,8 @@ shell and file tools.
 """
 
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
-from openalph.tools import execute_tool, ToolResult
+from openalph.tools import execute_tool
 from openalph.config import AgentConfig, ProviderConfig
 
 

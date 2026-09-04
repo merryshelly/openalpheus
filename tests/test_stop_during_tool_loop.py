@@ -5,7 +5,7 @@ which requires _process_message to run as a background task so
 sync_forever can dispatch the /stop event.
 """
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

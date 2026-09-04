@@ -6,7 +6,6 @@ detector's whole value depends on NOT firing on legitimate bounded repetition
 false-positive that truncates real output is worse than no detector, so the
 false-positive suite is as important as the true-positive suite.
 """
-import pytest
 
 from openalph.degen import DegenerationMonitor, _WORD_MAX
 
@@ -111,7 +110,8 @@ class TestFalsePositives:
         assert not tripped
 
     def test_base64_blob(self):
-        import base64, os
+        import base64
+        import os
         blob = base64.b64encode(os.urandom(6000)).decode()
         text = "Here is the encoded payload:\n" + blob + "\nEnd."
         mon, tripped = _feed_all(text)
@@ -176,7 +176,8 @@ class TestBoundedState:
     def test_cur_word_is_capped_on_whitespace_free_stream(self):
         # A long whitespace-free blob (base64/minified). Must complete and keep
         # the in-progress word bounded — no O(n^2), no unbounded memory.
-        import base64, os
+        import base64
+        import os
         blob = base64.b64encode(os.urandom(200_000)).decode()  # ~266K chars, no spaces
         mon, tripped = _feed_all(blob, chunk=1024)
         assert len(mon._cur_word) <= _WORD_MAX

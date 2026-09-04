@@ -15,7 +15,7 @@ Interface contract:
 
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock, call
+from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 from openalph.matrix import MatrixBot
 from openalph.config import AgentConfig, MatrixConfig, ProviderConfig

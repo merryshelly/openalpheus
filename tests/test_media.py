@@ -11,8 +11,7 @@ Spec: docs/media-handling-spec.md
 import pytest
 import asyncio
 import hashlib
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock, call
-from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 from openalph.matrix import MatrixBot, MAX_MEDIA_BYTES, MEDIA_DIR
 from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
 

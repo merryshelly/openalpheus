@@ -4,10 +4,8 @@ CLI subcommands: start, stop, restart, status, list, logs, new-agent, run, monit
 Systemctl/journalctl calls are mocked. Config discovery uses monkeypatched CONFIG_DIR.
 """
 
-import subprocess
 from argparse import Namespace
-from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -21,7 +19,6 @@ from openalph.cli import (
     cmd_list,
     cmd_logs,
     cmd_new_agent,
-    cmd_run,
     list_agents,
 )
 

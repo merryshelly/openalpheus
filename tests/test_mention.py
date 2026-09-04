@@ -12,7 +12,6 @@ Interface contract:
     The function is pure — no Matrix client or room state needed.
 """
 
-import pytest
 from openalph.mention import MentionCheckResult, mentions_me, strip_mention
 
 

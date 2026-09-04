@@ -7,11 +7,10 @@ Tests:
     - MatrixBot integration (with mocks)
 """
 
-import json
 import pytest
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from openalph.session import SessionLog, OVERFLOW_THRESHOLD
 from openalph.matrix import MatrixBot

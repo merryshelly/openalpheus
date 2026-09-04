@@ -35,10 +35,9 @@ from openalph.provider import Response, Usage, StreamEvent, ToolCall
 from openalph.matrix import MatrixBot
 from openalph.session import SessionLog
 from openalph.tools import (
-    execute_tool, discover_tools, tool_schemas,
-    ToolResult, ToolError, BUILTIN_TOOLS,
+    execute_tool, tool_schemas,
+    ToolResult, ToolError,
 )
-from openalph.tools.security import redact_credentials as _redact
 
 
 ROOM = "!fs-integ:matrix.local"

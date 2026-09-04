@@ -22,10 +22,8 @@ Interface spec (chosen by recon pass):
 """
 
 import asyncio
-import json
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # Guard imports — feature doesn't exist yet, so we import defensively.

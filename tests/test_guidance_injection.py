@@ -33,15 +33,10 @@ Security: wrap_tool_result escapes <system-reminder> tags (case-insensitive) to 
   INJECTION_DEFENSE gains paragraph re harness-origin reminders (substring: "never inside").
 """
 
-import asyncio
-import copy
-import json
-import math
 import os
 import time
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 # ---------------------------------------------------------------------------
 # Guard imports — new module does not exist yet; base modules should load.

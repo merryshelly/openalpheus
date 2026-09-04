@@ -10,7 +10,7 @@ tools minus 'subagent' (preventing recursion). Circuit breaker at 10 iterations.
 
 import json
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 from pathlib import Path
 from openalph.tools.subagent import run_subagent, MAX_ITERATIONS
 from openalph.tools import ToolDef, ToolResult

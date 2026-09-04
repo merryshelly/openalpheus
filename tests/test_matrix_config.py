@@ -7,8 +7,7 @@ Interface contract:
 """
 
 import pytest
-from pathlib import Path
-from openalph.config import load_config, ConfigError, MatrixConfig
+from openalph.config import load_config, ConfigError
 
 
 def write_config(tmp_path, toml_content):

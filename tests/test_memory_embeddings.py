@@ -10,7 +10,7 @@ Returns None (not raises) when model is unavailable (graceful degradation).
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 from openalph.memory.embeddings import EmbeddingProvider
 import asyncio
 import contextlib

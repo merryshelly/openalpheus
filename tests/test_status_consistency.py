@@ -11,7 +11,6 @@ Surfaces under test:
   4. overflow-guard view — agent._estimate_context_tokens + _resolve_model_limit
 """
 
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 

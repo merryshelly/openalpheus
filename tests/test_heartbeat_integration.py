@@ -14,7 +14,6 @@ without slow test runs.
 import pytest
 import asyncio
 import json
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from openalph.heartbeat import HeartbeatManager

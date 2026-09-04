@@ -284,7 +284,6 @@ class TestTurnCompletionFire:
     async def test_delivery_logs_jsonl_source_spotter(self, tmp_path):
         """I1 durability: log_spotter_flag fires at DELIVERY time and persists
         the RAW payload (framing is context-only)."""
-        from openalph.session import persist_assistant_turn  # sanity: seam exists
         config = make_agent_config(tmp_path)
         agent = Agent(config)
         agent._spotter = SpotterManager(config, agent)

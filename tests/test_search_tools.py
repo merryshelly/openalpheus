@@ -14,12 +14,11 @@ cross-test-module imports exist in this suite).
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.tools import execute_tool, ToolResult, BUILTIN_TOOLS
+from openalph.tools import execute_tool, BUILTIN_TOOLS
 
 
 # Exact overflow steering text (design §6, V3).  Em-dash is literal.

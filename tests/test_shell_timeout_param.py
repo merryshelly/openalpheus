@@ -13,8 +13,7 @@ Fix applied:
 """
 
 import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from openalph.tools import execute_tool, ToolResult
 from openalph.config import AgentConfig, ProviderConfig

@@ -20,14 +20,13 @@ cross-test-module imports exist in this suite).
 """
 
 import glob
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.tools import execute_tool, ToolResult
+from openalph.tools import execute_tool
 
 
 VALID_PY = "x = 1\n"

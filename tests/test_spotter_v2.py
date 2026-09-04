@@ -27,7 +27,7 @@ Run: cd /opt/openalph && python3 -m pytest tests/test_spotter_v2.py -q
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pytest
 

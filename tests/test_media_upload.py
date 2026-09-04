@@ -9,10 +9,8 @@ Spec: memory/projects/openalph/media-upload-spec.md
 """
 
 import pytest
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
-from pathlib import Path
-from openalph.tools import ToolResult, execute_tool, discover_tools, BUILTIN_TOOLS
+from unittest.mock import AsyncMock, MagicMock
+from openalph.tools import execute_tool, discover_tools, BUILTIN_TOOLS
 from openalph.tools.media import send_media
 from openalph.config import AgentConfig, ProviderConfig
 

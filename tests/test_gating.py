@@ -11,7 +11,6 @@ Interface contract:
     .room_id: str and .users: dict attributes).
 """
 
-import pytest
 from unittest.mock import MagicMock
 from openalph.mention import is_gated
 from openalph.config import MatrixConfig

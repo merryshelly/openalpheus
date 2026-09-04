@@ -4,7 +4,7 @@ import asyncio
 import time
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from openalph.agent import Agent
 from openalph.provider import StreamEvent, Response, Usage

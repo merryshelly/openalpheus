@@ -20,11 +20,10 @@ These tests are designed to FAIL against the unfixed code and PASS after the fix
 
 import pytest
 import asyncio
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from openalph.agent import Agent
-from openalph.config import AgentConfig, MatrixConfig, ProviderConfig
+from openalph.config import AgentConfig, MatrixConfig
 from openalph.matrix import MatrixBot
 from openalph.session import SessionLog
 

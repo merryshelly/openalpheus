@@ -33,9 +33,7 @@ unless the feature IS Matrix (SB directive, 2026-08-22).
 """
 
 import json
-import logging
 import pytest
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from openalph.config import AgentConfig, ProviderConfig
@@ -46,9 +44,9 @@ from openalph.provider import (
     _convert_messages_for_openai,
 )
 from openalph.tools import (
-    ToolDef, ToolResult, discover_tools, execute_tool,
+    ToolDef, discover_tools, execute_tool,
 )
-from openalph.tools.vision import view_image, frame_vision_batch
+from openalph.tools.vision import frame_vision_batch
 
 
 # --- Fixtures ---

@@ -14,7 +14,6 @@ message (a FAILED line, never a collection ERROR).
 """
 
 import re
-import pytest
 
 try:
     from openalph.tools.advisor import render_transcript, run_advisor

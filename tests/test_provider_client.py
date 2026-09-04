@@ -4,10 +4,9 @@ Verifies that HTTP clients are reused across calls for connection pooling.
 """
 
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, MagicMock
 from openalph.config import AgentConfig, ProviderConfig
-from openalph import provider as provider_module
-from openalph.provider import _get_client, _client_cache
+from openalph.provider import _get_client
 
 
 def make_provider(key="anthropic", type="anthropic", api_key="sk-test", base_url=None, quirks=None):
@@ -150,7 +149,6 @@ class TestCompleteReusesClient:
         """complete() should not re-instantiate the client on repeated calls."""
         import asyncio
         from openalph.provider import complete
-        from openalph.provider import Response, Usage
 
         config = make_config(workspace=str(tmp_path))
 

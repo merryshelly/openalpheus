@@ -13,11 +13,11 @@ Mocks both provider (LLM responses) and tool executors.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from openalph.agent import Agent
 from openalph.config import AgentConfig
-from openalph.provider import Response, Usage, ToolCall, StreamEvent, ThinkingBlock
+from openalph.provider import Response, Usage, ToolCall, StreamEvent
 from openalph.tools import ToolDef, ToolResult
 
 
