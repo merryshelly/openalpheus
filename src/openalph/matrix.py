@@ -3315,7 +3315,7 @@ class MatrixBot:
                     if self.agent.config.context.handoff_enabled:
                         outcome = apply_boundary_and_rebuild(
                             self.agent, self.session_log, room_id,
-                            trigger="manual", exclude_inflight=False)
+                            trigger="slash", exclude_inflight=False)
                         if outcome.get("applied"):
                             # kdsn.305.12 R3: this operator path applies the
                             # boundary DIRECTLY (not via the
@@ -3341,7 +3341,7 @@ class MatrixBot:
                                         "handoff /cache: applied-boundary "
                                         "note failed for %s (fail-soft)",
                                         room_id, exc_info=True)
-                            await self.send_notice(room_id, _handoff_confirm_text(outcome, "manual"))
+                            await self.send_notice(room_id, _handoff_confirm_text(outcome, "slash"))
                         else:
                             await self.send_notice(
                                 room_id,

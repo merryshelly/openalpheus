@@ -22,7 +22,8 @@ Interface contract:
     trigger, tokens before->after, durable summary, checkpoint status.
     Display-only (the JSONL marker is the audit record). Headless sinks
     render it to stderr (never stdout — the exec contract from T3).
-  - ``/cache handoff`` applies the boundary (manual trigger, cooldown
+  - ``/cache handoff`` applies the boundary (trigger 'slash' — spec 3.1
+    vocabulary; cooldown
     bypassed, the _note_handoff_boundary_applied seam driven); ``/cache gc``
     returns the deprecation error steering to ``/cache handoff``.
   - ``/cache`` status + ``/status``: "Handoff boundary: <idx> (<trigger>)";

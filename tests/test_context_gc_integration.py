@@ -375,7 +375,7 @@ class TestMatrixCommands:
         log.append(room=ROOM, sender=AGENT_ID, role="user", content="q")
         log.append(room=ROOM, sender=AGENT_ID, role="system",
                    event="handoff_boundary", entry_index=1, detail=json.dumps({
-                       "ts": "T", "boundary_index": 1, "trigger": "manual",
+                       "ts": "T", "boundary_index": 1, "trigger": "slash",
                        "tokens_before": 10, "tokens_after_est": 0,
                        "durable": {}, "errors": []}))
         room = MagicMock()
@@ -525,6 +525,29 @@ class TestSlashAuditFixes:
         assert len(entries) == n_before, "no boundary is applied"
         assert not any(e.get("event") in ("handoff_boundary", "toolstrip")
                        for e in entries)
+
+    def test_cache_handoff_trigger_is_slash(self, tmp_path):
+        """audit-fix (kdsn.322.9, spec 3.1): the /cache handoff path emits
+        trigger='slash' (the spec §3.1 vocabulary is auto|tool|slash|
+        exec-auto), not 'manual'. The operator-visible confirmation uses
+        the same vocabulary."""
+        bot, agent = self._bot(tmp_path)
+        self._seeded_room(bot, agent)
+        log = bot.session_log
+        room = MagicMock()
+        room.room_id = ROOM
+        asyncio.new_event_loop().run_until_complete(
+            bot._handle_room_message(room, _event("/cache handoff")))
+        markers = [e for e in log.read(ROOM)
+                   if e.get("event") == "handoff_boundary"]
+        assert markers, "the boundary must be applied"
+        manifest = json.loads(markers[-1].get("detail", "{}"))
+        assert manifest.get("trigger") == "slash", (
+            "spec 3.1 vocabulary: the slash path emits 'slash'")
+        sent = "\n".join(c.get("body", "")
+                         for c in self._send_contents(bot))
+        assert "(trigger: slash)" in sent, (
+            "the operator confirmation names the spec trigger")
 # ============================================================================
 # Real-path agent-loop pinning (workspace-kdsn.305.2, authored post-305 build).
 # Canonical pattern per tests/test_guidance_integration.py: REAL Agent + REAL
