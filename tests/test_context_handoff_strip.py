@@ -673,6 +673,45 @@ class TestRunwayGate:
         assert len(directives) == 1, (
             "once per epoch: a second boundary must not re-fire the directive")
 
+    def test_advisory_runway_reminder_does_not_latch_forced(self, tmp_path):
+        """audit-fix (kdsn.322.9): the ReminderEngine's ADVISORY
+        handoff-runway entry (turn_start, fraction >= 90%, NO detail key)
+        shares the trigger ID with the FORCED directive. The epoch latch
+        must key on detail=='forced' — an advisory entry must NOT suppress
+        this epoch's forced directive + bead."""
+        log = make_log(tmp_path)
+        append_all(log, [user("t" * 400)])
+        log.append(role="user", sender=AGENT_ID, room=ROOM,
+                   content="Context is 95% durable snapshot + "
+                           "post-boundary residue. Plan a handoff.",
+                   source="reminder", trigger="handoff-runway")
+        res = _apply(log, tmp_path, handoff_min=24000)
+        assert res["applied"]
+        assert res["forced_handoff"] is True, (
+            "an advisory handoff-runway reminder must NOT consume the "
+            "epoch's forced directive budget")
+        entries = log.read(ROOM)
+        directives = [e for e in entries if e.get("source") == "reminder"
+                      and e.get("trigger") == "handoff-runway"]
+        assert len(directives) == 2, "advisory + forced directive"
+
+    def test_forced_entry_latches_epoch_and_carries_detail(self, tmp_path):
+        """audit-fix (kdsn.322.9): the FORCED directive entry carries
+        detail='forced' and a forced entry DOES latch the epoch."""
+        log = make_log(tmp_path)
+        append_all(log, [user("t" * 400)])
+        _apply(log, tmp_path, handoff_min=24000)
+        forced = [e for e in log.read(ROOM)
+                  if e.get("source") == "reminder"
+                  and e.get("trigger") == "handoff-runway"]
+        assert forced and forced[0].get("detail") == "forced", (
+            "the forced directive entry is distinguished by detail='forced'")
+        append_all(log, [user("more " * 50)])
+        res2 = _apply(log, tmp_path, handoff_min=24000)
+        assert res2["applied"]
+        assert res2["forced_handoff"] is False, (
+            "a FORCED entry latches the epoch's forced directive")
+
 
 # ===========================================================================
 # Durable-set guards (ported load-bearing pins, 6f0c562)

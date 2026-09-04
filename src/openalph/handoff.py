@@ -748,8 +748,11 @@ def apply_boundary(
     handoff_pct / 100, handoff_min), handoff_advised = runway_after <
     threshold (strict < — equality does NOT fire). The forced-handoff
     directive + handoff bead fire ONLY when handoff_advised — decoupled from
-    the durable-set budget. Once per epoch: the existing latch scans the
-    room's JSONL for a prior TRIGGER_HANDOFF_RUNWAY reminder entry.
+    the durable-set budget. Once per epoch: the latch scans the room's JSONL
+    for a prior FORCED directive entry (trigger TRIGGER_HANDOFF_RUNWAY AND
+    detail == "forced" — the ReminderEngine's advisory handoff-runway
+    reminder shares the trigger ID but has no detail, so it does not
+    latch).
 
     Durable problems (missing files, malformed TOML, unreadable) never raise —
     they land in errors/warnings and the boundary still applies.
@@ -896,9 +899,16 @@ def apply_boundary(
             runway_after,
             threshold_tokens,
         )
+        # Epoch latch (audit-fix kdsn.322.9): key on the FORCED directive
+        # entry — trigger == handoff-runway AND detail == "forced". The
+        # ReminderEngine's ADVISORY handoff-runway reminder (turn_start,
+        # post-boundary consumption >= 90%) shares the trigger ID but
+        # carries no detail, so it must NOT consume the epoch's forced
+        # directive budget.
         if not any(
             e.get("role") == "user" and e.get("source") == "reminder"
             and e.get("trigger") == TRIGGER_HANDOFF_RUNWAY
+            and e.get("detail") == "forced"
             for e in entries
         ):
             forced_handoff = True
@@ -909,6 +919,7 @@ def apply_boundary(
                 content=frame_forced_handoff(runway_after, available),
                 source="reminder",
                 trigger=TRIGGER_HANDOFF_RUNWAY,
+                detail="forced",
             )
             _raise_handoff_bead(room_id, project, bd_path)
 
