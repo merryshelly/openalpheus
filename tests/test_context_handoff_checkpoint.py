@@ -279,6 +279,80 @@ class TestReArmSeam:
             "an applied boundary re-arms the checkpoint trigger (once per "
             "boundary CYCLE, not once per session)")
 
+    def test_boundary_site_state_carries_checkpoint_threshold(self, tmp_path):
+        """audit-fix (kdsn.322.9): spec 3.3 — checkpoint evaluates at BOTH
+        turn_start AND tool_loop_boundary. The boundary site must pass the
+        same checkpoint_threshold as the turn-start site (0 only when
+        handoff is disabled), or the predicate (gated on
+        ``checkpoint_threshold > 0``) stays silent mid-turn and the
+        ratified dual-point evaluation is defeated."""
+        from openalph.agent import Agent
+        from openalph.config import (
+            AgentConfig, ContextHandoffConfig, ProviderConfig)
+
+        config = AgentConfig(
+            name="bkpt",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=100,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic", api_key="sk-test")},
+            workspace=tmp_path,
+            context=ContextHandoffConfig(),
+        )
+        agent = Agent(config)
+        ROOM_ID = "!bkpt:test"
+        limit = agent._resolve_model_limit(ROOM_ID)
+        state = agent._boundary_reminder_state(
+            ROOM_ID,
+            iteration=3,
+            context_tokens=agent._estimate_context_tokens(ROOM_ID),
+            limit=limit,
+            completed_turns=0,
+            turn_source=None,
+            tool_calls_this_turn=1,
+            tool_calls_session=1,
+            todo_list=None,
+            enabled_tools=set(),
+        )
+        expected = int(agent._effective_available(limit)
+                       * config.context.checkpoint_pct / 100)
+        assert state.checkpoint_threshold == expected
+        assert state.checkpoint_threshold > 0
+        assert state.evaluation_point == "tool_loop_boundary"
+        assert state.available_tokens == agent._effective_available(limit)
+
+    def test_boundary_site_threshold_zero_when_handoff_disabled(self, tmp_path):
+        """audit-fix (kdsn.322.9): handoff off → threshold 0 (engine silent),
+        mirroring the turn-start site's ``if _gc_cfg.handoff_enabled else 0``."""
+        from openalph.agent import Agent
+        from openalph.config import (
+            AgentConfig, ContextHandoffConfig, ProviderConfig)
+
+        config = AgentConfig(
+            name="bkoff",
+            default_model="anthropic/claude-sonnet-4-20250514",
+            max_tokens=100,
+            providers={"anthropic": ProviderConfig(
+                key="anthropic", type="anthropic", api_key="sk-test")},
+            workspace=tmp_path,
+            context=ContextHandoffConfig(handoff_enabled=False),
+        )
+        agent = Agent(config)
+        ROOM_ID = "!bkoff:test"
+        state = agent._boundary_reminder_state(
+            ROOM_ID,
+            iteration=1,
+            context_tokens=0,
+            limit=agent._resolve_model_limit(ROOM_ID),
+            completed_turns=0,
+            turn_source=None,
+            tool_calls_this_turn=0,
+            tool_calls_session=0,
+            todo_list=None,
+            enabled_tools=set(),
+        )
+        assert state.checkpoint_threshold == 0
+
     def test_agent_state_fields_renamed(self, tmp_path):
         # the state-builder sites consume the renamed fields (both eval points)
         import inspect

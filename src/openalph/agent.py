@@ -490,6 +490,47 @@ class Agent:
         """Last applied boundary's runway fraction (0.0 pre-boundary/restart)."""
         return self._gc_last_runway.get(room_id, 0.0)
 
+    def _boundary_reminder_state(self, room_id, *, iteration, context_tokens,
+                                 limit, completed_turns, turn_source,
+                                 tool_calls_this_turn, tool_calls_session,
+                                 todo_list, enabled_tools):
+        """ReminderState for the tool-loop-boundary evaluation point.
+
+        audit-fix (kdsn.322.9, spec §3.3): the handoff checkpoint evaluates
+        at BOTH turn_start and tool_loop_boundary. This site must pass the
+        SAME checkpoint_threshold the turn-start site computes
+        (``checkpoint_pct`` of the usable runway, 0 when handoff is
+        disabled) — the predicate is gated on ``checkpoint_threshold > 0``
+        in reminders.py, so the dataclass default 0 keeps the trigger
+        silent mid-turn and defeats the ratified dual-point evaluation.
+        """
+        _gc_cfg = self.config.context
+        available = self._effective_available(limit)
+        return ReminderState(
+            evaluation_point="tool_loop_boundary",
+            iteration=iteration,
+            max_iterations=self.config.max_iterations,
+            # Post-tool-results, pre-call estimate — the same surface the
+            # pre-call overflow guard uses.
+            context_tokens=context_tokens,
+            context_limit=limit,
+            # D9: same expression as the overflow guard.
+            available_tokens=available,
+            completed_turns=completed_turns,
+            turn_source=turn_source,
+            tool_calls_this_turn=tool_calls_this_turn,
+            tool_calls_session=tool_calls_session,
+            todo_list=todo_list,
+            enabled_tools=enabled_tools,
+            # Mirrors the turn-start site exactly (kdsn.322.9): checkpoint
+            # threshold from [context].checkpoint_pct of the usable runway
+            # (0 when handoff disabled -> engine silent).
+            checkpoint_threshold=(
+                int(available * _gc_cfg.checkpoint_pct / 100)
+                if _gc_cfg.handoff_enabled else 0),
+            handoff_runway_fraction=self._gc_runway_cached(room_id),
+        )
+
     async def _gc_hard_tier(self, room_id: str, callbacks: dict | None, *,
                             context_tokens: int, available: int) -> bool:
         """Hard tier at the send-time overflow guard (kdsn.305).
@@ -1240,29 +1281,18 @@ class Agent:
                     else:
                         context_tokens = self._estimate_context_tokens(room_id)
                         limit = self._resolve_model_limit(room_id)
-                        _boundary_state = ReminderState(
-                            evaluation_point="tool_loop_boundary",
+                        _boundary_state = self._boundary_reminder_state(
+                            room_id,
                             iteration=iteration,
-                            max_iterations=self.config.max_iterations,
-                            # Post-tool-results, pre-call estimate — the same
-                            # surface the pre-call overflow guard uses.
                             context_tokens=context_tokens,
-                            context_limit=limit,
-                            # D9: same expression as the overflow guard below.
-                            available_tokens=self._effective_available(limit),
+                            limit=limit,
                             completed_turns=_completed_turns,
                             turn_source=_turn_source,
                             tool_calls_this_turn=dict(_tool_calls_this_turn),
-                            tool_calls_session=dict(self._room_tool_counts.get(room_id, {})),
+                            tool_calls_session=dict(
+                                self._room_tool_counts.get(room_id, {})),
                             todo_list=list(_TODO_STATE.get(room_id, [])),  # R1-3
                             enabled_tools=_enabled_tools,
-                            # kdsn.322: handoff inputs at the boundary site —
-                            # the checkpoint threshold flows the dataclass
-                            # default 0 (it is computed at the turn-start
-                            # site, so the checkpoint trigger stays silent
-                            # here) and handoff-runway is turn_start-only;
-                            # the fraction is passed for completeness.
-                            handoff_runway_fraction=self._gc_runway_cached(room_id),
                         )
                         _boundary_reminders = self._engine_for(room_id).evaluate(_boundary_state)
                         for _rem in _boundary_reminders:
