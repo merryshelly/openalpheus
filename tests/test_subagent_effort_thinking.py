@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from openalph.config import AgentConfig, ContextHandoffConfig
+from openalph.config import AgentConfig
 from openalph.provider import Response, ThinkingBlock, ToolCall, Usage
 from openalph.tools import BUILTIN_TOOLS, ToolDef, ToolResult, execute_tool
 from openalph.tools.subagent import _estimate_context_tokens, run_subagent

@@ -24,7 +24,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from openalph.config import AgentConfig, ProviderConfig
+from openalph.agent import Agent, ContextOverflowError
+from openalph.config import AgentConfig, ContextHandoffConfig, MatrixConfig, ProviderConfig
+from openalph.matrix import MatrixBot
+from openalph.provider import Response, StreamEvent, ToolCall, Usage
+from unittest.mock import patch
+import json as _json
 from openalph.session import SessionLog
 from openalph.tools import ToolResult, BUILTIN_TOOLS, execute_tool
 from openalph.reminders import ReminderEngine, ReminderState
@@ -592,18 +597,6 @@ class TestSlashAuditFixes:
 # invisible to every seam-mocked test (tool-management, "the one lesson").
 # ============================================================================
 
-import asyncio
-import json as _json
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
-
-from openalph.agent import Agent, ContextOverflowError
-from openalph.config import AgentConfig, ContextHandoffConfig, MatrixConfig, ProviderConfig
-from openalph.matrix import MatrixBot
-from openalph.session import SessionLog
-from openalph.provider import Response, StreamEvent, ToolCall, Usage
-
 GC_ROOM = "!gcloop:matrix.local"
 AGENT_ID = "@gci-agent:matrix.local"
 
@@ -728,7 +721,6 @@ def _run_turn(bot):
 
 
 async def _huge_tool(*args, name=None, input=None, **kw):
-    from openalph.tools import ToolResult
     return ToolResult(content="y" * 200000, is_error=False)
 
 
