@@ -276,7 +276,9 @@ class TestReArmSeam:
                 trigger="auto", exclude_inflight=False)
             return ok
 
-        assert asyncio.run(run()) is True
+        # kdsn.322.15: _gc_apply_boundary returns the APPLIED outcome dict
+        res = asyncio.run(run())
+        assert isinstance(res, dict) and res.get("applied") is True
         assert applied["n"] == 1
         # re-armed: the engine fires again at threshold after the boundary
         out = engine.evaluate(_state(

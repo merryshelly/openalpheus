@@ -726,8 +726,9 @@ def _run_turn(bot):
     # entry, as it always is in production. Driving _run_heartbeat_turn
     # bare leaves no pending entry and the protection would land on the
     # last seed entry instead (fixture artifact, not production shape).
-    bot.session_log.append(role="user", sender=AGENT_ID, room=GC_ROOM,
-                           content="[Automated heartbeat]")
+    bot.session_log.append(role="system", sender=AGENT_ID, room=GC_ROOM,
+                           content="[Automated heartbeat]",
+                           source="heartbeat")
     return asyncio.run(
         bot._run_heartbeat_turn(GC_ROOM, "[Automated heartbeat]",
                                 turn_source="heartbeat"))

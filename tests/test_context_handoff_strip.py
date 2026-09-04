@@ -462,9 +462,10 @@ class TestManifestShape:
         # snapshot + tail) plus tokens_dropped (render-only figure).
         assert set(mf.keys()) == {
             "ts", "boundary_index", "trigger", "tokens_before",
-            "tokens_after", "tokens_dropped",
+            "tokens_after", "tokens_dropped", "pending_protected",
             "durable", "runway", "checkpoint", "errors",
         }, f"manifest shape drifted: {sorted(mf.keys())}"
+        assert isinstance(mf["pending_protected"], bool)
         assert set(mf["durable"].keys()) == {
             "project", "files", "budget_tokens", "used_tokens", "over_budget"}
         assert set(mf["runway"].keys()) == {

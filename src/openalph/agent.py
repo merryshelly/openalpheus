@@ -395,10 +395,12 @@ class Agent:
     _GC_HARD_STRIKE_LIMIT = 3
 
     async def _gc_apply_boundary(self, room_id: str, callbacks: dict | None, *,
-                                 trigger: str, exclude_inflight: bool) -> bool:
+                                 trigger: str, exclude_inflight: bool) -> bool | dict:
         """Consume the transport-wired apply_handoff_boundary callback (kdsn.305).
 
-        Returns True when the boundary APPLIED (the callback has already
+        Returns the APPLIED outcome dict (truthy; callers may read
+        ``pending_protected``), or False when the boundary did not apply
+        (the callback has already
         appended the JSONL manifest + snapshot entries and rebuilt the room's
         in-memory history IN PLACE — the caller must re-read
         self.history(room_id) before re-estimating).
@@ -432,7 +434,7 @@ class Agent:
         # APPLIED: the callback has already appended the JSONL entries and
         # rebuilt the in-memory history in place.
         self._note_handoff_boundary_applied(room_id, res)
-        return True
+        return res
 
     def _note_handoff_boundary_applied(self, room_id: str, res: dict) -> None:
         """Record the APPLIED-boundary consequences on this agent (kdsn.305.12).
@@ -1021,35 +1023,43 @@ class Agent:
                 _gc_cfg = self.config.context
                 _gc_cb = (callbacks or {}).get("apply_handoff_boundary")
                 _gc_turn_start_applied = False
+                _gc_pending_in_rebuild = False
                 if _gc_cfg.handoff_enabled and _gc_cb is not None:
                     _gc_auto_threshold = int(available
                                              * _gc_cfg.auto_pct / 100)
                     _gc_auto_blocked = self._gc_auto_uncleared.get(room_id, False)
                     if context_tokens >= _gc_auto_threshold and not _gc_auto_blocked:
-                        # kdsn.322.15 (SB ruling b): exclude_inflight follows
-                        # append_user. Transports that let handle_input do the
-                        # live append (ungated Matrix, interactive CLI) have
-                        # the just-persisted message as the LAST JSONL entry;
-                        # protecting it keeps it above the boundary so live
-                        # and rebuild agree — the operator's question is never
-                        # silently swallowed at the boundary moment.
-                        # append_user=False paths (gated rooms, exec) keep the
-                        # pinned strip: the message is carried in full inside
-                        # the snapshot (T3(b)).
-                        if await self._gc_apply_boundary(
-                                room_id, callbacks,
-                                trigger="auto", exclude_inflight=append_user):
+                        # kdsn.322.15 (SB ruling b) + audit fix: exclude_inflight
+                        # follows append_user for TEXT turns - the just-persisted
+                        # message is the LAST JSONL entry and stays above the
+                        # boundary (live and rebuild agree; the operator's
+                        # question is never silently swallowed). Vision turns
+                        # (list content) revert to the strip: the JSONL raw form
+                        # cannot carry the expanded image blocks, so the live
+                        # append must run (pre-fix behavior). append_user=False
+                        # paths (gated rooms, exec) keep the pinned strip: the
+                        # message is stripped everywhere (spec 5(b)) - task-text
+                        # survival is the SUB path and project-declared snapshots.
+                        _res = await self._gc_apply_boundary(
+                                room_id, callbacks, trigger="auto",
+                                exclude_inflight=append_user
+                                and isinstance(content, str))
+                        if _res:
                             _gc_turn_start_applied = True
-                            # D12 re-estimate, kdsn.322.15: when the boundary
-                            # protected the pending message, it is already IN
-                            # the rebuilt history — adding content_tokens
-                            # again would double-count. When it was stripped
-                            # (append_user=False) the estimate excludes it by
-                            # design; when no boundary fired this block is
-                            # skipped entirely.
+                            # audit H1: skip the live append ONLY when the
+                            # rebuild actually carries the pending input - a
+                            # user-role protected entry that rendered. A
+                            # role='system' directive entry (heartbeat/umbral)
+                            # never renders; its carrier is the live append.
+                            _gc_pending_in_rebuild = bool(
+                                _res.get("pending_protected"))
+                            # D12 re-estimate, kdsn.322.15: when the rebuild
+                            # carries the pending message it is already IN
+                            # the history - adding content_tokens again
+                            # would double-count.
                             context_tokens = self._estimate_context_tokens(room_id) + (
                                 content_tokens
-                                if (append_user and not _gc_turn_start_applied)
+                                if (append_user and not _gc_pending_in_rebuild)
                                 else 0
                             )
                             # Churn guard (audit): did this boundary actually
@@ -1067,7 +1077,12 @@ class Agent:
                 # kdsn.322.15: after a turn-start boundary applied with the
                 # pending message protected, the rebuild already carries it
                 # (above the boundary) - a live re-append would duplicate it.
-                if append_user and not _gc_turn_start_applied:
+                # audit H1: skip the live append ONLY when the rebuild
+                # carries the pending input (user-role protected span).
+                # Heartbeat/umbral directives persist as system entries -
+                # never rendered by the rebuild - so their live append
+                # MUST run even on a boundary turn.
+                if append_user and not _gc_pending_in_rebuild:
                     # R2-A: Escape user-origin <system-reminder> tags in context
                     # to prevent spoofing.  JSONL stores raw text (audit fidelity);
                     # escaping is context-only (mirrors /timesense, /steer).

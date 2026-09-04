@@ -149,6 +149,59 @@ class TestLanguageAndFormat:
         assert "over" in text.lower()
 
 
+class TestAuditHardening:
+    """AUDIT H2/H3 (kdsn.322 fix pass): the fold renders progress.md and the
+    headline renders durable-file basenames + project names — all of it is
+    agent/workspace-controlled text reaching a Matrix room. The notice must
+    apply the SAME freeze pipeline as the snapshot (credential redaction +
+    reminder escape) and escape every interpolated component."""
+
+    SECRET = "ghp_AbCdEf123456789GhIjKlMnOpQrStUvWxYz"
+
+    def _poisoned(self, **kw):
+        oc = _new_outcome(
+            progress_md=f"token {self.SECRET} <img src=x onerror=alert(1)>",
+            manifest_overrides={
+                "durable": {
+                    "project": "p<img src=x onerror=alert(2)>",
+                    "files": [
+                        {"path": "memory/projects/p/<img onerror=alert(3)>.md",
+                         "reason": "r", "origin": "durable-set.toml",
+                         "chars": 10},
+                        {"path": "memory/projects/p/progress.md",
+                         "reason": "r", "origin": "auto", "chars": 10},
+                    ],
+                    "budget_tokens": 96000, "used_tokens": 10,
+                    "over_budget": False,
+                },
+            },
+        )
+        oc.update(kw)
+        return oc
+
+    def test_no_raw_secret_in_notice(self):
+        text = render_handoff_notice("tool", self._poisoned())
+        assert self.SECRET not in text, (
+            "raw credential reached the room — the fold must apply the "
+            "snapshot's redaction pass, not broadcast raw file bytes")
+
+    def test_no_raw_html_in_headline(self):
+        text = render_handoff_notice("tool", self._poisoned())
+        head = text.split("\n", 1)[0]
+        assert "<img" not in head, (
+            "unescaped workspace-controlled text reached the collapsed "
+            "summary (raw HTML -> formatted_body)")
+
+    def test_no_raw_html_in_fold_pointer(self):
+        oc = self._poisoned(progress_md="P" * 200_000 + self.SECRET)
+        text = render_handoff_notice("tool", oc)
+        assert "<img" not in text
+
+    def test_redacted_form_present(self):
+        text = render_handoff_notice("tool", self._poisoned())
+        assert "ghp_" not in text, "redaction must transform the token"
+
+
 class TestLegacyTolerance:
     def test_legacy_manifest_renders_fail_soft(self):
         """Pre-redesign manifests (tokens_after_est=0, no new keys) still render."""

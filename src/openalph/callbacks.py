@@ -17,6 +17,7 @@ import sys
 import mistune
 
 from openalph.reminders import Reminder
+from openalph.tools import escape_system_reminder_tags
 from openalph.handoff import (
     ACTIVE_PROJECT_EVENT,
     apply_boundary_and_rebuild,
@@ -450,20 +451,23 @@ def render_handoff_notice(trigger: str, outcome: dict) -> str:
     dropped = manifest.get("tokens_dropped")
     files = durable.get("files") or []
 
+    # Audit H3: project names and durable-file basenames are
+    # workspace-controlled text — html.escape everything interpolated into
+    # the headline (the sink concatenates it into formatted_body HTML).
     head = f"🪢 Handoff boundary applied ({trigger})"
     if tb is not None and ta is not None:
         head += f" — context ~{tb:,} → ~{ta:,} tok"
     elif tb is not None:
         head += f" — context ~{tb:,} tok"
     if project:
-        head += f" · project: {project}"
+        head += f" · project: {html.escape(str(project))}"
     head += f" · checkpoint: {ck}"
     if files:
         names = []
         for f in files:
             base = str(f.get("path", "?")).rsplit("/", 1)[-1]
             if base not in names:
-                names.append(base)
+                names.append(html.escape(base))
         head += f" · reinserted {len(files)} files: {', '.join(names)}"
 
     fold = []
@@ -484,10 +488,22 @@ def render_handoff_notice(trigger: str, outcome: dict) -> str:
     fold.append(f"errors: {len(errs)}" if errs else "errors: none")
     progress = outcome.get("progress_md")
     if progress:
-        text = html.escape(str(progress))
+        # Audit H2: the fold text reaches the room through the sink's HTML
+        # pipeline — apply the snapshot's own freeze pipeline as
+        # defense-in-depth (the outcome normally carries frozen text
+        # already; legacy/foreign outcomes may carry raw bytes). Never
+        # block the notice on a redaction failure (accepted over-redaction
+        # posture, kdsn.319).
+        text = str(progress)
+        try:
+            from openalph.tools.security import redact_credentials
+            text, _events = redact_credentials(text)
+        except Exception as e:  # noqa: BLE001 — fail-soft by design
+            logger.warning("handoff notice redaction pass failed: %s", e)
+        text = html.escape(escape_system_reminder_tags(text))
         if len(text) > _PROGRESS_FOLD_CAP_CHARS:
             removed = len(text) - _PROGRESS_FOLD_CAP_CHARS
-            pointer = (f"memory/projects/{project}/progress.md"
+            pointer = (f"memory/projects/{html.escape(str(project))}/progress.md"
                        if project else "the project progress.md")
             text = (text[:_PROGRESS_FOLD_CAP_CHARS] +
                     f"\n[truncated: {removed} chars removed — full text: "

@@ -393,10 +393,7 @@ def _post_boundary_tail_tokens(entries: list[dict], boundary_index: int) -> int:
     """
     total = 0
     for position in range(boundary_index, len(entries)):
-        entry = entries[position]
-        if not isinstance(entry, dict):
-            continue
-        total += _entry_content_chars(entry.get("content"))
+        total += _entry_render_chars(entries[position])
     return total // 4
 
 
@@ -407,6 +404,34 @@ def _post_boundary_tail_tokens(entries: list[dict], boundary_index: int) -> int:
 # values.
 _TOOL_CALL_OVERHEAD_CHARS = 80
 _TOOL_RESULT_OVERHEAD_CHARS = 80
+
+
+def _entry_render_chars(entry: dict) -> int:
+    """Render-side char weight of ONE JSONL entry — the shared accounting
+    for both the dropped-figure and the post-boundary tail (kdsn.322.14:
+    audit M — the two sides must weigh the same things). System entries
+    contribute 0 (build_context skips them by default — they never render).
+    Mirrors agent._estimate_context_tokens' rules; constants duplicated
+    here (agent import would cycle: agent -> session -> handoff); drift is
+    pinned by test_handoff_manifest_numbers."""
+    if not isinstance(entry, dict) or entry.get("role") == "system":
+        return 0
+    if entry.get("role") == "tool":
+        output = entry.get("output", entry.get("content", ""))
+        total = len(output) if isinstance(output, str) else 0
+        total += _TOOL_RESULT_OVERHEAD_CHARS
+        return total
+    total = _entry_content_chars(entry.get("content"))
+    th = entry.get("thinking")
+    if isinstance(th, str):
+        total += len(th)
+    elif isinstance(th, list):
+        for tb in th:
+            if isinstance(tb, dict):
+                total += len(tb.get("thinking", "")) + len(tb.get("signature", ""))
+    for tc in entry.get("tool_calls") or []:
+        total += len(str(tc.get("input", tc))) + _TOOL_CALL_OVERHEAD_CHARS
+    return total
 
 
 def _strip_tokens_before(entries: list[dict], boundary_index: int) -> int:
@@ -427,34 +452,7 @@ def _strip_tokens_before(entries: list[dict], boundary_index: int) -> int:
     # min() guard: boundary_index is the next-append position (len+1) — one
     # past the last real entry for a settled turn.
     for position in range(min(boundary_index, len(entries))):
-        entry = entries[position]
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("role") == "tool":
-            output = entry.get("output", entry.get("content", ""))
-            total += len(output) if isinstance(output, str) else 0
-            # kdsn.322.14: tool-result wire overhead (mirrors the estimator
-            # in agent.py; constants duplicated here — agent.py must not be
-            # imported from handoff (session -> handoff cycle). Drift is
-            # pinned by test_handoff_manifest_numbers, which imports the
-            # agent constants for its expected-value arithmetic.
-            total += _TOOL_RESULT_OVERHEAD_CHARS
-            continue
-        total += _entry_content_chars(entry.get("content"))
-        # kdsn.322.14: thinking + signatures + tool-call payloads are part
-        # of the pre-boundary render too — the full strip expunges them.
-        # JSONL entries may carry thinking as a plain string (transport
-        # shape) or as the structured block list (message shape) — take
-        # both; anything else contributes 0 (never raises).
-        th = entry.get("thinking")
-        if isinstance(th, str):
-            total += len(th)
-        elif isinstance(th, list):
-            for tb in th:
-                if isinstance(tb, dict):
-                    total += len(tb.get("thinking", "")) + len(tb.get("signature", ""))
-        for tc in entry.get("tool_calls") or []:
-            total += len(str(tc.get("input", tc))) + _TOOL_CALL_OVERHEAD_CHARS
+        total += _entry_render_chars(entries[position])
     return total // 4
 
 
@@ -869,10 +867,23 @@ def apply_boundary(
     # Checkpoint predicate (spec §3.2): pure, never blocks the boundary.
     checkpoint = checkpoint_status(entries, workspace, project)
 
+    # kdsn.322.15 audit fix (H1): does the protected span carry a RENDERING
+    # (user-role) pending entry? Heartbeat/umbral directives persist as
+    # role='system' — they never render, so the rebuild does NOT carry the
+    # turn's input and the caller must NOT skip its live append.
+    pending_protected = False
+    if exclude_inflight:
+        for position in range(max(boundary_index, 0), len(entries)):
+            entry = entries[position]
+            if isinstance(entry, dict) and entry.get("role") == "user":
+                pending_protected = True
+                break
+
     manifest = {
         "ts": ts,
         "boundary_index": boundary_index,
         "trigger": trigger,
+        "pending_protected": pending_protected,
         "tokens_before": tokens_before,
         "tokens_after": tokens_after,
         "tokens_dropped": tokens_dropped,
@@ -979,14 +990,17 @@ def apply_boundary(
         "over_budget": over_budget,
         "forced_handoff": forced_handoff,
         "handoff_advised": handoff_advised,
-        # kdsn.322.14: the FROZEN progress.md text (what the agent actually
-        # received in the snapshot) — the operator notice fold renders this,
-        # never a live disk read. None when no project is declared.
-        "progress_md": (
-            next((f["text"] for f in resolution["files"]
-                  if f.get("path", "").endswith("progress.md")), None)
-            if project is not None else None
-        ),
+        # kdsn.322.14 + audit fix (H2/H3): the FROZEN progress.md text —
+        # the SAME freeze pipeline the snapshot runs (credential redaction
+        # + reminder escape), never raw file bytes and never a live disk
+        # read. None when no project is declared.
+        "progress_md": _freeze_file_text(next(
+            (f["text"] for f in resolution["files"]
+             if f.get("path", "").endswith("progress.md")), "")) or None
+        if project is not None else None,
+        # audit H1: the caller skips the live append ONLY when the rebuild
+        # actually carries the pending input (user-role protected entry).
+        "pending_protected": pending_protected,
     }
 
 
@@ -1096,6 +1110,10 @@ def apply_boundary_and_rebuild(
                 "pre-boundary in-memory history (the next render picks up "
                 "the boundary from JSONL)", room_id, e, exc_info=True
             )
+            # audit H2: the rebuild failed — the caller must NOT skip the
+            # live append on the strength of a protected span we could not
+            # materialize. Fail open to the pre-fix append behavior.
+            outcome["pending_protected"] = False
         else:
             history = agent.history(room_id)
             history.clear()

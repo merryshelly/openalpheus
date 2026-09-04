@@ -3351,7 +3351,14 @@ class MatrixBot:
                                         "handoff /cache: applied-boundary "
                                         "note failed for %s (fail-soft)",
                                         room_id, exc_info=True)
-                            await self.send_notice(room_id, _handoff_confirm_text(outcome, "slash"))
+                        try:
+                            await self.send_notice(
+                                room_id,
+                                _handoff_confirm_text(outcome, "slash"))
+                        except Exception:
+                            logger.warning(
+                                "handoff /cache: operator notice failed for "
+                                "%s (fail-soft)", room_id, exc_info=True)
                         else:
                             await self.send_notice(
                                 room_id,
