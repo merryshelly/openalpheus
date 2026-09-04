@@ -1361,7 +1361,12 @@ def _setup_cli_session(config, agent, room_id, *, explicit_room=False):
     from openalph.session import SessionLog
     # Resolve user_id: Phase 1 agents have config.user_id; legacy agents use matrix.user_id
     uid = getattr(config, "user_id", None) or (config.matrix.user_id if config.matrix else "cli")
-    sl = SessionLog(config.workspace, uid)
+    # audit-fix (kdsn.322.9): resume renders through build_context, so the
+    # handoff full-strip default MUST follow the agent's config — the
+    # exec-path constructor already passes it (spec §3.5); the CLI resume
+    # path omitted it and rendered FULL pre-boundary history.
+    sl = SessionLog(config.workspace, uid,
+                    handoff_default=config.context.handoff_enabled)
     entries = sl.read(room_id)
 
     if entries:

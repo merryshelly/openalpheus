@@ -220,6 +220,65 @@ class TestCLISessionSetup:
         assert is_new is False
         assert room_name == "ocean fabric thunder"
 
+    def test_resume_honors_handoff_boundary_strip(self, tmp_path):
+        """audit-fix (kdsn.322.9): CLI resume must render with handoff.
+
+        A resumed session containing a handoff_boundary marker must have its
+        pre-boundary entries DROPPED from the rebuilt history (full strip) —
+        the old code constructed SessionLog without handoff_default, so
+        resume rendered FULL pre-boundary history.
+        """
+        from openalph.cli import _setup_cli_session
+        config = _make_config(tmp_path)
+        agent = _make_agent()
+        # Pre-populate: pre-boundary content, marker, snapshot, post-boundary.
+        sl = SessionLog(tmp_path, "@test:server")
+        sl.append(role="system", sender="@test:server", room="_cli",
+                  event="session_start", room_name="ocean fabric thunder")
+        sl.append(role="user", sender="op", room="_cli",
+                  content="PRE-BOUNDARY-MARKER-XYZ")
+        sl.append(role="assistant", sender="@test:server", room="_cli",
+                  content="pre-boundary reply")
+        sl.append(role="system", sender="@test:server", room="_cli",
+                  event="handoff_boundary", entry_index=3,
+                  detail="{}")
+        sl.append(role="user", sender="@test:server", room="_cli",
+                  content="SNAPSHOT-MARKER-XYZ",
+                  source="handoff_snapshot")
+        sl.append(role="user", sender="op", room="_cli",
+                  content="POST-BOUNDARY-MARKER-XYZ")
+        history_mock = MagicMock()
+        agent.history = MagicMock(return_value=history_mock)
+        _setup_cli_session(config, agent, "_cli", explicit_room=False)
+        extended_with = history_mock.extend.call_args[0][0]
+        contents = [m.get("content", "") for m in extended_with]
+        blob = "\n".join(c for c in contents if isinstance(c, str))
+        assert "PRE-BOUNDARY-MARKER-XYZ" not in blob  # dropped by full strip
+        assert "SNAPSHOT-MARKER-XYZ" in blob  # snapshot renders verbatim
+        assert "POST-BOUNDARY-MARKER-XYZ" in blob  # post-boundary survives
+
+    def test_resume_handoff_disabled_renders_full(self, tmp_path):
+        """audit-fix (kdsn.322.9): handoff_enabled=False → full verbatim resume."""
+        from openalph.cli import _setup_cli_session
+        config = _make_config(tmp_path)
+        config.context.handoff_enabled = False
+        agent = _make_agent()
+        sl = SessionLog(tmp_path, "@test:server")
+        sl.append(role="system", sender="@test:server", room="_cli",
+                  event="session_start", room_name="ocean fabric thunder")
+        sl.append(role="user", sender="op", room="_cli",
+                  content="PRE-BOUNDARY-MARKER-XYZ")
+        sl.append(role="system", sender="@test:server", room="_cli",
+                  event="handoff_boundary", entry_index=2,
+                  detail="{}")
+        history_mock = MagicMock()
+        agent.history = MagicMock(return_value=history_mock)
+        _setup_cli_session(config, agent, "_cli", explicit_room=False)
+        extended_with = history_mock.extend.call_args[0][0]
+        blob = "\n".join(m.get("content", "") for m in extended_with
+                         if isinstance(m.get("content"), str))
+        assert "PRE-BOUNDARY-MARKER-XYZ" in blob  # flag off → no strip
+
     def test_resume_pre_phase1_session_no_room_name(self, tmp_path):
         """A pre-Phase-1 session (no room_name in session_start) doesn't crash."""
         from openalph.cli import _setup_cli_session
