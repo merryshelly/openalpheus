@@ -26,6 +26,11 @@ class ConfigError(Exception):
 
 # System-wide config directory for per-agent TOML files
 CONFIG_DIR = Path("/etc/openalph/agents")
+# Canonical shared-dir path (created by install.sh; referenced by
+# admin.py new-agent setup and handoff.py durable-set containment —
+# kdsn.322.16: the durable-set guard mirrors the two-root OS sandbox,
+# workspace ∪ SHARED_DIR).
+SHARED_DIR = Path("/srv/openalph/shared")
 logger = logging.getLogger(__name__)
 
 

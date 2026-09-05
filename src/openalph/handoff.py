@@ -44,6 +44,8 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
+from openalph.config import SHARED_DIR
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -88,6 +90,7 @@ __all__ = [
     "_marker_indexes",
     "read_active_project",
     "parse_durable_set",
+    "default_extra_roots",
     "resolve_durable_set",
     "durable_budget_tokens",
     "frame_snapshot",
@@ -256,10 +259,22 @@ def _read_durable_text(workspace: Path, p: Path, errors: list[str]) -> tuple[boo
         return False, ""
 
 
+def default_extra_roots() -> list[Path]:
+    """Production durable-set containment roots BEYOND the workspace:
+    the platform shared dir (SHARED_DIR), the second BindPaths root.
+    kdsn.322.16 (SB ruling 2026-09-05): the durable-set guard mirrors
+    the actual two-root OS sandbox (workspace ∪ shared) instead of a
+    workspace-only app boundary — the SEC-9/kdsn.252 drift anti-pattern.
+    Host-independent: tests pass explicit extra_roots and pin this
+    default, so no test depends on /srv/openalph/shared existing."""
+    return [SHARED_DIR]
+
+
 def resolve_durable_set(
     workspace: Path,
     project: str | None,
     config_paths: list[str] | None = None,
+    extra_roots: list[Path] | None = None,
 ) -> dict:
     """Resolve the full durable set for a boundary application.
 
@@ -270,6 +285,11 @@ def resolve_durable_set(
          origin "durable-set.toml"
       3. config-declared path classes (glob patterns, workspace-relative) —
          origin "config"
+
+    Containment: entries are allowed ONLY under the workspace or under
+    `extra_roots` (default: default_extra_roots() = [SHARED_DIR]).
+    Checked against the RESOLVED path — symlinks that leave the allowed
+    region (including nesting out of an extra root) are refused.
 
     Returns dict:
       {
@@ -286,22 +306,34 @@ def resolve_durable_set(
     files: list[dict] = []
     missing: list[str] = []
 
+    try:
+        ws_root = workspace.resolve()
+    except (OSError, RuntimeError):
+        ws_root = workspace
+    _extra = extra_roots if extra_roots is not None else default_extra_roots()
+    allowed_roots = [ws_root] + [Path(r).resolve() for r in _extra]
+
     def add(p: Path, reason: str, origin: str) -> None:
         try:
             key = p.resolve()
         except (OSError, RuntimeError):
             key = Path(str(p).strip() or "/")
-        # WORKSPACE CONTAINMENT (audit: arbitrary-file-read via durable-set
-        # entries — `workspace / "../../etc/passwd"` or an absolute/symlinked
-        # path resolved straight out of the sandbox). Agent-authored TOML
-        # entries must never escape the workspace; violations are recorded,
+        # DURABLE-SET CONTAINMENT (audit-hardened 6f0c562; REALIGNED
+        # kdsn.322.16, SB ruling 2026-09-05): allowed region = workspace
+        # ∪ extra roots (production: SHARED_DIR, the second BindPaths
+        # root — the guard mirrors the actual two-root OS sandbox, not a
+        # workspace-only app boundary, which was the SEC-9/kdsn.252
+        # drift anti-pattern). This is NOT an access control (OS
+        # userland containment is — file_read already follows symlinks
+        # with no app-level check); it is the defense-in-depth floor for
+        # MODEL-AUTHORED persistent auto-injection: durable entries
+        # survive umbral and re-fire at every boundary without a
+        # current-turn model decision. Checked against the RESOLVED
+        # path — a symlink inside an extra root pointing back out is
+        # still refused (fail-closed nesting). Violations are recorded,
         # never read.
-        try:
-            ws_root = workspace.resolve()
-        except (OSError, RuntimeError):
-            ws_root = workspace
-        if not key.is_relative_to(ws_root):
-            errors.append(f"durable path escapes workspace: {p}")
+        if not any(key.is_relative_to(root) for root in allowed_roots):
+            errors.append(f"durable path escapes workspace and shared dir: {p}")
             return
         if key in seen:
             return

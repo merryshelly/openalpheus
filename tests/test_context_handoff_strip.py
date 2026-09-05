@@ -736,6 +736,137 @@ class TestDurableGuards:
         assert any("escapes workspace" in e for e in res["errors"])
         assert not any("passwd" in f["path"] for f in res["files"])
 
+    # ------------------------------------------------------------------
+    # kdsn.322.16 (SB ruling 2026-09-05) — ALIGNED containment: the
+    # allowed region is workspace ∪ extra roots (production:
+    # SHARED_DIR, the second BindPaths root). The check runs against
+    # the RESOLVED path — a symlink inside an extra root that points
+    # back out is still refused (fail-closed nesting). No test may
+    # depend on /srv/openalph/shared existing on the test host;
+    # behavioral tests pass explicit extra_roots.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mk_project(tmp_path, entries_text):
+        proj = tmp_path / "memory" / "projects" / "p"
+        proj.mkdir(parents=True, exist_ok=True)
+        (proj / "durable-set.toml").write_text(entries_text)
+        return proj
+
+    def test_D1_symlink_into_extra_root_accepted(self, tmp_path):
+        m = _handoff()
+        shared = tmp_path / "shared"
+        (shared / "skills").mkdir(parents=True)
+        (shared / "skills" / "foo.md").write_text("shared skill body")
+        (tmp_path / "skills").mkdir()
+        os.symlink(shared / "skills" / "foo.md", tmp_path / "skills" / "foo.md")
+        self._mk_project(tmp_path,
+                         '[[entries]]\npath = "skills/foo.md"\nreason = "r"\n')
+        res = m.resolve_durable_set(Path(tmp_path), "p",
+                                     extra_roots=[shared])
+        assert not any("escapes" in e for e in res["errors"]), res["errors"]
+        # display path is the RESOLVED rel path (symlink target under the
+        # extra root), not the lexical entry — assert on the content.
+        f = [x for x in res["files"] if "foo.md" in x["path"]]
+        assert f and f[0]["exists"] and f[0]["text"] == "shared skill body"
+
+    def test_D2_absolute_path_into_extra_root_accepted(self, tmp_path):
+        m = _handoff()
+        shared = tmp_path / "shared"
+        (shared / "docs").mkdir(parents=True)
+        (shared / "docs" / "ref.md").write_text("abs body")
+        self._mk_project(tmp_path,
+                         f'[[entries]]\npath = "{shared / "docs" / "ref.md"}"'
+                         '\nreason = "r"\n')
+        res = m.resolve_durable_set(Path(tmp_path), "p",
+                                     extra_roots=[shared])
+        assert not any("escapes" in e for e in res["errors"]), res["errors"]
+        assert any(f["exists"] and f["text"] == "abs body"
+                   for f in res["files"])
+
+    def test_D3_default_extra_roots_cover_platform_shared(self):
+        m = _handoff()
+        from openalph.config import SHARED_DIR
+        assert m.default_extra_roots() == [SHARED_DIR]
+
+    def test_D4_escape_outside_all_roots_still_rejected(self, tmp_path):
+        m = _handoff()
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        outside = tmp_path.parent / "kdsn32216_outside.txt"
+        outside.write_text("sensitive")
+        (tmp_path / "notes").mkdir()
+        try:
+            self._mk_project(tmp_path,
+                             '[[entries]]\npath = '
+                             '"notes/../../kdsn32216_outside.txt"'
+                             '\nreason = "r"\n')
+            res = m.resolve_durable_set(Path(tmp_path), "p",
+                                         extra_roots=[shared])
+            assert any("escapes workspace" in e
+                       for e in res["errors"]), res["errors"]
+            assert not any(f["exists"] for f in res["files"]
+                           if "kdsn32216_outside" in f["path"])
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_D5_nested_symlink_out_of_extra_root_refused(self, tmp_path):
+        """The relaxation must NOT open nesting: ws -> shared ->
+        outside resolves outside all roots and is refused."""
+        m = _handoff()
+        shared = tmp_path / "shared"
+        (shared / "skills").mkdir(parents=True)
+        outside = tmp_path.parent / "kdsn32216_nested_outside.txt"
+        outside.write_text("sensitive nested")
+        (shared / "skills" / "evil.md").symlink_to(outside)
+        (tmp_path / "skills").mkdir()
+        os.symlink(shared / "skills" / "evil.md",
+                   tmp_path / "skills" / "evil.md")
+        try:
+            self._mk_project(tmp_path,
+                             '[[entries]]\npath = "skills/evil.md"'
+                             '\nreason = "r"\n')
+            res = m.resolve_durable_set(Path(tmp_path), "p",
+                                         extra_roots=[shared])
+            assert any("escapes workspace" in e
+                       for e in res["errors"]), res["errors"]
+            assert not any(f["exists"] for f in res["files"]
+                           if "evil.md" in f["path"])
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_D6_dedup_across_roots_same_physical_file(self, tmp_path):
+        m = _handoff()
+        shared = tmp_path / "shared"
+        (shared / "skills").mkdir(parents=True)
+        (shared / "skills" / "foo.md").write_text("once")
+        (tmp_path / "skills").mkdir()
+        os.symlink(shared / "skills" / "foo.md", tmp_path / "skills" / "foo.md")
+        self._mk_project(
+            tmp_path,
+            '[[entries]]\npath = "skills/foo.md"\nreason = "a"\n'
+            f'[[entries]]\npath = "{shared / "skills" / "foo.md"}"'
+            '\nreason = "b"\n')
+        res = m.resolve_durable_set(Path(tmp_path), "p",
+                                     extra_roots=[shared])
+        assert not any("escapes" in e for e in res["errors"]), res["errors"]
+        bodies = [f for f in res["files"] if f["text"] == "once"]
+        assert len(bodies) == 1, "one physical file -> one durable entry"
+
+    def test_D7_real_ws_file_with_extra_roots_accepted(self, tmp_path):
+        m = _handoff()
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (tmp_path / "skills").mkdir()
+        (tmp_path / "skills" / "local.md").write_text("local body")
+        self._mk_project(tmp_path,
+                         '[[entries]]\npath = "skills/local.md"\nreason = "r"\n')
+        res = m.resolve_durable_set(Path(tmp_path), "p",
+                                     extra_roots=[shared])
+        assert res["errors"] == []
+        assert any(f["exists"] and f["text"] == "local body"
+                   for f in res["files"])
+
     def test_malformed_toml_never_raises(self, tmp_path):
         m = _handoff()
         proj = tmp_path / "memory" / "projects" / "p"

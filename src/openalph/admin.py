@@ -14,12 +14,11 @@ from typing import Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-from openalph.config import CONFIG_DIR  # canonical definition in config.py
+from openalph.config import CONFIG_DIR, SHARED_DIR  # canonical definitions in config.py
 from openalph.prompt import INJECTION_DEFENSE  # byte-identical to templates/SECURITY_FOOTER.md
 
 logger = logging.getLogger("openalph.admin")
 
-SHARED_DIR = Path("/srv/openalph/shared")
 OPENALPH_GROUP = "openalph"
 
 _RESERVED_NAMES = {"root", "nobody", "daemon", "bin", "sys", "all"}
