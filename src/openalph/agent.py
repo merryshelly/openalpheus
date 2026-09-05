@@ -2413,10 +2413,16 @@ class Agent:
             ContextOverflowError raises on every turn and no call ever
             succeeds to replace the phantom (audit H2: permanent brick the
             pre-fix heuristic could not produce).
+
+        Fail-soft: a non-numeric/stubbed `tokens` must never raise through
+        wake — ignore and let the first live call anchor normally.
         """
+        if isinstance(tokens, bool) or not isinstance(tokens, (int, float)):
+            logger.debug("_set_anchor_floor: ignoring non-numeric %r", tokens)
+            return
         available = self._effective_available(self._resolve_model_limit(room_id))
         auto_th = int(available * self.config.context.auto_pct / 100)
-        self._token_anchor[room_id] = (min(tokens, auto_th), None)
+        self._token_anchor[room_id] = (int(min(tokens, auto_th)), None)
 
     def status(self, room_id: str = "_default", history: list[dict] | None = None) -> dict:
         """Snapshot of agent state for operator visibility.
