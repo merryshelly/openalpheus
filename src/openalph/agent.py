@@ -829,23 +829,23 @@ class Agent:
         if has_images and not model_supports_vision(model_str, self.config):
             return f"Cannot switch to {model_str} — session contains images and model may not support vision."
 
-        # kdsn.329: a model switch changes tokenizer semantics — the anchor's
-        # ground truth (measured under the OLD model's tokenizer) no longer
-        # prices this room's context. Invalidate now that provider + vision
-        # validation has passed, but BEFORE the overflow re-check below:
-        # that check prices the payload against the NEW model's window, so it
-        # must run on a clean heuristic — a stale old-model anchor would
-        # block otherwise-valid switches (B02). Pre-validation failures (bad
-        # model, vision refusal) return above and retain the anchor.
-        self._token_anchor.pop(room_id, None)
-
-        # Context window guard: check current context vs model limit
-        # Use 3-layer resolution (same as _resolve_model_limit) to get the target model's window
+        # Context window guard: check current context vs model limit.
+        # kdsn.329: the estimate here is ANCHOR-AWARE on purpose — the
+        # provider-reported true prompt size is exactly the ground truth a
+        # too-small-target-window check should consume (audit F2). The pop
+        # waits until the switch actually COMMITS below: a switch refused by
+        # this guard must not destroy the old model's anchor while we stay
+        # on it (spec; audit F2/H3). Pre-validation failures (bad model,
+        # vision refusal) return above and retain the anchor.
         model_limit = self._resolve_model_limit_for(model_str)
         context_tokens = self._estimate_context_tokens(room_id)
         if context_tokens > model_limit - self.config.max_tokens:
             return f"Cannot switch to {model_str} — current context (~{context_tokens:,} tokens) exceeds model limit ({model_limit:,})."
 
+        # Committed switch: tokenizer semantics change — the anchor's ground
+        # truth (measured under the OLD model's tokenizer) no longer prices
+        # this room's context.
+        self._token_anchor.pop(room_id, None)
         self._room_models[room_id] = model_str
         return None
 
@@ -1413,12 +1413,6 @@ class Agent:
 
                     # Check for context overflow before calling the API (tool results may push over)
                     context_tokens = self._estimate_context_tokens(room_id)
-                    # kdsn.329: char total of the EXACT payload about to be
-                    # sent (the SAME single walk the estimator uses, so the
-                    # merge's marginal term shares its semantics). Loop-local:
-                    # refreshed every iteration; the record seam below anchors
-                    # the provider's true prompt size to this cursor.
-                    pre_call_chars = self._context_char_total(room_id)
                     limit = self._resolve_model_limit(room_id)
                     available = self._effective_available(limit)
                     # kdsn.305 HARD tier: attempt a boundary once the
@@ -1446,6 +1440,18 @@ class Agent:
                             _gc_cleared = context_tokens <= available
                         if context_tokens > available and not _gc_cleared:
                             raise ContextOverflowError(context_tokens, limit)
+
+                    # kdsn.329: char total of the EXACT payload about to be
+                    # sent (the SAME single walk the estimator uses, so the
+                    # merge's marginal term shares its semantics), captured
+                    # AFTER the hard-tier block above — a mid-turn boundary
+                    # rebuilds history wholesale, and a pre-boundary cursor
+                    # would pair this call's (rebuilt-payload) true prompt
+                    # with a stale pre-boundary char total (audit H1).
+                    # Loop-local: refreshed every iteration; the record seam
+                    # below anchors the provider's true prompt size to this
+                    # cursor.
+                    pre_call_chars = self._context_char_total(room_id)
 
                     # Pass tools=None if no tools available (backward compatibility)
                     tools_arg = _turn_tools if _turn_tools else None
@@ -2391,8 +2397,26 @@ class Agent:
         history rebuild where no live payload cursor exists. The next live
         call replaces the floor with a full-cursor anchor via the record
         seam.
+
+        Clamped to the room's AUTO threshold (audit H2): the JSONL is
+        append-only, so a usage entry PREDATING a handoff boundary
+        rehydrates a phantom full-runway floor. The floor's job is exactly
+        one bit — "real pressure existed at last measurement" — not an exact
+        count:
+          - handoff ENABLED: floor == auto threshold trips the turn-start
+            protective boundary (`>=`); the phantom buys a boundary, not a
+            wedge.
+          - handoff DISABLED / headless: floor == auto threshold < available,
+            so the pre-flight raise (`> available`, inclusive of pending
+            content) cannot fire before the first live call re-anchors with
+            a full cursor. An unclamped floor would wedge the room:
+            ContextOverflowError raises on every turn and no call ever
+            succeeds to replace the phantom (audit H2: permanent brick the
+            pre-fix heuristic could not produce).
         """
-        self._token_anchor[room_id] = (tokens, None)
+        available = self._effective_available(self._resolve_model_limit(room_id))
+        auto_th = int(available * self.config.context.auto_pct / 100)
+        self._token_anchor[room_id] = (min(tokens, auto_th), None)
 
     def status(self, room_id: str = "_default", history: list[dict] | None = None) -> dict:
         """Snapshot of agent state for operator visibility.

@@ -272,9 +272,9 @@ class TestAnchorMechanics:
         """Floor-only anchor (chars0=None): estimate = max(heuristic, floor)."""
         agent = Agent(make_config(tmp_path))
         agent.history(ROOM).append({"role": "user", "content": "x" * 4000})
-        agent._set_anchor_floor(ROOM, 250000)
-        assert agent._token_anchor[ROOM] == (250000, None)
-        assert agent._estimate_context_tokens(ROOM) == 250000
+        agent._set_anchor_floor(ROOM, 100000)  # below the auto clamp
+        assert agent._token_anchor[ROOM] == (100000, None)
+        assert agent._estimate_context_tokens(ROOM) == 100000
         agent._set_anchor_floor(ROOM, 4)  # heuristic (~1000+) beats a tiny floor
         assert agent._estimate_context_tokens(ROOM) >= 4  # floor clamps upward only
 
@@ -293,20 +293,36 @@ class TestAnchorInvalidation:
 
     def test_B02_committed_switch_invalidate_failed_retained(self, tmp_path):
         """Committed model switch: anchor out (tokenizer semantics change).
-        FAILED switch: anchor retained."""
+        FAILED switch: anchor retained. The overflow gate consumes the
+        ANCHORED estimate (ground truth is what a window check wants) and
+        the pop waits for the commit (audit F2/H3)."""
         cfg = make_config(tmp_path, providers={
             "anthropic": make_provider(),
             "openai": make_provider(key="openai", type="openai",
                                     base_url="http://x"),
         })
-        agent = Agent(cfg)
-        agent._token_anchor[ROOM] = (400000, 1000)
+        agent = Agent(cfg)  # window 200000, max_tokens 8192 → gate ≤ 191808
+        agent._token_anchor[ROOM] = (100000, 1000)
         res = agent.switch_model("bogus/model", ROOM)
         assert isinstance(res, str)  # error message; switch refused
-        assert agent._token_anchor[ROOM] == (400000, 1000)
+        assert agent._token_anchor[ROOM] == (100000, 1000)
         res = agent.switch_model("openai/q", ROOM)
         assert res is None
         assert ROOM not in agent._token_anchor
+
+    def test_B02b_switch_refused_by_overflow_gate_retains_anchor(self, tmp_path):
+        """A switch refused by the anchored overflow gate must NOT destroy
+        the old model's anchor while we stay on it (audit F2/H3)."""
+        cfg = make_config(tmp_path, providers={
+            "anthropic": make_provider(),
+            "openai": make_provider(key="openai", type="openai",
+                                    base_url="http://x"),
+        })
+        agent = Agent(cfg)  # gate ≤ 191808
+        agent._token_anchor[ROOM] = (195000, 1000)  # true prompt > gate
+        res = agent.switch_model("openai/q", ROOM)
+        assert isinstance(res, str)  # refused — context exceeds window
+        assert agent._token_anchor[ROOM] == (195000, 1000)
 
     def test_B03_boundary_bookkeeping_invalidate(self, tmp_path):
         """_note_handoff_boundary_applied pops the anchor BEFORE its churn
@@ -337,6 +353,40 @@ class TestAnchorInvalidation:
         import asyncio
         asyncio.run(bot._activate_room(ROOM))
         assert agent._token_anchor.get(ROOM) == (200, None)
+
+    def test_B06_floor_clamped_to_auto_threshold(self, tmp_path):
+        """Audit H2: the phantom-floor fix. A JSONL floor above the usable
+        runway (pre-boundary usage surviving in append-only JSONL) clamps to
+        the AUTO threshold — enough to trip the protective boundary
+        (handoff on) but never the pre-flight raise (handoff off), so the
+        next live call re-anchors instead of wedging the room."""
+        agent = Agent(make_config(tmp_path))  # 191808 avail → auto 163036
+        agent._set_anchor_floor(ROOM, 999999)
+        assert agent._token_anchor[ROOM] == (163036, None)
+
+    def test_B07_phantom_floor_no_wedge_handoff_off(self, tmp_path):
+        """The audit-H2 wedge scenario end to end: handoff DISABLED, a
+        phantom 235,249 floor in the JSONL (the Florin magnitude), restart
+        wake → floor clamps to available (229,376) → the turn runs and the
+        live record seam replaces the phantom with real ground truth."""
+        from openalph.config import ContextHandoffConfig
+        bot, agent = _real_bot(tmp_path, model_max_tokens=262144,
+                               max_tokens=32768)
+        agent.config.context = ContextHandoffConfig(handoff_enabled=False)
+        log = bot.session_log
+        log.append(role="user", sender=AGENT_ID, room=ROOM, content="go")
+        log.append(role="assistant", sender=AGENT_ID, room=ROOM, content="done",
+                   usage={"input_tokens": 235249, "output_tokens": 5,
+                          "cache_read_tokens": 0,
+                          "cache_creation_tokens": 0})
+        state = {}
+        with patch("openalph.agent.stream", _gc_stream(state)):
+            # MUST NOT raise ContextOverflowError — completion IS the wedge
+            # check (heartbeat turns return None by contract).
+            _hb_turn(bot)
+        # Live re-anchor replaced the phantom floor entirely.
+        anchor = agent._token_anchor.get(ROOM)
+        assert anchor is not None and anchor[0] <= 1000, anchor
 
     def test_B05_last_prompt_tokens_fail_soft(self, tmp_path):
         """No usage entries → None; malformed (bool) counters coerced away."""
@@ -423,6 +473,12 @@ class TestAnchorRealPath:
         assert marks, "hard tier must apply a boundary mid-turn"
         assert _json.loads(marks[-1]["detail"])["trigger"] == "hard"
         assert state.get("stream_calls", 0) >= 2
+        # Audit H1: the cursor captured AFTER the hard-tier rebuild pairs
+        # the post-boundary payload (shredded, small) — never the stale
+        # pre-boundary char total (~500K in this fixture).
+        final = agent._token_anchor.get(ROOM)
+        assert final is not None
+        assert final[1] < 200000, final
 
     def test_C02_control_heuristic_below_hard_no_boundary(self, tmp_path):
         """Without anchor contributions the in-loop heuristic stays under
