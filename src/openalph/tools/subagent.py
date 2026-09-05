@@ -90,14 +90,13 @@ def _resolve_sub_context_window(config: AgentConfig, model_str: str) -> int:
     return config.model_max_tokens
 
 
-def _estimate_context_tokens(msgs: list[dict]) -> int:
-    """Estimate token count from messages list (1 token ≈ 4 chars).
+def _context_char_total(msgs: list[dict]) -> int:
+    """Char total of a sub-run messages list (kdsn.329 single walk).
 
-    Counts str content, list-content parts (vision blocks: string values
-    incl. base64 image data), assistant tool_call INPUT string values, and
-    assistant thinking-block text (kdsn.305.14: reasoning-heavy runs burn
-    exactly the context this estimate gates — the same blindness class the
-    wave-2 audit fixed for str-only content counting).
+    The ONE walk both `_estimate_context_tokens` (heuristic = chars // 4)
+    and the anchor-cursor capture at the usage-accumulate block consume —
+    one walk, one semantics, no drift between the estimator and the anchor
+    cursor.
     """
     total_chars = 0
     for msg in msgs:
@@ -126,7 +125,38 @@ def _estimate_context_tokens(msgs: list[dict]) -> int:
         for tb in msg.get("thinking") or []:
             if isinstance(tb, dict) and isinstance(tb.get("thinking"), str):
                 total_chars += len(tb["thinking"])
-    return total_chars // 4
+    return total_chars
+
+
+def _estimate_context_tokens(msgs: list[dict],
+                             anchor: tuple[int, int | None] | None = None) -> int:
+    """Estimate token count from messages list (1 token ≈ 4 chars).
+
+    Counts str content, list-content parts (vision blocks: string values
+    incl. base64 image data), assistant tool_call INPUT string values, and
+    assistant thinking-block text (kdsn.305.14: reasoning-heavy runs burn
+    exactly the context this estimate gates — the same blindness class the
+    wave-2 audit fixed for str-only content counting).
+
+    kdsn.329: `anchor` = (true_prompt_tokens, char_cursor) — the last
+    provider-reported true prompt size for this list plus its char total at
+    capture time (char_cursor None = floor-only anchor). Merge rule:
+        heuristic = chars // 4
+        anchored  = tokens0 if chars0 is None
+                    else tokens0 + max(0, chars - chars0) // 4
+        return max(heuristic, anchored)
+    Anchoring only ever RAISES the estimate (fires tiers earlier, never
+    later); shrink-without-invalidation clamps to the floor (fail-high).
+    Without an anchor the result is byte-identical to the legacy heuristic.
+    """
+    total_chars = _context_char_total(msgs)
+    heuristic = total_chars // 4
+    if anchor is None:
+        return heuristic
+    tokens0, chars0 = anchor
+    anchored = (tokens0 if chars0 is None
+                else tokens0 + max(0, total_chars - chars0) // 4)
+    return max(heuristic, anchored)
 
 
 
@@ -343,6 +373,10 @@ async def run_subagent(
     total_tool_calls = 0
     completed_iterations = 0
     peak_context_tokens = 0
+    # kdsn.329: live token anchor for this run's message list —
+    # (true_prompt_tokens, char_cursor) from the last provider response's
+    # usage, or None (no ground truth yet / invalidated by a boundary).
+    _token_anchor: tuple[int, int | None] | None = None
     # Cost tracking (workspace-kdsn.218): single fixed model per sub-run
     # (config.default_model never changes mid-run -- no per-call switch
     # mechanism exists for subs), so cache_ttl_fallback="1h" is a safe
@@ -469,7 +503,7 @@ async def run_subagent(
             # the estimated context reaches the auto threshold. Invariants in
             # the setup block above.
             if _gc_enabled and not _gc_latched:
-                _gc_est = _estimate_context_tokens(messages)
+                _gc_est = _estimate_context_tokens(messages, anchor=_token_anchor)
                 if _gc_est >= _gc_threshold:
                     _gc_outcome = apply_handoff_to_messages(
                         messages,
@@ -478,6 +512,9 @@ async def run_subagent(
                         trigger="auto",
                     )
                     messages = _gc_outcome["messages"]
+                    # kdsn.329: wholesale message replacement — the anchor's
+                    # cursor no longer prices the surviving payload.
+                    _token_anchor = None
                     _gc_boundary_count += 1
                     _mf = _gc_outcome["manifest"]
                     _append_transcript({
@@ -501,7 +538,7 @@ async def run_subagent(
                         _gc_boundary_count, iteration,
                         _mf["tokens_before"], _mf["tokens_after_est"],
                     )
-                    _gc_post = _estimate_context_tokens(messages)
+                    _gc_post = _estimate_context_tokens(messages, anchor=_token_anchor)
                     if _gc_post >= _gc_threshold:
                         _gc_latched = True
                         _append_transcript({
@@ -564,6 +601,18 @@ async def run_subagent(
                 cache_creation_tokens += response.usage.cache_creation_tokens or 0
                 total_output_tokens += response.usage.output_tokens or 0
                 _accrue_cost(response.model, response.usage)
+                # kdsn.329: anchor this run's estimate to the provider's
+                # true prompt size (input + cache_read + cache_creation —
+                # the uniform formula for both provider types). This block
+                # runs BEFORE the assistant message is appended to
+                # `messages`, so the char total below prices EXACTLY the
+                # payload just sent. Zero true-prompt must not trample an
+                # existing anchor.
+                _true_prompt = ((response.usage.input_tokens or 0)
+                                + (response.usage.cache_read_tokens or 0)
+                                + (response.usage.cache_creation_tokens or 0))
+                if _true_prompt > 0:
+                    _token_anchor = (_true_prompt, _context_char_total(messages))
 
             # Flight recorder: record this iteration's assistant turn verbatim
             # (content + tool call name/id/input) — out-of-band, does not touch messages.
@@ -752,7 +801,7 @@ async def run_subagent(
 
             tools_called = [tc.name for tc in response.tool_calls]
             total_tool_calls += len(tools_called)
-            context_tokens = _estimate_context_tokens(messages)
+            context_tokens = _estimate_context_tokens(messages, anchor=_token_anchor)
             if context_tokens > peak_context_tokens:
                 peak_context_tokens = context_tokens
             iter_elapsed = time.time() - iter_start
@@ -787,7 +836,7 @@ async def run_subagent(
         # REGARDLESS of the turn-start latch (one last best-effort reduction
         # before the deliverable-saving call; it cannot churn: it runs once).
         if _gc_enabled:
-            _gc_est = _estimate_context_tokens(messages)
+            _gc_est = _estimate_context_tokens(messages, anchor=_token_anchor)
             if _gc_est >= _gc_threshold:
                 _gc_outcome = apply_handoff_to_messages(
                     messages,
@@ -796,6 +845,9 @@ async def run_subagent(
                     trigger="breaker",
                 )
                 messages = _gc_outcome["messages"]
+                # kdsn.329: wholesale message replacement — the anchor's
+                # cursor no longer prices the surviving payload.
+                _token_anchor = None
                 _gc_boundary_count += 1
                 _mf = _gc_outcome["manifest"]
                 _append_transcript({

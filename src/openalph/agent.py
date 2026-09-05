@@ -240,6 +240,13 @@ class Agent:
         self._current_tasks: dict[str, asyncio.Task] = {}
         self._room_locks: dict[str, asyncio.Lock] = {}
         self._room_models: dict[str, str] = {}  # room_id → model override
+        # kdsn.329: per-room provider-usage token anchor —
+        # room_id → (true_prompt_tokens, char_cursor). char_cursor None =
+        # floor-only (restart rehydration); int = the char total of the exact
+        # payload the provider last measured (live record seam). The
+        # estimator merges this with the chars//4 heuristic — see
+        # _estimate_context_tokens. Anchoring only ever RAISES estimates.
+        self._token_anchor: dict[str, tuple[int, int | None]] = {}
         self._warned_models: set = set()  # warn-once for unknown model context windows
         self._truncation_retry = False
         # R1-4: Per-room reminder engines (replaces shared _reminder_engine)
@@ -380,6 +387,9 @@ class Agent:
         self._gc_fail_strikes.pop(room_id, None)
         self._gc_last_runway.pop(room_id, None)
         self._gc_auto_uncleared.pop(room_id, None)
+        # kdsn.329: wholesale history reset — the anchor's cursor no longer
+        # prices anything in this room.
+        self._token_anchor.pop(room_id, None)
 
     # --- Context GC boundary consumption (workspace-kdsn.305) --------------
     # The agent owns the CHECKS (auto tier at turn start, hard tier at the
@@ -467,6 +477,12 @@ class Agent:
         # unbounded JSONL growth). Same arithmetic as the auto tier:
         # post-boundary inclusive estimate < auto threshold. Fail-soft — on
         # any estimation failure the pre-existing latch state stands.
+        # kdsn.329: an APPLIED boundary rebuilt history wholesale — the
+        # anchor's char cursor no longer prices the surviving payload. Pop
+        # BEFORE the churn re-arm estimate below so the re-arm prices the
+        # rebuilt history with a clean heuristic (a stale cursor must never
+        # survive a rebuild).
+        self._token_anchor.pop(room_id, None)
         try:
             _limit = self._resolve_model_limit(room_id)
             _available = self._effective_available(_limit)
@@ -607,7 +623,8 @@ class Agent:
 
     def _record_turn_usage(self, room_id: str, usage, model: str, cache_ttl: str | None,
                            provider_key: str | None = None,
-                           provider_type: str | None = None) -> None:
+                           provider_type: str | None = None,
+                           pre_call_chars: int | None = None) -> None:
         """Called once per API call (text + tool turns + summary). Updates globals
         AND per-room token counters, and stores the per-turn delta for the serializer.
         `usage` is a provider Usage object (.input_tokens, .output_tokens,
@@ -615,7 +632,14 @@ class Agent:
         `model` is the resolved/authoritative model string for this call (used to
         freeze cost); `cache_ttl` is the room's cache TTL label, used only as the
         aggregate-cache-write fallback multiplier inside compute_cost.
-        `provider_key`/`provider_type` gate pricing by provider (F2)."""
+        `provider_key`/`provider_type` gate pricing by provider (F2).
+        `pre_call_chars` (kdsn.329): the char total of the EXACT payload the
+        provider just measured (captured at the pre-call guard's walk). When
+        given AND the usage carries prompt tokens, this call anchors the
+        room's estimate to the true prompt size (input + cache_read +
+        cache_creation). Continuation/summary call sites omit it → they never
+        update the anchor (we never anchor without the matching payload
+        cursor)."""
         cr = usage.cache_read_tokens or 0
         cc = usage.cache_creation_tokens or 0
         # globals (unchanged semantics)
@@ -653,6 +677,15 @@ class Agent:
             "cache_creation_1h": usage.cache_creation_1h_tokens or 0,
             "unpriced_tokens": _unpriced,
         }
+        # kdsn.329: live anchor set — the provider just measured this exact
+        # payload's true prompt size. Uniform formula for both provider
+        # types (openai puts cached in cache_read; anthropic splits
+        # cache_read/cache_creation): true_prompt = input + cr + cc.
+        # Zero/no usage must NOT trample an existing anchor.
+        if pre_call_chars is not None:
+            _true_prompt = (usage.input_tokens or 0) + cr + cc
+            if _true_prompt > 0:
+                self._token_anchor[room_id] = (_true_prompt, pre_call_chars)
 
     def _record_tool_calls(self, room_id: str, n: int) -> None:
         self.total_tool_calls += n
@@ -795,6 +828,16 @@ class Agent:
         )
         if has_images and not model_supports_vision(model_str, self.config):
             return f"Cannot switch to {model_str} — session contains images and model may not support vision."
+
+        # kdsn.329: a model switch changes tokenizer semantics — the anchor's
+        # ground truth (measured under the OLD model's tokenizer) no longer
+        # prices this room's context. Invalidate now that provider + vision
+        # validation has passed, but BEFORE the overflow re-check below:
+        # that check prices the payload against the NEW model's window, so it
+        # must run on a clean heuristic — a stale old-model anchor would
+        # block otherwise-valid switches (B02). Pre-validation failures (bad
+        # model, vision refusal) return above and retain the anchor.
+        self._token_anchor.pop(room_id, None)
 
         # Context window guard: check current context vs model limit
         # Use 3-layer resolution (same as _resolve_model_limit) to get the target model's window
@@ -1370,6 +1413,12 @@ class Agent:
 
                     # Check for context overflow before calling the API (tool results may push over)
                     context_tokens = self._estimate_context_tokens(room_id)
+                    # kdsn.329: char total of the EXACT payload about to be
+                    # sent (the SAME single walk the estimator uses, so the
+                    # merge's marginal term shares its semantics). Loop-local:
+                    # refreshed every iteration; the record seam below anchors
+                    # the provider's true prompt size to this cursor.
+                    pre_call_chars = self._context_char_total(room_id)
                     limit = self._resolve_model_limit(room_id)
                     available = self._effective_available(limit)
                     # kdsn.305 HARD tier: attempt a boundary once the
@@ -1519,7 +1568,8 @@ class Agent:
                     _pkey, _ptype = self._provider_gate(self.get_model(room_id))
                     self._record_turn_usage(
                         room_id, response.usage, response.model, cache_ttl,
-                        provider_key=_pkey, provider_type=_ptype)
+                        provider_key=_pkey, provider_type=_ptype,
+                        pre_call_chars=pre_call_chars)
                     # kdsn.315 P1 (loop-level belt): canonicalize
                     # budget-exhaustion vocabulary at the point the loop sees
                     # the response. The provider seam already maps
@@ -2265,11 +2315,15 @@ class Agent:
 
         return 0
 
-    def _estimate_context_tokens(self, room_id: str = "_default", history: list[dict] | None = None) -> int:
-        """Estimate current context size in tokens for a room.
+    def _context_char_total(self, room_id: str = "_default",
+                            history: list[dict] | None = None) -> int:
+        """Char total of the context payload for a room (kdsn.329 single walk).
 
-        Includes system prompt + room history. Uses 1 token ≈ 4 chars.
-        If history is provided, use that instead of looking up by room_id.
+        system prompt + tool definitions + messages (the explicit `history`
+        arg when given, else the room's in-memory history). This is the ONE
+        walk both `_estimate_context_tokens` (heuristic = chars//4) and the
+        pre-call guard's anchor-cursor capture consume — one walk, one
+        semantics, no drift between the estimator and the anchor cursor.
         """
         total_chars = len(self.system_prompt)
         total_chars += self._tool_defs_chars
@@ -2298,7 +2352,47 @@ class Agent:
             # Wire envelope overhead for tool result messages
             if msg.get("role") == "tool":
                 total_chars += _TOOL_RESULT_OVERHEAD_CHARS
-        return total_chars // 4
+        return total_chars
+
+    def _estimate_context_tokens(self, room_id: str = "_default", history: list[dict] | None = None) -> int:
+        """Estimate current context size in tokens for a room.
+
+        Includes system prompt + room history. Uses 1 token ≈ 4 chars.
+        If history is provided, use that instead of looking up by room_id
+        (the merge below applies for ANY history arg — ONE behavior).
+
+        kdsn.329: when the room carries a provider-usage token anchor
+        (`_token_anchor[room_id]` = (true_prompt_tokens, char_cursor)), the
+        estimate is anchored to the provider's last reported true prompt
+        size plus marginal chars//4 growth since that call:
+            heuristic = chars // 4
+            anchored  = tokens0 if chars0 is None
+                        else tokens0 + max(0, chars - chars0) // 4
+            return max(heuristic, anchored)
+        `max(0, ...)` clamps shrink-without-invalidation to the floor
+        (fail-high); the outer max() means anchoring only ever RAISES
+        estimates — tiers fire earlier, never later. Without an anchor the
+        result is byte-identical to the legacy heuristic.
+        """
+        total_chars = self._context_char_total(room_id, history=history)
+        heuristic = total_chars // 4
+        anchor = self._token_anchor.get(room_id)
+        if anchor is None:
+            return heuristic
+        tokens0, chars0 = anchor
+        anchored = (tokens0 if chars0 is None
+                    else tokens0 + max(0, total_chars - chars0) // 4)
+        return max(heuristic, anchored)
+
+    def _set_anchor_floor(self, room_id: str, tokens: int) -> None:
+        """Restart-rehydration floor (kdsn.329): store (tokens, None).
+
+        The merge reduces to max(heuristic, tokens) — safe after a wholesale
+        history rebuild where no live payload cursor exists. The next live
+        call replaces the floor with a full-cursor anchor via the record
+        seam.
+        """
+        self._token_anchor[room_id] = (tokens, None)
 
     def status(self, room_id: str = "_default", history: list[dict] | None = None) -> dict:
         """Snapshot of agent state for operator visibility.

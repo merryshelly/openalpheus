@@ -283,6 +283,36 @@ class SessionLog:
 
         return totals
 
+    def last_prompt_tokens(self, room_id: str) -> int | None:
+        """Last provider-reported TRUE prompt size (kdsn.329 rehydration floor).
+
+        Scans assistant entries LAST-wins for a `usage` whose true prompt —
+        `input_tokens + cache_read_tokens + cache_creation_tokens` (the same
+        uniform formula both provider types price with, cf. usage_totals'
+        field map) — is > 0. Returns the most recent such total, or None
+        when no entry carries prompt usage.
+
+        Fail-soft (mirrors usage_totals' `_num`): a malformed persisted
+        value (string/None/list) or a bool coerces to 0 — a corrupt entry
+        must never rehydrate a bogus floor."""
+        def _num(v):
+            if isinstance(v, bool):
+                return 0
+            return v if isinstance(v, (int, float)) else 0
+        last: int | None = None
+        for entry in self.read(room_id):
+            if entry.get("role") != "assistant":
+                continue
+            u = entry.get("usage")
+            if not isinstance(u, dict):
+                continue
+            true_prompt = (_num(u.get("input_tokens", 0))
+                           + _num(u.get("cache_read_tokens", 0))
+                           + _num(u.get("cache_creation_tokens", 0)))
+            if true_prompt > 0:
+                last = int(true_prompt)
+        return last
+
     def build_context(
         self, room_id: str, *, skip_system: bool = True,
         handoff_enabled: bool | None = None,

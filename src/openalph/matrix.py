@@ -2192,6 +2192,22 @@ class MatrixBot:
                     room_id))
                 self.agent.restore_usage(room_id, session_log.usage_totals(room_id))
 
+                # kdsn.329: rehydrate the token-anchor FLOOR from the last
+                # provider-reported true prompt size. Floor-only (None
+                # cursor): history was just rebuilt wholesale above, so no
+                # live payload cursor exists — the merge prices
+                # max(heuristic, floor) until the next live call replaces it
+                # with a full-cursor anchor. When the JSONL carries no usage
+                # (last_prompt_tokens is None) the floor stays ABSENT and an
+                # existing in-memory anchor is left untouched — activation
+                # must not destroy an anchor that was set for this room
+                # before the wake (the next live call re-anchors anyway;
+                # in production a no-usage activation finds no existing
+                # anchor, since reset_room pops on archive+wipe).
+                _anchor_floor = session_log.last_prompt_tokens(room_id)
+                if _anchor_floor is not None:
+                    self.agent._set_anchor_floor(room_id, _anchor_floor)
+
                 # R1-4: Rehydrate per-room reminder engine fired-state from JSONL
                 # (e.g., a once-per-session trigger does not re-fire after restart)
                 self.agent.rehydrate_reminders(room_id, existing)

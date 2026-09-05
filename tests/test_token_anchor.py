@@ -30,7 +30,6 @@ writer — only the provider stream (and in C02, the tool executor) are fakes.
 """
 
 import json as _json
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -399,8 +398,8 @@ class TestAnchorRealPath:
             _hb_turn(bot)
         assert _boundary_markers(bot) == []
 
-    @pytest.mark.asyncio
-    async def test_C02_hard_tier(self, tmp_path):
+
+    def test_C02_hard_tier(self, tmp_path):
         """The live record seam (usage from call 1) anchors mid-turn so the
         PRE-CALL guard trips at the hard threshold when a tool result grows
         the context — even though the chars//4 heuristic stays BELOW it."""
@@ -435,7 +434,6 @@ class TestAnchorRealPath:
         async def _big_tool(*args, name=None, input=None, **kw):
             return ToolResult(content="y" * 80000, is_error=False)
 
-        import asyncio
         usable = agent._effective_available(150000)
         hard_th = int(usable * agent.config.context.hard_pct / 100)
         # heuristic (seed + 80K result) ≈ (81K)//4 ≈ 20K — far below hard.
