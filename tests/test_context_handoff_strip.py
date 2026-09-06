@@ -81,6 +81,7 @@ the carving test files' existence.
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -741,9 +742,17 @@ class TestDurableGuards:
     # allowed region is workspace ∪ extra roots (production:
     # SHARED_DIR, the second BindPaths root). The check runs against
     # the RESOLVED path — a symlink inside an extra root that points
-    # back out is still refused (fail-closed nesting). No test may
-    # depend on /srv/openalph/shared existing on the test host;
-    # behavioral tests pass explicit extra_roots.
+    # back out is still refused (fail-closed nesting).
+    #
+    # DISCRIMINATION (audit kdsn32216, synglm53 Q5 MED): the acceptance
+    # pins (D1/D2/D6) place the extra root OUTSIDE the workspace — the
+    # production shape (/srv/openalph/shared is not inside any agent
+    # workspace). With an in-workspace root the suite cannot distinguish
+    # the relaxed guard from the old workspace-only guard (audit-proof:
+    # old guard passes all of them). Refusal pins (D4/D5/D8) +
+    # test_containment_escape_rejected guard the other direction.
+    # No test may depend on /srv/openalph/shared existing on the test
+    # host; behavioral tests pass explicit extra_roots.
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -753,36 +762,50 @@ class TestDurableGuards:
         (proj / "durable-set.toml").write_text(entries_text)
         return proj
 
+    @staticmethod
+    def _outside_shared(tmp_path):
+        """Extra root OUTSIDE the workspace (production shape), uniquely
+        named per test, caller cleans up in finally."""
+        return tmp_path.parent / f"kdsn32216_shared_{tmp_path.name}"
+
     def test_D1_symlink_into_extra_root_accepted(self, tmp_path):
         m = _handoff()
-        shared = tmp_path / "shared"
-        (shared / "skills").mkdir(parents=True)
-        (shared / "skills" / "foo.md").write_text("shared skill body")
-        (tmp_path / "skills").mkdir()
-        os.symlink(shared / "skills" / "foo.md", tmp_path / "skills" / "foo.md")
-        self._mk_project(tmp_path,
-                         '[[entries]]\npath = "skills/foo.md"\nreason = "r"\n')
-        res = m.resolve_durable_set(Path(tmp_path), "p",
-                                     extra_roots=[shared])
-        assert not any("escapes" in e for e in res["errors"]), res["errors"]
-        # display path is the RESOLVED rel path (symlink target under the
-        # extra root), not the lexical entry — assert on the content.
-        f = [x for x in res["files"] if "foo.md" in x["path"]]
-        assert f and f[0]["exists"] and f[0]["text"] == "shared skill body"
+        shared = self._outside_shared(tmp_path)
+        try:
+            (shared / "skills").mkdir(parents=True)
+            (shared / "skills" / "foo.md").write_text("shared skill body")
+            (tmp_path / "skills").mkdir()
+            os.symlink(shared / "skills" / "foo.md",
+                       tmp_path / "skills" / "foo.md")
+            self._mk_project(tmp_path,
+                             '[[entries]]\npath = "skills/foo.md"'
+                             '\nreason = "r"\n')
+            res = m.resolve_durable_set(Path(tmp_path), "p",
+                                         extra_roots=[shared])
+            assert not any("escapes" in e for e in res["errors"]), res["errors"]
+            # display path is the resolved (absolute, out-of-ws) path, not
+            # the lexical entry — assert on the content.
+            f = [x for x in res["files"] if "foo.md" in x["path"]]
+            assert f and f[0]["exists"] and f[0]["text"] == "shared skill body"
+        finally:
+            shutil.rmtree(shared, ignore_errors=True)
 
     def test_D2_absolute_path_into_extra_root_accepted(self, tmp_path):
         m = _handoff()
-        shared = tmp_path / "shared"
-        (shared / "docs").mkdir(parents=True)
-        (shared / "docs" / "ref.md").write_text("abs body")
-        self._mk_project(tmp_path,
-                         f'[[entries]]\npath = "{shared / "docs" / "ref.md"}"'
-                         '\nreason = "r"\n')
-        res = m.resolve_durable_set(Path(tmp_path), "p",
-                                     extra_roots=[shared])
-        assert not any("escapes" in e for e in res["errors"]), res["errors"]
-        assert any(f["exists"] and f["text"] == "abs body"
-                   for f in res["files"])
+        shared = self._outside_shared(tmp_path)
+        try:
+            (shared / "docs").mkdir(parents=True)
+            (shared / "docs" / "ref.md").write_text("abs body")
+            self._mk_project(tmp_path,
+                             f'[[entries]]\npath = "{shared / "docs" / "ref.md"}"'
+                             '\nreason = "r"\n')
+            res = m.resolve_durable_set(Path(tmp_path), "p",
+                                         extra_roots=[shared])
+            assert not any("escapes" in e for e in res["errors"]), res["errors"]
+            assert any(f["exists"] and f["text"] == "abs body"
+                       for f in res["files"])
+        finally:
+            shutil.rmtree(shared, ignore_errors=True)
 
     def test_D3_default_extra_roots_cover_platform_shared(self):
         m = _handoff()
@@ -791,38 +814,39 @@ class TestDurableGuards:
 
     def test_D4_escape_outside_all_roots_still_rejected(self, tmp_path):
         m = _handoff()
-        shared = tmp_path / "shared"
-        shared.mkdir()
-        outside = tmp_path.parent / "kdsn32216_outside.txt"
-        outside.write_text("sensitive")
+        shared = self._outside_shared(tmp_path)
+        outside = tmp_path.parent / f"kdsn32216_outside_{tmp_path.name}.txt"
         (tmp_path / "notes").mkdir()
         try:
+            shared.mkdir(parents=True)
+            outside.write_text("sensitive")
             self._mk_project(tmp_path,
                              '[[entries]]\npath = '
-                             '"notes/../../kdsn32216_outside.txt"'
+                             f'"notes/../../{outside.name}"'
                              '\nreason = "r"\n')
             res = m.resolve_durable_set(Path(tmp_path), "p",
                                          extra_roots=[shared])
             assert any("escapes workspace" in e
                        for e in res["errors"]), res["errors"]
             assert not any(f["exists"] for f in res["files"]
-                           if "kdsn32216_outside" in f["path"])
+                           if outside.name in f["path"])
         finally:
             outside.unlink(missing_ok=True)
+            shutil.rmtree(shared, ignore_errors=True)
 
     def test_D5_nested_symlink_out_of_extra_root_refused(self, tmp_path):
         """The relaxation must NOT open nesting: ws -> shared ->
         outside resolves outside all roots and is refused."""
         m = _handoff()
-        shared = tmp_path / "shared"
-        (shared / "skills").mkdir(parents=True)
-        outside = tmp_path.parent / "kdsn32216_nested_outside.txt"
-        outside.write_text("sensitive nested")
-        (shared / "skills" / "evil.md").symlink_to(outside)
-        (tmp_path / "skills").mkdir()
-        os.symlink(shared / "skills" / "evil.md",
-                   tmp_path / "skills" / "evil.md")
+        shared = self._outside_shared(tmp_path)
+        outside = tmp_path.parent / f"kdsn32216_nested_{tmp_path.name}.txt"
         try:
+            (shared / "skills").mkdir(parents=True)
+            outside.write_text("sensitive nested")
+            (shared / "skills" / "evil.md").symlink_to(outside)
+            (tmp_path / "skills").mkdir()
+            os.symlink(shared / "skills" / "evil.md",
+                       tmp_path / "skills" / "evil.md")
             self._mk_project(tmp_path,
                              '[[entries]]\npath = "skills/evil.md"'
                              '\nreason = "r"\n')
@@ -834,38 +858,66 @@ class TestDurableGuards:
                            if "evil.md" in f["path"])
         finally:
             outside.unlink(missing_ok=True)
+            shutil.rmtree(shared, ignore_errors=True)
 
     def test_D6_dedup_across_roots_same_physical_file(self, tmp_path):
         m = _handoff()
-        shared = tmp_path / "shared"
-        (shared / "skills").mkdir(parents=True)
-        (shared / "skills" / "foo.md").write_text("once")
-        (tmp_path / "skills").mkdir()
-        os.symlink(shared / "skills" / "foo.md", tmp_path / "skills" / "foo.md")
-        self._mk_project(
-            tmp_path,
-            '[[entries]]\npath = "skills/foo.md"\nreason = "a"\n'
-            f'[[entries]]\npath = "{shared / "skills" / "foo.md"}"'
-            '\nreason = "b"\n')
-        res = m.resolve_durable_set(Path(tmp_path), "p",
-                                     extra_roots=[shared])
-        assert not any("escapes" in e for e in res["errors"]), res["errors"]
-        bodies = [f for f in res["files"] if f["text"] == "once"]
-        assert len(bodies) == 1, "one physical file -> one durable entry"
+        shared = self._outside_shared(tmp_path)
+        try:
+            (shared / "skills").mkdir(parents=True)
+            (shared / "skills" / "foo.md").write_text("once")
+            (tmp_path / "skills").mkdir()
+            os.symlink(shared / "skills" / "foo.md",
+                       tmp_path / "skills" / "foo.md")
+            self._mk_project(
+                tmp_path,
+                '[[entries]]\npath = "skills/foo.md"\nreason = "a"\n'
+                f'[[entries]]\npath = "{shared / "skills" / "foo.md"}"'
+                '\nreason = "b"\n')
+            res = m.resolve_durable_set(Path(tmp_path), "p",
+                                         extra_roots=[shared])
+            assert not any("escapes" in e for e in res["errors"]), res["errors"]
+            bodies = [f for f in res["files"] if f["text"] == "once"]
+            assert len(bodies) == 1, "one physical file -> one durable entry"
+        finally:
+            shutil.rmtree(shared, ignore_errors=True)
 
     def test_D7_real_ws_file_with_extra_roots_accepted(self, tmp_path):
         m = _handoff()
-        shared = tmp_path / "shared"
-        shared.mkdir()
-        (tmp_path / "skills").mkdir()
-        (tmp_path / "skills" / "local.md").write_text("local body")
-        self._mk_project(tmp_path,
-                         '[[entries]]\npath = "skills/local.md"\nreason = "r"\n')
-        res = m.resolve_durable_set(Path(tmp_path), "p",
-                                     extra_roots=[shared])
-        assert res["errors"] == []
-        assert any(f["exists"] and f["text"] == "local body"
-                   for f in res["files"])
+        shared = self._outside_shared(tmp_path)
+        try:
+            shared.mkdir(parents=True)
+            (tmp_path / "skills").mkdir()
+            (tmp_path / "skills" / "local.md").write_text("local body")
+            self._mk_project(tmp_path,
+                             '[[entries]]\npath = "skills/local.md"'
+                             '\nreason = "r"\n')
+            res = m.resolve_durable_set(Path(tmp_path), "p",
+                                         extra_roots=[shared])
+            assert res["errors"] == []
+            assert any(f["exists"] and f["text"] == "local body"
+                       for f in res["files"])
+        finally:
+            shutil.rmtree(shared, ignore_errors=True)
+
+    def test_D8_explicit_empty_extra_roots_workspace_only(self, tmp_path):
+        """extra_roots=[] (explicit) differs from None (production
+        default [SHARED_DIR]): with no extra roots the region collapses
+        to workspace-only — the old, stricter behavior, on purpose."""
+        m = _handoff()
+        shared = self._outside_shared(tmp_path)
+        try:
+            (shared / "skills").mkdir(parents=True)
+            (shared / "skills" / "foo.md").write_text("x")
+            self._mk_project(tmp_path,
+                             f'[[entries]]\npath = "{shared / "skills" / "foo.md"}"'
+                             '\nreason = "r"\n')
+            res = m.resolve_durable_set(Path(tmp_path), "p",
+                                         extra_roots=[])
+            assert any("escapes workspace" in e
+                       for e in res["errors"]), res["errors"]
+        finally:
+            shutil.rmtree(shared, ignore_errors=True)
 
     def test_malformed_toml_never_raises(self, tmp_path):
         m = _handoff()

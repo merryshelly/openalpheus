@@ -44,8 +44,6 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openalph.config import SHARED_DIR
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -267,6 +265,7 @@ def default_extra_roots() -> list[Path]:
     workspace-only app boundary — the SEC-9/kdsn.252 drift anti-pattern.
     Host-independent: tests pass explicit extra_roots and pin this
     default, so no test depends on /srv/openalph/shared existing."""
+    from openalph.config import SHARED_DIR  # lazy: module-purity contract (see module docstring); config.py is stdlib-only, no cycle
     return [SHARED_DIR]
 
 
@@ -311,7 +310,12 @@ def resolve_durable_set(
     except (OSError, RuntimeError):
         ws_root = workspace
     _extra = extra_roots if extra_roots is not None else default_extra_roots()
-    allowed_roots = [ws_root] + [Path(r).resolve() for r in _extra]
+    allowed_roots = [ws_root]
+    for r in _extra:
+        try:
+            allowed_roots.append(Path(r).resolve())
+        except (OSError, RuntimeError):
+            pass  # unresolvable root is not trusted (fail-closed)
 
     def add(p: Path, reason: str, origin: str) -> None:
         try:
