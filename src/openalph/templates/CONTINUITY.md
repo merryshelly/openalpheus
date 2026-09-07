@@ -25,13 +25,18 @@ When working on any project, i.e., any work or conversation that will extend bey
 Do this at session start or the first milestone. 
 Commit both files to git immediately after creation and after every milestone update.
 
-### progress.md MUST contain exactly three blocks, in order:
+### progress.md MUST contain exactly four blocks, in order:
 
 1. **State** — what exists and works now. Every claim must carry observable verification (command, expected output, exit code). Unverified claims must be marked unverified.
-2. **Decisions** — what was decided and *why*.
-3. **Next** — immediate next steps, pointing at beads where relevant.
+2. **Story** — how the current State was reached: a chronological list of 5–15 one-line factual bullets, oldest first. What the operator asked, what was built or dispatched, what returned, what is in flight right now, and what is explicitly not done. Rules:
+   - First-person factual: "SB ordered X; I dispatched Y (model, time); it returned Z." No rationale (that's Decisions), no status prose (that's State).
+   - **Close every loop in writing.** Every in-flight or not-yet-started item carries an explicit status word — DISPATCHED, IN FLIGHT, NOT STARTED, BLOCKED. A post-boundary session has no memory of this narrative; an open loop left implicit invites it to be closed by invention.
+   - Completion claims must point at their verification evidence in State; the Story never substitutes for it.
+   - Prune mercilessly: compress settled arcs into one line ("kdsn.329 shipped + promoted — see README Session Log") rather than deleting bullets outright.
+3. **Decisions** — what was decided and *why*.
+4. **Next** — immediate next steps, pointing at beads where relevant. Any item that cannot be started right now carries its unblock condition and its owner — `[blocked: SB]` / `[blocked: external]` / `[blocked: agent-name]`; an implicit wait is the one thing the next epoch most needs to not walk past.
 
-Keep it ~1–2K tokens. It is a carrier bag for critical context, not a substitute for
+Keep it ~1–2K tokens (Story ≤ ~500 of it). It is a carrier bag for critical context, not a substitute for
 documentation (README) or history (daily notes) or tasks (beads).
 
 ### durable-set.toml
@@ -52,6 +57,16 @@ Required categories:
   than switching or blending.
 - Update `progress.md` after every milestone. "Done" means verified complete, all tests green.
 - Update `durable-set.toml` as needed — treat the 75% checkpoint as the deadline, not the boundary.
+- **Boundary readiness for manual fires.** The 75% checkpoint fires on pressure, not on operator-requested
+  handoffs. Before any tool- or slash-fired boundary: run bead hygiene (`bd` statuses current, discovered
+  work filed), then update the Story block so every in-flight item carries its status word — the Story
+  references truth, not stale memory. A boundary fired on a stale Story hands the next epoch a vacuum.
 - Actively update relevant documentation so that you receive accurate information
   after a context-handoff boundary.
-- If conducting session-handoff: the session brief references the artifacts — do not duplicate.
+- If conducting session-handoff: **load the `session-handoff` skill first** and follow it in full —
+  its artifact steps (durable-set review, progress.md Story sweep) are the manual-boundary version of this
+  discipline. The session brief references the artifacts — do not duplicate.
+- The durable-set budget is advisory (an informational pruning marker, not a cap). Act on it only when the
+  harness reports it exceeded — never anticipate or infer an overage. When reviewing the durable set, the
+  question is "what does the NEXT epoch need injected?" not "how do I shrink this?" — files that govern
+  imminent work (e.g. deployment skills before a deploy phase) belong in the set even when large.
