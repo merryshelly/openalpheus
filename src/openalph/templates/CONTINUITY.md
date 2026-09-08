@@ -7,11 +7,11 @@ These artifacts are critically important to persist context across **context-han
 
 Context pressure is measured against usable runway (model window minus max_tokens):
 
-- **75% — checkpoint.** The harness injects a checkpoint directive: stop starting new work and update your artifacts NOW.
-- **85% — boundary.** ALL pre-boundary conversation is dropped from your context. The handoff package — your declared project's `progress.md` + `durable-set.toml` snapshot — is the only carryover. Tool outputs, reasoning, and conversation history do not survive. The snapshot is frozen at the boundary, so artifact updates must land BEFORE it fires.
+- **75% — checkpoint.** The harness inserts a checkpoint directive: stop starting new work and update your artifacts NOW.
+- **85% — boundary.** ALL pre-boundary conversation is dropped from your context. The handoff snapshot — a directive user turn naming your declared project's durable set as a read list, with `progress.md` inlined — is the only carryover. Tool outputs, reasoning, and conversation history do not survive. The snapshot is frozen at the boundary, so artifact updates must land BEFORE it fires.
 - **92% — overflow guard.** Emergency floor with a 3-strike breaker, not a grace band — a single fast-growing turn can cross it between checkpoint evaluations.
 
-If no project is declared, the boundary strips anyway and the snapshot is a bare rehydration pointer: your workspace, `memory/`, and beads are the recovery path. In isolated environments where the template files below are unreadable, the checkpoint directive embeds condensed skeletons — reproduce them. If the checkpoint is skipped, the boundary fires anyway and the carryover is whatever the files last contained — the manifest records it `stale`.
+If no project is declared, the boundary strips anyway and the snapshot is a bare directive plus a manifest pointer: your workspace, `memory/`, and beads are the recovery path. In isolated environments where the template files below are unreadable, the checkpoint directive embeds condensed skeletons — reproduce them. If the checkpoint is skipped, the boundary fires anyway and the carryover is whatever the files last contained — the manifest records it `stale`.
 
 ## The Artifacts
 
@@ -41,9 +41,11 @@ documentation (README) or history (daily notes) or tasks (beads).
 
 ### durable-set.toml
 
-The re-inject list: a TOML array of `[[entries]]` with `path` and `reason`. After a
-context-handoff boundary, the harness re-injects the listed files verbatim (live-read at boundary
-time). `progress.md` and `durable-set.toml` are auto-injected; do not list them.
+The durable-set declaration: a TOML array of `[[entries]]` with `path` and `reason`. After a
+context-handoff boundary, the snapshot lists these files for you to read LIVE via `file_read`
+(path + reason as a directive read list — their bytes are NOT inlined; kdsn.333). `progress.md` is
+the one artifact whose bytes are inlined in the snapshot; `progress.md` and `durable-set.toml` are
+auto-included, so do not list them as entries.
 
 Required categories:
 - Project README
@@ -68,5 +70,5 @@ Required categories:
   discipline. The session brief references the artifacts — do not duplicate.
 - The durable-set budget is advisory (an informational pruning marker, not a cap). Act on it only when the
   harness reports it exceeded — never anticipate or infer an overage. When reviewing the durable set, the
-  question is "what does the NEXT epoch need injected?" not "how do I shrink this?" — files that govern
+  question is "what does the NEXT epoch need on its read list?" not "how do I shrink this?" — files that govern
   imminent work (e.g. deployment skills before a deploy phase) belong in the set even when large.
