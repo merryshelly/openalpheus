@@ -247,11 +247,14 @@ class Agent:
         # estimator merges this with the chars//4 heuristic — see
         # _estimate_context_tokens. Anchoring only ever RAISES estimates.
         self._token_anchor: dict[str, tuple[int, int | None]] = {}
-        # kdsn.333: per-room PENDING epoch record — the last applied handoff
-        # boundary as (boundary_index, manifest ts), consumed (pop-on-read)
-        # by _orient_inputs so the next turn-start session-orient labels the
-        # epoch ("Epoch began: <ts> (context handoff boundary <N>)").
-        self._pending_handoff_epoch: dict[str, tuple[int, str]] = {}
+        # kdsn.333: per-room EPOCH record — the last applied handoff boundary
+        # as (boundary_index, manifest ts). Read (NOT consumed) by
+        # _orient_inputs on every populated turn-start so session-orient
+        # labels the epoch for the epoch's whole lifetime: a mid-epoch /model
+        # switch refires with the same "Epoch began" row (audit M1 —
+        # pop-on-read silently dropped the label on refires). Overwritten by
+        # the next applied boundary; cleared by reset_room.
+        self._handoff_epoch: dict[str, tuple[int, str]] = {}
         self._warned_models: set = set()  # warn-once for unknown model context windows
         self._truncation_retry = False
         # R1-4: Per-room reminder engines (replaces shared _reminder_engine)
@@ -340,11 +343,14 @@ class Agent:
                            "in %s — using raw string (%s: %s)",
                            model, room_id, type(exc).__name__, exc)
             model_resolved = model
-        # kdsn.333: the pending epoch record (last applied boundary) is
-        # CONSUMED here — pop-on-read, defaults 0/"" when absent. The
-        # manifest ts ("YYYY-MM-DDTHH:MM:SSZ", UTC) renders host-local,
-        # same shape as orient_ts.
-        _epoch = self._pending_handoff_epoch.pop(room_id, None)
+        # kdsn.333: the epoch record (last applied boundary) is READ here —
+        # persist-on-read, defaults 0/"" when absent (fresh epoch). A
+        # mid-epoch model switch refires session-orient with the same Epoch
+        # label; the record lives until the next boundary or reset_room.
+        # The manifest ts ("YYYY-MM-DDTHH:MM:SSZ", UTC) renders host-local,
+        # same shape as orient_ts. An unrenderable ts drops the whole epoch
+        # pair (never a blank "- Epoch began:  (...)" row — audit L1/L3).
+        _epoch = self._handoff_epoch.get(room_id)
         _epoch_index, _epoch_ts_raw = (0, "") if not _epoch else _epoch
         _epoch_ts = ""
         if _epoch_index and _epoch_ts_raw:
@@ -356,7 +362,7 @@ class Agent:
                     .strftime("%A, %B %d, %Y — %H:%M %Z")
                 )
             except (TypeError, ValueError):
-                _epoch_ts = ""
+                _epoch_index, _epoch_ts = 0, ""
         return {
             "model_resolved": model_resolved,
             "model_vision": model_supports_vision(model, self.config),
@@ -378,7 +384,7 @@ class Agent:
         """
         if room_id in self._rooms:
             self._rooms[room_id].clear()
-        self._pending_handoff_epoch.pop(room_id, None)
+        self._handoff_epoch.pop(room_id, None)
         self._room_usage.pop(room_id, None)
         self._last_turn_usage.pop(room_id, None)
         self._last_stop_reason.pop(room_id, None)
@@ -502,8 +508,11 @@ class Agent:
         if isinstance(_manifest, dict):
             _idx = _manifest.get("boundary_index")
             _ts = _manifest.get("ts")
-            if isinstance(_idx, int) and isinstance(_ts, str) and _ts:
-                self._pending_handoff_epoch[room_id] = (_idx, _ts)
+            # bool is an int subclass — a bool "index" would render as
+            # "boundary True" (audit L2: same guard class as _set_anchor_floor).
+            if (isinstance(_idx, int) and not isinstance(_idx, bool)
+                    and isinstance(_ts, str) and _ts):
+                self._handoff_epoch[room_id] = (_idx, _ts)
         # An APPLIED boundary re-arms the auto tier ONLY if it cleared the
         # auto threshold (audit kdsn.322.9: the unconditional pop let a
         # mid-turn hard/tool/slash boundary re-arm a churn-latched auto tier

@@ -288,6 +288,17 @@ class TestSessionOrientEpochVariant:
         assert len(refired) == 1
         assert "- Epoch began:" in refired[0].text
 
+    def test_empty_epoch_ts_falls_back_to_session_label(self, tmp_path):
+        """Audit L1: index>0 with an empty ts must NOT render a blank
+        '- Epoch began:  (...)' row — the engine defends even if the agent
+        guard is bypassed."""
+        eng = ReminderEngine(_cfg(tmp_path))
+        st = _orient_state(handoff_epoch_index=12, handoff_epoch_ts="")
+        orient = [r for r in eng.evaluate(st) if r.trigger == ORIENT_ID]
+        assert len(orient) == 1
+        assert "- Session began:" in orient[0].text
+        assert "- Epoch began:" not in orient[0].text
+
     def test_suppression_forms_preserved(self, tmp_path):
         eng = ReminderEngine(_cfg(tmp_path))
         silent = eng.evaluate(_orient_state(model_resolved=""))
@@ -329,14 +340,48 @@ class TestAgentEpochWiring:
                   .astimezone().strftime("%A, %B %d, %Y — %H:%M %Z"))
         assert inputs["handoff_epoch_ts"] == expect
 
-    def test_pending_epoch_consumed_on_read(self, tmp_path):
+    def test_epoch_record_persists_for_epoch_lifetime(self, tmp_path):
+        """Audit M1: pop-on-read was a fixture error — the epoch record must
+        PERSIST so a mid-epoch model-switch refire keeps the Epoch label.
+        It is overwritten by the next boundary and cleared by reset_room."""
         agent = self._agent(tmp_path)
         agent._note_handoff_boundary_applied(ROOM, self._outcome())
         first = agent._orient_inputs(ROOM)
         assert first["handoff_epoch_index"] == 247
         second = agent._orient_inputs(ROOM)
-        assert second["handoff_epoch_index"] == 0
-        assert second["handoff_epoch_ts"] == ""
+        assert second["handoff_epoch_index"] == first["handoff_epoch_index"]
+        assert second["handoff_epoch_ts"] == first["handoff_epoch_ts"]
+        # next boundary overwrites
+        agent._note_handoff_boundary_applied(
+            ROOM, self._outcome(ts="2026-09-08T12:00:00Z", idx=300))
+        third = agent._orient_inputs(ROOM)
+        assert third["handoff_epoch_index"] == 300
+
+    def test_bool_boundary_index_rejected(self, tmp_path):
+        """Audit L2: bool is an int subclass — a malformed bool index must
+        not render as 'boundary True'."""
+        agent = self._agent(tmp_path)
+        agent._note_handoff_boundary_applied(
+            ROOM, {"applied": True,
+                   "manifest": {"ts": "2026-09-08T11:08:11Z",
+                                "boundary_index": True,
+                                "runway": {"tokens_after": 1,
+                                           "available": 2}}})
+        inputs = agent._orient_inputs(ROOM)
+        assert inputs["handoff_epoch_index"] == 0
+
+    def test_unrenderable_ts_drops_epoch_pair(self, tmp_path):
+        """Audit L1/L3: never a blank '- Epoch began:  (...)' row."""
+        agent = self._agent(tmp_path)
+        agent._note_handoff_boundary_applied(
+            ROOM, {"applied": True,
+                   "manifest": {"ts": "not-a-timestamp",
+                                "boundary_index": 247,
+                                "runway": {"tokens_after": 1,
+                                           "available": 2}}})
+        inputs = agent._orient_inputs(ROOM)
+        assert inputs["handoff_epoch_index"] == 0
+        assert inputs["handoff_epoch_ts"] == ""
 
     def test_inputs_without_boundary_default_fresh(self, tmp_path):
         agent = self._agent(tmp_path)

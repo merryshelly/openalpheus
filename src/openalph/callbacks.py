@@ -414,7 +414,7 @@ def build_context_status(agent, room_id, *, room_name=None, session_log=None, he
 # build_callbacks — headless
 # ---------------------------------------------------------------------------
 
-# kdsn.322.14: fold cap for the reinserted progress.md — past this the fold
+# kdsn.322.14: fold cap for the inserted progress.md — past this the fold
 # truncates with a pointer to the on-disk file. The snapshot in the JSONL
 # remains the complete audit record regardless.
 _PROGRESS_FOLD_CAP_CHARS = 16_000
@@ -432,7 +432,7 @@ def render_handoff_notice(trigger: str, outcome: dict) -> str:
     accounting as /status (system prompt + tool defs + render), with the
     after-number MEASURED (snapshot + surviving tail), never the retired
     pinned-0; checkpoint as the bare status value (no definitional gloss);
-    the reinserted file list; and the FROZEN progress.md below the fold.
+    the progress block + read list; and the FROZEN progress.md below the fold.
     Insert-language throughout — never "inject". Display-only: the JSONL
     marker is the audit record.
     """
@@ -468,7 +468,7 @@ def render_handoff_notice(trigger: str, outcome: dict) -> str:
             base = str(f.get("path", "?")).rsplit("/", 1)[-1]
             if base not in names:
                 names.append(html.escape(base))
-        head += f" · reinserted {len(files)} files: {', '.join(names)}"
+        head += f" · durable set {len(files)} files (read list; progress.md inserted): {', '.join(names)}"
 
     fold = []
     bits = []
@@ -508,7 +508,7 @@ def render_handoff_notice(trigger: str, outcome: dict) -> str:
             text = (text[:_PROGRESS_FOLD_CAP_CHARS] +
                     f"\n[truncated: {removed} chars removed — full text: "
                     f"{pointer}]")
-        fold.append("── progress.md as reinserted (frozen at boundary) ──")
+        fold.append("── progress.md as inserted (frozen at boundary) ──")
         fold.append(text)
     return head + "\n" + "\n".join(fold)
 

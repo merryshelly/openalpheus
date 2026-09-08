@@ -194,10 +194,16 @@ class ReminderEngine:
             # invites confabulated history); on a fresh epoch it is the
             # session start. Vocabulary: "inserted", never "injected"
             # (spec §2.3).
+            # Epoch row requires index>0 AND a rendered ts — a missing/
+            # unrenderable ts would print a blank "Epoch began:  (...)"
+            # row; the agent drops the pair in that case, and the engine
+            # defends the same way (audit L1/L3).
+            _epoch_labeled = (state.handoff_epoch_index > 0
+                              and bool(state.handoff_epoch_ts))
             _begin_row = (
                 f"- Epoch began: {state.handoff_epoch_ts} (context handoff "
                 f"boundary {state.handoff_epoch_index})"
-                if state.handoff_epoch_index > 0
+                if _epoch_labeled
                 else f"- Session began: {state.orient_ts}"
             )
             results.append(Reminder(

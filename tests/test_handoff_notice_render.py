@@ -78,9 +78,9 @@ class TestHeadline:
             "checkpoint": {"status": "stale", "fired_ts": "x", "project_mtime": None}})
         assert "checkpoint: stale" in render_handoff_notice("tool", oc)
 
-    def test_reinserted_file_list_visible(self):
+    def test_durable_set_file_list_visible(self):
         text = render_handoff_notice("tool", _new_outcome())
-        assert "reinserted 3 files:" in text
+        assert "durable set 3 files (read list; progress.md inserted):" in text
         for name in ("progress.md", "durable-set.toml", "README.md"):
             assert name in text
 
@@ -127,7 +127,7 @@ class TestFold:
             "durable": {"project": None, "files": [], "budget_tokens": 96000,
                         "used_tokens": 0, "over_budget": False}})
         text = render_handoff_notice("tool", oc)
-        assert "as reinserted" not in text
+        assert "as reinserted" not in text  # wording is now "as inserted"
 
 
 class TestLanguageAndFormat:
