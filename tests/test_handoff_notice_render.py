@@ -11,11 +11,11 @@ Pins the operator-facing notice format ruled by SB 2026-09-04:
   its own key so "what did the strip buy" survives.
 - Headline (the sink renders line 1 as the collapsed <details> summary):
   knot emoji, trigger, ~before → ~after tok, project, checkpoint (bare
-  status value — NO definitional gloss), reinserted file list.
+  status value — NO definitional gloss), durable-set file list.
 - Fold: dropped tokens, durable budget (no parentheticals), boundary
   index (audit ref), errors, full progress.md FROM THE FROZEN SNAPSHOT
   (html-escaped, size-capped with a truncation marker).
-- Language: insert/reinserted everywhere; the string "inject" must not
+- Language: insert/inserted everywhere; the string "inject" must not
   appear in any rendered notice.
 - Legacy manifests (tokens_after_est=0, no new keys) render fail-soft.
 """

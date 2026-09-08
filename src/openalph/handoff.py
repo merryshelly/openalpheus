@@ -519,9 +519,11 @@ def frame_snapshot(
     block. The retired data-dump framing (BEGIN/END blocks, trust-level
     line) is gone — the read list makes live re-reads explicit.
 
-    Deterministic: given the same inputs the bytes are identical, and the
-    caller picks the timestamp ONCE (``frozen_at``) so replay renders the
-    stored bytes verbatim.
+    Deterministic: given the same inputs the bytes are identical, and replay
+    renders the stored bytes verbatim (A05/A06). ``frozen_at`` is RETAINED as
+    a no-op parameter for API compatibility — the kdsn.333 directive header
+    embeds no timestamp (snapshot-age calibration moved to the session-orient
+    'Epoch began' row), so old callers passing it need no change (audit L).
 
     The inlined progress.md bytes MUST pass through
     ``_freeze_file_text`` (credential redaction + escape_system_reminder_tags
@@ -609,8 +611,11 @@ def _no_project_fallback_body(boundary_index: int, tokens_before: int) -> str:
     — a resuming-after-handoff directive instead of a bare data dump. The
     full strip still applies; the package is just a deterministic manifest
     summary plus a fixed rehydration pointer. Deterministic — no timestamps.
-    The first line keeps the "durable context snapshot" marker (the
-    render-detection marker) and the manifest summary line is unchanged.
+    The first line keeps the "durable context snapshot" marker. Historical
+    note: it was once believed to double as the render's verbatim-snapshot
+    detection marker; that branch actually keys on the JSONL ``source``
+    field (``handoff_snapshot``), so the marker text is cosmetic — kept
+    stable for log greps and existing test needles (audit L).
     """
     return (
         f"[Handoff boundary {boundary_index} — durable context snapshot]\n"
@@ -1009,7 +1014,7 @@ def apply_boundary(
         # + manifest record. NO directive, NO bead, NO ntfy — the full durable
         # set is attached verbatim regardless.
         logger.warning(
-            "handoff boundary %d: durable set over reinjection budget (%d > %d "
+            "handoff boundary %d: durable set over budget (%d > %d "
             "tokens) — informational marker only",
             boundary_index,
             used_tokens,

@@ -501,9 +501,11 @@ class Agent:
         self._engine_for(room_id).reset()
         self._gc_fail_strikes[room_id] = 0
         self._gc_last_runway[room_id] = self._handoff_runway_fraction(res.get("manifest"))
-        # kdsn.333: record this boundary as the room's pending epoch start.
-        # The next populated turn-start evaluation consumes it (pop-on-read)
-        # via _orient_inputs; a malformed outcome must never break the seam.
+        # kdsn.333: record this boundary as the room's epoch start. The
+        # record PERSISTS for the epoch's lifetime — every populated
+        # turn-start reads it via _orient_inputs (overwritten by the next
+        # applied boundary, cleared by reset_room). A malformed outcome must
+        # never break the seam.
         _manifest = res.get("manifest") if isinstance(res, dict) else None
         if isinstance(_manifest, dict):
             _idx = _manifest.get("boundary_index")

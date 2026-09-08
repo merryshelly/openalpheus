@@ -28,8 +28,10 @@ Changes under test:
 4. agent.py — epoch wiring:
    - _note_handoff_boundary_applied records the boundary (index + manifest ts)
      as the room's pending epoch start
-   - _orient_inputs returns handoff_epoch_* keyed from the pending record and
-     CONSUMES it (pop-on-read); reset_room clears it
+   - _orient_inputs returns handoff_epoch_* keyed from the epoch record;
+     the record PERSISTS for the epoch's lifetime (audit M1: pop-on-read
+     dropped the label on model-switch refires); overwritten by the next
+     applied boundary; reset_room clears it
 5. handoff.py::apply_boundary — manifest gains "anchored_estimate" (int|None),
    threaded from apply_boundary_and_rebuild (agent in scope there).
 6. Sub-agent boundary body (SUB_BODY_PREFIX path) — directive sentence

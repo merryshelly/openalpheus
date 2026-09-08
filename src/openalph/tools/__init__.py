@@ -1827,7 +1827,7 @@ async def _execute_context_handoff(input: dict, callbacks: dict | None) -> "Tool
     files = durable.get("files") or []
     used = durable.get("used_tokens", 0)
     budget = durable.get("budget_tokens", 0)
-    flag = " — over reinsertion budget" if outcome.get("over_budget") else ""
+    flag = " — over durable-set budget" if outcome.get("over_budget") else ""
     # kdsn.322.14: unified accounting — tokens_after is MEASURED (composite:
     # system prompt + tool defs + snapshot + tail); tokens_dropped is the
     # render-only figure. Legacy manifests fall back to the runway figure.
@@ -1840,7 +1840,8 @@ async def _execute_context_handoff(input: dict, callbacks: dict | None) -> "Tool
         content=(
             f"Context handoff boundary {manifest.get('boundary_index', '?')} "
             f"applied (trigger=tool). Full strip: all pre-boundary content "
-            f"dropped; {len(files)} durable file(s) reinserted. "
+            f"dropped; {len(files)} durable file(s) listed "
+            f"(read via file_read; progress.md inserted). "
             f"Context ~{manifest.get('tokens_before', 0):,} -> "
             f"~{_ta:,} tok (system prompt + tool defs included)."
             f"{dropped_seg} "

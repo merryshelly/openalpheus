@@ -224,7 +224,7 @@ class TestHandoffTool:
         # the old pinned-after (40000) was the retired tokens_after_est=0
         # era's estimate figure.
         assert "12" in res.content and "~90,000" in res.content
-        assert "reinserted" in res.content and "(est.)" not in res.content
+        assert "read via file_read" in res.content and "(est.)" not in res.content
         cb.assert_awaited_once()
         assert cb.call_args.kwargs.get("trigger", cb.call_args.args[-1] if cb.call_args.args else None) in (None, "tool")
 
