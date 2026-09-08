@@ -510,93 +510,115 @@ def frame_snapshot(
     budget_tokens: int,
     frozen_at: str | None = None,
 ) -> str:
-    """Render the frozen durable-set snapshot block (stored verbatim in JSONL).
+    """Render the directive handoff snapshot block (stored verbatim in JSONL).
 
-    Deterministic given ``frozen_at``: the timestamp is chosen ONCE by the
-    caller at boundary time and the stored bytes never change afterwards
-    (replay renders them verbatim). ``frozen_at`` is agent-visible freshness —
-    the manifest ts is system-event JSONL detail and never enters context, so
-    this stamp is the only way a replaying agent can calibrate snapshot age.
-    Structure:
+    kdsn.333 (spec §3.1, SB-approved verbatim): a directive user-turn shape
+    instead of a bare data dump — (1) fully read the project's durable set
+    (a READ LIST: path + reason; file bytes are NOT inlined), (2) read
+    progress.md (the ONE inlined artifact, below) and continue per its Next
+    block. The retired data-dump framing (BEGIN/END blocks, trust-level
+    line) is gone — the read list makes live re-reads explicit.
 
-        [Handoff boundary N — durable context snapshot]
-        Project: <name|"none">
-        <provenance: frozen-at + drift note + trust tier — workspace-file
-        DATA at file_read level, NOT harness-authoritative>
+    Deterministic: given the same inputs the bytes are identical, and the
+    caller picks the timestamp ONCE (``frozen_at``) so replay renders the
+    stored bytes verbatim.
 
-        --- BEGIN <path> (<reason>) ---
-        <escaped file bytes — escape_system_reminder_tags applied>
-        --- END <path> ---
-
-        [missing at snapshot time: <path> (<reason>) — re-read via file_read
-        if it has since been created]
-        [<error lines from resolution["errors"]>]
-        [durable budget <used>/<budget> tokens — informational only]
-
-    File bytes MUST pass through openalph.tools.escape_system_reminder_tags
-    before embedding (R2-A discipline: snapshot content is file-data, and must
-    never forge reminder markup). Escape is applied HERE, at freeze time, so
-    the stored bytes are exactly what the model will see on every replay.
+    The inlined progress.md bytes MUST pass through
+    ``_freeze_file_text`` (credential redaction + escape_system_reminder_tags
+    — R2-A discipline: snapshot content is file-data and must never forge
+    reminder markup), applied HERE at freeze time so the stored bytes are
+    exactly what the model sees on every replay.
     """
-    frozen_clause = (
-        f"Content frozen at boundary time {frozen_at} and may have changed "
-        "since — verify the live file via file_read if freshness matters to "
-        "your next action."
-        if frozen_at
-        else "Content frozen at boundary time and may have changed since — "
-        "verify the live file via file_read if freshness matters to your "
-        "next action."
-    )
     lines = [
-        f"[Handoff boundary {boundary_index} — durable context snapshot]",
-        f"Project: {_frame_field(str(resolution.get('project') or 'none'))}",
-        f"Trust level: workspace-file DATA at file_read level, NOT "
-        f"harness-authoritative. {frozen_clause}",
+        f"[Handoff boundary {boundary_index} — context handoff]",
+        "",
+        "You are resuming this session after a context handoff. All "
+        "conversation before this boundary was stripped; the state below "
+        "and your workspace files are your only carryover. Proceed in order:",
+        "",
+        "1. Fully read every file in the project's durable set (use "
+        "file_read; read the live files, do not work from memory or "
+        "summaries):",
     ]
+    progress_files = []
     for f in resolution.get("files", []):
-        if f.get("exists"):
-            escaped = _freeze_file_text(f.get("text", ""))
-            lines.append(f"--- BEGIN {_frame_field(f['path'])} ({_frame_field(f['reason'])}) ---")
-            lines.append(escaped)
-            lines.append(f"--- END {_frame_field(f['path'])} ---")
-    missing = resolution.get("missing", [])
-    if missing:
-        reasons = {f["path"]: f["reason"] for f in resolution.get("files", [])}
-        for path in missing:
+        if not f.get("exists"):
+            continue
+        if _is_progress_md(f):
+            progress_files.append(f)
+        else:
             lines.append(
-                f"[missing at snapshot time: {_frame_field(path)} "
-                f"({_frame_field(reasons.get(path, 'n/a'))}) — "
-                "re-read via file_read if it has since been created]"
+                f"   - {_frame_field(f['path'])} — {_frame_field(f['reason'])}"
             )
-    for err in resolution.get("errors", []):
-        lines.append(f"[error: {_frame_field(str(err))}]")
+    lines += [
+        "",
+        "2. Read the project progress below (State / Story / Decisions / "
+        "Next), then continue the work as specified in its Next block.",
+        "",
+        "Notes:",
+        "- This is an automated handoff inserted by the platform, not an "
+        "operator message.",
+        "- Do not claim continuity with pre-boundary turns you cannot see. "
+        "If a claim about earlier work is not in progress.md or on disk, "
+        "mark it unverified rather than asserting it.",
+        "- progress.md was last updated at checkpoint time; if the Story's "
+        "status words conflict with what you verify on disk, trust the disk "
+        "and update progress.md.",
+        "",
+    ]
+    for f in progress_files:
+        lines.append("--- progress.md (auto-inserted) ---")
+        lines.append(_freeze_file_text(f.get("text", "")))
+        lines.append("--- end progress.md ---")
+    lines.append("")
     if over_budget:
         lines.append(
             f"[durable budget {resolution.get('used_tokens', 0)}/{budget_tokens} "
-            "tokens — over reinjection budget; informational only, prune "
+            "tokens — over budget; informational only, prune "
             "durable-set.toml when convenient]"
         )
     else:
         lines.append(
             f"[durable budget {resolution.get('used_tokens', 0)}/{budget_tokens} tokens]"
         )
+    missing = resolution.get("missing", [])
+    if missing:
+        reasons = {f["path"]: f["reason"] for f in resolution.get("files", [])}
+        for path in missing:
+            lines.append(
+                f"[missing at boundary time: {_frame_field(path)} "
+                f"({_frame_field(reasons.get(path, 'n/a'))}) — "
+                "read via file_read if since created]"
+            )
+    for err in resolution.get("errors", []):
+        lines.append(f"[error: {_frame_field(str(err))}]")
     return "\n".join(lines) + "\n"
+
+
+def _is_progress_md(f: dict) -> bool:
+    """The auto progress.md entry — the orientation artifact inlined in the
+    snapshot (all other durable entries become read-list lines)."""
+    return f.get("origin") == "auto" and str(f.get("path", "")).endswith(
+        "progress.md")
 
 
 def _no_project_fallback_body(boundary_index: int, tokens_before: int) -> str:
     """Snapshot body when NO project is declared (spec §3.2 fallback).
 
-    The full strip still applies; the package is just a deterministic
-    manifest summary plus a fixed rehydration pointer. Deterministic — no
-    timestamps. The first line carries the "durable context snapshot" marker
-    so the render's verbatim-snapshot branch recognizes it exactly like the
-    durable-set body.
+    kdsn.333: same directive shape as the project body (SB-locked Q3: yes)
+    — a resuming-after-handoff directive instead of a bare data dump. The
+    full strip still applies; the package is just a deterministic manifest
+    summary plus a fixed rehydration pointer. Deterministic — no timestamps.
+    The first line keeps the "durable context snapshot" marker (the
+    render-detection marker) and the manifest summary line is unchanged.
     """
     return (
         f"[Handoff boundary {boundary_index} — durable context snapshot]\n"
-        "Project: none\n"
-        "No handoff package was declared for this session. Your workspace is "
-        "memory: read your workspace, memory/, and beads before acting.\n"
+        "You are resuming this session after a context handoff. All "
+        "conversation before this boundary was stripped. No handoff "
+        "package was declared for this session. Your workspace is memory: "
+        "read your workspace, memory/, and beads before acting. Do not "
+        "claim continuity with pre-boundary turns you cannot see.\n"
         f"manifest: boundary={boundary_index} tokens_before={tokens_before}\n"
     )
 
@@ -748,7 +770,7 @@ def _raise_handoff_bead(room_id: str, project: str | None, bd_path: str | None) 
         desc = (
             "The context-handoff post-boundary runway was nearly exhausted at "
             "a handoff boundary (the durable budget is an informational "
-            "marker and is NOT the trigger). The harness injected the "
+            "marker and is NOT the trigger). The harness inserted the "
             "forced-handoff directive (active project: "
             f"{project or 'none'}). Execute session-handoff triage."
         )
@@ -785,6 +807,7 @@ def apply_boundary(
     handoff_pct: float = 10.0,
     handoff_min: int = 24000,
     bd_path: str | None = BD_PATH,
+    anchored_estimate: int | None = None,
 ) -> dict:
     """Apply a handoff boundary: append manifest event + snapshot to JSONL.
 
@@ -931,6 +954,11 @@ def apply_boundary(
         "tokens_before": tokens_before,
         "tokens_after": tokens_after,
         "tokens_dropped": tokens_dropped,
+        # kdsn.333: the ANCHORED pre-boundary estimate (agent-side
+        # max(heuristic, provider-usage anchored), or None when the caller
+        # could not compute one) — audit: restart-floor firings must not
+        # read as spurious low-context.
+        "anchored_estimate": anchored_estimate,
         "durable": {
             "project": project,
             "files": [
@@ -1115,6 +1143,16 @@ def apply_boundary_and_rebuild(
             logger.warning(          # window-only, the boundary still applies
                 "handoff available resolution failed for %s: %s", room_id, e)
             available = window
+    # kdsn.333: the anchored pre-boundary estimate (agent is in scope HERE —
+    # the pure apply_boundary cannot reach the provider-usage anchor).
+    # Computed BEFORE the boundary applies (pre-boundary context). Fail-soft:
+    # a mock agent without the estimator records None.
+    _est_fn = getattr(agent, "_estimate_context_tokens", None)
+    try:
+        anchored_estimate = int(_est_fn(room_id)) if callable(_est_fn) else None
+    except Exception as e:  # fail-soft: the boundary still applies
+        logger.debug("anchored estimate failed for %s: %s", room_id, e)
+        anchored_estimate = None
     try:
         outcome = apply_boundary(
             session_log,
@@ -1125,6 +1163,7 @@ def apply_boundary_and_rebuild(
             config_paths=list(durable_paths),
             system_prompt_chars=len(getattr(agent, "system_prompt", "") or ""),
             tool_defs_chars=int(getattr(agent, "_tool_defs_chars", 0) or 0),
+            anchored_estimate=anchored_estimate,
             window=window,
             budget_pct=budget_pct,
             budget_min=budget_min,
@@ -1195,13 +1234,18 @@ def _frame_sub_body(boundary_index: int, task_text: str, trigger: str,
                     messages_after: int) -> str:
     """Full-strip body for the message-list boundary path (sub-agent parity).
 
-    ONE appended user message carrying the task IN FULL (the sub's task is
-    its working state — the standing SB durable ruling on task text carries
-    over) plus a deterministic manifest summary line. Deterministic; no
-    locale-dependent formatting; no timestamps.
+    kdsn.333: the first line keeps the SUB_BODY_PREFIX header; a directive
+    sentence (resuming after a context handoff, no claimed continuity) is
+    prepended before the task. The task rides IN FULL and verbatim (the sub's
+    task is its working state — the standing SB durable ruling on task text
+    carries over) plus a deterministic manifest summary line. Deterministic;
+    no locale-dependent formatting; no timestamps.
     """
     return (
         f"{SUB_BODY_PREFIX}{boundary_index} ({trigger})]\n"
+        "You are resuming this session after a context handoff. All "
+        "pre-boundary context was stripped; your task follows verbatim "
+        "below. Continue it. Do not claim continuity with stripped turns.\n"
         f"task: {_escape_reminder_tags(task_text)}\n"
         f"manifest: boundary={boundary_index} trigger={trigger} "
         f"tokens_before={tokens_before} tokens_after_est=0 "

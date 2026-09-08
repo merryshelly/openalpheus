@@ -539,7 +539,7 @@ class TestSinksAndJsonl:
         sl.append(role="user", sender="@op:x", room=ROOM_A, event_id="$e1",
                   content="hello")
         framed = (TAG_OPEN + "\n"
-                  "Session orientation (injected automatically at context-epoch start):\n"
+                  "Session orientation (inserted automatically at context-epoch start):\n"
                   f"- Session began: {ORIENT_TS}\n"
                   f"- Active model: {MODEL_DEFAULT}\n"
                   "- Context window: 200,000 tokens\n"

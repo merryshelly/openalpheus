@@ -414,11 +414,14 @@ class TestSnapshotBodies:
         entries = log.read(ROOM)
         body = [e for e in entries if e.get("source") == "handoff_snapshot"][-1]
         text = body["content"]
-        assert text.startswith("[Handoff boundary 7 — durable context snapshot]")
-        assert "Project: proj" in text
-        assert "--- BEGIN memory/projects/proj/progress.md (project working state) ---" in text
+        # kdsn.333: directive framing (spec §3.1, SB-approved verbatim) —
+        # durable entries become a read list, progress.md is the inlined
+        # artifact, trust-level line retired.
+        assert text.startswith("[Handoff boundary 7 — context handoff]")
+        assert "1. Fully read every file in the project's durable set" in text
+        assert "--- progress.md (auto-inserted) ---" in text
         assert "# State" in text
-        assert "--- END memory/projects/proj/progress.md ---" in text
+        assert "--- end progress.md ---" in text
 
     def test_no_project_fallback_body(self, tmp_path):
         log = make_log(tmp_path)
@@ -440,7 +443,7 @@ class TestSnapshotBodies:
         again = _render(log)
         assert first == again
         snap = [m for m in first if isinstance(m.get("content"), str)
-                and "durable context snapshot" in m.get("content", "")][0]
+                and "context handoff" in m.get("content", "")][0]
         # frozen bytes render exactly as stored (no re-escape drift)
         entries = log.read(ROOM)
         stored = [e for e in entries
@@ -464,6 +467,7 @@ class TestManifestShape:
         assert set(mf.keys()) == {
             "ts", "boundary_index", "trigger", "tokens_before",
             "tokens_after", "tokens_dropped", "pending_protected",
+            "anchored_estimate",
             "durable", "runway", "checkpoint", "errors",
         }, f"manifest shape drifted: {sorted(mf.keys())}"
         assert isinstance(mf["pending_protected"], bool)
@@ -960,7 +964,7 @@ class TestDurableGuards:
         text = m.frame_snapshot(9, res, False, 1000, frozen_at="2026-09-03T00:00:00Z")
         assert "&lt;system-reminder&gt;" in text
         assert "<system-reminder>" not in text
-        assert text.startswith("[Handoff boundary 9 — durable context snapshot]")
+        assert text.startswith("[Handoff boundary 9 — context handoff]")
 
     def test_frame_snapshot_redacts_credentials(self, tmp_path):
         m = _handoff()

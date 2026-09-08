@@ -99,6 +99,14 @@ class ReminderState:
     # no longer feeds a trigger). Default 0.0 = no boundary seen yet
     # (in-memory only; restarts empty) → handoff-runway silent.
     handoff_runway_fraction: float = 0.0
+    # kdsn.333 handoff-epoch labeling (session-orient S7): the pending
+    # epoch record consumed from the agent at turn start. handoff_epoch_index
+    # = the applied boundary's index (0 = fresh epoch / no pending record →
+    # the "Session began" row); handoff_epoch_ts = the manifest ts rendered
+    # host-local by the agent ("" when index is 0 or unrenderable → the
+    # fresh row stands).
+    handoff_epoch_index: int = 0
+    handoff_epoch_ts: str = ""
 
 
 @dataclass
@@ -180,13 +188,25 @@ class ReminderEngine:
                 and state.model_resolved != self._oriented_model
                 and (state.model_resolved or self._oriented_model is not None)):
             self._oriented_model = state.model_resolved
+            # kdsn.333: the begin-time row reflects the epoch START — on a
+            # handoff epoch the boundary application time IS the epoch begin
+            # (a multi-hour-old session start against a fresh transcript
+            # invites confabulated history); on a fresh epoch it is the
+            # session start. Vocabulary: "inserted", never "injected"
+            # (spec §2.3).
+            _begin_row = (
+                f"- Epoch began: {state.handoff_epoch_ts} (context handoff "
+                f"boundary {state.handoff_epoch_index})"
+                if state.handoff_epoch_index > 0
+                else f"- Session began: {state.orient_ts}"
+            )
             results.append(Reminder(
                 trigger="session-orient",
                 detail=state.model_resolved,
                 text=(
-                    "Session orientation (injected automatically at "
+                    "Session orientation (inserted automatically at "
                     "context-epoch start):\n"
-                    f"- Session began: {state.orient_ts}\n"
+                    f"{_begin_row}\n"
                     f"- Active model: {state.model_resolved}\n"
                     f"- Context window: {state.context_limit:,} tokens\n"
                     f"- Vision: {'yes' if state.model_vision else 'no'}"
@@ -310,7 +330,7 @@ class ReminderEngine:
                     "[[entries]]\n"
                     "path = \"memory/projects/<project>/<file>\"\n"
                     "reason = \"why a post-boundary session must re-read it\"\n"
-                    "(progress.md and durable-set.toml are auto-injected — "
+                    "(progress.md and durable-set.toml are auto-included — "
                     "do not list them.)"
                 ),
             ))

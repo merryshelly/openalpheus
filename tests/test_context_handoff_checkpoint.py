@@ -138,7 +138,7 @@ class TestCheckpointTrigger:
         # mount — "the inline skeleton is the guarantee". The directive must
         # EMBED condensed skeletons for both artifacts.
         for needle in ("## State", "## Decisions", "## Next",
-                       "[[entries]]", "path =", "reason =", "auto-injected"):
+                       "[[entries]]", "path =", "reason =", "auto-included"):
             assert needle in text, f"directive must embed the skeleton piece {needle!r}"
         # the old tool-note seam is DELETED (spec §4 feedback item 4)
         assert "context_gc" not in text

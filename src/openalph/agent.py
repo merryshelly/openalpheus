@@ -247,6 +247,11 @@ class Agent:
         # estimator merges this with the chars//4 heuristic — see
         # _estimate_context_tokens. Anchoring only ever RAISES estimates.
         self._token_anchor: dict[str, tuple[int, int | None]] = {}
+        # kdsn.333: per-room PENDING epoch record — the last applied handoff
+        # boundary as (boundary_index, manifest ts), consumed (pop-on-read)
+        # by _orient_inputs so the next turn-start session-orient labels the
+        # epoch ("Epoch began: <ts> (context handoff boundary <N>)").
+        self._pending_handoff_epoch: dict[str, tuple[int, str]] = {}
         self._warned_models: set = set()  # warn-once for unknown model context windows
         self._truncation_retry = False
         # R1-4: Per-room reminder engines (replaces shared _reminder_engine)
@@ -335,11 +340,30 @@ class Agent:
                            "in %s — using raw string (%s: %s)",
                            model, room_id, type(exc).__name__, exc)
             model_resolved = model
+        # kdsn.333: the pending epoch record (last applied boundary) is
+        # CONSUMED here — pop-on-read, defaults 0/"" when absent. The
+        # manifest ts ("YYYY-MM-DDTHH:MM:SSZ", UTC) renders host-local,
+        # same shape as orient_ts.
+        _epoch = self._pending_handoff_epoch.pop(room_id, None)
+        _epoch_index, _epoch_ts_raw = (0, "") if not _epoch else _epoch
+        _epoch_ts = ""
+        if _epoch_index and _epoch_ts_raw:
+            try:
+                _epoch_ts = (
+                    datetime.strptime(_epoch_ts_raw, "%Y-%m-%dT%H:%M:%SZ")
+                    .replace(tzinfo=timezone.utc)
+                    .astimezone()
+                    .strftime("%A, %B %d, %Y — %H:%M %Z")
+                )
+            except (TypeError, ValueError):
+                _epoch_ts = ""
         return {
             "model_resolved": model_resolved,
             "model_vision": model_supports_vision(model, self.config),
             "orient_ts": datetime.now(timezone.utc).astimezone().strftime(
                 "%A, %B %d, %Y — %H:%M %Z"),
+            "handoff_epoch_index": _epoch_index,
+            "handoff_epoch_ts": _epoch_ts,
         }
 
     def rehydrate_reminders(self, room_id: str, entries: list[dict]) -> None:
@@ -354,6 +378,7 @@ class Agent:
         """
         if room_id in self._rooms:
             self._rooms[room_id].clear()
+        self._pending_handoff_epoch.pop(room_id, None)
         self._room_usage.pop(room_id, None)
         self._last_turn_usage.pop(room_id, None)
         self._last_stop_reason.pop(room_id, None)
@@ -470,6 +495,15 @@ class Agent:
         self._engine_for(room_id).reset()
         self._gc_fail_strikes[room_id] = 0
         self._gc_last_runway[room_id] = self._handoff_runway_fraction(res.get("manifest"))
+        # kdsn.333: record this boundary as the room's pending epoch start.
+        # The next populated turn-start evaluation consumes it (pop-on-read)
+        # via _orient_inputs; a malformed outcome must never break the seam.
+        _manifest = res.get("manifest") if isinstance(res, dict) else None
+        if isinstance(_manifest, dict):
+            _idx = _manifest.get("boundary_index")
+            _ts = _manifest.get("ts")
+            if isinstance(_idx, int) and isinstance(_ts, str) and _ts:
+                self._pending_handoff_epoch[room_id] = (_idx, _ts)
         # An APPLIED boundary re-arms the auto tier ONLY if it cleared the
         # auto threshold (audit kdsn.322.9: the unconditional pop let a
         # mid-turn hard/tool/slash boundary re-arm a churn-latched auto tier
