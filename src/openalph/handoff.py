@@ -1071,6 +1071,11 @@ def apply_boundary(
         # the SAME freeze pipeline the snapshot runs (credential redaction
         # + reminder escape), never raw file bytes and never a live disk
         # read. None when no project is declared.
+        # kdsn.333 follow-up: the FULL framed snapshot text — the operator
+        # notice needs it to satisfy the inserts-visible invariant (the
+        # directive read list steers the new epoch and must be room-visible,
+        # collapsed). Same freeze pipeline, already applied by frame_snapshot.
+        "snapshot": snapshot,
         "progress_md": _freeze_file_text(next(
             (f["text"] for f in resolution["files"]
              if f.get("path", "").endswith("progress.md")), "")) or None

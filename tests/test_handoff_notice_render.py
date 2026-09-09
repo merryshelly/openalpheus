@@ -58,7 +58,18 @@ def _new_outcome(**kw):
     outcome = {"applied": True, "manifest": manifest,
                "over_budget": False, "handoff_advised": False,
                "forced_handoff": False,
-               "progress_md": "FROZEN PROGRESS <script>alert(1)</script> & more"}
+               "progress_md": "FROZEN PROGRESS <script>alert(1)</script> & more",
+               "snapshot": (
+                   "[Handoff boundary 87 — context handoff]\n\n"
+                   "You are resuming this session after a context handoff.\n"
+                   "1. Fully read every file in the project's durable set:\n"
+                   "   - memory/projects/context-handoff-test/README.md — project home\n\n"
+                   "Notes:\n"
+                   "- Do not claim continuity with pre-boundary turns.\n\n"
+                   "--- progress.md (auto-inserted) ---\n"
+                   "FROZEN PROGRESS <script>alert(1)</script> & more\n"
+                   "--- end progress.md ---\n"
+                   "[durable budget 1492/96000 tokens]\n")}
     outcome.update(kw)
     return outcome
 
@@ -118,7 +129,9 @@ class TestFold:
         assert "&lt;script&gt;" in text
 
     def test_progress_md_size_capped(self):
+        """Legacy fallback path (no snapshot key): progress fold is capped."""
         oc = _new_outcome(progress_md="P" * 200_000)
+        oc.pop("snapshot")  # legacy outcome — exercises the fallback fold
         text = render_handoff_notice("tool", oc)
         assert "[truncated" in text
 
@@ -128,6 +141,52 @@ class TestFold:
                         "used_tokens": 0, "over_budget": False}})
         text = render_handoff_notice("tool", oc)
         assert "as reinserted" not in text  # wording is now "as inserted"
+
+
+class TestSnapshotDirectiveVisibility:
+    """kdsn.333 follow-up: the harness-inserts-visible invariant. The notice
+    fold must show the FULL framed snapshot — the directive read list is the
+    part that steers the new epoch; showing only progress.md hides the most
+    load-bearing bytes from the operator (SB 2026-09-08)."""
+
+    def test_directive_block_rendered(self):
+        text = render_handoff_notice("tool", _new_outcome())
+        assert "You are resuming this session after a context handoff" in text
+        assert "Fully read every file in the project&#x27;s durable set" in text
+        assert "- memory/projects/context-handoff-test/README.md — project home" in text
+        assert "Do not claim continuity" in text
+
+    def test_snapshot_markers_rendered(self):
+        text = render_handoff_notice("tool", _new_outcome())
+        assert "--- progress.md (auto-inserted) ---" in text
+        assert "--- end progress.md ---" in text
+        assert "[durable budget 1492/96000 tokens]" in text
+
+    def test_snapshot_escaped(self):
+        text = render_handoff_notice("tool", _new_outcome())
+        assert "<script>" not in text
+        assert "&lt;script&gt;" in text
+
+    def test_snapshot_size_capped(self):
+        oc = _new_outcome()
+        oc["snapshot"] = "DIRECTIVE\n" + ("P" * 200_000)
+        text = render_handoff_notice("tool", oc)
+        assert "DIRECTIVE" in text
+        assert "[truncated" in text
+
+    def test_snapshot_preferred_over_progress_md_fold(self):
+        """When the snapshot is present, there is exactly one content fold —
+        no duplicate rendering of the progress bytes."""
+        text = render_handoff_notice("tool", _new_outcome())
+        assert text.count("FROZEN PROGRESS") == 1
+
+    def test_legacy_outcome_without_snapshot_falls_back(self):
+        """Pre-kdsn.333 outcomes (progress_md only) still render the
+        progress fold."""
+        oc = _new_outcome()
+        oc.pop("snapshot")
+        text = render_handoff_notice("tool", oc)
+        assert "FROZEN PROGRESS" in text
 
 
 class TestLanguageAndFormat:

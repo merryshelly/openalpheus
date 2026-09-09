@@ -486,7 +486,12 @@ def render_handoff_notice(trigger: str, outcome: dict) -> str:
                 f"(session JSONL marker — audit ref)")
     errs = manifest.get("errors") or []
     fold.append(f"errors: {len(errs)}" if errs else "errors: none")
-    progress = outcome.get("progress_md")
+    # kdsn.333 follow-up (SB 2026-09-08): the harness-inserts-visible
+    # invariant — the fold shows the FULL framed snapshot when present
+    # (directive read list + inlined progress.md), not just progress.md.
+    # Legacy outcomes carrying only progress_md fall back to the old fold.
+    snapshot = outcome.get("snapshot")
+    progress = snapshot if snapshot else outcome.get("progress_md")
     if progress:
         # Audit H2: the fold text reaches the room through the sink's HTML
         # pipeline — apply the snapshot's own freeze pipeline as
@@ -508,7 +513,10 @@ def render_handoff_notice(trigger: str, outcome: dict) -> str:
             text = (text[:_PROGRESS_FOLD_CAP_CHARS] +
                     f"\n[truncated: {removed} chars removed — full text: "
                     f"{pointer}]")
-        fold.append("── progress.md as inserted (frozen at boundary) ──")
+        if snapshot:
+            fold.append("── handoff snapshot as inserted (frozen at boundary) ──")
+        else:
+            fold.append("── progress.md as inserted (frozen at boundary) ──")
         fold.append(text)
     return head + "\n" + "\n".join(fold)
 
