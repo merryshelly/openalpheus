@@ -214,7 +214,12 @@ def test_parse_ledger_entries_refuses_terminal_regression(tmp_path):
          "detail": json.dumps({"dispatch_id": "d1", "state": "completed", "result": "ok"})},
         {"role": "system", "event": "subagent_terminal",
          "detail": json.dumps({"dispatch_id": "d1", "state": "running"})},  # late stray
+        # re-audit F1: terminal->TERMINAL regression (failed after completed)
+        {"role": "system", "event": "subagent_terminal",
+         "detail": json.dumps({"dispatch_id": "d1", "state": "failed", "error": "late"})},
     ]
     records = parse_ledger_entries(entries)
     assert records["d1"].state == "completed", (
         f"parser regressed a terminal record: {records['d1'].state}")
+    assert records["d1"].result == "ok", "first terminal's result must win"
+    assert not records["d1"].error, "later chained terminal leaked error into first"

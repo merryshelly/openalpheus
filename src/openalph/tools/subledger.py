@@ -392,9 +392,20 @@ def parse_ledger_entries(entries: list[dict]) -> dict[str, DispatchRecord]:
             state = detail.get("state")
             if state in (COMPLETED, FAILED, CANCELLED, ORPHANED_AT_RESTART,
                          PENDING_DELIVERY):
-                rec.state = state
-                rec.terminal_at = (detail.get("terminal_at")
-                                   or entry.get("ts") or rec.terminal_at)
+                # kdsn.330 re-audit F1: terminal-state protection at rebuild —
+                # a later chained terminal entry (e.g. a stray 'running' or a
+                # failed-after-completed) must not regress an already-terminal
+                # record, mirroring in-memory transition(). First terminal
+                # wins; later ones are logged and skipped.
+                if rec.state in TERMINAL_STATES and state != rec.state:
+                    logger.warning(
+                        "subledger rebuild: refusing chained terminal %s -> %s "
+                        "for %s (terminal-state protection)",
+                        rec.state, state, dispatch_id)
+                else:
+                    rec.state = state
+                    rec.terminal_at = (detail.get("terminal_at")
+                                       or entry.get("ts") or rec.terminal_at)
             rec.result = detail.get("result")
             rec.error = detail.get("error")
             rec.usage = {
