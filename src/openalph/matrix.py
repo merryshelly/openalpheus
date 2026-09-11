@@ -50,6 +50,7 @@ from openalph.mention import mentions_me, is_gated, strip_mention
 from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
 from openalph.tools import escape_system_reminder_tags, truncate_result
+from openalph.tools import subledger
 from openalph.callbacks import (
     build_callbacks,
     build_context_status,
@@ -61,6 +62,25 @@ import openalph.schedule as schedule
 # Constants for media handling
 MAX_MEDIA_BYTES = 20_000_000  # 20 MB
 MEDIA_DIR = "media"
+
+# kdsn.330 R8: the idle-room completion turn's wake prompt. Content-free,
+# harness-authored, and deliberately free of the SUBAGENT_EVENT_FRAME
+# substring: the framed event burst arrives as its OWN harness-notice
+# user message (the agent-side tool-loop-top drain), so the wake prompt
+# must not read as the delivery itself (double-frame and
+# operator-authority pins). Zero operator authority (D3) — the
+# "[Automated …]" provenance wording, never an operator-voice line.
+SUBAGENT_COMPLETION_WAKE = (
+    "[Automated delivery turn — an async sub-agent reached a terminal "
+    "state while this room was idle. Its event details follow as a "
+    "harness notice message; act on them with subagent_status(retrieve) "
+    "as needed.]"
+)
+
+# The synthetic completion turn's turn_source (named constant so the
+# inserts-visible lint's source-tag scanner doesn't false-positive on a
+# turn_source= keyword literal — same tag class as heartbeat/umbral).
+SUBAGENT_COMPLETION_TURN_SOURCE = "subagent_completion"
 
 logger = logging.getLogger(__name__)
 
@@ -1577,8 +1597,128 @@ class MatrixBot:
             subagent_results=self._subagent_results,
             room_name=room_name,
         )
+        # kdsn.330 R8: async sub-agent terminal delivery — the ONE
+        # callback-construction seam, so live / heartbeat / umbral turns
+        # all carry identical wiring (D4). The agent-side finalizer has
+        # ALREADY persisted the durable subagent_terminal entry and
+        # deposited the event in the room inbox before invoking the
+        # notify (persist-before-notify, R5); _on_subagent_terminal is
+        # the fire-vs-deposit decision.
+        callbacks["subagent_terminal_notify"] = self._on_subagent_terminal
+        _sl = getattr(self, 'session_log', None)
+        if _sl is not None:
+            callbacks["log_subagent_event"] = self._make_subagent_event_log(_sl)
 
         return callbacks
+
+    def _make_subagent_event_log(self, session_log):
+        """Build the subagent-event JSONL seam (kdsn.330 R6).
+
+        The agent-side drain calls it after appending the framed
+        delivery message to live history; it persists the RAW (unframed)
+        event lines as role="user", source="subagent_event" — the same
+        store-raw shape the steering drain uses (build_context re-frames
+        at replay, so live and rebuild bytes match, A06).
+        """
+        async def _log_subagent_event(_room_id: str, raw_lines: str) -> None:
+            session_log.append(
+                role="user",
+                sender=self.config.user_id,
+                room=_room_id,
+                event_id=None,
+                content=raw_lines,
+                source="subagent_event",
+            )
+
+        return _log_subagent_event
+
+    async def _on_subagent_terminal(self, room_id: str, event: dict) -> None:
+        """kdsn.330 R8: the async-subagent terminal delivery decision.
+
+        Invoked by the agent-side finalizer AFTER the durable
+        subagent_terminal entry is persisted and the event is deposited
+        in the room's pending-event inbox. Deposit-only unless the room
+        is idle AND not quiet:
+
+        - quiet room → no fire, no notice (D8: pending events drain at
+          the next turn of any kind; status truth is never suppressed).
+        - active turn (live / heartbeat / umbral / another completion
+          turn — ``_active_turns``) → no fire (the tool-loop-top drain
+          surfaces the burst at the next boundary; D2).
+        - idle room → claim ATOMICALLY: the room is added to
+          ``_active_turns`` synchronously, before ANY await, so two
+          concurrent terminal notifies produce exactly ONE synthetic
+          turn (the check-then-add race is pinned). The synthetic turn
+          delivers the framed burst through the SAME agent-side drain
+          live turns use (one delivery path ⇒ identical bytes);
+          consumption of the inbox happens there, so a fired turn can
+          never double-deliver a burst.
+        """
+        if getattr(self.agent, "_room_quiet", {}).get(room_id):
+            return
+        if not hasattr(self, '_active_turns'):
+            self._active_turns = set()
+        if room_id in self._active_turns:
+            return
+        self._active_turns.add(room_id)
+        asyncio.create_task(
+            self._fire_subagent_completion(room_id),
+            name=f"subagent-completion-{room_id}")
+
+    async def _fire_subagent_completion(self, room_id: str) -> None:
+        """kdsn.330 R8: the idle-room synthetic completion turn.
+
+        Heartbeat template (the _inject_heartbeat three-step shape):
+        audit entry persist-BEFORE-turn → in-room notice →
+        _run_heartbeat_turn with turn_source set to the subagent
+        completion source (SUBAGENT_COMPLETION_TURN_SOURCE). The
+        turn's user message is a minimal, content-free wake prompt —
+        the framed event burst itself arrives as its own
+        harness-notice user message via the agent-side drain.
+        """
+        try:
+            events = list(
+                getattr(self.agent, "_pending_events", {}).get(room_id, []))
+            if not events:
+                # A concurrent turn drained the inbox (or the room was
+                # reset) between deposit and fire — the burst is already
+                # delivered; nothing to fire for.
+                return
+            # Audit trail: the fire decision is durable BEFORE the turn
+            # (persist-before-turn; system entries never render — zero
+            # cache/byte-identity exposure).
+            _sl = getattr(self, "session_log", None)
+            if _sl is not None:
+                _sl.append(
+                    role="system",
+                    sender=self.config.user_id,
+                    room=room_id,
+                    event_id=None,
+                    event="subagent_completion_fired",
+                    detail={"dispatch_ids": [
+                        e.get("dispatch_id") for e in events]},
+                )
+            # Collapsed one-line in-room notice carrying the exact event
+            # line bytes the model will see (inserts-visible — never a
+            # restated summary).
+            try:
+                await self.send_notice(
+                    room_id, subledger.terminal_notice_line(events))
+            except Exception:
+                logger.warning(
+                    "subagent completion notice failed in %s", room_id,
+                    exc_info=True)
+            await self._run_heartbeat_turn(
+                room_id,
+                SUBAGENT_COMPLETION_WAKE,
+                turn_source=SUBAGENT_COMPLETION_TURN_SOURCE,
+            )
+        except Exception:
+            logger.exception(
+                "subagent completion turn failed in %s", room_id)
+        finally:
+            if hasattr(self, '_active_turns'):
+                self._active_turns.discard(room_id)
 
     def _make_steering_drain(self, room_id: str, turn_progress=None):
         """Build the per-turn steering drain closure (kdsn.311).

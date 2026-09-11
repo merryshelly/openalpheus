@@ -330,6 +330,14 @@ class Agent:
         # sync-safely. Sync-only batches never reach the store: they
         # disarm at gather end exactly as pre-kdsn.330.
         self._room_keepalive: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
+        # kdsn.330 R10: per-room quiet flag (D8) — READ here by the
+        # delivery fire/notice guards (delivery callback + drain
+        # notice). The operator-facing setter and the quiet_override
+        # persistence / _activate_room restore are phase 2e. It JOINS
+        # _room_models / _room_locks in reset_room's preserved list
+        # (reset_room never pops it) so an umbral rotation can never
+        # silently un-quiet a room.
+        self._room_quiet: dict[str, bool] = {}
 
     async def _vision_deposit(self, room_id: str, tag: str) -> None:
         """Append a staged [media:] tag to this room's vision inbox (kdsn.279).
@@ -1689,6 +1697,54 @@ class Agent:
                                 logger.warning(
                                     "log_vision_injection callback failed in %s",
                                     room_id, exc_info=True)
+
+                    # Drain this room's pending async-subagent terminal
+                    # events (kdsn.330 R7) at the top of every iteration —
+                    # AFTER the steering + vision drains, BEFORE the spotter
+                    # (operator > harness > monitor; the harness tier keeps its
+                    # vision-before-subagent order). Finalizers deposited the
+                    # event dicts into _pending_events AFTER persisting the
+                    # durable subagent_terminal entry (persist-before-notify),
+                    # so this is pure consumption: N events => ONE user
+                    # message, harness-framed (D3), content-free (ids/states/
+                    # task heads + the sanitized error/result line). The RAW
+                    # (unframed) lines are persisted as a
+                    # source="subagent_event" user entry — build_context
+                    # re-frames with the identical pure expression at rebuild
+                    # (R6 store-raw/frame-at-build ⇒ A05/A06). Fail-soft like
+                    # the vision drain: delivery is NEVER gated on logging.
+                    _sub_events = self._pending_events.pop(room_id, [])
+                    if _sub_events:
+                        _sub_raw = subledger.subagent_event_lines(_sub_events)
+                        history.append({
+                            "role": "user",
+                            "content": subledger.frame_subagent_event_content(
+                                _sub_raw),
+                        })
+                        _log_ev_cb = (callbacks or {}).get("log_subagent_event")
+                        if callable(_log_ev_cb):
+                            try:
+                                await _log_ev_cb(room_id, _sub_raw)
+                            except Exception:
+                                logger.warning(
+                                    "log_subagent_event callback failed in %s",
+                                    room_id, exc_info=True)
+                        # Collapsed in-room notice carrying the exact event
+                        # line bytes (inserts-visible; D1). Suppressed under
+                        # the room's quiet flag (D8: quiet suppresses fires
+                        # AND notices — never status truth). Best-effort:
+                        # delivery is never gated on the notice.
+                        if not getattr(self, "_room_quiet", {}).get(room_id):
+                            _notice_ev_cb = (callbacks or {}).get("send_notice")
+                            if callable(_notice_ev_cb):
+                                try:
+                                    await _notice_ev_cb(
+                                        room_id,
+                                        subledger.terminal_notice_line(_sub_events))
+                                except Exception:
+                                    logger.warning(
+                                        "subagent event notice failed in %s",
+                                        room_id, exc_info=True)
 
                     # Drain the SPOTTER's flag inbox at the top of every iteration —
                     # AFTER the steering + vision drains, BEFORE reminder evaluation

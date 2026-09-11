@@ -105,6 +105,9 @@ _EXPECTED_CALLBACK_KEYS = frozenset({
     # context-GC (workspace-kdsn.305): boundary application + project declaration
     "apply_handoff_boundary",
     "set_active_project",
+    # kdsn.330: async-subagent terminal delivery (fire-or-deposit decision).
+    # Built in MatrixBot._build_agent_callbacks (bot-side: needs _active_turns).
+    "subagent_terminal_notify",
 })
 
 _SIDE_EFFECT_KEYS = frozenset({
@@ -143,7 +146,7 @@ class TestCallbacksDictKeys:
         """kdsn.290: wire format grew 15 → 17 with the raw timer managers."""
         bot = _make_bot()
         cb = bot._build_agent_callbacks("!room:server", None)
-        assert len(cb) == 19
+        assert len(cb) == 20  # kdsn.330: +subagent_terminal_notify
 
     def test_manager_keys_carry_bot_managers(self):
         """kdsn.290: callbacks["heartbeat"]/["umbral"] forward bot.heartbeat /
@@ -373,7 +376,9 @@ class TestBuildCallbacksHeadless:
         agent = _make_agent()
         sinks = MagicMock()  # duck-typed — any object with the sink methods
         cb = build_callbacks(agent, "!room:server", sinks, turn_source=None)
-        assert set(cb.keys()) == set(_EXPECTED_CALLBACK_KEYS)
+        # kdsn.330: subagent_terminal_notify is MATRIX-side only (the fire
+        # guard needs the bot's _active_turns) — headless omits it.
+        assert set(cb.keys()) == set(_EXPECTED_CALLBACK_KEYS) - {"subagent_terminal_notify"}
 
     def test_manager_keys_default_to_none(self):
         """kdsn.290: heartbeat/umbral keys are present even when no managers

@@ -166,6 +166,85 @@ def terminal_event_dict(rec: DispatchRecord) -> dict:
     return event
 
 
+# --- delivery framing (R6): store-raw / frame-at-build ----------------------
+#
+# The drained batch / synthetic-turn content is stored as
+# role="user", source="subagent_event" with the RAW (unframed) event
+# lines; the frame is CONTEXT-ONLY (steer precedent) and applied with
+# ONE shared expression — frame_subagent_event_content — at live-append
+# (agent.py tool-loop-top drain) and at build_context rebuild
+# (session.py), so live and rebuilt bytes match (A05/A06). The frame is
+# a PURE FUNCTION of the stored content: no ledger or mutable
+# interpolation (pinned: test_frame_pure_function_of_stored_content).
+
+SUBAGENT_EVENT_FRAME = ("[Automated sub-agent events — harness notice, "
+                        "not operator input]")
+
+
+def _one_line(text) -> str:
+    """Collapse a field to a single line (notice lines never span)."""
+    return " ".join(str(text).split())
+
+
+def _escape(text: str) -> str:
+    """Store-time escape for sub-produced bytes.
+
+    Sub-produced text (task head, error, result) passes the reminder-tag
+    escaper BEFORE the line is stored, so a forged harness tag in sub
+    output lands in the delivered bytes as inert data. Idempotent: the
+    sanitized error line (already escaped at deposit time) is untouched.
+    """
+    from openalph.tools import escape_system_reminder_tags
+    return escape_system_reminder_tags(text)
+
+
+def format_event_line(event: dict) -> str:
+    """ONE harness-authored line per terminal event (R6/D3).
+
+    Content-free rule (D1 notify-then-pull): dispatch id + state + task
+    head, plus the sanitized error line for failed dispatches. The
+    RESULT is never rendered here — it is retrieve-only (the parent
+    pulls it via subagent_status; the delivery message is a pointer,
+    not the payload). Error text is escaped at line build (store) time,
+    so the stored bytes ARE the delivered bytes.
+    """
+    line = f"- {event.get('dispatch_id', '?')}: {event.get('state', '?')}"
+    task_head = _one_line(event.get("task_head") or "")
+    if task_head:
+        line += f" — task: {_escape(task_head)}"
+    error = event.get("error")
+    if error is not None:
+        line += f" — error: {_escape(_one_line(error))}"
+    return line
+
+
+def subagent_event_lines(events: list[dict]) -> str:
+    """The RAW (unframed) stored content for a terminal-event batch:
+    one line per event, newline-joined. This is exactly what the
+    source="subagent_event" user entry stores."""
+    return "\n".join(format_event_line(e) for e in events)
+
+
+def frame_subagent_event_content(raw_lines: str) -> str:
+    """Frame stored raw event lines for model context.
+
+    THE single framing expression: the agent-side live drain-append and
+    session.py's build_context rebuild both call this, so the frame is
+    a pure function of the stored bytes (A06) and cannot drift between
+    the two paths.
+    """
+    return SUBAGENT_EVENT_FRAME + "\n" + raw_lines
+
+
+def terminal_notice_line(events: list[dict]) -> str:
+    """Collapsed ONE-line in-room notice for a terminal burst (D1/R6).
+
+    Carries the exact event line bytes the model sees — never a
+    restated summary (inserts-visible lint pin)."""
+    return SUBAGENT_EVENT_FRAME + " — " + " | ".join(
+        format_event_line(e) for e in events)
+
+
 # --- error sanitization (D5: sanitized error, never raw exception repr) -----
 
 # system-reminder tags in BOTH the entity-escaped form (&lt;…&gt; — what a

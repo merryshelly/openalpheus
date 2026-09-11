@@ -250,20 +250,32 @@ async def test_A05_strict_prefix_with_midturn_drain(tmp_path):
 
 @pytest.mark.asyncio
 async def test_A06_replay_identity_drained_message(tmp_path):
-    """A06: build_context reproduces the drained message byte-identically."""
+    """A06: build_context reproduces the drained message byte-identically.
+
+    Needle = the task head (harness-authored line content), NOT the sub
+    result — D1 keeps the report retrieve-only; drained lines never
+    carry it (pinned by test_build_context_skips_ledger_entries).
+    """
     bot, agent = build_bot(tmp_path)
     bot._active_turns.add(ROOM)
-    await _complete_one(bot, agent, call_id="tc_g3k", content="A06-PAYLOAD-9")
+    from openalph.tools import execute_tool
+    with patch("openalph.tools.subagent.complete",
+               side_effect=sub_complete_factory(delay=0.0, content="A06-PAYLOAD-9")):
+        await execute_tool("subagent",
+                           sub_tool_call(task="A06-TASK-NEEDLE-9 summarize things"),
+                           {}, agent.config, tools=None, callbacks=_cb(bot, "tc_g3k"))
+    await await_terminal(agent, ROOM, "tc_g3k")
     await settle()
     await agent.handle_input("next", room_id=ROOM, callbacks=_cb(bot))
     live = [m for m in history_user_messages(agent, ROOM)
-            if EVENT_FRAME in str(m.get("content", "")) and "tc_g3k" in str(m.get("content"))]
+            if EVENT_FRAME in str(m.get("content", ""))
+            and "tc_g3k" in str(m.get("content"))]
     assert live, "no drained message in live history"
     rebuilt = bot.session_log.build_context(ROOM)
     r = [m for m in rebuilt
          if SOURCE_TAG == m.get("source") or EVENT_FRAME in str(m.get("content", ""))]
     assert r, "drained message missing from rebuild"
-    live_bytes = [m for m in rebuilt if "A06-PAYLOAD-9" in str(m.get("content", ""))]
+    live_bytes = [m for m in rebuilt if "A06-TASK-NEEDLE-9" in str(m.get("content", ""))]
     assert live_bytes and str(live_bytes[0].get("content")) == str(live[-1].get("content")), (
         "live and rebuilt drained-message bytes diverge — A06 violation")
 

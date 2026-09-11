@@ -25,6 +25,7 @@ from openalph.handoff import (
 from openalph.provider import ToolCall
 from openalph.spotter import frame_spotter_flag
 from openalph.tools import escape_system_reminder_tags
+from openalph.tools import subledger
 
 logger = logging.getLogger(__name__)
 
@@ -446,8 +447,19 @@ class SessionLog:
                         # Spotter advisories (design §9): the advisory frame is
                         # context-only; frame_spotter_flag escapes the payload.
                         _user_content = frame_spotter_flag(_user_content)
+                    elif _source == "subagent_event":
+                        # kdsn.330 R6: the raw terminal-event lines are stored
+                        # UNFRAMED; the harness frame is context-only and is
+                        # applied here with the identical pure expression the
+                        # live drain-append uses (frame_subagent_event_content),
+                        # so rebuilt bytes match live (A06) and a later ledger
+                        # transition can never mutate already-stored bytes.
+                        # Sub-produced fields were escaped at line-build time —
+                        # trusted harness content, replayed verbatim.
+                        _user_content = subledger.frame_subagent_event_content(
+                            _user_content)
                     elif _source not in ("reminder", "steer", "spotter",
-                                         HANDOFF_SNAPSHOT_SOURCE):
+                                         "subagent_event", HANDOFF_SNAPSHOT_SOURCE):
                         # R2-A: escape user-origin reminder tags in context.
                         # Reminder/steer/spotter entries are trusted harness
                         # content replayed verbatim (JSONL stores raw user

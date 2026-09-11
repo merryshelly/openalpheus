@@ -31,6 +31,7 @@ REGISTERED = {
     "handoff_snapshot": "🪢 render_handoff_notice (callbacks.py) — fold carries the full framed snapshot",
     "spotter": "spotter._send_notice advisory",
     "view_image": "log_vision_injection callback + room notice",
+    "subagent_event": "collapsed one-line terminal notice (matrix.py _fire_subagent_completion + agent drain) — carries the exact event line bytes",
 }
 
 # Non-authored or non-content tags — visible by authorship, no surface owed:
@@ -102,6 +103,27 @@ class TestNoticeSurfaces:
     def test_view_image_notice_surface(self):
         text = (SRC / "agent.py").read_text()
         assert "log_vision_injection" in text
+
+    def test_subagent_event_notice_carries_event_line_bytes(self):
+        """The fire/drain notice must carry the exact event line bytes the
+        model sees — a restated summary breaks the inserts-visible
+        invariant. The notice payload is built by the same pure line
+        builder as the delivery message (subledger.format_event_line),
+        and both delivery paths wire that builder."""
+        from openalph.tools import subledger
+        event = {"dispatch_id": "tc_surface_1", "state": "completed",
+                 "task_head": "surface check",
+                 "terminal_at": "2026-09-11T00:00:00Z"}
+        line = subledger.format_event_line(event)
+        assert "tc_surface_1" in line and "completed" in line
+        notice = subledger.terminal_notice_line([event])
+        assert line in notice, "notice must carry the exact event line bytes"
+        assert "\n" not in notice, "notice must stay collapsed to one line"
+        # The seam exists on both delivery paths (fire + live drain):
+        assert "subagent_terminal_notify" in (SRC / "matrix.py").read_text(), (
+            "fire-seam registration missing from _build_agent_callbacks")
+        assert "log_subagent_event" in (SRC / "agent.py").read_text(), (
+            "drain-seam JSONL log callback missing from the agent drain")
 
     def test_snapshot_surface_is_behavioral_not_decorative(self):
         """The surface must carry the inserted bytes end-to-end: boundary
