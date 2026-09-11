@@ -139,6 +139,9 @@ async def test_cancel_running_dispatch(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cancel_terminal_dispatch_is_error(tmp_path):
+    from openalph.tools import BUILTIN_TOOLS
+    assert "subagent_status" in BUILTIN_TOOLS, (
+        "tool must exist first — an unknown-tool refusal is not this pin")
     bot, agent = build_bot(tmp_path)
     call_id = await _dispatch_one(tmp_path, bot, agent, call_id="tc_g5_c2", delay=0.0)
     await await_terminal(agent, ROOM, call_id)
@@ -149,6 +152,9 @@ async def test_cancel_terminal_dispatch_is_error(tmp_path):
 @pytest.mark.asyncio
 async def test_sub_sentinel_refused_for_all_actions(tmp_path):
     """R16: subs inherit the tool but the __sub__ sentinel refuses every action."""
+    from openalph.tools import BUILTIN_TOOLS
+    assert "subagent_status" in BUILTIN_TOOLS, (
+        "tool must exist first — an unknown-tool refusal is not this pin")
     bot, agent = build_bot(tmp_path)
     call_id = await _dispatch_one(tmp_path, bot, agent, call_id="tc_g5_x", delay=0.0)
     await await_terminal(agent, ROOM, call_id)
