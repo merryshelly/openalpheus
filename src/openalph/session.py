@@ -281,6 +281,26 @@ class SessionLog:
             totals["advisor_cost_usd"] += _num(entry.get("cost_usd", 0.0))
             totals["unpriced_tokens"] += _num(entry.get("unpriced_tokens", 0))
 
+        # kdsn.330 R15: async dispatches have no tool-result entry carrying
+        # cost — per-sub usage rides the `subagent_terminal` system ledger
+        # entry (detail carries cost_usd / unpriced_tokens flat). Mirror the
+        # advisor_consult loop's guard discipline: role + event guard,
+        # fail-soft _num coercion. The detail is stored either as a nested
+        # dict or a JSON string (writers vary) — tolerate both.
+        for entry in entries:
+            if entry.get("role") != "system" or entry.get("event") != "subagent_terminal":
+                continue
+            detail = entry.get("detail")
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except (ValueError, TypeError):
+                    continue
+            if not isinstance(detail, dict):
+                continue
+            totals["subagent_cost_usd"] += _num(detail.get("cost_usd", 0.0))
+            totals["unpriced_tokens"] += _num(detail.get("unpriced_tokens", 0))
+
         return totals
 
     def last_prompt_tokens(self, room_id: str) -> int | None:

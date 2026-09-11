@@ -718,6 +718,12 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "enum": ["off", "low", "medium", "high", "xhigh", "max"],
                     "description": "Reasoning effort for the sub-agent (optional; default medium — override to run the sub hotter or turn reasoning off)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": ("Run without blocking this turn (optional; default false). "
+                                    "When true the call returns immediately with a dispatch id "
+                                    "and the report is retrieved later with the subagent_status tool.")
                 }
             },
             "required": ["task"]
@@ -2486,13 +2492,71 @@ async def _execute_tool_inner(
             result_limit=getattr(agent_config, "truncation_limit", None),
         )
     elif name == "subagent":
-        from .subagent import run_subagent
+        from .subagent import run_subagent, _EFFORT_LEVELS
         # BUG-3: honour the documented `default_max_iterations` config key when
         # the call omits max_iterations, instead of silently falling back to the
         # module constant. Explicit per-call max_iterations still wins.
         _sub_max_iters = input.get("max_iterations")
         if _sub_max_iters is None:
             _sub_max_iters = tool_config.get("default_max_iterations")
+
+        # kdsn.330 R1: `background: bool` async mode — validated BEFORE any
+        # I/O (dispatch spawn, log files, provider calls): rejected input
+        # must not spawn a sub, write a ledger record, or touch the ledger.
+        # The sync path (no key, or false) falls through UNTOUCHED — its
+        # bytes are pinned (test_background_absent_is_sync_default /
+        # test_sync_path_result_byte_identical).
+        _background = input.get("background", False)
+        if not isinstance(_background, bool):
+            return ToolResult(
+                content=(
+                    "Invalid subagent input: 'background' must be a boolean "
+                    "(true = run without blocking this turn; omit or false = "
+                    "wait for the result). Rejected — no sub-agent was started."
+                ),
+                is_error=True,
+            )
+        if _background:
+            # effort pre-dispatch validation — the SAME pattern/vocabulary
+            # run_subagent applies internally (kdsn.305.14): the async path
+            # refuses BEFORE scheduling anything.
+            _effort = input.get("effort")
+            if _effort is not None and (isinstance(_effort, bool)
+                                        or not isinstance(_effort, str)
+                                        or _effort not in _EFFORT_LEVELS):
+                return ToolResult(
+                    is_error=True,
+                    content=f"Invalid effort {_effort!r} — must be one of: "
+                            "off, low, medium, high, xhigh, max",
+                )
+            # context_status pattern (headless refusal): the dispatch seam is
+            # an agent-layer callback — without it background dispatch is
+            # refused (state unmutated), never silently downgraded to sync.
+            _dispatch_cb = (callbacks or {}).get("subagent_dispatch")
+            if not _dispatch_cb:
+                return ToolResult(
+                    is_error=True,
+                    content="subagent background dispatch requires a callback "
+                            "from the agent layer (headless contexts: wire "
+                            "build_callbacks).",
+                )
+            # The agent's dispatch method records the dispatch (ledger +
+            # subagent_dispatched system entry), schedules the sub as a
+            # background task, and returns the immediate receipt. The
+            # receipt flows through this wrapper's R9 redaction tail like
+            # every other ToolResult.
+            return await _dispatch_cb(
+                dispatch_id=(callbacks or {}).get("call_id"),
+                task=input["task"],
+                model=input.get("model"),
+                effort=_effort,
+                system_prompt=input.get("system_prompt"),
+                max_tokens=input.get("max_tokens"),
+                max_iterations=_sub_max_iters,
+                tools=tools,
+                tool_executors=tool_executors,
+                sub_callbacks=callbacks,
+            )
         # Parent-turn liveness while we are blocked here is emitted by
         # run_subagent itself, from REAL sub-run milestones (each provider
         # response, each completed tool-call iteration) via

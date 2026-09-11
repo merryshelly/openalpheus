@@ -19,7 +19,12 @@ from pathlib import Path
 from openalph.config import AgentConfig
 from openalph.prompt import assemble_prompt
 from openalph.provider import complete, stream, ping_cache, ThinkingBlock, Usage, compute_cost, model_supports_vision
-from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, _TODO_STATE
+from openalph.tools import discover_tools, execute_tool, truncate_result, wrap_tool_result, escape_system_reminder_tags, _TODO_STATE, ToolResult
+# kdsn.330 (async subagents): the dispatch ledger core (pure module) and the
+# sub runner, imported THROUGH THE MODULE so call-site attribute lookup
+# resolves test patches of openalph.tools.subagent.run_subagent.
+from openalph.tools import subledger
+from openalph.tools import subagent as _tools_subagent
 from openalph.reminders import ReminderEngine, ReminderState
 from openalph.spotter import SpotterManager
 
@@ -304,6 +309,27 @@ class Agent:
         # absent or deleted).
         self._spotter = SpotterManager(self.config, self)
         self._spotter_inbox: dict[str, list] = {}
+        # kdsn.330 (async subagents, D4): per-room dispatch ledger —
+        # room_id -> {dispatch_id -> subledger.DispatchRecord}. Agent-owned
+        # (the transport must never own harness state) and CLEARED in
+        # reset_room, so a post-umbral room starts dispatch-free. The
+        # background dispatch tasks live in _dispatch_tasks (NOT
+        # _current_tasks — that holds exactly ONE turn task per room, so
+        # background work is invisible to the legacy cancel path; D7
+        # reaches them from the ledger).
+        self._dispatch_ledger: dict[str, dict] = {}
+        self._dispatch_tasks: dict[str, dict[str, asyncio.Task]] = {}
+        # kdsn.330 R7: per-room pending terminal-event inbox — finalizers
+        # deposit terminal event dicts here; the tool-loop-top drain /
+        # idle-room completion turn consumes them.
+        self._pending_events: dict[str, list[dict]] = {}
+        # kdsn.330 R9: keepalives RETAINED past the batch gather for rooms
+        # with running async dispatches — room_id -> (task, stop). The
+        # gather-finally stores it, the LAST async terminal
+        # (_finalize_dispatch) disarms it, and reset_room disarms it
+        # sync-safely. Sync-only batches never reach the store: they
+        # disarm at gather end exactly as pre-kdsn.330.
+        self._room_keepalive: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
 
     async def _vision_deposit(self, room_id: str, tag: str) -> None:
         """Append a staged [media:] tag to this room's vision inbox (kdsn.279).
@@ -421,6 +447,22 @@ class Agent:
         # kdsn.329: wholesale history reset — the anchor's cursor no longer
         # prices anything in this room.
         self._token_anchor.pop(room_id, None)
+        # kdsn.330 D4: a reset room starts dispatch-free — the per-room
+        # ledger, its dispatch task slots, and the pending terminal-event
+        # inbox are wiped with the history (post-umbral / post-restart
+        # rooms must not resurrect stale dispatches).
+        self._dispatch_ledger.pop(room_id, None)
+        self._dispatch_tasks.pop(room_id, None)
+        self._pending_events.pop(room_id, None)
+        # R9: a keepalive retained for this room's async dispatches dies
+        # with the room. reset_room is SYNC — stop + cancel is safe here
+        # (the cancelled loop task completes on the next loop iteration);
+        # the storage is popped so no later terminal can re-disarm a
+        # dead entry or double-cancel.
+        _ka_retained = self._room_keepalive.pop(room_id, None)
+        if _ka_retained is not None:
+            _ka_retained[1].set()
+            _ka_retained[0].cancel()
 
     # --- Context GC boundary consumption (workspace-kdsn.305) --------------
     # The agent owns the CHECKS (auto tier at turn start, hard tier at the
@@ -939,13 +981,17 @@ class Agent:
         except Exception as e:
             logger.warning(f"Failed to write JSONL log: {e}")
 
-    def _maybe_arm_cache_keepalive(self, *, room_id, active_tool_calls,
-                                   request_messages, tools_arg, cache_ttl, callbacks,
-                                   thinking, stream_start=None):
+    async def _maybe_arm_cache_keepalive(self, *, room_id, active_tool_calls,
+                                         request_messages, tools_arg, cache_ttl, callbacks,
+                                         thinking, stream_start=None):
         """Arm a background cache-keepalive task iff a subagent is in the batch AND
         the active model is an Anthropic provider with subagent_cache_keepalive on.
         Returns (task, stop_event) or (None, None). Zero overhead in the default path.
         One task covers the parent's single cache prefix even for N parallel subagents.
+
+        kdsn.330: async so the keepalive-lifecycle recorder seam can wrap it
+        (``await original(...)``); the body is unchanged — the arm decision
+        and task creation are the same, only the call site now awaits.
         """
         if not any(getattr(tc, "name", None) == "subagent" for tc in active_tool_calls):
             return None, None
@@ -1049,6 +1095,284 @@ class Agent:
                 await on_miss(room_id)
             except Exception:
                 logger.error("cache keepalive miss notice failed in %s", room_id, exc_info=True)
+
+    # --- kdsn.330: async (background) subagent dispatch --------------------
+
+    async def dispatch_background_subagent(
+        self, *, room_id, dispatch_id, task, model=None, effort=None,
+        system_prompt=None, max_tokens=None, max_iterations=None,
+        tools=None, tool_executors=None, sub_callbacks=None, session_log=None,
+    ):
+        """Record a background subagent dispatch and spawn its runner task.
+
+        Returns the immediate receipt ToolResult (dispatch ID + pointer at
+        the ``subagent_status`` retrieval surface) — the sub itself runs as
+        a background task, so the caller's batch gather completes at
+        receipt time and the turn never blocks on sub duration (D1/D9).
+
+        Ordering (R5, persist-before-notify): the ledger record is created
+        and the ``subagent_dispatched`` system entry is durably written
+        BEFORE the receipt returns.
+        """
+        if not dispatch_id:
+            return ToolResult(
+                is_error=True,
+                content="subagent background dispatch refused: the harness "
+                        "threaded no dispatch id (call_id).",
+            )
+        # The record's model is the resolved one (R4: model provenance);
+        # the sub RUN receives the raw input model (None -> the sub's own
+        # default resolution), byte-identical to the sync path.
+        rec_model = model or self.get_model(room_id)
+        rec = subledger.DispatchRecord(
+            dispatch_id=dispatch_id,
+            task=task,
+            task_head=subledger.make_task_head(task),
+            model=rec_model,
+            effort=effort,
+            dispatched_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        self._dispatch_ledger.setdefault(room_id, {})[dispatch_id] = rec
+
+        # R5: the dispatch entry is durable before the receipt returns.
+        # Fail-soft: a ledger-write failure must never block the dispatch
+        # (the record is live in memory); it is logged loudly.
+        if session_log is not None:
+            try:
+                session_log.append(
+                    role="system",
+                    sender=session_log.agent_user_id,
+                    room=room_id,
+                    event_id=None,
+                    event="subagent_dispatched",
+                    detail=subledger.dispatched_detail(rec),
+                )
+            except Exception:
+                logger.error(
+                    "subagent dispatch: subagent_dispatched entry failed "
+                    "for %s in %s", dispatch_id, room_id, exc_info=True)
+
+        runner = asyncio.create_task(
+            self._run_background_dispatch(
+                room_id, dispatch_id,
+                _tools_subagent.run_subagent(
+                    task=task,
+                    config=self.config,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    model=model,
+                    max_tokens=max_tokens,
+                    max_iterations=max_iterations,
+                    call_id=dispatch_id,
+                    parent_room_id=room_id,
+                    callbacks=sub_callbacks,
+                    effort=effort,
+                    tool_executors=tool_executors,
+                ),
+                sub_callbacks=sub_callbacks,
+                session_log=session_log,
+            ),
+            name=f"subagent-dispatch-{dispatch_id}",
+        )
+        self._dispatch_tasks.setdefault(room_id, {})[dispatch_id] = runner
+
+        # One loop yield so the scheduled runner reaches its first await
+        # (the sub's provider I/O) before the receipt returns: an
+        # immediate spawn failure is already being handled by the runner
+        # (terminal `failed`) rather than silently parked, and the
+        # receipt's observable ledger state is the dispatch the runner
+        # will report on.
+        await asyncio.sleep(0)
+
+        return ToolResult(
+            content=(
+                f"Background subagent dispatched: {dispatch_id}\n"
+                f"Task: {rec.task_head}\n"
+                f"Status: running — check subagent_status(action=\"status\","
+                f" id=\"{dispatch_id}\") or retrieve it; the completion "
+                f"report is delivered automatically when it lands."
+            ),
+            is_error=False,
+        )
+
+    async def _run_background_dispatch(self, room_id, dispatch_id, coro, *,
+                                       sub_callbacks=None, session_log=None):
+        """Background runner for one async dispatch: run the sub to
+        terminal, then finalize the ledger record (D1/D5).
+
+        - CancelledError (operator /stop, shutdown, umbral pre-wipe) is
+          terminal ``cancelled``: the record is finalized, THEN the
+          cancellation re-raises so the task ends cancelled (the harness
+          task graph stays truthful).
+        - Exceptions escaping the sub and error ToolResults are terminal
+          ``failed`` with a SANITIZED error (never a raw exception repr,
+          never reminder-tag or credential text) — a failed sub is never
+          silent.
+        """
+        try:
+            result = await coro
+        except asyncio.CancelledError:
+            await self._finalize_dispatch(
+                room_id, dispatch_id, subledger.CANCELLED,
+                sub_callbacks=sub_callbacks, session_log=session_log,
+                error="cancelled (operator /stop or room lifecycle)")
+            raise
+        except Exception as exc:
+            err = subledger.sanitize_dispatch_error(exc)
+            await self._finalize_dispatch(
+                room_id, dispatch_id, subledger.FAILED,
+                sub_callbacks=sub_callbacks, session_log=session_log,
+                error=err)
+            return
+        if result.is_error:
+            # run_subagent wraps its own exceptions as an error
+            # ToolResult ("Sub-agent error: …"); sanitize that content
+            # for the durable ledger exactly like the exception path.
+            await self._finalize_dispatch(
+                room_id, dispatch_id, subledger.FAILED,
+                sub_callbacks=sub_callbacks, session_log=session_log,
+                error=subledger.sanitize_dispatch_error(result.content))
+            return
+        await self._finalize_dispatch(
+            room_id, dispatch_id, subledger.COMPLETED,
+            sub_callbacks=sub_callbacks, session_log=session_log,
+            result=result.content)
+
+    async def _finalize_dispatch(self, room_id, dispatch_id, state, *,
+                                 sub_callbacks=None, session_log=None,
+                                 result=None, error=None):
+        """Terminal handling for one async dispatch (R5/R9/R15 ordering).
+
+        Sequence: bridge pop (usage substrate) -> state transition
+        (terminal-state protected) -> ``subagent_terminal`` system entry
+        persisted BEFORE any notify -> live accrual into the room usage
+        counters -> terminal event deposited in the room's pending-event
+        inbox -> fail-soft ``subagent_terminal_notify`` -> keepalive
+        disarm iff no running dispatches remain in the room.
+
+        A missing record (post-reset room) skips the persist/deposit but
+        still runs the keepalive re-gate, so a wiped room cannot pin a
+        keepalive alive.
+        """
+        # Task-slot cleanup on EVERY path (incl. missing record): the
+        # runner task must not linger in _dispatch_tasks.
+        tasks_by_room = self._dispatch_tasks.get(room_id)
+        if tasks_by_room is not None:
+            tasks_by_room.pop(dispatch_id, None)
+
+        room_ledger = self._dispatch_ledger.get(room_id)
+        rec = room_ledger.get(dispatch_id) if room_ledger is not None else None
+        if rec is None:
+            logger.info(
+                "subagent finalize: no ledger record for %s in %s — "
+                "skipping persist (post-reset room)", dispatch_id, room_id)
+        else:
+            # kdsn.218 bridge (written by run_subagent at terminal): the
+            # usage/cost substrate. One pop feeds the ledger entry and
+            # the live accrual below (mirrors the sync consumer).
+            usage = {}
+            try:
+                bridge = (sub_callbacks or {}).get("subagent_results")
+                if isinstance(bridge, dict):
+                    bridge = bridge.pop((room_id, dispatch_id), None)
+                if isinstance(bridge, dict):
+                    usage = {
+                        "input_tokens": bridge.get("input_tokens", 0) or 0,
+                        "output_tokens": bridge.get("output_tokens", 0) or 0,
+                        "cost_usd": bridge.get("cost_usd", 0.0) or 0.0,
+                        "unpriced_tokens": bridge.get("unpriced_tokens", 0) or 0,
+                    }
+            except Exception:
+                logger.warning(
+                    "subagent finalize: bridge pop failed for %s in %s",
+                    dispatch_id, room_id, exc_info=True)
+            rec.usage = usage
+            if result is not None:
+                rec.result = result
+            if error is not None:
+                rec.error = error
+
+            if not rec.transition(state):
+                # Terminal-state protection (R4): a late in-flight event
+                # after a terminal record is logged and ignored — no
+                # second terminal entry, no double accrual.
+                logger.warning(
+                    "subagent finalize: late %s for terminal record %s in "
+                    "%s ignored", state, dispatch_id, room_id)
+            else:
+                # R5: persist the terminal entry BEFORE any notify.
+                # Fail-soft like every ledger write (counters + record
+                # still move; a failed audit row is logged).
+                if session_log is not None:
+                    try:
+                        session_log.append(
+                            role="system",
+                            sender=session_log.agent_user_id,
+                            room=room_id,
+                            event_id=None,
+                            event="subagent_terminal",
+                            detail=subledger.terminal_detail(rec),
+                        )
+                    except Exception:
+                        logger.error(
+                            "subagent finalize: subagent_terminal entry "
+                            "failed for %s in %s", dispatch_id, room_id,
+                            exc_info=True)
+                # R15: live accrual — the async path has no tool-result
+                # append site, so terminal persistence IS the accrual
+                # point. Disjoint from the restart re-sum (usage_totals
+                # re-reads the same entries after wipe-and-rehydrate).
+                try:
+                    u = self._usage_for(room_id)
+                    u["subagent_cost_usd"] += usage.get("cost_usd", 0.0) or 0.0
+                    u["unpriced_tokens"] += usage.get("unpriced_tokens", 0) or 0
+                except Exception:
+                    logger.warning(
+                        "subagent finalize: live accrual failed for %s "
+                        "in %s", dispatch_id, room_id, exc_info=True)
+                # R7: deposit the terminal event for the delivery drain /
+                # idle-room completion turn (the drain consumes
+                # _pending_events).
+                self._pending_events.setdefault(room_id, []).append(
+                    subledger.terminal_event_dict(rec))
+                # R8: fail-soft notify — the transport MAY wire a
+                # subagent_terminal_notify (the idle-fire decision is
+                # the transport's); its failure never blocks the ledger.
+                notify = (sub_callbacks or {}).get("subagent_terminal_notify")
+                if notify is not None:
+                    try:
+                        await notify(room_id, subledger.terminal_event_dict(rec))
+                    except Exception:
+                        logger.warning(
+                            "subagent finalize: terminal notify failed for "
+                            "%s in %s", dispatch_id, room_id, exc_info=True)
+
+        # R9: a keepalive retained for this room's async dispatches dies
+        # when the LAST running dispatch goes terminal — any terminal
+        # state (completed/failed/cancelled), on every path.
+        room_ledger = self._dispatch_ledger.get(room_id)
+        still_running = (
+            room_ledger is not None
+            and any(r.state == subledger.RUNNING for r in room_ledger.values())
+        )
+        if not still_running:
+            await self._disarm_room_keepalive(room_id)
+
+    async def _disarm_room_keepalive(self, room_id):
+        """Disarm the keepalive retained for this room's async dispatches.
+
+        Idempotent: the gather-finally and the terminal handler may both
+        reach the room in either order — only the STORED entry is
+        disarmed, exactly once (pop)."""
+        ka = self._room_keepalive.pop(room_id, None)
+        if ka is None:
+            return
+        ka_task, ka_stop = ka
+        ka_stop.set()
+        ka_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ka_task
+        logger.info("cache keepalive disarmed in %s (last async terminal)", room_id)
 
     async def handle_input(self, text: str, room_id: str = "_default", *,
                            on_tool_call=None, on_tool_intent=None, thinking: str | None = None,
@@ -2110,7 +2434,7 @@ class Agent:
                             **_tx_exec,
                         ))
 
-                    _ka_task, _ka_stop = self._maybe_arm_cache_keepalive(
+                    _ka_task, _ka_stop = await self._maybe_arm_cache_keepalive(
                         room_id=room_id,
                         active_tool_calls=active_tool_calls,
                         request_messages=_ka_request_messages,
@@ -2124,11 +2448,39 @@ class Agent:
                         results = await asyncio.gather(*tool_coros)
                     finally:
                         if _ka_task is not None:
-                            _ka_stop.set()
-                            _ka_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await _ka_task
-                            logger.info("cache keepalive disarmed in %s", room_id)
+                            _room_ledger = self._dispatch_ledger.get(room_id)
+                            _async_running = (
+                                _room_ledger is not None
+                                and any(r.state == subledger.RUNNING
+                                        for r in _room_ledger.values())
+                            )
+                            if _async_running:
+                                # kdsn.330 R9: async dispatches are still in
+                                # flight — the gather returned at RECEIPT
+                                # time, not at sub completion, so the
+                                # keepalive must outlive the batch. Retain
+                                # the (task, stop) pair; the LAST async
+                                # terminal (Agent._finalize_dispatch)
+                                # disarms it. Supersede any prior retained
+                                # entry for the room — stop + cancel its
+                                # loop first so a second arm never leaves
+                                # an orphan loop or double-disarms.
+                                _prev_ka = self._room_keepalive.get(room_id)
+                                if _prev_ka is not None:
+                                    _prev_ka[1].set()
+                                    _prev_ka[0].cancel()
+                                    with contextlib.suppress(asyncio.CancelledError):
+                                        await _prev_ka[0]
+                                self._room_keepalive[room_id] = (_ka_task, _ka_stop)
+                                logger.info(
+                                    "cache keepalive retained for async "
+                                    "dispatch in %s", room_id)
+                            else:
+                                _ka_stop.set()
+                                _ka_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await _ka_task
+                                logger.info("cache keepalive disarmed in %s", room_id)
 
                     # Track total tool calls (aggregate + per-tool-name + per-turn)
                     self._record_tool_calls(room_id, len(active_tool_calls))
@@ -2329,17 +2681,36 @@ class Agent:
         It is NOT a "cancel the current one" fallback: there is no such thing
         when rooms run concurrently, and pretending there was is what let a
         `/stop` in one room kill another room's work.
+
+        kdsn.330 D7: ``/stop`` also stops the room's BACKGROUND WORK. Async
+        subagent dispatches are separate background tasks invisible to
+        ``_current_tasks`` (one turn task per room), so they are cancelled
+        from the ledger (``_dispatch_tasks``): each runner observes the
+        cancellation as terminal ``cancelled`` (durable ledger entry +
+        notice via its finalizer), so "stop stops the room's work" holds
+        after async dispatch exists.
+
+        The ``_dispatch_tasks`` reads are getattr-defensive (default
+        empty): unit tests build ``Agent.__new__(Agent)`` with only
+        ``_current_tasks`` seeded — pre-dispatch agents must keep the
+        exact legacy cancel behaviour.
         """
+        _dispatch_tasks = getattr(self, "_dispatch_tasks", {}) or {}
         if room_id is not None:
             task = self._current_tasks.get(room_id)
             if task:
                 task.cancel()
+            for dtask in list(_dispatch_tasks.get(room_id, {}).values()):
+                dtask.cancel()
             return task
 
         last: asyncio.Task | None = None
         for task in list(self._current_tasks.values()):
             task.cancel()
             last = task
+        for droom in _dispatch_tasks.values():
+            for dtask in list(droom.values()):
+                dtask.cancel()
         return last
 
     def _estimate_content_tokens(self, content: str | list[dict]) -> int:

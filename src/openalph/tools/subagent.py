@@ -402,7 +402,14 @@ async def run_subagent(
     def _write_subagent_bridge() -> None:
         """Fail-soft: write frozen sub-run cost to the callbacks bridge for
         the parent's tool-result JSONL entry. Must never raise (mirrors
-        advisor.py's bridge at tools/advisor.py:~415-431)."""
+        advisor.py's bridge at tools/advisor.py:~415-431).
+
+        kdsn.330: also carries the sub's token counters (``input_tokens`` /
+        ``output_tokens``) — the async terminal path (Agent finalizer) reads
+        the same bridge for the ``subagent_terminal`` ledger entry. The sync
+        consumer (matrix ``_tool_notice``) reads only cost_usd/unpriced_tokens
+        with .get() defaults, so the extra keys are inert there (byte-
+        identical sync path)."""
         try:
             if callbacks and "subagent_results" in callbacks:
                 _key = (parent_room_id, call_id)
@@ -410,6 +417,8 @@ async def run_subagent(
                     "cost_usd": sub_cost,
                     "unpriced_tokens": sub_unpriced,
                     "model": config.default_model,
+                    "input_tokens": uncached_input_tokens,
+                    "output_tokens": total_output_tokens,
                 }
         except Exception:
             pass

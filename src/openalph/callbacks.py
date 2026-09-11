@@ -750,8 +750,52 @@ def build_callbacks(
 
         _callbacks["apply_handoff_boundary"] = _gc_apply_cb
         _callbacks["set_active_project"] = _gc_set_project_cb
+
+        # kdsn.330: async subagent dispatch seam. The callable is bound to
+        # the AGENT (D4/kdsn.276: the dispatch ledger lives on Agent, per
+        # room — no Matrix imports in the state owner) and to this
+        # transport's SessionLog (the persist-before-notify JSONL substrate
+        # — R5). The tool branch (tools/__init__.py, `subagent` with
+        # background=true) calls it with the per-call dispatch id
+        # (callbacks["call_id"]) and the sub parameters; it records the
+        # dispatch, writes the subagent_dispatched system entry BEFORE the
+        # receipt returns, and schedules the sub as a background task.
+        #
+        # Conditional on session_log exactly like the GC-boundary keys
+        # above: a transport with no JSONL ledger cannot persist the ledger
+        # chain, so the tool branch refuses background dispatch (missing
+        # callback ⇒ is_error refusal) instead of silently running a sub
+        # whose completion has no durable record. Headless/CLI turns that
+        # do wire a session_log get the identical callback (one
+        # construction seam — live, heartbeat, umbral, CLI).
+        async def _subagent_dispatch_cb(*, dispatch_id, task, model=None,
+                                        effort=None, system_prompt=None,
+                                        max_tokens=None, max_iterations=None,
+                                        tools=None, tool_executors=None,
+                                        sub_callbacks=None):
+            return await agent.dispatch_background_subagent(
+                room_id=room_id,
+                dispatch_id=dispatch_id,
+                task=task,
+                model=model,
+                effort=effort,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                max_iterations=max_iterations,
+                tools=tools,
+                sub_callbacks=sub_callbacks,
+                tool_executors=tool_executors,
+                session_log=session_log,
+            )
+
+        _callbacks["subagent_dispatch"] = _subagent_dispatch_cb
     else:
         _callbacks["apply_handoff_boundary"] = None
         _callbacks["set_active_project"] = None
+        # No key at all (NOT None) when session_log is absent: the wire
+        # format's key SET is pinned for session_log-less transports
+        # (test_callback_seam) and the tool branch treats absence as the
+        # headless refusal.
+        pass
 
     return _callbacks
