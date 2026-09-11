@@ -1262,6 +1262,16 @@ class Agent:
         still runs the keepalive re-gate, so a wiped room cannot pin a
         keepalive alive.
         """
+        # kdsn.330 re-audit: a CancelledError injected at the notify await
+        # below (operator `subagent_status cancel` / `/stop` on a runner
+        # that has already reached its finalizer) is remembered here and
+        # re-raised AFTER the safe cleanup at the end of this method —
+        # the runner task must end cancelled (cancellation semantics hold),
+        # but persistence has already happened and the keepalive re-gate
+        # below must still run (a cancelled finalize must not leave a
+        # keepalive pinned).
+        _swallowed_cancel = None
+
         # Task-slot cleanup on EVERY path (incl. missing record): the
         # runner task must not linger in _dispatch_tasks.
         tasks_by_room = self._dispatch_tasks.get(room_id)
@@ -1350,6 +1360,16 @@ class Agent:
                 if notify is not None:
                     try:
                         await notify(room_id, subledger.terminal_event_dict(rec))
+                    except asyncio.CancelledError as _cancel_exc:
+                        # kdsn.330 re-audit: `except Exception` does NOT
+                        # catch CancelledError — an operator cancel can
+                        # land its injection exactly on this await. The
+                        # durable subagent_terminal entry is ALREADY
+                        # persisted (R5 persist-before-notify), so complete
+                        # the remaining safe cleanup (the keepalive
+                        # re-gate below) and re-raise there: the task
+                        # still ends cancelled, nothing is lost.
+                        _swallowed_cancel = _cancel_exc
                     except Exception:
                         logger.warning(
                             "subagent finalize: terminal notify failed for "
@@ -1365,6 +1385,9 @@ class Agent:
         )
         if not still_running:
             await self._disarm_room_keepalive(room_id)
+
+        if _swallowed_cancel is not None:
+            raise _swallowed_cancel
 
     async def _disarm_room_keepalive(self, room_id):
         """Disarm the keepalive retained for this room's async dispatches.

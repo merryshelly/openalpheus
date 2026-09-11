@@ -12,18 +12,16 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from subledger_fixtures import (
-    ROOM, DEFAULT_TASK,
-    build_bot, real_callbacks, make_main_stream, sub_complete_factory,
+    ROOM,
+    build_bot, real_callbacks, sub_complete_factory,
     sub_tool_call, sub_tool_call_tc, await_terminal, settle, pending_events,
-    history_user_messages,
 )
-from openalph.session import SessionLog
-from openalph.provider import Response, Usage, ToolCall
+from openalph.provider import Response, Usage, ToolCall, StreamEvent
+from subledger_fixtures import default_main_stream  # noqa: F401  (fixture provider)
 
 EVENT_FRAME = "[Automated sub-agent events"
 
-import pytest as _pytest
-_pytestmark = _pytest.mark.usefixtures("default_main_stream")
+pytestmark = pytest.mark.usefixtures("default_main_stream")
 
 
 def _cb(bot, call_id=None, **extra):
@@ -105,7 +103,6 @@ async def test_quiet_slash_setter_roundtrip(tmp_path):
     await bot._cmd_subagentquiet(ROOM, "off")
     assert agent._room_quiet.get(ROOM) is False, "slash 'off' did not clear the flag"
     # And a fresh agent rehydrates it:
-    from openalph.config import MatrixConfig
     bot2, agent2 = build_bot(tmp_path)
     await bot2._activate_room(ROOM)
     assert agent2._room_quiet.get(ROOM) is False, "last-wins 'off' not restored"
@@ -136,12 +133,12 @@ async def test_cancelled_sub_usage_captured(tmp_path):
                         usage=Usage(input_tokens=1, output_tokens=1),
                         stop_reason="end_turn")
 
-    from openalph.tools import execute_tool
+    from openalph.tools import discover_tools, execute_tool
+    tools = discover_tools(agent.config.workspace)
     with patch("openalph.tools.subagent.complete", side_effect=two_iteration_sub):
         await execute_tool("subagent", sub_tool_call(),
-                           {}, agent.config, tools=None, callbacks=_cb(bot, "tc_rc"))
+                           {}, agent.config, tools=tools, callbacks=_cb(bot, "tc_rc"))
     await asyncio.sleep(0.4)  # let iteration 1 accrue
-    from openalph.tools import execute_tool as _et
     res = await execute_tool("subagent_status", {"action": "cancel", "id": "tc_rc"},
                              {}, agent.config, tools=None, callbacks=_cb(bot))
     assert not res.is_error, f"cancel failed: {res.content}"

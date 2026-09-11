@@ -977,3 +977,14 @@ async def run_subagent(
         })
         _write_subagent_bridge()
         return ToolResult(content=final_content, is_error=True)
+    finally:
+        # kdsn.330 re-audit (cancelled-sub burn): the bridge write must be
+        # a GUARANTEED path — the `except Exception` above does NOT catch
+        # CancelledError (operator /stop, `subagent_status cancel`, umbral
+        # pre-wipe, process shutdown), so without this finally a cancelled
+        # sub's ACCRUED usage/cost never reaches the parent's bridge and
+        # the finalizer's durable `cancelled` terminal entry carries a
+        # zero burn. Idempotent for the paths that already write it
+        # before returning (same key, same frozen counter values), so the
+        # sync result stays byte-identical.
+        _write_subagent_bridge()

@@ -1751,6 +1751,116 @@ class MatrixBot:
             if hasattr(self, '_active_turns'):
                 self._active_turns.discard(room_id)
 
+    # A persistently failing completion turn (e.g. a room stuck in
+    # ContextOverflow) must not turn the D2 re-arm into an unbounded
+    # auto-retry loop — each fire is a full model turn plus a notice.
+    # Three re-arms per room; the budget resets whenever the room's
+    # inbox is observed empty (the burst was delivered).
+    _SUBAGENT_REARM_LIMIT = 3
+
+    def _rearm_subagent_fire(self, room_id: str) -> None:
+        """kdsn.330 D2: turn-end re-arm of a LOST subagent completion wake.
+
+        The gap: a terminal that lands during a turn's FINAL model call
+        is never drained by that turn (the agent-side drain runs at the
+        tool-loop TOP, pre-model-call) and the terminal's own fire
+        (``_on_subagent_terminal`` -> ``_fire_subagent_completion``) was
+        VETOED at claim time — the turn's own ``_active_turns`` mark was
+        still held across the claim's grace window. Without this re-arm
+        the burst strands until some arbitrary future turn.
+
+        Called from the turn-end finally of BOTH turn kinds — the live
+        path in ``_process_message`` and ``_run_heartbeat_turn`` (which
+        covers heartbeat / umbral / synthetic completion turns) — AFTER
+        the turn's own mark is discarded. Schedules only when the room
+        inbox is non-empty, the room is not quiet, and no other turn is
+        active for the room. ``_fire_subagent_completion``'s claim-time
+        checks (grace + quiet re-check + atomic claim) remain the
+        authority, so this can never double-fire: a fire the re-arm
+        schedules loses to a concurrent turn's claim just like the
+        terminal's own fire did.
+
+        Bounded: ``_SUBAGENT_REARM_LIMIT`` re-arms per room, budget
+        reset whenever the inbox is observed empty.
+        """
+        _rearms = getattr(self, "_subagent_rearm_counts", None)
+        if _rearms is None:
+            _rearms = self._subagent_rearm_counts = {}
+        _pe = getattr(self.agent, "_pending_events", None)
+        if not isinstance(_pe, dict) or not _pe.get(room_id):
+            # Inbox empty — nothing stranded (or the burst was
+            # delivered); reset the budget so a LATER lost wakeup is
+            # not starved by an old failure streak.
+            _rearms.pop(room_id, None)
+            return
+        if getattr(self.agent, "_room_quiet", {}).get(room_id):
+            return  # D8: quiet rooms drain at the next turn of any kind
+        if not hasattr(self, '_active_turns'):
+            self._active_turns = set()
+        if room_id in self._active_turns:
+            return  # another turn is active — its drain / turn-end re-arms
+        n = _rearms.get(room_id, 0)
+        if n >= self._SUBAGENT_REARM_LIMIT:
+            logger.warning(
+                "subagent completion re-arm limit (%d) reached in %s — "
+                "burst stays in the inbox for the next turn",
+                self._SUBAGENT_REARM_LIMIT, room_id)
+            return
+        _rearms[room_id] = n + 1
+        # House idiom (not a bare create_task): _fire_background keeps a
+        # strong reference — the fire sleeps the claim grace before it
+        # claims, and an unreferenced task could be collected mid-flight.
+        self._fire_background(self._fire_subagent_completion(room_id))
+
+    async def _cmd_subagentquiet(self, room_id: str, arg: str) -> None:
+        """kdsn.330 D8: the operator-facing per-room subagent-quiet setter.
+
+        `/subagentquiet on|off` — the room-scoped slash handler the D8
+        contract promised: nothing in src/ previously SET the per-room
+        flag the subagent completion fire/notice guards read
+        (``agent._room_quiet``).
+
+        - arg "on"/"off" (the caller lowercases before dispatching):
+          sets ``agent._room_quiet[room_id]`` to the matching bool AND
+          appends the ``quiet_override`` system room-override entry —
+          the SAME append shape the ``_activate_room`` restore scan
+          reads (detail "on"/"off", last-wins) — so the operator's
+          choice survives restarts.
+        - any other arg: usage-error notice, state UNMUTATED (no flag
+          write, no override entry).
+        - D8 scope: the flag suppresses delivery fires and in-room
+          completion notices only — status truth (``subagent_status``)
+          is never read against it, and pending events drain at the
+          next turn of any kind.
+        """
+        if arg not in ("on", "off"):
+            await self.send(
+                room_id,
+                "Usage: `/subagentquiet on` or `/subagentquiet off` — "
+                "suppress or re-enable automatic subagent completion "
+                "deliveries in this room. State unchanged.",
+            )
+            return
+        if not hasattr(self.agent, "_room_quiet"):
+            self.agent._room_quiet = {}
+        self.agent._room_quiet[room_id] = (arg == "on")
+        if self.session_log:
+            self.session_log.append(
+                role="system",
+                sender=self.config.user_id,
+                room=room_id,
+                event_id=None,
+                event="quiet_override",
+                detail=arg,
+            )
+        await self.send(
+            room_id,
+            f"Subagent completion deliveries in this room: **{arg}**"
+            + (" (pending events drain at the next turn; "
+               "subagent_status is unaffected)"
+               if arg == "on" else ""),
+        )
+
     def _make_steering_drain(self, room_id: str, turn_progress=None):
         """Build the per-turn steering drain closure (kdsn.311).
 
@@ -2044,6 +2154,11 @@ class MatrixBot:
                     pass
             if hasattr(self, '_active_turns'):
                 self._active_turns.discard(room_id)
+            # kdsn.330 D2: a terminal that landed during this turn's FINAL
+            # model call was never drained (drain is pre-model-call) and
+            # its fire was vetoed by the mark we just released — re-arm
+            # now (no-op unless the inbox is non-empty + room idle).
+            self._rearm_subagent_fire(room_id)
 
     def _build_context_status(self, rid: str) -> dict:
         """Assemble context status data dict for the context_status tool.
@@ -2164,6 +2279,14 @@ class MatrixBot:
             # fire a completion turn that would race the wipe.
             if not hasattr(self, '_active_turns'):
                 self._active_turns = set()
+            # Ownership-aware mark (kdsn.330 re-audit): remember whether
+            # THIS block added the mark. An unconditional discard in the
+            # finally would strip an OVERLAPPING live/heartbeat turn's
+            # mark (heartbeat turns don't hold the session lock, so the
+            # overlap is real — see the kdsn.311 note in
+            # _run_heartbeat_turn), releasing a still-running turn's
+            # claim and letting a completion fire race the wipe.
+            _umbral_owned_mark = room_id not in self._active_turns
             self._active_turns.add(room_id)
             try:
                 _pe = getattr(self.agent, "_pending_events", None)
@@ -2199,7 +2322,10 @@ class MatrixBot:
                         if _self is not None and _self.cancelling():
                             raise
             finally:
-                self._active_turns.discard(room_id)
+                # Discard ONLY this block's own mark (ownership-aware —
+                # see the add above).
+                if _umbral_owned_mark:
+                    self._active_turns.discard(room_id)
             archive_name = self.session_log.archive(room_id)
             self.session_log.wipe(room_id)
             self.session_log.append(
@@ -2530,12 +2656,23 @@ class MatrixBot:
                     _recon_live_tasks = (
                         getattr(self.agent, "_dispatch_tasks", {}) or {}
                     ).get(room_id) or {}
-                    _delivered = {
-                        str(e.get("content") or "")
+                    # Delivery evidence is LINE-ANCHORED (kdsn.330
+                    # re-audit): a dispatch id counts as delivered only
+                    # when some delivery event LINE begins with its own
+                    # `- <id>:` marker (the format_event_line shape). A
+                    # raw substring scan over the whole batch content
+                    # would let "call_1" count as delivered merely
+                    # because "call_12"'s line was drained — a
+                    # strict-prefix id that never delivered would
+                    # silently lose its pending_delivery re-delivery and
+                    # the event would be stranded forever.
+                    _delivery_lines = [
+                        _line
                         for e in existing
                         if e.get("role") == "user"
                         and e.get("source") == "subagent_event"
-                    }
+                        for _line in str(e.get("content") or "").splitlines()
+                    ]
                     for _did, _rec in _recon.items():
                         if _did in _recon_ledger:
                             continue  # live in-memory record wins
@@ -2573,7 +2710,12 @@ class MatrixBot:
                             # event goes to the room inbox for the next
                             # turn's drain (transition() is only legal
                             # from running; reconstitution sets state).
-                            if not any(_did in _d for _d in _delivered):
+                            # ANCHORED match: the id must start its own
+                            # event line (`- <id>:`), never match as a
+                            # substring of another dispatch's line.
+                            if not any(
+                                    _line.startswith(f"- {_did}:")
+                                    for _line in _delivery_lines):
                                 _rec.state = subledger.PENDING_DELIVERY
                                 self.agent._pending_events.setdefault(
                                     room_id, []).append(
@@ -3141,6 +3283,11 @@ class MatrixBot:
                     pass
             if hasattr(self, '_active_turns'):
                 self._active_turns.discard(room_id)
+            # kdsn.330 D2: same turn-end re-arm as the heartbeat path —
+            # a terminal that landed during this turn's FINAL model call
+            # was never drained and its fire was vetoed by the mark we
+            # just released (no-op unless the inbox is non-empty).
+            self._rearm_subagent_fire(room_id)
 
             # Release per-room session lock so queued messages can proceed.
             # The lock was acquired before the user-message JSONL write and
@@ -3863,6 +4010,14 @@ class MatrixBot:
                     detail=value,
                 )
             await self.send(room_id, f"Timesense set to **{value}** for this room")
+            return
+
+        if body.startswith("/subagentquiet"):
+            # kdsn.330 D8: operator-controlled per-room subagent quiet
+            # flag — the room-scoped setter for agent._room_quiet.
+            parts = body.split(None, 1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            await self._cmd_subagentquiet(room_id, arg)
             return
 
         if body.startswith("/heartbeat"):
