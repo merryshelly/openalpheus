@@ -82,9 +82,12 @@ async def test_terminal_undelivered_becomes_pending_delivery(tmp_path):
 
 @pytest.mark.asyncio
 async def test_pending_delivery_drains_at_next_turn(tmp_path):
+    """D1 content-free: the drained line carries id/state/task head — the
+    RESULT is retrieve-only (pinned by test_build_context_skips_ledger_entries
+    + format_event_line). Needle accordingly."""
     from openalph.session import SessionLog
     sl = SessionLog(tmp_path, "@agent:matrix.local")
-    _write_dispatch_entry(sl, ROOM, "tc_g7d")
+    _write_dispatch_entry(sl, ROOM, "tc_g7d", task="PENDING-DELIVERY-TASK-NEEDLE-55 do the work")
     _write_terminal_entry(sl, ROOM, "tc_g7d", result="RESTART-REPORT-55")
     bot, agent = build_bot(tmp_path)
     bot._active_turns.add(ROOM)
@@ -95,7 +98,11 @@ async def test_pending_delivery_drains_at_next_turn(tmp_path):
                if EVENT_FRAME in str(m.get("content", ""))
                and "tc_g7d" in str(m.get("content"))]
     assert drained, "pending_delivery event never drained at the next turn"
-    assert "RESTART-REPORT-55" in str(drained[0].get("content"))
+    assert "PENDING-DELIVERY-TASK-NEEDLE-55" in str(drained[0].get("content"))
+    assert "pending_delivery" in str(drained[0].get("content"))
+    body = str(drained[0].get("content"))
+    assert "RESTART-REPORT-55" not in body, (
+        "result text leaked into the drained delivery line — D1 violation")
 
 
 @pytest.mark.asyncio

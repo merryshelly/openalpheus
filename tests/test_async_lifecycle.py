@@ -97,7 +97,13 @@ async def test_umbral_cancellation_entries_land_in_archive(tmp_path):
     await bot._inject_umbral(ROOM)
     await settle()
     # The live session was wiped; the archive must carry the cancelled record.
-    archives = sorted((bot.session_log.workspace / "sessions").glob("*_*.jsonl"))
+    # Selector: the room's safe id contains '_' (async-room_matrix.local), so
+    # the LIVE file also matches *_*.jsonl and sorts AFTER its archives
+    # ('-' 0x2D < '_' 0x5F → archive sorts first). Exclude the live file.
+    sessions = bot.session_log.workspace / "sessions"
+    archives = sorted(
+        f for f in sessions.glob("*_*.jsonl")
+        if f.name != "async-room_matrix.local.jsonl")
     assert archives, "no archive written"
     text = archives[-1].read_text()
     assert "tc_g6d" in text, "cancellation not in the archive"
@@ -207,7 +213,12 @@ async def test_umbral_drain_endruns_quiet(tmp_path):
     assert pending_events(agent, ROOM)
     await bot._inject_umbral(ROOM)
     await settle()
-    archives = sorted((bot.session_log.workspace / "sessions").glob("*_*.jsonl"))
+    # Exclude the LIVE room file (safe id contains '_' — see the archive
+    # selector note in test_umbral_cancellation_entries_land_in_archive).
+    sessions = bot.session_log.workspace / "sessions"
+    archives = sorted(
+        f for f in sessions.glob("*_*.jsonl")
+        if f.name != "async-room_matrix.local.jsonl")
     assert archives and "tc_g6h" in archives[-1].read_text(), (
         "umbral drain did not end-run quiet — completed event lost at rotation")
 
@@ -222,7 +233,9 @@ async def test_handoff_boundary_lets_inflight_survive(tmp_path):
     cb = _cb(bot)
     apply_cb = cb.get("apply_handoff_boundary")
     assert apply_cb is not None, "boundary tool callback missing from real callbacks"
-    await apply_cb()
+    # Real callers pass room_id positionally + trigger kwarg (context_handoff
+    # tool / _gc_apply_boundary precedent).
+    await apply_cb(ROOM, trigger="test")
     rec = await await_terminal(agent, ROOM, "tc_g6i")
     assert rec.state == "completed", (
         f"boundary must NOT cancel in-flight dispatches (D10), got {rec.state}")
