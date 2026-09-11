@@ -86,12 +86,16 @@ async def test_terminal_state_protection_late_event_cannot_regress(tmp_path):
 async def test_persist_before_notify_jsonl_entry_exists(tmp_path):
     """D1/D5: the subagent_terminal system entry is durable, not just announced."""
     bot, agent = build_bot(tmp_path)
-    fired = []
+    order = []
     cb = _cb(bot, "tc_g1d")
     orig = cb.get("subagent_terminal_notify")
 
     async def spying_notify(room_id, event):
-        fired.append(event)
+        # CAUSAL PIN: at the moment the notify fires, the terminal entry
+        # must ALREADY be durable. (Sabotage-tested: inverting persist/notify
+        # order must turn this red — existence checks alone don't.)
+        at_notify = ledger_entries(bot.session_log, ROOM, "subagent_terminal")
+        order.append(len(at_notify))
         if orig is not None:
             await orig(room_id, event)
 
@@ -105,7 +109,10 @@ async def test_persist_before_notify_jsonl_entry_exists(tmp_path):
     await settle()
     entries = ledger_entries(bot.session_log, ROOM, "subagent_terminal")
     assert entries, "no subagent_terminal system entry persisted"
-    assert fired, "notify callback never fired"
+    assert order, "notify callback never fired"
+    assert order[0] >= 1, (
+        "notify fired BEFORE the terminal entry was persisted — "
+        "persist-before-notify violated (D1/D5 causality)")
     detail = entries[0].get("detail")
     payload = detail if isinstance(detail, dict) else json.loads(str(detail))
     assert payload.get("dispatch_id") == "tc_g1d", (
