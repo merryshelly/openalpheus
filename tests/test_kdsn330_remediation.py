@@ -14,7 +14,7 @@ import pytest
 from subledger_fixtures import (
     ROOM,
     build_bot, real_callbacks, sub_complete_factory,
-    sub_tool_call, sub_tool_call_tc, await_terminal, settle, pending_events,
+    sub_tool_call_tc, await_terminal, settle, pending_events,
 )
 from openalph.provider import Response, Usage, ToolCall, StreamEvent
 from subledger_fixtures import default_main_stream  # noqa: F401  (fixture provider)
@@ -114,18 +114,31 @@ async def test_quiet_slash_setter_roundtrip(tmp_path):
 async def test_cancelled_sub_usage_captured(tmp_path):
     """audit-synkimi3 #3 / synglm53 #5-adjacent: CancelledError bypasses the
     bridge write, so a cancelled sub's partial burn is lost. After the fix
-    (bridge write in a finally), the cancelled terminal entry carries the
-    accrued usage. Choreography: iteration 1 completes (accrues), iteration 2
-    blocks, cancel lands mid-flight."""
+    (bridge write in a finally), the cancelled sub's bridge carries the
+    accrued usage.
+
+    Unit-level choreography (pollution-proof): drive run_subagent directly
+    with a stub tool executor (no real shell, no provider I/O beyond the
+    mock) and cancel the task after iteration 1 accrues. The full
+    dispatch-to-terminal-entry carry-through is covered by the lifecycle
+    cancel pins; this pins the bridge guarantee itself.
+    """
+    from openalph.tools import ToolResult
+    from openalph.tools.subagent import run_subagent
     bot, agent = build_bot(tmp_path)
+    cb = _cb(bot, "tc_rc")
     calls = [0]
+
+    async def stub_executor(name, inp, **kw):
+        return ToolResult(content="burn-ok", is_error=False)
 
     async def two_iteration_sub(**kwargs):
         calls[0] += 1
         if calls[0] == 1:
             tc = ToolCall(id=f"subtc_{calls[0]}", name="shell",
                           input={"command": "echo burn"})
-            return Response(content="", tool_calls=[tc], model="anthropic/claude-sonnet-4-20250514",
+            return Response(content="", tool_calls=[tc],
+                            model="anthropic/claude-sonnet-4-20250514",
                             usage=Usage(input_tokens=250, output_tokens=120),
                             stop_reason="tool_use")
         await asyncio.sleep(30)  # iteration 2 blocks; cancel lands here
@@ -133,26 +146,20 @@ async def test_cancelled_sub_usage_captured(tmp_path):
                         usage=Usage(input_tokens=1, output_tokens=1),
                         stop_reason="end_turn")
 
-    from openalph.tools import discover_tools, execute_tool
-    tools = discover_tools(agent.config.workspace)
+    task = asyncio.create_task(run_subagent(
+        "burn some tokens", agent.config, tools=None,
+        call_id="tc_rc", parent_room_id=ROOM, callbacks=cb,
+        tool_executors={"shell": stub_executor}))
     with patch("openalph.tools.subagent.complete", side_effect=two_iteration_sub):
-        await execute_tool("subagent", sub_tool_call(),
-                           {}, agent.config, tools=tools, callbacks=_cb(bot, "tc_rc"))
-    await asyncio.sleep(0.4)  # let iteration 1 accrue
-    res = await execute_tool("subagent_status", {"action": "cancel", "id": "tc_rc"},
-                             {}, agent.config, tools=None, callbacks=_cb(bot))
-    assert not res.is_error, f"cancel failed: {res.content}"
-    rec = await await_terminal(agent, ROOM, "tc_rc")
-    assert rec.state == "cancelled"
-    await settle()
-    entries = [e for e in bot.session_log.read(ROOM)
-               if e.get("role") == "system" and e.get("event") == "subagent_terminal"
-               and "tc_rc" in str(e.get("detail"))]
-    assert entries, "cancelled terminal entry missing"
-    detail = entries[0].get("detail")
-    payload = detail if isinstance(detail, dict) else json.loads(str(detail))
-    assert payload.get("input_tokens", 0) >= 250, (
-        f"cancelled sub's partial burn lost: {payload} — bridge must write in a finally")
+        await asyncio.sleep(0.4)  # iteration 1 executed + accrued
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    bridge = (cb.get("subagent_results") or {}).get((ROOM, "tc_rc"))
+    assert bridge is not None, (
+        "cancelled sub wrote no bridge entry — bridge must be a guaranteed path")
+    assert bridge.get("input_tokens", 0) >= 250, (
+        f"cancelled sub's partial burn lost: {bridge} — bridge must write in a finally")
+    await settle(0.1)
 
 
 # --- R-D (MEDIUM, synglm53): reconstitution delivery match is line-anchored -
