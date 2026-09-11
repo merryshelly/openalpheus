@@ -82,6 +82,14 @@ SUBAGENT_COMPLETION_WAKE = (
 # turn_source= keyword literal — same tag class as heartbeat/umbral).
 SUBAGENT_COMPLETION_TURN_SOURCE = "subagent_completion"
 
+# kdsn.330 R8: grace between the terminal notify and the completion
+# turn's CLAIM. The idle check is a claim-time decision: a turn that
+# starts after the terminal (its own claim lands in _active_turns) must
+# veto the fire and drain the burst itself. The grace is ≫ any live
+# claim seam (a turn claiming the room after the terminal wins before
+# the fire wakes) and ≪ the settle windows the completion tests wait.
+SUBAGENT_COMPLETION_CLAIM_GRACE = 0.05
+
 logger = logging.getLogger(__name__)
 
 
@@ -1642,31 +1650,40 @@ class MatrixBot:
 
         - quiet room → no fire, no notice (D8: pending events drain at
           the next turn of any kind; status truth is never suppressed).
-        - active turn (live / heartbeat / umbral / another completion
-          turn — ``_active_turns``) → no fire (the tool-loop-top drain
-          surfaces the burst at the next boundary; D2).
-        - idle room → claim ATOMICALLY: the room is added to
-          ``_active_turns`` synchronously, before ANY await, so two
-          concurrent terminal notifies produce exactly ONE synthetic
-          turn (the check-then-add race is pinned). The synthetic turn
-          delivers the framed burst through the SAME agent-side drain
-          live turns use (one delivery path ⇒ identical bytes);
-          consumption of the inbox happens there, so a fired turn can
-          never double-deliver a burst.
+        - otherwise the completion task is SCHEDULED; the idle check is
+          a CLAIM-TIME decision — ``_fire_subagent_completion`` re-verifies
+          quiet + ``_active_turns`` after SUBAGENT_COMPLETION_CLAIM_GRACE
+          and claims the room atomically there. A turn that starts
+          between the terminal and the claim vetoes the fire: its own
+          tool-loop-top drain delivers the burst (no lost wakeup, no
+          double delivery), so the claim must not happen earlier than
+          the claim itself. The atomic claim (room added to
+          ``_active_turns`` synchronously, before ANY await) still makes
+          two concurrent fires produce exactly ONE synthetic turn. The
+          synthetic turn delivers the framed burst through the SAME
+          agent-side drain live turns use (one delivery path ⇒ identical
+          bytes); consumption of the inbox happens there, so a fired
+          turn can never double-deliver a burst.
         """
         if getattr(self.agent, "_room_quiet", {}).get(room_id):
             return
-        if not hasattr(self, '_active_turns'):
-            self._active_turns = set()
-        if room_id in self._active_turns:
-            return
-        self._active_turns.add(room_id)
         asyncio.create_task(
             self._fire_subagent_completion(room_id),
             name=f"subagent-completion-{room_id}")
 
     async def _fire_subagent_completion(self, room_id: str) -> None:
         """kdsn.330 R8: the idle-room synthetic completion turn.
+
+        CLAIM-TIME idle check: after a short grace
+        (SUBAGENT_COMPLETION_CLAIM_GRACE) the room's idleness and quiet
+        state are re-verified, and the room is claimed ATOMICALLY —
+        added to ``_active_turns`` synchronously, before ANY await in
+        the turn path — so two concurrent terminal notifies produce
+        exactly ONE synthetic turn (the check-then-add race is pinned).
+        A turn (live / heartbeat / umbral) that started after the
+        terminal vetoes the fire; its drain delivers the burst instead
+        (the skip path claims nothing and discards nothing — it can
+        never strip another turn's mark).
 
         Heartbeat template (the _inject_heartbeat three-step shape):
         audit entry persist-BEFORE-turn → in-room notice →
@@ -1676,13 +1693,27 @@ class MatrixBot:
         the framed event burst itself arrives as its own
         harness-notice user message via the agent-side drain.
         """
+        # Grace before the claim: ≫ any live claim seam (a turn starting
+        # after the terminal wins the room before the fire can claim it),
+        # ≪ the settle windows the completion tests wait.
+        await asyncio.sleep(SUBAGENT_COMPLETION_CLAIM_GRACE)
+        # Quiet re-checked at claim time too — a quiet set between the
+        # terminal and the claim still suppresses the fire (D8).
+        if getattr(self.agent, "_room_quiet", {}).get(room_id):
+            return
+        if not hasattr(self, '_active_turns'):
+            self._active_turns = set()
+        if room_id in self._active_turns:
+            return
+        self._active_turns.add(room_id)
         try:
             events = list(
                 getattr(self.agent, "_pending_events", {}).get(room_id, []))
             if not events:
                 # A concurrent turn drained the inbox (or the room was
                 # reset) between deposit and fire — the burst is already
-                # delivered; nothing to fire for.
+                # delivered; nothing to fire for (the claim is released
+                # by the finally below).
                 return
             # Audit trail: the fire decision is durable BEFORE the turn
             # (persist-before-turn; system entries never render — zero
@@ -2109,6 +2140,66 @@ class MatrixBot:
 
         # Archive + wipe regardless of turn success (failed turns still consume context)
         try:
+            # kdsn.330 R13/D6: pre-archive truthfulness — the archive must
+            # carry the FULL dispatch lifecycle, so BEFORE archive():
+            #   (a) drain every pending terminal event for the room —
+            #       their source="subagent_event" delivery entries (RAW
+            #       lines, the SAME store seam the tool-loop drain uses)
+            #       land in the archive. The umbral drain end-runs quiet:
+            #       no _room_quiet read here (D8).
+            #   (b) cancel the in-flight dispatches with the SAME
+            #       primitive /stop uses and AWAIT each runner — the
+            #       runner's CancelledError path persists the durable
+            #       `cancelled` subagent_terminal entry before the task
+            #       ends, so after this loop the ledger shows no running
+            #       and the entries are durable in the session about to
+            #       be archived.
+            # Success path ONLY (runs before the archive attempt): an
+            # archive failure below still takes the pinned no-wipe
+            # branch, and the cancelled states/entries stay truthful in
+            # the preserved session. The room is marked an active turn
+            # for the hook's duration (it IS the umbral lifecycle — R8
+            # lists umbral among the active-turn sources): a
+            # cancellation finalizer's notify must deposit only, never
+            # fire a completion turn that would race the wipe.
+            if not hasattr(self, '_active_turns'):
+                self._active_turns = set()
+            self._active_turns.add(room_id)
+            try:
+                _pe = getattr(self.agent, "_pending_events", None)
+                _umbral_events = (
+                    _pe.pop(room_id, []) if isinstance(_pe, dict) else [])
+                if _umbral_events and self.session_log is not None:
+                    # Fail-soft: a persist error must not flip the umbral
+                    # into the OSError no-wipe branch.
+                    try:
+                        await self._make_subagent_event_log(
+                            self.session_log)(
+                                room_id,
+                                subledger.subagent_event_lines(
+                                    _umbral_events))
+                    except Exception:
+                        logger.warning(
+                            "umbral: pre-archive drain persist failed in "
+                            "%s", room_id, exc_info=True)
+                _dt_by_room = getattr(self.agent, "_dispatch_tasks", {}) or {}
+                _umbral_tasks = list((_dt_by_room.get(room_id) or {}).values())
+                for _dtask in _umbral_tasks:
+                    _dtask.cancel()
+                for _dtask in _umbral_tasks:
+                    try:
+                        await _dtask
+                    except asyncio.CancelledError:
+                        # Expected: each runner re-raises its own
+                        # cancellation AFTER finalizing the durable
+                        # `cancelled` terminal entry. Re-raise only when
+                        # THIS umbral task is itself cancelled — our own
+                        # cancellation is never swallowed.
+                        _self = asyncio.current_task()
+                        if _self is not None and _self.cancelling():
+                            raise
+            finally:
+                self._active_turns.discard(room_id)
             archive_name = self.session_log.archive(room_id)
             self.session_log.wipe(room_id)
             self.session_log.append(
@@ -2403,6 +2494,90 @@ class MatrixBot:
                             if detail == "on":
                                 self._room_timesense[room_id] = True
                             _restored_timesense = detail
+                        # kdsn.330 R10: the room's quiet flag (D8) persists
+                        # as a room override — last-wins like the others;
+                        # detail "on"/"off" maps to the bool the delivery
+                        # fire/notice guards read (agent._room_quiet).
+                        elif ev == "quiet_override" and detail:
+                            if not hasattr(self.agent, "_room_quiet"):
+                                self.agent._room_quiet = {}
+                            self.agent._room_quiet[room_id] = (detail == "on")
+
+                # kdsn.330 R14/D5: reconstitute the per-room dispatch
+                # ledger from the JSONL chain (the rehydration parser is
+                # pure — records come back exactly as the chain records
+                # them). D5 kill-on-restart, never re-arm:
+                #  - a dispatch still `running` in the chain (no terminal
+                #    entry) AND with no live runner task for it (a
+                #    re-activation of an ACTIVE room keeps its own
+                #    in-flight work — live in-memory records win over
+                #    rebuilt ones) resolves to `orphaned_at_restart`, and
+                #    the resolution is DURABLE: a `subagent_terminal`
+                #    system entry (same persist path as every other
+                #    transition) lands in the causality chain before any
+                #    delivery work;
+                #  - a terminal record with no drain evidence (no
+                #    source="subagent_event" delivery entry in the chain
+                #    carrying the dispatch id) is `pending_delivery`,
+                #    deposited in the room inbox for the NEXT turn's
+                #    drain — a turn of any kind.
+                # NO synthetic fire, NO re-arm, NO keepalive (D5): the
+                # restart never does work the dead process was doing.
+                _recon = subledger.parse_ledger_entries(existing)
+                if _recon:
+                    _recon_ledger = self.agent._dispatch_ledger.setdefault(
+                        room_id, {})
+                    _recon_live_tasks = (
+                        getattr(self.agent, "_dispatch_tasks", {}) or {}
+                    ).get(room_id) or {}
+                    _delivered = {
+                        str(e.get("content") or "")
+                        for e in existing
+                        if e.get("role") == "user"
+                        and e.get("source") == "subagent_event"
+                    }
+                    for _did, _rec in _recon.items():
+                        if _did in _recon_ledger:
+                            continue  # live in-memory record wins
+                        _recon_ledger[_did] = _rec
+                        if _rec.state == subledger.RUNNING \
+                                and _did not in _recon_live_tasks:
+                            # kill-on-restart: the process died with this
+                            # dispatch in flight. Durably record the
+                            # resolution (idempotent — a later activation
+                            # parses the entry back and never
+                            # double-records).
+                            if _rec.transition(subledger.ORPHANED_AT_RESTART):
+                                try:
+                                    session_log.append(
+                                        role="system",
+                                        sender=self.config.user_id,
+                                        room=room_id,
+                                        event_id=None,
+                                        event="subagent_terminal",
+                                        detail=subledger.terminal_detail(_rec),
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "subagent reconstitute: orphan "
+                                        "resolution entry failed for %s "
+                                        "in %s", _did, room_id,
+                                        exc_info=True)
+                        elif _rec.state in (subledger.COMPLETED,
+                                            subledger.FAILED,
+                                            subledger.CANCELLED,
+                                            subledger.PENDING_DELIVERY):
+                            # terminal-but-undelivered: the drain's
+                            # delivery marker (a source="subagent_event"
+                            # entry for this dispatch) is absent — the
+                            # event goes to the room inbox for the next
+                            # turn's drain (transition() is only legal
+                            # from running; reconstitution sets state).
+                            if not any(_did in _d for _d in _delivered):
+                                _rec.state = subledger.PENDING_DELIVERY
+                                self.agent._pending_events.setdefault(
+                                    room_id, []).append(
+                                        subledger.terminal_event_dict(_rec))
 
                 # kdsn.329: rehydrate the token-anchor FLOOR from the last
                 # provider-reported true prompt size. Floor-only (None
