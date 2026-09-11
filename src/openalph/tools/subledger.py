@@ -406,8 +406,8 @@ def parse_ledger_entries(entries: list[dict]) -> dict[str, DispatchRecord]:
                     rec.state = state
                     rec.terminal_at = (detail.get("terminal_at")
                                        or entry.get("ts") or rec.terminal_at)
-            rec.result = detail.get("result")
-            rec.error = detail.get("error")
+                    rec.result = detail.get("result")
+                    rec.error = detail.get("error")
             rec.usage = {
                 "input_tokens": detail.get("input_tokens", 0) or 0,
                 "output_tokens": detail.get("output_tokens", 0) or 0,
