@@ -789,6 +789,25 @@ def build_callbacks(
             )
 
         _callbacks["subagent_dispatch"] = _subagent_dispatch_cb
+
+        # kdsn.330 R2: companion tool for background subagent dispatches —
+        # actions list|status|retrieve|cancel over the Agent-owned
+        # per-room dispatch ledger (cancel reaches the runner task in
+        # _dispatch_tasks; the runner's CancelledError path writes the
+        # durable `cancelled` terminal entry). Agent-bound (the state
+        # owner stays on Agent — no Matrix imports), thin closure like
+        # the other agent-state callbacks.
+        #
+        # Conditional on session_log exactly like subagent_dispatch
+        # above: the wire format's key set is pinned for session_log-less
+        # transports (test_callback_seam), and a transport with no JSONL
+        # ledger cannot persist the dispatch chain the status tool
+        # reports on — absence is the headless refusal (the tool branch
+        # returns is_error without the callback).
+        async def _subagent_status_cb(*, action, dispatch_id=None):
+            return await agent.subagent_status(action, room_id, dispatch_id)
+
+        _callbacks["subagent_status"] = _subagent_status_cb
     else:
         _callbacks["apply_handoff_boundary"] = None
         _callbacks["set_active_project"] = None

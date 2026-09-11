@@ -732,6 +732,54 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "default_max_iterations": 100
         }
     },
+    "subagent_status": {
+        "description": (
+            "Query, retrieve, or cancel background subagent dispatches "
+            "(the subagent(background=true) dispatch ledger) for this room. "
+            "list reports every dispatch in the room (id, state, task head; "
+            "plus terminal_at when terminal); status summarizes one dispatch "
+            "(state, task head, model, effort, dispatched_at, terminal_at); "
+            "retrieve returns the completed report text — retrieve is the "
+            "ONLY way to read a sub's report: completion delivery messages "
+            "are pointers and never carry results; cancel stops a running "
+            "dispatch (its work is lost; the ledger records it as terminal "
+            "cancelled). "
+            "IMPORTANT: sub-agents inherit this tool but every action is "
+            "deliberately refused for them (the read-refused policy is "
+            "pinned both ways). "
+            "NEVER cancel a dispatch you still need — terminal dispatches "
+            "(completed/failed/cancelled/orphaned) cannot be cancelled; "
+            "re-dispatch instead. "
+            "WHEN NOT TO USE: for your own context window / session "
+            "monitoring use /status (context_status), not this."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "status", "retrieve", "cancel"],
+                    "description": (
+                        "Action: \"list\" (every dispatch in this room), "
+                        "\"status\" (one dispatch's summary — needs id), "
+                        "\"retrieve\" (one dispatch's completed report — "
+                        "needs id, refused while running), \"cancel\" "
+                        "(stop a running dispatch — needs id)"
+                    )
+                },
+                "id": {
+                    "type": "string",
+                    "description": (
+                        "Dispatch id from the background dispatch receipt "
+                        "(required for status/retrieve/cancel; ignored by "
+                        "list)"
+                    )
+                }
+            },
+            "required": ["action"]
+        },
+        "config": {}
+    },
     "advisor": {
         "description": (
             "Consult a second, typically stronger model for strategic guidance mid-task. "
@@ -2627,6 +2675,45 @@ async def _execute_tool_inner(
             result = ToolResult(content=_json.dumps(status_data, indent=2))
         except Exception as e:
             result = ToolResult(content=f"Failed to get context status: {e}", is_error=True)
+    elif name == "subagent_status":
+        # kdsn.330 R2/R16: the companion tool for background subagent
+        # dispatches. The action logic is an agent-layer callback
+        # (build_callbacks, bound to the Agent-owned per-room dispatch
+        # ledger) — the context_status pattern: missing callback ⇒ is_error
+        # refusal (headless contexts that never wired build_callbacks).
+        if callbacks and callbacks.get("room_id") == "__sub__":
+            # R16: sub-agents inherit this tool but the __sub__ sentinel
+            # refuses EVERY action — the deliberate read-refused policy
+            # (a sub's own report IS its deliverable; it does not query the
+            # parent's dispatch ledger). The sentinel is read here, from
+            # callbacks["room_id"], not stripped in matrix.py.
+            return ToolResult(
+                is_error=True,
+                content="subagent_status is refused inside sub-agents "
+                        "(this room is a sub context — __sub__ sentinel). "
+                        "Deliver your report as your final response instead "
+                        "of querying the dispatch ledger.",
+            )
+        _status_cb = callbacks.get("subagent_status") if callbacks else None
+        if not _status_cb:
+            return ToolResult(
+                is_error=True,
+                content="subagent_status requires a callback from the agent "
+                        "layer (headless contexts: wire build_callbacks).",
+            )
+        _status_action = input.get("action")
+        if _status_action not in ("list", "status", "retrieve", "cancel"):
+            return ToolResult(
+                is_error=True,
+                content=f"Invalid subagent_status action {_status_action!r} "
+                        "— must be one of: list, status, retrieve, cancel",
+            )
+        try:
+            result = await _status_cb(action=_status_action,
+                                      dispatch_id=input.get("id"))
+        except Exception as e:
+            result = ToolResult(content=f"subagent_status failed: {e}",
+                                is_error=True)
     elif name == "send_media":
         from .media import send_media
         result = await send_media(

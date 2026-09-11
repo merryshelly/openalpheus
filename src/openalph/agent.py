@@ -1382,6 +1382,146 @@ class Agent:
             await ka_task
         logger.info("cache keepalive disarmed in %s (last async terminal)", room_id)
 
+    async def subagent_status(self, action: str, room_id: str,
+                              dispatch_id: str | None = None) -> ToolResult:
+        """kdsn.330 R2: the companion ``subagent_status`` tool actions
+        (``list`` | ``status`` | ``retrieve`` | ``cancel``) over the
+        room's dispatch ledger (Agent-owned, D4).
+
+        Truth-telling (D8): the per-room quiet flag suppresses delivery
+        fires and in-room notices, NEVER this — there is deliberately no
+        ``_room_quiet`` read in this method. Reset-room interplay is free:
+        ``reset_room`` clears the ledger, so a post-umbral room answers
+        unknown-id steering exactly like an id that never existed — no
+        special casing.
+        """
+        room_ledger = self._dispatch_ledger.get(room_id) or {}
+
+        if action == "list":
+            if not room_ledger:
+                return ToolResult(
+                    content="No background subagent dispatches in this room.",
+                    is_error=False)
+            lines = []
+            for did, rec in room_ledger.items():
+                line = f"- {did}: {rec.state} — task: {rec.task_head}"
+                if rec.terminal_at is not None:
+                    line += f" (terminal at {rec.terminal_at})"
+                lines.append(line)
+            return ToolResult(content="\n".join(lines), is_error=False)
+
+        if not dispatch_id:
+            return ToolResult(
+                is_error=True,
+                content=f"subagent_status action {action!r} requires an id "
+                        "(the dispatch id from the background dispatch "
+                        "receipt).",
+            )
+        rec = room_ledger.get(dispatch_id)
+        if rec is None:
+            # Unknown id — steer, never fabricate (also the post-umbral
+            # answer: the room's ledger starts dispatch-free).
+            return ToolResult(
+                is_error=True,
+                content=f"No dispatch {dispatch_id!r} in this room's "
+                        "ledger. Use action=\"list\" to see the live "
+                        "dispatch ids (a room that just went through an "
+                        "umbral starts dispatch-free).",
+            )
+
+        if action == "status":
+            fields = [
+                f"dispatch_id: {rec.dispatch_id}",
+                f"state: {rec.state}",
+                f"task: {rec.task_head}",
+                f"model: {rec.model}",
+                f"effort: {rec.effort}",
+                f"dispatched_at: {rec.dispatched_at}",
+                f"terminal_at: {rec.terminal_at}",
+            ]
+            return ToolResult(content="\n".join(fields), is_error=False)
+
+        if action == "retrieve":
+            if rec.state == subledger.RUNNING:
+                return ToolResult(
+                    is_error=True,
+                    content=f"Dispatch {dispatch_id!r} is still running — "
+                            "no report exists yet. Check it with "
+                            "subagent_status(action=\"status\", "
+                            f"id=\"{dispatch_id}\") or wait for the "
+                            "completion notice.",
+                )
+            if rec.state == subledger.ORPHANED_AT_RESTART:
+                return ToolResult(
+                    is_error=True,
+                    content=f"Dispatch {dispatch_id!r} was orphaned at "
+                            "restart — killed in flight, no result exists. "
+                            "Re-dispatch the task if it is still needed.",
+                )
+            if rec.result is not None:
+                # Report-only (R11): the stored result bytes, no metadata
+                # block — and this ToolResult flows through the normal
+                # pipeline (credential redaction in the execute_tool tail,
+                # truncate+wrap at the call site), exactly like any other
+                # tool result.
+                report = rec.result
+                limit = getattr(self.config, "truncation_limit", None)
+                if limit and len(report) > limit:
+                    # R11 over-truncation: the standard house marker,
+                    # re-pointed at the flight recorder — the sub's FULL
+                    # output lives in sessions/subs/.
+                    removed = len(report) - limit
+                    marker = (f"[truncated: {removed} chars removed — "
+                              "full report in the flight recorder: "
+                              "sessions/subs/]")
+                    head_len = max(limit - len(marker), 0)
+                    report = report[:head_len] + marker
+                return ToolResult(content=report, is_error=False)
+            # Terminal without a report (failed / cancelled): the
+            # report-only surface has nothing to retrieve — the truth is
+            # the state + the sanitized error line.
+            return ToolResult(
+                content=f"Dispatch {dispatch_id!r} reached {rec.state} "
+                        f"with no report. Error: "
+                        f"{rec.error or '(none recorded)'}",
+                is_error=False,
+            )
+
+        if action == "cancel":
+            if rec.state != subledger.RUNNING:
+                return ToolResult(
+                    is_error=True,
+                    content=f"Cannot cancel an already-terminal dispatch "
+                            f"{dispatch_id!r} (state: {rec.state}). "
+                            "Re-dispatch if the work is still needed.",
+                )
+            tasks_by_room = self._dispatch_tasks.get(room_id) or {}
+            task = tasks_by_room.get(dispatch_id)
+            if task is None or task.done():
+                return ToolResult(
+                    is_error=True,
+                    content=f"No live background task found for dispatch "
+                            f"{dispatch_id!r} — its ledger state may be "
+                            "stale; use action=\"status\" to check.",
+                )
+            # The same primitive Agent.cancel uses for /stop (D7): the
+            # runner observes the cancellation, writes the durable
+            # `cancelled` terminal entry via its finalizer, and re-raises
+            # so the task graph stays truthful.
+            task.cancel()
+            return ToolResult(
+                content=f"Cancelled dispatch {dispatch_id!r} — the runner "
+                        "records it as terminal `cancelled`. Confirm with "
+                        "action=\"status\".",
+                is_error=False,
+            )
+
+        return ToolResult(
+            is_error=True,
+            content=f"Invalid subagent_status action {action!r} — must be "
+                    "one of: list, status, retrieve, cancel",
+        )
+
     async def handle_input(self, text: str, room_id: str = "_default", *,
                            on_tool_call=None, on_tool_intent=None, thinking: str | None = None,
                            callbacks: dict | None = None,
