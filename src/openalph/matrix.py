@@ -3831,15 +3831,24 @@ class MatrixBot:
                                         "handoff /cache: applied-boundary "
                                         "note failed for %s (fail-soft)",
                                         room_id, exc_info=True)
-                        try:
-                            await self.send_notice(
-                                room_id,
-                                _handoff_confirm_text(outcome, "slash"))
-                        except Exception:
-                            logger.warning(
-                                "handoff /cache: operator notice failed for "
-                                "%s (fail-soft)", room_id, exc_info=True)
+                            try:
+                                await self.send_notice(
+                                    room_id,
+                                    _handoff_confirm_text(outcome, "slash"))
+                            except Exception:
+                                logger.warning(
+                                    "handoff /cache: operator notice failed for "
+                                    "%s (fail-soft)", room_id, exc_info=True)
                         else:
+                            # kdsn.340: the no-op notice is the else of the
+                            # APPLIED check — it was a sibling try/else that
+                            # fired on every SUCCESSFUL slash boundary
+                            # (spurious "not applied — no-op" right after
+                            # the confirm) while refusals also got a junk
+                            # apply-headline (render_handoff_notice assumes
+                            # an applied outcome). Refusals surface ONLY
+                            # the reason here — the shared seam posts no
+                            # notice for no-op outcomes by contract.
                             await self.send_notice(
                                 room_id,
                                 f"⚠️ Handoff boundary not applied — "

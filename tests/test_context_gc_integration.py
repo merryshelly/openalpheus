@@ -593,6 +593,129 @@ class TestSlashAuditFixes:
             "a boundary that cleared the auto threshold must re-arm the "
             "auto tier (pop the churn latch)")
 
+
+class TestSlashNoticePairPins:
+    """kdsn.340 (2026-09-12): the /cache handoff operator notice pair.
+
+    The else of the confirm-notice try was misattached — it ran on
+    SUCCESS, so every applied slash boundary emitted a spurious
+    '⚠️ Handoff boundary not applied — no-op' right after the confirm
+    (while /status truthfully showed the boundary applied), and REAL
+    no-ops (applied=False) posted nothing. Pins: applied → confirm only,
+    never 'not applied'; refused → the no-op notice carries noop_reason.
+    """
+
+    def _bot(self, tmp_path):
+        """Same real MatrixBot shell as TestSlashAuditFixes._bot."""
+        from openalph.matrix import MatrixBot
+        from openalph.agent import Agent
+        from openalph.config import MatrixConfig
+
+        ws = tmp_path
+        (ws / "skills").mkdir(exist_ok=True)
+        config = _cfg(ws)
+        agent = Agent(config)
+        mcfg = MatrixConfig(
+            homeserver="https://matrix.local", user_id=AGENT_ID,
+            device_id="TEST", password="p", access_token=None,
+            context_reserve=16384, sync_timeout=30000,
+            retry_base=1, retry_max=10,
+        )
+        bot = MatrixBot.__new__(MatrixBot)
+        bot.config = mcfg
+        bot.agent = agent
+        bot.client = MagicMock()
+        bot.client.room_send = AsyncMock(return_value=MagicMock(event_id="$r1"))
+        bot.client.room_typing = AsyncMock()
+        bot._current_room = None
+        bot._synced = True
+        bot._active_rooms = set()
+        bot._room_effort = {}
+        bot._room_cache_ttl = {}
+        bot._room_timesense = {}
+        bot._halted_rooms = set()
+        bot._background_tasks = set()
+        bot._session_locks = {}
+        bot.session_log = SessionLog(ws, AGENT_ID)
+        bot.heartbeat = None
+        bot.umbral = None
+        bot._degraded_provider_notice = {}
+        return bot, agent
+
+    def _seeded_room(self, bot, agent):
+        log = bot.session_log
+        for e in [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+            {"role": "tool", "call_id": "c1", "name": "shell",
+             "output": "o" * 4000},
+        ]:
+            log.append(room=ROOM, sender=AGENT_ID, **e)
+        agent._rooms[ROOM] = list(agent.history(ROOM)) or []
+        agent.history(ROOM).extend(log.build_context(ROOM))
+        return log
+
+    @staticmethod
+    def _send_contents(bot):
+        out = []
+        for c in bot.client.room_send.call_args_list:
+            content = c.kwargs.get("content")
+            if content is None and len(c.args) >= 3:
+                content = c.args[2]
+            content = content or {}
+            if content.get("msgtype") in ("m.text", "m.notice"):
+                out.append(content)
+        return out
+
+    def test_applied_boundary_emits_confirm_and_never_noop(self, tmp_path):
+        """Real path: a successful /cache handoff emits the confirm notice
+        and NO 'not applied' line (kdsn.340: the try/except/else else ran
+        on confirm success, posting the spurious no-op after every apply)."""
+        bot, agent = self._bot(tmp_path)
+        self._seeded_room(bot, agent)
+        room = MagicMock()
+        room.room_id = ROOM
+        asyncio.new_event_loop().run_until_complete(
+            bot._handle_room_message(room, _event("/cache handoff")))
+        markers = [e for e in bot.session_log.read(ROOM)
+                   if e.get("event") == "handoff_boundary"]
+        assert markers, "the boundary must be applied"
+        sent = "\n".join(c.get("body", "") for c in self._send_contents(bot))
+        assert "applied (slash)" in sent, "confirm notice must reach the room"
+        assert "not applied" not in sent, (
+            "kdsn.340: a SUCCESSFUL slash boundary must not emit the "
+            "'not applied — no-op' notice")
+
+    def test_refused_boundary_emits_noop_notice_with_reason(self, tmp_path):
+        """The applied=False branch must emit the no-op notice carrying the
+        noop_reason (previously the else was unreachable for refusals —
+        real no-ops were silent). The boundary function is the upstream
+        input here; the branch under test is the notice logic."""
+        from unittest.mock import patch as _patch
+        bot, agent = self._bot(tmp_path)
+        self._seeded_room(bot, agent)
+        room = MagicMock()
+        room.room_id = ROOM
+        refusal = {"applied": False,
+                   "noop_reason": "computed boundary index 4 does not "
+                                  "exceed current boundary index 4",
+                   "manifest": None, "over_budget": False,
+                   "handoff_advised": False}
+        with _patch("openalph.matrix.apply_boundary_and_rebuild",
+                    return_value=refusal):
+            asyncio.new_event_loop().run_until_complete(
+                bot._handle_room_message(room, _event("/cache handoff")))
+        sent = [c.get("body", "") for c in self._send_contents(bot)]
+        noops = [b for b in sent if "not applied" in b]
+        assert noops, "a REFUSED boundary must emit the no-op notice"
+        assert "does not exceed" in noops[0], (
+            "the noop_reason must surface to the operator, not a bare no-op")
+        assert not any("applied (slash)" in b for b in sent), (
+            "kdsn.340: the refusal path must not post the apply-headline — "
+            "render_handoff_notice assumes an applied outcome (manifest is "
+            "None) and must never be called for refusals")
+
+
 # ============================================================================
 # Real-path agent-loop pinning (workspace-kdsn.305.2, authored post-305 build).
 # Canonical pattern per tests/test_guidance_integration.py: REAL Agent + REAL

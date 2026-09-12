@@ -1132,12 +1132,19 @@ class Agent:
         # the sub RUN receives the raw input model (None -> the sub's own
         # default resolution), byte-identical to the sync path.
         rec_model = model or self.get_model(room_id)
+        # kdsn.338: same provenance discipline for effort — the sub RUN
+        # resolves the omitted param to the default inside run_subagent
+        # (kdsn.305.14), so the record (and every surface reading it:
+        # subagent_status, the dispatched/terminal JSONL details) must
+        # carry the RESOLVED value, never the raw None.
+        rec_effort = (effort if effort is not None
+                      else _tools_subagent.DEFAULT_EFFORT)
         rec = subledger.DispatchRecord(
             dispatch_id=dispatch_id,
             task=task,
             task_head=subledger.make_task_head(task),
             model=rec_model,
-            effort=effort,
+            effort=rec_effort,
             dispatched_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         self._dispatch_ledger.setdefault(room_id, {})[dispatch_id] = rec

@@ -125,6 +125,23 @@ class TestNoticeSurfaces:
         assert "log_subagent_event" in (SRC / "agent.py").read_text(), (
             "drain-seam JSONL log callback missing from the agent drain")
 
+    def test_subagent_event_notice_has_icon_prefix(self):
+        """kdsn.339: the terminal notice must be visually scannable as a
+        sub-agent event — the house sub-agent icon (🤖, same family as the
+        sync completion notice) prefixes the display line. The icon is
+        display-only decoration: it sits OUTSIDE the frame and the exact
+        event-line bytes it must carry stay intact below it."""
+        from openalph.tools import subledger
+        event = {"dispatch_id": "tc_icon_1", "state": "completed",
+                 "task_head": "icon check",
+                 "terminal_at": "2026-09-12T00:00:00Z"}
+        notice = subledger.terminal_notice_line([event])
+        assert notice.startswith("🤖 "), (
+            "terminal notice must carry the sub-agent icon prefix (kdsn.339)")
+        line = subledger.format_event_line(event)
+        assert line in notice, "icon must not displace the event line bytes"
+        assert "\n" not in notice, "notice must stay collapsed to one line"
+
     def test_snapshot_surface_is_behavioral_not_decorative(self):
         """The surface must carry the inserted bytes end-to-end: boundary
         outcome carries the framed snapshot AND the notice renders it. See

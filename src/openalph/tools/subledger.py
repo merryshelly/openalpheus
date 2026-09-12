@@ -241,7 +241,11 @@ def terminal_notice_line(events: list[dict]) -> str:
 
     Carries the exact event line bytes the model sees — never a
     restated summary (inserts-visible lint pin)."""
-    return SUBAGENT_EVENT_FRAME + " — " + " | ".join(
+    # kdsn.339: house sub-agent icon (🤖 — same family as the sync
+    # completion notice) prefixes the DISPLAY line. Display-only: the icon
+    # is not part of the model-facing frame bytes; the exact event lines
+    # stay intact after it.
+    return "🤖 " + SUBAGENT_EVENT_FRAME + " — " + " | ".join(
         format_event_line(e) for e in events)
 
 

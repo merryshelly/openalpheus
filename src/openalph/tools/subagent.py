@@ -34,6 +34,12 @@ MAX_ITERATIONS = 100
 # own module constant.
 _EFFORT_LEVELS = ("off", "low", "medium", "high", "xhigh", "max")
 
+# kdsn.338: the omitted-param default (kdsn.305.14 ruling) as a named
+# constant — BOTH the sync resolution below and the async dispatch ledger
+# record (agent.dispatch_background_subagent) resolve against it, so the
+# record always states the effort the sub will actually run at.
+DEFAULT_EFFORT = "medium"
+
 # Safety preamble loaded once at import time — shared across all subagent invocations.
 # This file contains hard safety constraints that every subagent must follow.
 _PREAMBLE_PATH = Path("/srv/openalph/shared/skills/subagent-preamble.md")
@@ -236,7 +242,7 @@ async def run_subagent(
     # Default-to-medium by construction: config.thinking is bypassed
     # entirely (ruling 1) — every complete() below carries an explicit
     # thinking value, never None.
-    effective_effort = effort if effort is not None else "medium"
+    effective_effort = effort if effort is not None else DEFAULT_EFFORT
 
     # Build system prompt: safety preamble + custom/default
     system = _build_system_prompt(system_prompt)

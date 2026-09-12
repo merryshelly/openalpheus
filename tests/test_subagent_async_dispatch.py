@@ -120,6 +120,30 @@ async def test_effort_param_passthrough(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_effort_default_recorded_resolved(tmp_path):
+    """kdsn.338: the ledger record must carry the RESOLVED default effort.
+
+    run_subagent runs the sub at 'medium' when the param is omitted
+    (kdsn.305.14, unchanged for async per spec §7) — so the record (and
+    every surface reading it: subagent_dispatched/terminal JSONL details,
+    subagent_status status) must say 'medium', not the raw None. The R4
+    model-provenance pattern (record what will run) applied to effort too.
+    """
+    bot, agent = build_bot(tmp_path)
+    from openalph.tools import execute_tool
+    with patch("openalph.tools.subagent.run_subagent", new_callable=AsyncMock) as m:
+        m.return_value = __import__("openalph.tools", fromlist=["ToolResult"]).ToolResult(
+            content="ok", is_error=False)
+        await execute_tool("subagent", sub_tool_call(),  # no effort key
+                           {}, agent.config, tools=None, callbacks=_cb(bot, "tc_k338"))
+    rec = agent._dispatch_ledger.get(ROOM, {}).get("tc_k338")
+    assert rec is not None
+    assert rec.effort == "medium", (
+        "record must carry the resolved default effort, not the raw None "
+        "(kdsn.338: 'effort: None' in subagent_status misled the operator)")
+
+
+@pytest.mark.asyncio
 async def test_background_absent_is_sync_default(tmp_path):
     """Spec non-goal guard: no background param ⇒ the legacy sync path."""
     bot, agent = build_bot(tmp_path)

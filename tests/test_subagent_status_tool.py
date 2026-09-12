@@ -82,6 +82,25 @@ async def test_status_single_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_status_shows_resolved_effort(tmp_path):
+    """kdsn.338: the status surface renders the RESOLVED effort — the
+    dispatch default (medium) when the call omitted the param, never the
+    raw record None ('effort: None' is what misled the operator in the
+    2026-09-12 wonmun smoke)."""
+    bot, agent = build_bot(tmp_path)
+    call_id = await _dispatch_one(tmp_path, bot, agent, call_id="tc_g5_eff",
+                                  delay=0.0)
+    await await_terminal(agent, ROOM, call_id)
+    await settle()
+    res = await _status(agent, "status", _cb(bot), id=call_id)
+    assert not res.is_error
+    assert "effort: None" not in res.content, (
+        "raw None must never surface as the effort value (kdsn.338)")
+    assert "effort: medium" in res.content, (
+        "the resolved default effort must be displayed")
+
+
+@pytest.mark.asyncio
 async def test_retrieve_returns_completed_report(tmp_path):
     bot, agent = build_bot(tmp_path)
     await _dispatch_one(tmp_path, bot, agent, call_id="tc_g5_r1", delay=0.0,
