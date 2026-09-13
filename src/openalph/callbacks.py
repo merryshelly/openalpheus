@@ -321,9 +321,16 @@ def build_context_status(agent, room_id, *, room_name=None, session_log=None, he
     _hist = session_log.build_context(room_id) if session_log else None
     status_data = agent.status(room_id, history=_hist)
 
-    # Session age
+    # Session age + turn count from the canonical JSONL
     if session_log:
         entries = session_log.read(room_id)
+        # kdsn.342: turn counts come from the canonical store — agent.status()
+        # counts in-memory history, which a handoff boundary legitimately
+        # strips to the snapshot entry (render strip is NOT state reset).
+        status_data["turns"] = sum(
+            1 for e in entries
+            if e.get("role") == "user"
+            and e.get("source") != "handoff_snapshot")
         if entries:
             first_ts = entries[0].get("ts", "")
             try:
@@ -544,10 +551,13 @@ def build_callbacks(
     (pre-Spotter / transport-less) keep the historical 17-key wire format.
     """
 
-    async def _context_status_callback(req_room_id=None):
+    async def _context_status_callback():
+        # kdsn.342: always the INVOKING room — tool input can never select
+        # another room (a fabricated id previously fabricated a report:
+        # zero counters + config-default model + this room's name).
         return build_context_status(
             agent,
-            req_room_id or room_id,
+            room_id,
             room_name=room_name,
             session_log=session_log,
             heartbeat=heartbeat,

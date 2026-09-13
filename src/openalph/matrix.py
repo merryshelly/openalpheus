@@ -3662,6 +3662,15 @@ class MatrixBot:
                 _status_history = self.session_log.build_context(
                     room_id)
             status = self.agent.status(room_id, history=_status_history)
+            # kdsn.342: turns from the canonical JSONL — a handoff boundary
+            # strips RENDER (the in-memory history rebuild), never session
+            # accounting; without this every applied boundary collapses the
+            # row to ~1 on BOTH status surfaces.
+            if getattr(self, 'session_log', None):
+                status["turns"] = sum(
+                    1 for e in self.session_log.read(room_id)
+                    if e.get("role") == "user"
+                    and e.get("source") != "handoff_snapshot")
             ctx = status['context_tokens']
             ctx_max = status['context_max']
             ctx_pct = status['context_pct']

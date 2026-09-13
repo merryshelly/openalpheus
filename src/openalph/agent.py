@@ -3073,6 +3073,11 @@ class Agent:
         If history is provided (e.g. from session_log.build_context()),
         use it for the context estimate instead of raw in-memory history.
         This ensures toolstrip-aware context sizes.
+
+        turns is counted from in-memory history — the fallback for callers
+        with no session log. Handoff boundaries strip the in-memory
+        rebuild, so session-log-equipped callers (/status, context_status)
+        recompute turns from the canonical JSONL (kdsn.342).
         """
         context_tokens = self._estimate_context_tokens(room_id, history=history)
         model_max = self._resolve_model_limit(room_id)

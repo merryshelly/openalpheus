@@ -715,6 +715,30 @@ class TestSlashNoticePairPins:
             "render_handoff_notice assumes an applied outcome (manifest is "
             "None) and must never be called for refusals")
 
+    def test_status_turns_survive_boundary(self, tmp_path):
+        """kdsn.342: /status turns must count the SESSION (canonical JSONL),
+        not the post-rebuild in-memory history — else every applied
+        boundary collapses both accounting surfaces to turns≈1."""
+        bot, agent = self._bot(tmp_path)
+        log = self._seeded_room(bot, agent)  # 1 user entry
+        for i in range(2):  # 3 user entries total
+            log.append(room=ROOM, sender=AGENT_ID, role="user", content=f"u{i}")
+            log.append(room=ROOM, sender=AGENT_ID, role="assistant",
+                       content=f"a{i}")
+        from openalph.handoff import apply_boundary_and_rebuild
+        outcome = apply_boundary_and_rebuild(
+            agent, log, ROOM, trigger="slash", exclude_inflight=False)
+        assert outcome.get("applied"), "fixture boundary must apply"
+        agent._note_handoff_boundary_applied(ROOM, outcome)
+        room = MagicMock()
+        room.room_id = ROOM
+        asyncio.new_event_loop().run_until_complete(
+            bot._handle_room_message(room, _event("/status")))
+        sent = "\n".join(c.get("body", "") for c in self._send_contents(bot))
+        assert "| **Turns** | 3 |" in sent, (
+            "post-boundary /status collapsed Turns to the in-memory rebuild")
+        assert "| **Turns** | 1 |" not in sent
+
 
 # ============================================================================
 # Real-path agent-loop pinning (workspace-kdsn.305.2, authored post-305 build).

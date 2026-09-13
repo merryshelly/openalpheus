@@ -908,16 +908,12 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "Return current agent self-monitoring data as JSON: context window usage, "
             "session age, model info, token stats, and heartbeat state. "
             "Use before delegating or when approaching context limits to inform handoff decisions. "
-            "No parameters required — room_id is injected by the framework."
+            "No parameters required (and none accepted) — it always reports the "
+            "calling room; room identity comes from the session, never the tool input."
         ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "room_id": {
-                    "type": "string",
-                    "description": "Room ID (injected by framework, do not set manually)"
-                }
-            },
+            "properties": {},
             "required": []
         },
         "config": {}
@@ -2671,7 +2667,11 @@ async def _execute_tool_inner(
                 is_error=True,
             )
         try:
-            status_data = await cb(input.get("room_id"))
+            # kdsn.342: room identity comes from the session callback —
+            # never from tool input (a model-supplied id previously built a
+            # report for a NONEXISTENT room: zero counters + config default
+            # model composited with the real room's name).
+            status_data = await cb()
             result = ToolResult(content=_json.dumps(status_data, indent=2))
         except Exception as e:
             result = ToolResult(content=f"Failed to get context status: {e}", is_error=True)

@@ -32,10 +32,23 @@ class TestToolRegistration:
         schema = BUILTIN_TOOLS["context_status"]["parameters"]
         assert schema.get("required", []) == []
 
-    def test_has_room_id_parameter(self):
-        """room_id is an optional parameter (framework injects it)."""
-        props = BUILTIN_TOOLS["context_status"]["parameters"]["properties"]
-        assert "room_id" in props
+    def test_no_room_id_parameter(self):
+        """kdsn.342: room identity comes from the session, never the input.
+
+        The old optional ``room_id`` param was documented "framework-
+        injected, do not set manually" — but nothing injected it: the seam
+        honoured ANY model-supplied id verbatim and would silently build a
+        report for a NONEXISTENT room (zero counters + config-default model
+        + the closure's REAL room_name — a composite Franken-report that
+        read like boundary damage). The schema now carries no room selector
+        at all — context_status reports the calling room, period."""
+        entry = BUILTIN_TOOLS["context_status"]
+        props = entry["parameters"]["properties"]
+        assert "room_id" not in props, (
+            "context_status must not accept a room selector — it always "
+            "reports the calling room")
+        assert "calling room" in entry["description"], (
+            "the description must state the calling-room scope")
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +67,84 @@ def _make_config(workspace=None):
         )},
         workspace=workspace or Path("/tmp/test-workspace"),
     )
+
+
+class TestCallingRoomOnly:
+    """kdsn.342 (2026-09-12): context_status is session-scoped, period.
+
+    Real-path pins (real Agent + real SessionLog + REAL build_callbacks
+    seam): the seam must never let tool input select another room, and
+    session accounting must survive a handoff boundary (the boundary
+    strips RENDER, never state).
+    """
+
+    ROOM = "!cs342:test"
+
+    def _scene(self, tmp_path, n_user=3):
+        """Real Agent + real SessionLog + REAL callback-construction path."""
+        from openalph.agent import Agent
+        from openalph.session import SessionLog
+        from openalph.callbacks import build_callbacks, HeadlessSinks
+
+        config = _make_config(workspace=tmp_path)
+        agent = Agent(config)
+        log = SessionLog(tmp_path, "@cs342:test")
+        for i in range(n_user):
+            log.append(role="user", sender="@sb:test", room=self.ROOM,
+                       content=f"q{i}")
+            log.append(role="assistant", sender="@cs342:test",
+                       room=self.ROOM, content=f"a{i} " + "z" * 300)
+        agent._room_models[self.ROOM] = "macstudio-qwen/qwen38-coder"
+        cbids = build_callbacks(
+            agent, self.ROOM, HeadlessSinks(), turn_source=None,
+            session_log=log, room_name="cs342 room")
+        return agent, log, cbids
+
+    @pytest.mark.asyncio
+    async def test_bogus_input_room_id_cannot_select_another_room(self, tmp_path):
+        """The seam must never build a report for a nonexistent room — a
+        fabricated id previously produced zero-counters + config-default
+        model + the closure's REAL room_name (the kdsn.342 Franken-report)."""
+        agent, log, cbids = self._scene(tmp_path)
+        res = await execute_tool(
+            name="context_status",
+            input={"room_id": "!totally-fabricated:room"},
+            tool_config={}, agent_config=agent.config, callbacks=cbids)
+        data = json.loads(res.content)
+        assert data["room_id"] == self.ROOM, (
+            "model-supplied room_id silently selected another room")
+        assert data["room_name"] == "cs342 room", (
+            "a bogus id produced a room_name belonging to neither room")
+        assert data["model"] == "macstudio-qwen/qwen38-coder", (
+            "fabricated room reported the config default, not the override")
+        assert data["turns"] == 3, "fabricated room zeroed the session counters"
+        assert "!totally-fabricated" not in res.content
+
+    @pytest.mark.asyncio
+    async def test_truthful_after_handoff_boundary(self, tmp_path):
+        """A boundary strips RENDER, never accounting: turns/age/usage/
+        model must remain truthful after apply + _note."""
+        agent, log, cbids = self._scene(tmp_path)
+        u = agent._usage_for(self.ROOM)
+        u["uncached_input_tokens"] = 50000
+        u["total_output_tokens"] = 1234
+        from openalph.handoff import apply_boundary_and_rebuild
+        outcome = apply_boundary_and_rebuild(
+            agent, log, self.ROOM, trigger="tool", exclude_inflight=False)
+        assert outcome.get("applied"), "fixture boundary must apply"
+        agent._note_handoff_boundary_applied(self.ROOM, outcome)
+        res = await execute_tool(
+            name="context_status", input={}, tool_config={},
+            agent_config=agent.config, callbacks=cbids)
+        data = json.loads(res.content)
+        assert data["turns"] == 3, (
+            f"post-boundary turns collapsed to {data['turns']} — counted "
+            f"from the stripped in-memory rebuild instead of the JSONL")
+        assert data["session_age_minutes"] is not None
+        assert data["uncached_input_tokens"] == 50000, (
+            "boundary must not zero usage counters")
+        assert data["model"] == "macstudio-qwen/qwen38-coder"
+        assert data["room_id"] == self.ROOM
 
 
 class TestContextStatusExecution:
