@@ -1899,10 +1899,11 @@ class Agent:
                                 logger.warning(
                                     "log_subagent_event callback failed in %s",
                                     room_id, exc_info=True)
-                        # Collapsed in-room notice carrying the exact event
-                        # line bytes (inserts-visible; D1). Suppressed under
-                        # the room's quiet flag (D8: quiet suppresses fires
-                        # AND notices — never status truth). Best-effort:
+                        # Collapsed house-fold in-room notice (headline +
+                        # folded frame/event lines via MatrixSinks —
+                        # inserts-visible; D1). Suppressed under the room's
+                        # quiet flag (D8: quiet suppresses fires AND
+                        # notices — never status truth). Best-effort:
                         # delivery is never gated on the notice.
                         if not getattr(self, "_room_quiet", {}).get(room_id):
                             _notice_ev_cb = (callbacks or {}).get("send_notice")
@@ -1910,7 +1911,7 @@ class Agent:
                                 try:
                                     await _notice_ev_cb(
                                         room_id,
-                                        subledger.terminal_notice_line(_sub_events))
+                                        subledger.terminal_notice(_sub_events))
                                 except Exception:
                                     logger.warning(
                                         "subagent event notice failed in %s",

@@ -57,9 +57,20 @@ async def test_stop_writes_terminal_entry_and_notice(tmp_path):
     entries = ledger_entries(bot.session_log, ROOM, "subagent_terminal")
     assert any("tc_g6b" in str(e.get("detail")) for e in entries), (
         "cancellation entry missing from the ledger causality chain")
-    notices = [str(c.args[1]) for c in bot.send_notice.call_args_list
-               if len(c.args) >= 2]
-    assert any("tc_g6b" in n for n in notices), "no room notice for the cancellation"
+    # The cancellation terminal event reaches the room as a notice through
+    # the fire path — MatrixSinks.send_notice (house <details> fold), which
+    # lands on _room_send_with_retry, not the placeholder send_notice mock.
+    sent = [c.args[1] for c in bot._room_send_with_retry.call_args_list
+            if len(c.args) >= 2 and isinstance(c.args[1], dict)
+            and c.args[1].get("msgtype") == "m.notice"]
+    assert any("tc_g6b" in str(n.get("body", "")) for n in sent), (
+        "no room notice for the cancellation")
+    # Seam pin (kdsn.339 follow-up): terminal notices never ride the plain
+    # un-folded send_notice (the drain-path notice inside the synthetic turn
+    # would satisfy the positive assertion either way — this discriminates
+    # the fire path's OWN notice).
+    assert not any("tc_g6b" in str(c) for c in bot.send_notice.call_args_list), (
+        "terminal notice leaked to the plain un-folded send_notice seam")
 
 
 # --- umbral (D6) ------------------------------------------------------------

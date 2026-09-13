@@ -190,12 +190,30 @@ async def test_synthetic_turn_framing_and_turn_source(tmp_path):
     assert synth, "no synthetic turn"
     body = str(synth[0].get("content"))
     assert body.startswith(EVENT_FRAME), "synthetic content must lead with harness framing"
-    # Notice surface exists in-room (display-only channel):
-    notice_bodies = [c.args[1] for c in bot.send_notice.call_args_list
-                     if len(c.args) >= 2] or \
-                    [c.kwargs.get("body") for c in bot.send_notice.call_args_list]
-    assert any("tc_g3h" in str(b) for b in notice_bodies if b), (
-        "no in-room notice carrying the terminal event (inserts-visible invariant)")
+    # Notice surface exists in-room (display-only channel): the fire path
+    # rides the SAME seam as the live drain — MatrixSinks.send_notice,
+    # which means line 1 is the <details> summary and the frame + exact
+    # event lines fold (kdsn.339 follow-up; the placeholder
+    # bot.send_notice mock is NOT the seam, _room_send_with_retry is).
+    sent = [c for c in bot._room_send_with_retry.call_args_list
+            if len(c.args) >= 2 and isinstance(c.args[1], dict)]
+    notices = [c.args[1] for c in sent
+               if c.args[1].get("msgtype") == "m.notice"]
+    assert notices, "no in-room notice sent for the terminal event"
+    assert any("tc_g3h" in str(c.get("body", "")) for c in notices), (
+        "no in-room notice carrying the terminal event "
+        "(inserts-visible invariant)")
+    assert any("<details>" in str(c.get("formatted_body", ""))
+               for c in notices), (
+        "the fire-path notice must ride the house <details> fold "
+        "(MatrixSinks), not the plain un-folded m.notice")
+    # Seam pin (kdsn.339 follow-up): the fire path's OWN notice must not
+    # leak through the bot's plain, un-folded send_notice — every terminal
+    # notice rides the MatrixSinks fold (the drain-path notice inside the
+    # synthetic turn would satisfy the positive assertions either way, so
+    # this is the discriminating check).
+    assert not any("tc_g3h" in str(c) for c in bot.send_notice.call_args_list), (
+        "fire-path notice leaked to the plain un-folded send_notice seam")
 
 
 @pytest.mark.asyncio

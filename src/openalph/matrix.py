@@ -1729,12 +1729,15 @@ class MatrixBot:
                     detail={"dispatch_ids": [
                         e.get("dispatch_id") for e in events]},
                 )
-            # Collapsed one-line in-room notice carrying the exact event
-            # line bytes the model will see (inserts-visible — never a
-            # restated summary).
+            # Collapsed house-fold in-room notice — the SAME seam as the
+            # live drain (MatrixSinks.send_notice: line 1 = <details>
+            # summary; frame + exact event lines fold). Never a restated
+            # summary (inserts-visible; kdsn.339 follow-up — the plain
+            # send_notice here rendered the whole burst above the fold and
+            # inconsistent with the drain path).
             try:
-                await self.send_notice(
-                    room_id, subledger.terminal_notice_line(events))
+                await MatrixSinks(self, room_id).send_notice(
+                    room_id, subledger.terminal_notice(events))
             except Exception:
                 logger.warning(
                     "subagent completion notice failed in %s", room_id,

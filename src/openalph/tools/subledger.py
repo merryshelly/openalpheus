@@ -236,17 +236,29 @@ def frame_subagent_event_content(raw_lines: str) -> str:
     return SUBAGENT_EVENT_FRAME + "\n" + raw_lines
 
 
-def terminal_notice_line(events: list[dict]) -> str:
-    """Collapsed ONE-line in-room notice for a terminal burst (D1/R6).
+def terminal_notice(events: list[dict]) -> str:
+    """House-pattern collapsed in-room notice for a terminal burst (D1/R6).
 
-    Carries the exact event line bytes the model sees — never a
-    restated summary (inserts-visible lint pin)."""
-    # kdsn.339: house sub-agent icon (🤖 — same family as the sync
-    # completion notice) prefixes the DISPLAY line. Display-only: the icon
-    # is not part of the model-facing frame bytes; the exact event lines
-    # stay intact after it.
-    return "🤖 " + SUBAGENT_EVENT_FRAME + " — " + " | ".join(
-        format_event_line(e) for e in events)
+    Rides `MatrixSinks.send_notice` — the reminder/handoff convention —
+    so LINE 1 is the `<details>` summary above the fold: the 🤖 sub-agent
+    icon plus a deterministic count/state summary built ONLY from
+    closed-vocabulary values (state is an enum; MatrixSinks inserts the
+    summary line raw into formatted HTML, and task heads/ids are
+    model-authored free text — they belong in the escaped fold).
+    Everything after line 1 folds: the provenance frame the model sees,
+    then the exact event-line bytes the model sees — never a restated
+    summary (inserts-visible; the kdsn.339 follow-up replaced the
+    unreadable wall-of-text one-liner at the operator's ruling)."""
+    counts: dict[str, int] = {}
+    for e in events:
+        state = str(e.get("state", "?"))
+        counts[state] = counts.get(state, 0) + 1
+    parts = ", ".join(f"{n} {s}" for s, n in counts.items())
+    noun = "event" if len(events) == 1 else "events"
+    head = f"🤖 Sub-agent terminal {noun} ({parts})"
+    return "\n".join(
+        [head, SUBAGENT_EVENT_FRAME,
+         *(format_event_line(e) for e in events)])
 
 
 # --- error sanitization (D5: sanitized error, never raw exception repr) -----

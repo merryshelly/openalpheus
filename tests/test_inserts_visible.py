@@ -116,31 +116,50 @@ class TestNoticeSurfaces:
                  "terminal_at": "2026-09-11T00:00:00Z"}
         line = subledger.format_event_line(event)
         assert "tc_surface_1" in line and "completed" in line
-        notice = subledger.terminal_notice_line([event])
-        assert line in notice, "notice must carry the exact event line bytes"
-        assert "\n" not in notice, "notice must stay collapsed to one line"
+        notice = subledger.terminal_notice([event])
+        # House fold shape (kdsn.339 follow-up, SB ruling 2026-09-12): line 1
+        # is the <details> SUMMARY — icon + count/state from closed
+        # vocabulary only (MatrixSinks inserts the summary raw into
+        # formatted HTML; task text/ids are model-authored free text and
+        # belong in the escaped fold). Everything after line 1 folds.
+        head, *fold_lines = notice.split("\n")
+        assert head.startswith("🤖 "), "house sub-agent icon on the summary"
+        assert "1 completed" in head, "count/state summary on the summary line"
+        assert "surface check" not in head, "task text belongs in the fold"
+        assert "tc_surface_1" not in head, "dispatch ids belong in the fold"
+        fold = "\n".join(fold_lines)
+        assert subledger.SUBAGENT_EVENT_FRAME in fold, (
+            "the model-facing frame bytes must be visible")
+        assert line in fold, "notice fold must carry the exact event line bytes"
         # The seam exists on both delivery paths (fire + live drain):
         assert "subagent_terminal_notify" in (SRC / "matrix.py").read_text(), (
             "fire-seam registration missing from _build_agent_callbacks")
         assert "log_subagent_event" in (SRC / "agent.py").read_text(), (
             "drain-seam JSONL log callback missing from the agent drain")
 
-    def test_subagent_event_notice_has_icon_prefix(self):
-        """kdsn.339: the terminal notice must be visually scannable as a
-        sub-agent event — the house sub-agent icon (🤖, same family as the
-        sync completion notice) prefixes the display line. The icon is
-        display-only decoration: it sits OUTSIDE the frame and the exact
-        event-line bytes it must carry stay intact below it."""
+    def test_subagent_event_notice_fold_shape_multi_event(self):
+        """kdsn.339 follow-up (SB 2026-09-12): multi-event bursts must not
+        collapse to a wall-of-text line above the fold. Plural headline with
+        deterministic count/state summary; one folded line per event, each
+        carrying the exact bytes the model sees."""
         from openalph.tools import subledger
-        event = {"dispatch_id": "tc_icon_1", "state": "completed",
-                 "task_head": "icon check",
-                 "terminal_at": "2026-09-12T00:00:00Z"}
-        notice = subledger.terminal_notice_line([event])
-        assert notice.startswith("🤖 "), (
-            "terminal notice must carry the sub-agent icon prefix (kdsn.339)")
-        line = subledger.format_event_line(event)
-        assert line in notice, "icon must not displace the event line bytes"
-        assert "\n" not in notice, "notice must stay collapsed to one line"
+        events = [
+            {"dispatch_id": f"tc_fold_{i}", "state": s,
+             "task_head": f"task {i}",
+             "terminal_at": "2026-09-12T00:00:00Z"}
+            for i, s in enumerate(("completed", "completed", "failed"), 1)
+        ]
+        notice = subledger.terminal_notice(events)
+        lines = notice.split("\n")
+        assert lines[0] == (
+            "🤖 Sub-agent terminal events (2 completed, 1 failed)")
+        assert sum(1 for ln in lines if ln.startswith("- tc_fold_")) == 3
+        for e in events:
+            assert subledger.format_event_line(e) in notice
+        # Singular form for a single event:
+        single = subledger.terminal_notice([events[0]])
+        assert single.split("\n")[0] == (
+            "🤖 Sub-agent terminal event (1 completed)")
 
     def test_snapshot_surface_is_behavioral_not_decorative(self):
         """The surface must carry the inserted bytes end-to-end: boundary
