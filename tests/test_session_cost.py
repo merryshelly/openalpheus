@@ -181,6 +181,8 @@ class TestPricingTable:
             "claude-sonnet-4-6": (3.0, 15.0),
             "claude-haiku-4-5": (1.0, 5.0),
             "claude-fable-5": (10.0, 50.0),
+            "claude-fable-5-1": (10.0, 50.0),
+            "claude-sonnet-5": (2.0, 10.0),
         }
         anthropic_table = _MODEL_PRICING["anthropic"]
         for model, (inp, out) in exp.items():
@@ -244,13 +246,16 @@ class TestComputeCost:
         assert r.priced is True
         assert r.cost_usd == pytest.approx(0.35, abs=APPROX)
 
-    def test_sonnet5_effective_date_intro_vs_standard(self):
+    def test_sonnet5_scheduled_increase_cancelled_flat_2_10(self):
+        """The $3/$15 increase scheduled for 2026-09-01 was CANCELLED (vendor
+        pricing page, verified 2026-09-13) — the intro $2/$10 is the standard
+        rate for every call date. Pins the flat-rate table against regression."""
         assert compute_cost is not None, NOT_IMPL_CALC
         usage = _u(input_tokens=1_000_000, output_tokens=1_000_000)
         intro = compute_cost("claude-sonnet-5", usage, now=date(2026, 8, 31))
         std = compute_cost("claude-sonnet-5", usage, now=date(2026, 9, 1))
         assert intro.cost_usd == pytest.approx(12.0, abs=APPROX)   # 2 + 10
-        assert std.cost_usd == pytest.approx(18.0, abs=APPROX)     # 3 + 15
+        assert std.cost_usd == pytest.approx(12.0, abs=APPROX)     # 2 + 10 (increase cancelled)
 
     def test_unpriced_non_anthropic(self):
         assert compute_cost is not None, NOT_IMPL_CALC

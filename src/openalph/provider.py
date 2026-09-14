@@ -458,6 +458,10 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("opus-4-7",  1_048_576, 128_000, True),
     ("opus-4-8",  1_048_576, 128_000, True),
     ("opus-5",    1_048_576, 128_000, True),
+    # fable-5-1 MUST precede the generic "fable" row: "fable" is a substring of
+    # "claude-fable-5-1" and first-match-wins, so the explicit row pins 5.1's
+    # specs independently of any future fable-5 legacy edit (onboarded 2026-09-13).
+    ("fable-5-1", 1_048_576, 128_000, True),
     ("fable",     1_048_576, 128_000, True),
     # Synthetic (kdsn.281) — hf:-namespaced open-weight IDs. Windows are from
     # Synthetic's live GET /openai/v1/models (2026-08-23) and are SMALLER than
@@ -775,8 +779,10 @@ SALT = "openalph-fireworks-affinity-v1"
 
 # ---- Session USD cost pricing (Anthropic only) --------------------------
 # Verified 2026-07-09 against platform.claude.com/docs/en/about-claude/pricing
-# (official Anthropic docs). Base rates in USD per MTok. Cache costs derive
-# from these uniform multipliers (confirmed uniform across every model row):
+# (official Anthropic docs); re-verified 2026-09-13 (fable-5.1 + sonnet-5).
+# Base rates in USD per MTok. Cache costs derive from these uniform multipliers
+# — uniform across every model row EXCEPT claude-fable-5-1 (cache reads 0.025x,
+# $0.25/MTok, carried as a per-model absolute "cached_input" rate):
 CACHE_READ_MULT = 0.1        # cache hit / refresh  = 0.1x base input
 CACHE_WRITE_5M_MULT = 1.25   # 5-minute cache write = 1.25x base input
 CACHE_WRITE_1H_MULT = 2.0    # 1-hour cache write   = 2.0x base input
@@ -804,14 +810,18 @@ _MODEL_PRICING: dict[str, dict] = {
         "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0},
         "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0},
         "claude-fable-5":    {"input": 10.0, "output": 50.0},
+        # Fable 5.1 (onboarded 2026-09-13): same token price as fable-5, but
+        # cache HITS price at 0.025x base input ($0.25/MTok) — the ONLY Anthropic
+        # model breaking the uniform CACHE_READ_MULT (all others 0.1x). Carried
+        # as a per-model absolute rate, same field convention as the fireworks
+        # namespace. Cache WRITES stay standard (5m 1.25x / 1h 2.0x).
+        "claude-fable-5-1":  {"input": 10.0, "output": 50.0, "cached_input": 0.25},
         "claude-mythos-5":   {"input": 10.0, "output": 50.0},
-        "claude-sonnet-5": {
-            # (effective_date, rates) — pick the latest date <= call date.
-            "effective": [
-                (date(1970, 1, 1),  {"input": 2.0, "output": 10.0}),   # introductory
-                (date(2026, 9, 1),  {"input": 3.0, "output": 15.0}),   # standard
-            ],
-        },
+        # Sonnet 5: the $3/$15 increase scheduled for 2026-09-01 WAS CANCELLED —
+        # the intro $2/$10 is the standard price (vendor pricing page, verified
+        # 2026-09-13). The former effective-date schedule is removed; rates are
+        # flat $2/$10 for every call date.
+        "claude-sonnet-5":   {"input": 2.0,  "output": 10.0},
     },
     "fireworks": {
         # VERIFIED 2026-07 against docs.fireworks.ai/serverless/pricing
@@ -942,7 +952,13 @@ def compute_cost(model: str, usage: Usage, *, cache_ttl_fallback: str = "1h",
 
     cost = in_tok * in_rate + out_tok * out_rate
     if ns == "anthropic":
-        cost += cache_read * in_rate * CACHE_READ_MULT
+        # Per-model cache-read override (fable-5.1's 0.025x); models without a
+        # cached_input rate keep the uniform 0.1x multiplier.
+        cached = rates.get("cached_input")
+        if cached is not None:
+            cost += cache_read * cached
+        else:
+            cost += cache_read * in_rate * CACHE_READ_MULT
         # Cache-write cost by TTL bucket. F8 (kdsn.218 remediation): treat a
         # present-but-zero split the same as an absent split, and cost any residual
         # (split sum < aggregate) at the fallback multiplier — so an SDK-inconsistent
