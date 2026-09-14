@@ -397,6 +397,12 @@ class TestMatrixCommands:
 
     def test_project_set_and_status(self, tmp_path):
         bot, agent = self._bot(tmp_path)
+        # fixture precondition (kdsn.331 audit R2): the operator path now
+        # refuses a missing project dir BEFORE appending (aligned with the
+        # tool path) — the declared dirs must exist. Assertions untouched.
+        for name in ("foo", "bar"):
+            (Path(tmp_path) / "memory" / "projects" / name).mkdir(
+                parents=True, exist_ok=True)
         room = MagicMock()
         room.room_id = ROOM
         loop = asyncio.new_event_loop()

@@ -41,6 +41,7 @@ from openalph.handoff import (
     ACTIVE_PROJECT_EVENT,
     apply_boundary_and_rebuild,
     project_echo_text,
+    project_valid_name,
     read_active_project,
 )
 from openalph.provider import ProviderError, ProviderUnavailableError, resolve_model_checked
@@ -3937,14 +3938,16 @@ class MatrixBot:
                 project = parts[1]
             if project is not None:
                 project = project.strip()
-                # Name guard: this detail feeds workspace-relative path joins
-                # at boundary application — no separators, no traversal.
-                if ("/" in project or "\\" in project or project.startswith(".")
-                        or project in ("", ".", "..")):
+                # Shared name guard (kdsn.331): the detail feeds
+                # workspace-relative path joins at boundary application —
+                # bare names, one nesting level (`foo/initiative`), no
+                # dots/traversal.
+                if not project_valid_name(project):
                     await self.send(
                         room_id,
-                        "⚠️ Invalid project name — use a bare directory name "
-                        "like `foo` (no paths, no dots-prefix).",
+                        "⚠️ Invalid project name — use `foo` or "
+                        "`foo/initiative` (bare names, one nesting level, "
+                        "no dot-prefix, no control chars, no traversal).",
                     )
                     return
                 if not self.session_log:
@@ -3953,6 +3956,17 @@ class MatrixBot:
                 agent_config = self.agent.config
                 workspace = Path(agent_config.workspace)
                 proj_dir = workspace / "memory" / "projects" / project
+                if not proj_dir.is_dir():
+                    # kdsn.331 audit (glm MEDIUM): refuse BEFORE append —
+                    # aligns with the tool path; a typo'd canonical-looking
+                    # nested name must not persist as the room's project
+                    # with an empty durable package at the next boundary.
+                    await self.send(
+                        room_id,
+                        f"⚠️ Project directory does not exist: {proj_dir} — "
+                        "create memory/projects/<name>/ before declaring.",
+                    )
+                    return
                 entries = self.session_log.read(room_id)
                 existing = read_active_project(entries)
                 self.session_log.append(
@@ -3964,12 +3978,6 @@ class MatrixBot:
                     detail=project,
                 )
                 text = project_echo_text(workspace, project)
-                if not proj_dir.is_dir():
-                    text = (
-                        f"⚠️ Directory not found: {proj_dir} — create "
-                        "memory/projects/<name>/ before the next boundary.\n"
-                        + text
-                    )
                 if existing is not None and existing != project:
                     text = (
                         f"⚠️ Operator override: was **{existing}**, now "

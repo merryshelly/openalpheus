@@ -1025,11 +1025,15 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "memory/projects/<name>/ directory whose progress.md and "
             "durable-set.toml form the room's durable set, re-attached as a "
             "frozen snapshot at every GC boundary. "
-            "IMPORTANT: declare-once per session epoch and one project per room — "
-            "a second, different project is refused (escalate to the operator); "
-            "re-declaring the same project is a clean no-op. "
-            "IMPORTANT: the directory must already exist at "
+            "Name form: `foo` or `foo/initiative` (exactly one nesting "
+            "level, no dots/traversal); the directory must already exist at "
             "memory/projects/<name>/ under the workspace. "
+            "IMPORTANT: declare-once per session epoch — a second, different "
+            "project is refused (escalate to the operator, or use /project, "
+            "which retains operator-override authority); the one exception is "
+            "descent from the declared parent to its initiative "
+            "(foo -> foo/bar), allowed once. "
+            "Re-declaring the same project is a clean no-op. "
             "The result lists the parsed durable-set entries (path + reason) so "
             "the operator can see exactly what a boundary will carry."
         ),
@@ -1038,7 +1042,8 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "project": {
                     "type": "string",
-                    "description": "memory/projects/<name>/ directory name"
+                    "description": ("memory/projects/<name>/ directory name: "
+                                    "`foo` or `foo/initiative`")
                 }
             },
             "required": ["project"]

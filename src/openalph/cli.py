@@ -1040,8 +1040,9 @@ def cmd_exec(args):
     if args.project is not None:
         from openalph.handoff import project_valid_name
         if not project_valid_name(args.project):
-            _fail(f"invalid --project name {args.project!r} — use a bare "
-                  "directory name (no paths, no dots-prefix)", 1)
+            _fail(f"invalid --project name {args.project!r} — use `foo` or "
+                  "`foo/initiative` (bare names, one nesting level, "
+                  "no dot-prefix, no control chars, no traversal)", 1)
         _proj_dir = (Path(config.workspace) / "memory" / "projects"
                      / args.project)
         if not _proj_dir.is_dir():

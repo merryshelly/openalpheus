@@ -703,14 +703,17 @@ def checkpoint_status(entries: list[dict], workspace: Path, project: str | None)
 # ---------------------------------------------------------------------------
 
 def project_valid_name(project: str) -> bool:
-    """Bare-directory-name guard: the active_project detail feeds
-    workspace-relative path joins at boundary application — no separators,
-    no traversal, no dots-prefix."""
-    return bool(project) and not (
-        "/" in project
-        or "\\" in project
-        or project.startswith(".")
-        or project in ("", ".", "..")
+    """Project-directory-name guard: the active_project detail feeds
+    workspace-relative path joins at boundary application. Segment-based
+    (kdsn.331): exactly one nesting level is legal — ``foo`` or
+    ``foo/initiative`` — every segment bare (non-empty, no dots-prefix,
+    no backslashes, no control characters); no traversal, no depth > 2. Case and interior
+    whitespace stay legal (no charset rules)."""
+    parts = project.split("/")
+    return 1 <= len(parts) <= 2 and all(
+        part and not part.startswith(".") and "\\" not in part
+        and all(ord(c) >= 0x20 and ord(c) != 0x7F for c in part)
+        for part in parts
     )
 
 

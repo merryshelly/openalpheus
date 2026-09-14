@@ -723,22 +723,36 @@ def build_callbacks(
         async def _gc_set_project_cb(project):
             entries = session_log.read(room_id)
             existing = read_active_project(entries)
-            if existing is not None:
-                if existing == project:
-                    return {"ok": True, "text": "already declared (no-op)"}
-                return {
-                    "ok": False,
-                    "text": (
-                        f"Project '{existing}' already declared for this room — "
-                        "one project per room; escalate to your operator"
-                    ),
-                }
             if not project_valid_name(project):
                 return {
                     "ok": False,
-                    "text": ("Invalid project name — use a bare directory "
-                             "name like `foo` (no paths, no dots-prefix)."),
+                    "text": ("Invalid project name — use `foo` or "
+                             "`foo/initiative` (bare names, one nesting "
+                             "level, no dot-prefix, no control chars, "
+                             "no traversal)."),
                 }
+            if existing is not None:
+                if existing == project:
+                    return {"ok": True, "text": "already declared (no-op)"}
+                # kdsn.331: descent — a room that declared `foo` may
+                # re-declare `foo/<initiative>` (one level, at most once:
+                # a descendant of a 2-segment name is >2 segments and dies
+                # at the validity gate). Ascent/sibling/unrelated stay
+                # refused.
+                remainder = project[len(existing) + 1:]
+                descendant = (
+                    project.startswith(existing + "/")
+                    and remainder and "/" not in remainder
+                )
+                if not descendant:
+                    return {
+                        "ok": False,
+                        "text": (
+                            f"Project '{existing}' already declared for this "
+                            "room — one project per room; escalate to your "
+                            "operator"
+                        ),
+                    }
             workspace = Path(agent.config.workspace)
             proj_dir = workspace / "memory" / "projects" / project
             if not proj_dir.is_dir():
@@ -753,10 +767,26 @@ def build_callbacks(
                 event=ACTIVE_PROJECT_EVENT,
                 detail=project,
             )
-            return {
-                "ok": True,
-                "text": project_echo_text(workspace, project),
-            }
+            text = project_echo_text(workspace, project)
+            if existing is not None:
+                text = (f"Descended from **{existing}** to "
+                        f"**{project}**.\n{text}")
+                # kdsn.331 audit (kimi+glm converged): a descent moves the
+                # room's durable-set SOURCE — operators get a passive,
+                # room-visible signal, mirroring the boundary-notice
+                # fail-soft pattern (§3.4).
+                try:
+                    await sinks.send_notice(
+                        room_id,
+                        f"📁 Project descended: **{existing}** → "
+                        f"**{project}** — durable set now sourced from "
+                        f"memory/projects/{project}/",
+                    )
+                except Exception:
+                    logger.warning(
+                        "project-descent visibility notice failed "
+                        "(fail-soft)", exc_info=True)
+            return {"ok": True, "text": text}
 
         _callbacks["apply_handoff_boundary"] = _gc_apply_cb
         _callbacks["set_active_project"] = _gc_set_project_cb

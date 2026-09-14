@@ -25,8 +25,6 @@ Sections:
 """
 
 import asyncio
-import json
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -35,7 +33,6 @@ import pytest
 from openalph.handoff import (
     checkpoint_status,
     frame_snapshot,
-    parse_durable_set,
     project_valid_name,
     read_active_project,
     resolve_durable_set,
@@ -80,7 +77,7 @@ def _make_bot(tmp_path, projects=("foo", "foo/bar", "foo/baz", "qux")):
     from openalph.session import SessionLog
 
     ws = Path(tmp_path)
-    (ws / "skills").mkdir(exist_ok=True)
+    (ws / "skills").mkdir(parents=True, exist_ok=True)
     for p in projects:
         (ws / "memory" / "projects" / p).mkdir(parents=True, exist_ok=True)
     config = _cfg(ws)
@@ -132,6 +129,27 @@ def _project_events(bot):
             and e.get("event") == "active_project"]
 
 
+class TestDescentNotice:
+    def test_E6_descent_emits_room_visible_notice(self, tmp_path):
+        """kdsn.331 audit R1 (kimi+glm+qwen converged): a descent moves the
+        room's durable-set SOURCE — operators get a passive room-visible
+        signal (boundary-notice fail-soft pattern), not just tool-result
+        text buried in a collapsed detail."""
+        bot, _ = _make_bot(tmp_path)
+        assert _declare(bot, "foo")["ok"]
+        bot.client.room_send.reset_mock()
+        res = _declare(bot, "foo/bar")
+        assert res["ok"], res
+        sent = _send_texts(bot)
+        assert "foo" in sent and "foo/bar" in sent, (
+            "descent must emit a room notice naming old and new project")
+        # flat first-declare stays quiet (parity with pre-existing behavior)
+        bot.client.room_send.reset_mock()
+        bot2, _ = _make_bot(tmp_path / "ws2")
+        assert _declare(bot2, "foo")["ok"]
+        assert _send_texts(bot2) == "", "first declare is not a descent"
+
+
 # ===========================================================================
 # A. Name grammar (spec D1) — segment-based, one nesting level, parity
 # ===========================================================================
@@ -160,6 +178,12 @@ def test_A_name_accepted(name):
     "proj//sub",       # empty mid segment
     "proj\\bar",       # backslash separator
     "foo/bar/",        # trailing slash, nested
+    # kdsn.331 audit R3 (glm+qwen converged): control chars rejected at the
+    # validator — they render unescaped into notice/echo copy otherwise
+    "proj\ninit",      # newline in segment
+    "proj\tinit",      # tab in segment
+    "foo/bar\nbaz",    # newline in nested segment
+    "proj\x7f",        # DEL
 ])
 def test_A_name_rejected(name):
     assert not project_valid_name(name), f"{name!r} must be rejected"
@@ -241,6 +265,11 @@ class TestDescent:
         ws = Path(tmp_path)
         (ws / "docs").mkdir(exist_ok=True)
         (ws / "docs" / "extra.md").write_text("extra context\n")
+        # fixture precondition: the nested dir must exist before the toml
+        # write (_make_bot creates it later) — orchestrator fixture fix,
+        # assertion untouched
+        (ws / "memory" / "projects" / "foo" / "bar").mkdir(parents=True,
+                                                           exist_ok=True)
         toml = (ws / "memory" / "projects" / "foo" / "bar"
                 / "durable-set.toml")
         toml.write_text(
@@ -447,3 +476,14 @@ class TestProjectSlashCommand:
         bot.client.room_send.reset_mock()
         _slash(bot, "/project")
         assert "foo/bar" in _send_texts(bot)
+
+    def test_E5_operator_set_missing_dir_refused_pre_append(self, tmp_path):
+        """kdsn.331 audit R2 (glm MEDIUM): the operator path must refuse
+        BEFORE appending — a typo'd canonical-looking nested name must not
+        persist as the room's project with an empty durable package."""
+        bot, _ = _make_bot(tmp_path, projects=("foo",))  # foo/bar NOT created
+        _slash(bot, "/project set foo/bar")
+        sent = _send_texts(bot)
+        assert "does not exist" in sent, sent
+        assert read_active_project(bot.session_log.read(ROOM)) is None, (
+            "refusal must not append the active_project event")
