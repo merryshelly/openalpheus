@@ -986,7 +986,8 @@ class TestDurableGuards:
         assert m.project_valid_name("proj")
         assert not m.project_valid_name("")
         assert not m.project_valid_name("..")
-        assert not m.project_valid_name("a/b")
+        # kdsn.331: one nesting level is now LEGAL (spec D1; SB ruling)
+        assert m.project_valid_name("a/b")
         assert not m.project_valid_name(".hidden")
         assert not m.project_valid_name("a\\b")
 
