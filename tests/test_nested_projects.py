@@ -252,6 +252,17 @@ class TestDescent:
         assert not res["ok"]
         assert "Invalid project name" in res["text"], res
         assert "one project per room" not in res["text"]
+        # R4 copy precision (re-audit LOW): the rule is dot-PREFIX; the copy
+        # must say so or operators read `foo.bar` as illegal
+        assert "dot-prefix" in res["text"], res
+
+    def test_B11_tool_description_names_grammar_precisely(self):
+        """R4 re-audit LOW: the model-facing description must carry the same
+        precision as the refusal copy."""
+        from openalph.tools import BUILTIN_TOOLS
+        desc = BUILTIN_TOOLS["set_active_project"]["description"]
+        assert "no dot-prefix" in desc, desc
+        assert "foo/initiative" in desc, desc
 
     def test_B8_descent_missing_dir_refused_pre_append(self, tmp_path):
         bot, _ = _make_bot(tmp_path)
