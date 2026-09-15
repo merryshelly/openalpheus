@@ -2090,6 +2090,25 @@ class Agent:
                     _ka_request_messages = list(history)
                     _degenerate_notified = False
 
+                    # kdsn.345: mid-stream retry reset seam. Only wired when the room driver
+                    # passed callbacks['on_stream_reset'] (live + heartbeat paths); subagent /
+                    # CLI / keepalive paths keep today's fatal mid-stream behavior.
+                    _stream_reset_cb = (callbacks or {}).get("on_stream_reset")
+
+                    async def _on_stream_reset(info: dict) -> None:
+                        nonlocal accumulated_text, accumulated_thinking, response
+                        nonlocal text_emitted, thinking_emitted, usage, tool_calls
+                        nonlocal _degenerate_notified
+                        accumulated_text = ""
+                        accumulated_thinking = ""
+                        response = None
+                        text_emitted = False
+                        thinking_emitted = False
+                        usage = None
+                        tool_calls = []
+                        _degenerate_notified = False
+                        await _stream_reset_cb(info)
+
                     async for event in stream(
                         config=self.config,
                         system=self.system_prompt,
@@ -2100,6 +2119,7 @@ class Agent:
                         cache_ttl=cache_ttl,
                         room_id=room_id,
                         strict=_terminal_strict,
+                        on_stream_reset=_on_stream_reset if _stream_reset_cb else None,
                     ):
                         if event.type == "text":
                             accumulated_text += event.content

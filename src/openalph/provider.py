@@ -5,6 +5,7 @@ Routes completion requests to either Anthropic or OpenAI SDKs based on configura
 The adapter handles the differences in API shapes and response formats between providers.
 """
 
+import asyncio
 import copy
 import hashlib
 import logging
@@ -203,6 +204,16 @@ _client_cache: dict[tuple, object] = {}
 # backoff sleep. Mid-stream failures cannot be resumed (accepted); history is
 # unchanged since the assistant turn is appended only after the stream completes.
 _MAX_SDK_RETRIES = 20
+
+# Mid-stream transport-error retry budget (kdsn.345). A stream that
+# drops after >=1 chunk is re-issued from scratch ONCE after a fixed
+# backoff, but only when the caller wired the display-reset seam
+# (``on_stream_reset``) and the provider's ``retry_enabled`` kill
+# switch is on. Zero-yield failures never reach this layer — the SDK's
+# ``max_retries=20`` owns establishment (kdsn.220). /stop stays live:
+# CancelledError propagates through the backoff sleep.
+_MIDSTREAM_MAX_RETRIES = 1
+_MIDSTREAM_RETRY_DELAY_S = 5.0
 
 # Bounded-response read cap for hardened (key-bearing) calls (kdsn.304). A
 # hardened stream whose accumulated body exceeds this aborts with
@@ -2029,6 +2040,16 @@ async def ping_cache(
     )
 
 
+def _midstream_retry_due(on_stream_reset, attempt, provider_cfg) -> bool:
+    """kdsn.345: mid-stream retry requires the display-reset seam wired,
+    budget remaining, and the per-provider kill switch on."""
+    return (
+        on_stream_reset is not None
+        and attempt < _MIDSTREAM_MAX_RETRIES
+        and getattr(provider_cfg, "retry_enabled", True)
+    )
+
+
 async def stream(
     config: AgentConfig,
     system: str,
@@ -2042,12 +2063,19 @@ async def stream(
     tool_choice: str | None = None,
     strict: bool = False,
     hardened: bool = False,
+    on_stream_reset=None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """
     Stream completion events from Anthropic or OpenAI SDK based on config.providers.
     
     Yields StreamEvent objects for each event in the stream.
     Final event is always type="done" with the complete Response.
+    ``on_stream_reset`` (kdsn.345): optional async callback fired before a
+    mid-stream retry (after the backoff sleep), passed the retry info dict
+    ({"error": str, "chunks": int, "attempt": int}). Raising inside it
+    aborts the retry (fail-safe against garbled display). Zero-yield
+    failures are never retried here (SDK max_retries=20 owns
+    establishment, kdsn.220).
     """
     # Resolve model string to provider and API model name
     model_str = model or config.default_model
@@ -2095,97 +2123,125 @@ async def stream(
             tool_choice=tool_choice,
         )
         
-        _stream_count = 0
-        # Bounded body read for hardened calls (kdsn.304): accumulate the
-        # size of every consumed stream item and fail loud past the cap, so a
-        # key-bearing call can never buffer an unbounded response.
-        _hardened_bytes = 0
-        try:
-            async with client.messages.stream(**api_kwargs) as stream:
-                accumulated_text = ""
-                
-                async for event in stream:
-                    if hardened:
-                        # Measure the event's serialized wire size — SDK
-                        # stream objects are pydantic models (no __len__).
-                        _hardened_bytes += len(event.model_dump_json().encode("utf-8"))
-                        if _hardened_bytes > _HARDENED_MAX_RESPONSE_BYTES:
-                            raise ProviderError(
-                                "hardened call: response body exceeded byte cap"
-                            )
-                    _stream_count += 1
-                    event_type = getattr(event, "type", None)
-                    
-                    if event_type == "text":
-                        yield StreamEvent(type="text", content=event.text)
-                        accumulated_text += event.text
-                    elif event_type == "thinking":
-                        yield StreamEvent(type="thinking", content=event.thinking)
-                    elif event_type == "signature":
-                        yield StreamEvent(type="signature", content=event.signature)
-                    elif event_type == "input_json":
-                        yield StreamEvent(
-                            type="tool_delta",
-                            content=event.partial_json,
-                        )
-                    elif event_type == "content_block_start":
-                        block = event.content_block
-                        if getattr(block, "type", None) == "tool_use":
+        attempt = 0
+        while True:
+            _stream_count = 0
+            # Bounded body read for hardened calls (kdsn.304): accumulate the
+            # size of every consumed stream item and fail loud past the cap, so a
+            # key-bearing call can never buffer an unbounded response.
+            _hardened_bytes = 0
+            accumulated_text = ""
+            _retry_info = None
+            try:
+                async with client.messages.stream(**api_kwargs) as stream:
+                    async for event in stream:
+                        if hardened:
+                            # Measure the event's serialized wire size — SDK
+                            # stream objects are pydantic models (no __len__).
+                            _hardened_bytes += len(event.model_dump_json().encode("utf-8"))
+                            if _hardened_bytes > _HARDENED_MAX_RESPONSE_BYTES:
+                                raise ProviderError(
+                                    "hardened call: response body exceeded byte cap"
+                                )
+                        _stream_count += 1
+                        event_type = getattr(event, "type", None)
+
+                        if event_type == "text":
+                            yield StreamEvent(type="text", content=event.text)
+                            accumulated_text += event.text
+                        elif event_type == "thinking":
+                            yield StreamEvent(type="thinking", content=event.thinking)
+                        elif event_type == "signature":
+                            yield StreamEvent(type="signature", content=event.signature)
+                        elif event_type == "input_json":
                             yield StreamEvent(
-                                type="tool_start",
-                                tool_index=event.index,
-                                tool_id=block.id,
-                                tool_name=block.name,
+                                type="tool_delta",
+                                content=event.partial_json,
                             )
-                    elif event_type == "content_block_stop":
-                        block = event.content_block
-                        if getattr(block, "type", None) == "tool_use":
+                        elif event_type == "content_block_start":
+                            block = event.content_block
+                            if getattr(block, "type", None) == "tool_use":
+                                yield StreamEvent(
+                                    type="tool_start",
+                                    tool_index=event.index,
+                                    tool_id=block.id,
+                                    tool_name=block.name,
+                                )
+                        elif event_type == "content_block_stop":
+                            block = event.content_block
+                            if getattr(block, "type", None) == "tool_use":
+                                yield StreamEvent(
+                                    type="tool_done",
+                                    tool_index=event.index,
+                                    tool_call=ToolCall(
+                                        id=block.id,
+                                        name=block.name,
+                                        input=block.input,
+                                    ),
+                                )
+                        elif event_type == "message_stop":
+                            # Get final message and build response
+                            final_message = await stream.get_final_message()
+                            response = _parse_anthropic_response(final_message)
+                            response.content, response.degenerate = _detect_and_truncate_degeneration(response.content)
+
                             yield StreamEvent(
-                                type="tool_done",
-                                tool_index=event.index,
-                                tool_call=ToolCall(
-                                    id=block.id,
-                                    name=block.name,
-                                    input=block.input,
-                                ),
+                                type="done",
+                                stop_reason=final_message.stop_reason,
+                                model=final_message.model,
+                                response=response,
                             )
-                    elif event_type == "message_stop":
-                        # Get final message and build response
-                        final_message = await stream.get_final_message()
-                        response = _parse_anthropic_response(final_message)
-                        response.content, response.degenerate = _detect_and_truncate_degeneration(response.content)
-                        
-                        yield StreamEvent(
-                            type="done",
-                            stop_reason=final_message.stop_reason,
-                            model=final_message.model,
-                            response=response,
-                        )
-                        
-        except anthropic.APIStatusError as e:
-            raise ProviderError(
-                _sanitize_error(e.message), status_code=e.status_code,
-            ) from e
-        except anthropic.APITimeoutError as e:
-            raise ProviderError("Provider request timed out") from e
-        except anthropic.APIConnectionError as e:
-            raise ProviderError("Provider unreachable — connection failed") from e
-        except httpx.TimeoutException as e:
-            if _stream_count == 0:
-                raise ProviderError("Provider timed out before streaming any data") from e
-            raise ProviderError(
-                f"Provider timed out mid-stream after {_stream_count} chunk(s)"
-            ) from e
-        except httpx.HTTPError as e:
-            _exc_name = type(e).__name__
-            if _stream_count == 0:
+                break  # normal completion — no retry
+
+            except anthropic.APIStatusError as e:
                 raise ProviderError(
-                    f"Provider transport error ({_exc_name}) before streaming any data"
+                    _sanitize_error(e.message), status_code=e.status_code,
                 ) from e
-            raise ProviderError(
-                f"Provider transport error mid-stream after {_stream_count} chunk(s) ({_exc_name})"
-            ) from e
-    
+            except anthropic.APITimeoutError as e:
+                raise ProviderError("Provider request timed out") from e
+            except anthropic.APIConnectionError as e:
+                raise ProviderError("Provider unreachable — connection failed") from e
+            except httpx.TimeoutException as e:
+                if _stream_count == 0:
+                    raise ProviderError("Provider timed out before streaming any data") from e
+                if not _midstream_retry_due(on_stream_reset, attempt, provider_cfg):
+                    raise ProviderError(
+                        f"Provider timed out mid-stream after {_stream_count} chunk(s)"
+                    ) from e
+                _retry_info = {
+                    "error": f"{type(e).__name__}: {e}",
+                    "chunks": _stream_count,
+                    "attempt": attempt + 1,
+                }
+            except httpx.HTTPError as e:
+                if _stream_count == 0:
+                    raise ProviderError(
+                        f"Provider transport error ({type(e).__name__}) before streaming any data"
+                    ) from e
+                if not _midstream_retry_due(on_stream_reset, attempt, provider_cfg):
+                    raise ProviderError(
+                        f"Provider transport error mid-stream after {_stream_count} chunk(s) ({type(e).__name__})"
+                    ) from e
+                _retry_info = {
+                    "error": f"{type(e).__name__}: {e}",
+                    "chunks": _stream_count,
+                    "attempt": attempt + 1,
+                }
+            # kdsn.345 retry epilogue — reached only when _retry_info is
+            # set (every other path above either broke out or raised).
+            # Log, back off, fire the display-reset seam, then loop to
+            # re-issue the full request from scratch. A raise inside
+            # on_stream_reset aborts the retry (fail-safe against a
+            # garbled display); CancelledError during the backoff sleep
+            # propagates (/stop stays live).
+            attempt += 1
+            logger.warning(
+                "kdsn.345 mid-stream retry %d/%d after %d chunks (%s) — re-issuing request",
+                attempt, _MIDSTREAM_MAX_RETRIES, _retry_info["chunks"], _retry_info["error"],
+            )
+            await asyncio.sleep(_MIDSTREAM_RETRY_DELAY_S)
+            await on_stream_reset(_retry_info)
+
     elif provider_cfg.type == "openai":
         # ``hardened`` (kdsn.304) is a cache-key component: hardened
         # (key-bearing) calls get their own cached client on a hardened
@@ -2198,7 +2254,6 @@ async def stream(
         # config-gated and dormant (its mid-stream teardown + truncation precision
         # are validated in Phase 2 before it is armed in production).
         _degen_mode = provider_cfg.degen_detector if provider_cfg.degen_detector is not None else getattr(config, "degen_detector", "off")
-        degen_monitor = DegenerationMonitor(mode=_degen_mode)
 
         api_kwargs = _build_openai_kwargs(
             api_model=api_model,
@@ -2230,14 +2285,16 @@ async def stream(
             api_kwargs["user"] = affinity
             api_kwargs["extra_headers"] = {"x-session-affinity": affinity}
 
-        _stream_count = 0
-        # Bounded body read for hardened calls (kdsn.304): accumulate the
-        # size of every consumed stream chunk and fail loud past the cap, so a
-        # key-bearing call can never buffer an unbounded response.
-        _hardened_bytes = 0
-        try:
-            response = await client.chat.completions.create(**api_kwargs)
-            
+        attempt = 0
+        while True:
+            _stream_count = 0
+            # Bounded body read for hardened calls (kdsn.304): accumulate the
+            # size of every consumed stream chunk and fail loud past the cap, so a
+            # key-bearing call can never buffer an unbounded response.
+            _hardened_bytes = 0
+            # Per-attempt state (kdsn.345): a dead attempt must leave nothing
+            # behind — accumulators, usage, and a FRESH degen monitor (stale
+            # n-gram state from the dead attempt must not contaminate the retry).
             accumulated_text = ""
             accumulated_reasoning = ""
             usage = None
@@ -2246,191 +2303,221 @@ async def stream(
             degen_aborted = False
             # Accumulate tool call data: index -> {"id": str, "name": str, "arguments": str}
             tool_call_accumulators: dict[int, dict] = {}
-            
-            async for chunk in response:
-                _stream_count += 1
-                if hardened:
-                    # Measure the chunk's serialized wire size — SDK stream
-                    # objects are pydantic models (no __len__).
-                    _hardened_bytes += len(chunk.model_dump_json().encode("utf-8"))
-                    if _hardened_bytes > _HARDENED_MAX_RESPONSE_BYTES:
-                        raise ProviderError(
-                            "hardened call: response body exceeded byte cap"
-                        )
-                # Capture generation ID from first chunk
-                if not generation_id and getattr(chunk, "id", None):
-                    generation_id = chunk.id
+            degen_monitor = DegenerationMonitor(mode=_degen_mode)
+            _retry_info = None
+            try:
+                response = await client.chat.completions.create(**api_kwargs)
 
-                # Handle usage chunk
-                if chunk.usage:
-                    usage = _openai_usage(chunk.usage)
-                
-                # Process content deltas
-                if chunk.choices:
-                    choice = chunk.choices[0]
-                    delta = choice.delta
-                    
-                    # Handle text content
-                    if delta.content is not None:
-                        yield StreamEvent(type="text", content=delta.content)
-                        accumulated_text += delta.content
-                        if degen_monitor.feed(delta.content):
-                            logger.warning(
-                                "degeneration detected on stream: layer=%s pos=%s model=%s gen=%s mode=%s",
-                                degen_monitor.trigger_layer, degen_monitor.trigger_pos,
-                                api_model, generation_id, degen_monitor.mode,
+                async for chunk in response:
+                    _stream_count += 1
+                    if hardened:
+                        # Measure the chunk's serialized wire size — SDK stream
+                        # objects are pydantic models (no __len__).
+                        _hardened_bytes += len(chunk.model_dump_json().encode("utf-8"))
+                        if _hardened_bytes > _HARDENED_MAX_RESPONSE_BYTES:
+                            raise ProviderError(
+                                "hardened call: response body exceeded byte cap"
                             )
-                            yield StreamEvent(
-                                type="degenerate", model=api_model,
-                                generation_id=generation_id,
-                            )
-                            if degen_monitor.mode == "abort":
-                                degen_aborted = True
-                                break
-                    
-                    # Handle reasoning (OpenRouter extension)
-                    reasoning_text = getattr(delta, 'reasoning', None) or getattr(delta, 'reasoning_content', None)
-                    if isinstance(reasoning_text, str) and reasoning_text:
-                        yield StreamEvent(type="thinking", content=reasoning_text)
-                        accumulated_reasoning += reasoning_text
-                    
-                    # Handle tool calls
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            # Google's Gemini OpenAI-compat streaming never
-                            # populates tool_calls[].index (verified live
-                            # 2026-07-16 — always None). Falling back to the
-                            # call's own id keeps concurrent tool calls from
-                            # colliding into the same accumulator slot (they
-                            # would otherwise all land on the same `None` key,
-                            # corrupting/losing all but one call in a
-                            # multi-tool-call turn). Real index-bearing
-                            # providers are unaffected — idx stays their int.
-                            idx = tc_delta.index
-                            if idx is None:
-                                idx = tc_delta.id or f"__unindexed_{len(tool_call_accumulators)}"
-                            if idx not in tool_call_accumulators:
-                                tool_call_accumulators[idx] = {
-                                    "id": tc_delta.id or "",
-                                    "name": tc_delta.function.name or "",
-                                    "arguments": "",
-                                    # Opaque metadata (e.g. Google's
-                                    # extra_content.google.thought_signature)
-                                    # that must be echoed back next turn —
-                                    # see ToolCall.extra_content docstring.
-                                    "extra_content": getattr(tc_delta, "extra_content", None),
-                                }
-                            if tc_delta.function.arguments:
-                                tool_call_accumulators[idx]["arguments"] += tc_delta.function.arguments
-                    
-                    # Track finish reason
-                    if choice.finish_reason:
-                        stop_reason = _normalize_stop_reason(choice.finish_reason)
-            
-            # Mid-stream degeneration abort (kdsn.241.4). We broke out of the
-            # consume loop; tear down the HTTP stream so we stop reading (and,
-            # for providers that honor it, stop being billed for) the garbage
-            # tail, then truncate the emitted text at the detection point and
-            # append the standard warning. NOTE: real-network teardown semantics
-            # are validated in Phase 2 before "abort" is armed in production;
-            # the shipped default is "warn" (this branch is dormant).
-            if degen_aborted:
-                try:
-                    await response.close()
-                except Exception:
-                    logger.debug("degen-abort: stream close raised (ignored)", exc_info=True)
-                cut = degen_monitor.trigger_pos
-                if cut is not None and 0 <= cut <= len(accumulated_text):
-                    accumulated_text = accumulated_text[:cut].rstrip()
-                accumulated_text = (accumulated_text + _DEGEN_WARNING) if accumulated_text else _DEGEN_WARNING.lstrip()
-                stop_reason = stop_reason or "degenerate"
-                # Drop any partially-accumulated tool calls: a mid-stream abort
-                # means their JSON args are incomplete/garbage — never emit or
-                # execute them.
-                tool_call_accumulators.clear()
-            
-            # Yield tool_done events for accumulated tool calls
-            for idx in sorted(tool_call_accumulators.keys()):
-                tc_data = tool_call_accumulators[idx]
-                try:
-                    input_dict = json.loads(tc_data["arguments"])
-                except json.JSONDecodeError:
-                    input_dict = {}
-                
-                yield StreamEvent(
-                    type="tool_done",
-                    tool_index=idx,
-                    tool_call=ToolCall(
+                    # Capture generation ID from first chunk
+                    if not generation_id and getattr(chunk, "id", None):
+                        generation_id = chunk.id
+
+                    # Handle usage chunk
+                    if chunk.usage:
+                        usage = _openai_usage(chunk.usage)
+
+                    # Process content deltas
+                    if chunk.choices:
+                        choice = chunk.choices[0]
+                        delta = choice.delta
+
+                        # Handle text content
+                        if delta.content is not None:
+                            yield StreamEvent(type="text", content=delta.content)
+                            accumulated_text += delta.content
+                            if degen_monitor.feed(delta.content):
+                                logger.warning(
+                                    "degeneration detected on stream: layer=%s pos=%s model=%s gen=%s mode=%s",
+                                    degen_monitor.trigger_layer, degen_monitor.trigger_pos,
+                                    api_model, generation_id, degen_monitor.mode,
+                                )
+                                yield StreamEvent(
+                                    type="degenerate", model=api_model,
+                                    generation_id=generation_id,
+                                )
+                                if degen_monitor.mode == "abort":
+                                    degen_aborted = True
+                                    break
+
+                        # Handle reasoning (OpenRouter extension)
+                        reasoning_text = getattr(delta, 'reasoning', None) or getattr(delta, 'reasoning_content', None)
+                        if isinstance(reasoning_text, str) and reasoning_text:
+                            yield StreamEvent(type="thinking", content=reasoning_text)
+                            accumulated_reasoning += reasoning_text
+
+                        # Handle tool calls
+                        if delta.tool_calls:
+                            for tc_delta in delta.tool_calls:
+                                # Google's Gemini OpenAI-compat streaming never
+                                # populates tool_calls[].index (verified live
+                                # 2026-07-16 — always None). Falling back to the
+                                # call's own id keeps concurrent tool calls from
+                                # colliding into the same accumulator slot (they
+                                # would otherwise all land on the same `None` key,
+                                # corrupting/losing all but one call in a
+                                # multi-tool-call turn). Real index-bearing
+                                # providers are unaffected — idx stays their int.
+                                idx = tc_delta.index
+                                if idx is None:
+                                    idx = tc_delta.id or f"__unindexed_{len(tool_call_accumulators)}"
+                                if idx not in tool_call_accumulators:
+                                    tool_call_accumulators[idx] = {
+                                        "id": tc_delta.id or "",
+                                        "name": tc_delta.function.name or "",
+                                        "arguments": "",
+                                        # Opaque metadata (e.g. Google's
+                                        # extra_content.google.thought_signature)
+                                        # that must be echoed back next turn —
+                                        # see ToolCall.extra_content docstring.
+                                        "extra_content": getattr(tc_delta, "extra_content", None),
+                                    }
+                                if tc_delta.function.arguments:
+                                    tool_call_accumulators[idx]["arguments"] += tc_delta.function.arguments
+
+                        # Track finish reason
+                        if choice.finish_reason:
+                            stop_reason = _normalize_stop_reason(choice.finish_reason)
+
+                # Mid-stream degeneration abort (kdsn.241.4). We broke out of the
+                # consume loop; tear down the HTTP stream so we stop reading (and,
+                # for providers that honor it, stop being billed for) the garbage
+                # tail, then truncate the emitted text at the detection point and
+                # append the standard warning. NOTE: real-network teardown semantics
+                # are validated in Phase 2 before "abort" is armed in production;
+                # the shipped default is "warn" (this branch is dormant).
+                if degen_aborted:
+                    try:
+                        await response.close()
+                    except Exception:
+                        logger.debug("degen-abort: stream close raised (ignored)", exc_info=True)
+                    cut = degen_monitor.trigger_pos
+                    if cut is not None and 0 <= cut <= len(accumulated_text):
+                        accumulated_text = accumulated_text[:cut].rstrip()
+                    accumulated_text = (accumulated_text + _DEGEN_WARNING) if accumulated_text else _DEGEN_WARNING.lstrip()
+                    stop_reason = stop_reason or "degenerate"
+                    # Drop any partially-accumulated tool calls: a mid-stream abort
+                    # means their JSON args are incomplete/garbage — never emit or
+                    # execute them.
+                    tool_call_accumulators.clear()
+
+                # Yield tool_done events for accumulated tool calls
+                for idx in sorted(tool_call_accumulators.keys()):
+                    tc_data = tool_call_accumulators[idx]
+                    try:
+                        input_dict = json.loads(tc_data["arguments"])
+                    except json.JSONDecodeError:
+                        input_dict = {}
+
+                    yield StreamEvent(
+                        type="tool_done",
+                        tool_index=idx,
+                        tool_call=ToolCall(
+                            id=tc_data["id"],
+                            name=tc_data["name"],
+                            input=input_dict,
+                            extra_content=tc_data.get("extra_content"),
+                        ),
+                    )
+
+                # Build tool_calls list for the response
+                response_tool_calls = []
+                for idx in sorted(tool_call_accumulators.keys()):
+                    tc_data = tool_call_accumulators[idx]
+                    try:
+                        input_dict = json.loads(tc_data["arguments"])
+                    except json.JSONDecodeError:
+                        input_dict = {}
+                    response_tool_calls.append(ToolCall(
                         id=tc_data["id"],
                         name=tc_data["name"],
                         input=input_dict,
                         extra_content=tc_data.get("extra_content"),
-                    ),
-                )
-            
-            # Build tool_calls list for the response
-            response_tool_calls = []
-            for idx in sorted(tool_call_accumulators.keys()):
-                tc_data = tool_call_accumulators[idx]
-                try:
-                    input_dict = json.loads(tc_data["arguments"])
-                except json.JSONDecodeError:
-                    input_dict = {}
-                response_tool_calls.append(ToolCall(
-                    id=tc_data["id"],
-                    name=tc_data["name"],
-                    input=input_dict,
-                    extra_content=tc_data.get("extra_content"),
-                ))
-            
-            # Build and yield final done event
-            thinking_blocks = []
-            if accumulated_reasoning:
-                thinking_blocks.append(ThinkingBlock(thinking=accumulated_reasoning, signature=""))
+                    ))
 
-            response_obj = Response(
-                content=accumulated_text,
-                model=api_model,
-                usage=usage or Usage(input_tokens=0, output_tokens=0),
-                stop_reason=stop_reason or "",
-                tool_calls=response_tool_calls,
-                thinking=thinking_blocks,
-                generation_id=generation_id,
-            )
-            response_obj.content, response_obj.degenerate = _detect_and_truncate_degeneration(response_obj.content)
-            response_obj.degenerate = response_obj.degenerate or degen_monitor.tripped
-            
-            yield StreamEvent(
-                type="done",
-                stop_reason=stop_reason or "",
-                model=api_model,
-                response=response_obj,
-            )
-            
-        except openai.APIStatusError as e:
-            raise ProviderError(
-                _sanitize_error(e.message), status_code=e.status_code,
-            ) from e
-        except openai.APITimeoutError as e:
-            raise ProviderError("Provider request timed out") from e
-        except openai.APIConnectionError as e:
-            raise ProviderError("Provider unreachable — connection failed") from e
-        except httpx.TimeoutException as e:
-            if _stream_count == 0:
-                raise ProviderError("Provider timed out before streaming any data") from e
-            raise ProviderError(
-                f"Provider timed out mid-stream after {_stream_count} chunk(s)"
-            ) from e
-        except httpx.HTTPError as e:
-            _exc_name = type(e).__name__
-            if _stream_count == 0:
+                # Build and yield final done event
+                thinking_blocks = []
+                if accumulated_reasoning:
+                    thinking_blocks.append(ThinkingBlock(thinking=accumulated_reasoning, signature=""))
+
+                response_obj = Response(
+                    content=accumulated_text,
+                    model=api_model,
+                    usage=usage or Usage(input_tokens=0, output_tokens=0),
+                    stop_reason=stop_reason or "",
+                    tool_calls=response_tool_calls,
+                    thinking=thinking_blocks,
+                    generation_id=generation_id,
+                )
+                response_obj.content, response_obj.degenerate = _detect_and_truncate_degeneration(response_obj.content)
+                response_obj.degenerate = response_obj.degenerate or degen_monitor.tripped
+
+                yield StreamEvent(
+                    type="done",
+                    stop_reason=stop_reason or "",
+                    model=api_model,
+                    response=response_obj,
+                )
+                break  # normal completion — no retry
+
+            except openai.APIStatusError as e:
                 raise ProviderError(
-                    f"Provider transport error ({_exc_name}) before streaming any data"
+                    _sanitize_error(e.message), status_code=e.status_code,
                 ) from e
-            raise ProviderError(
-                f"Provider transport error mid-stream after {_stream_count} chunk(s) ({_exc_name})"
-            ) from e
-    
+            except openai.APITimeoutError as e:
+                raise ProviderError("Provider request timed out") from e
+            except openai.APIConnectionError as e:
+                raise ProviderError("Provider unreachable — connection failed") from e
+            except httpx.TimeoutException as e:
+                if _stream_count == 0:
+                    raise ProviderError("Provider timed out before streaming any data") from e
+                if not _midstream_retry_due(on_stream_reset, attempt, provider_cfg):
+                    raise ProviderError(
+                        f"Provider timed out mid-stream after {_stream_count} chunk(s)"
+                    ) from e
+                _retry_info = {
+                    "error": f"{type(e).__name__}: {e}",
+                    "chunks": _stream_count,
+                    "attempt": attempt + 1,
+                }
+            except httpx.HTTPError as e:
+                if _stream_count == 0:
+                    raise ProviderError(
+                        f"Provider transport error ({type(e).__name__}) before streaming any data"
+                    ) from e
+                if not _midstream_retry_due(on_stream_reset, attempt, provider_cfg):
+                    raise ProviderError(
+                        f"Provider transport error mid-stream after {_stream_count} chunk(s) ({type(e).__name__})"
+                    ) from e
+                _retry_info = {
+                    "error": f"{type(e).__name__}: {e}",
+                    "chunks": _stream_count,
+                    "attempt": attempt + 1,
+                }
+            # kdsn.345 retry epilogue — reached only when _retry_info is
+            # set (every other path above either broke out or raised).
+            # Log, back off, fire the display-reset seam, then loop to
+            # re-issue the full request from scratch. A raise inside
+            # on_stream_reset aborts the retry (fail-safe against a
+            # garbled display); CancelledError during the backoff sleep
+            # propagates (/stop stays live).
+            attempt += 1
+            logger.warning(
+                "kdsn.345 mid-stream retry %d/%d after %d chunks (%s) — re-issuing request",
+                attempt, _MIDSTREAM_MAX_RETRIES, _retry_info["chunks"], _retry_info["error"],
+            )
+            await asyncio.sleep(_MIDSTREAM_RETRY_DELAY_S)
+            await on_stream_reset(_retry_info)
+
     else:
         raise ValueError(f"Unsupported provider type: {provider_cfg.type}")
 

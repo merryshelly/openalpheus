@@ -457,6 +457,39 @@ class StreamingDelivery:
         }
         await self.bot._room_send_with_retry(self.room_id, content)
 
+    async def reset(self):
+        """Mid-stream retry seam (kdsn.345): annotate the in-flight partial
+        message (cursor stripped, " ⟳" appended) and clear delivery state so
+        the retried attempt starts a FRESH message. Fail-soft: annotation
+        failure is logged, never raised — the provider's retry must proceed.
+        Leaves _delivered/_delivered_text untouched: the partial was never
+        finalized, so terminal duplicate-detection semantics are unchanged."""
+        if self._event_id is not None:
+            partial = self._buffer.rstrip()
+            display = (partial + " ⟳") if partial else "⟳ retrying…"
+            content = {
+                "msgtype": "m.text",
+                "body": f"* {display}",
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": display,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": mistune.html(display),
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": self._event_id,
+                },
+            }
+            try:
+                await self.bot._room_send_with_retry(self.room_id, content)
+            except Exception as exc:
+                logger.warning("Reset edit failed (non-critical): %s", exc)
+        self._buffer = ""
+        self._event_id = None
+        self._last_edit_time = 0
+        self._last_edit_len = 0
+
 
 class MatrixBot:
     """Matrix client wrapping an OpenAlph Agent.
@@ -2087,6 +2120,18 @@ class MatrixBot:
             self._active_turns.add(room_id)
             _hb_drain = self._make_steering_drain(room_id)
             callbacks['drain_steering'] = _hb_drain
+
+            async def _hb_stream_reset(info: dict):
+                # kdsn.345: background turns have no live streaming display — the
+                # reset seam here is notice-only. Fail-soft: never kill the turn.
+                try:
+                    await self.send_notice(
+                        room_id,
+                        f"⏳ Stream dropped mid-flight ({info.get('error', 'transport error')} "
+                        f"after {info.get('chunks', '?')} chunks) — retrying once…")
+                except Exception:
+                    logger.warning("stream reset notice failed (non-fatal)", exc_info=True)
+            callbacks['on_stream_reset'] = _hb_stream_reset
             # NOTE (audit qwen MEDIUM-2): heartbeat turns do not hold the
             # per-room session lock, so a fired heartbeat turn CAN overlap a
             # live operator turn in this room. Both install drains over the
@@ -3046,6 +3091,21 @@ class MatrixBot:
                     await _flush_thinking()
                     await streaming.push(text, done=done)
 
+                async def _stream_reset(info: dict):
+                    # kdsn.345: annotate the partial message fail-soft, clear delivery
+                    # state (retry starts a fresh message), then one retry notice.
+                    try:
+                        await streaming.reset()
+                    except Exception:
+                        logger.warning("stream reset delivery failed (non-fatal)", exc_info=True)
+                    try:
+                        await self.send_notice(
+                            room_id,
+                            f"⏳ Stream dropped mid-flight ({info.get('error', 'transport error')} "
+                            f"after {info.get('chunks', '?')} chunks) — retrying once…")
+                    except Exception:
+                        logger.warning("stream reset notice failed (non-fatal)", exc_info=True)
+
                 async def _cache_status(usage, model_str):
                     """Emit in-room notice on significant prompt cache miss if provider opted in."""
                     cr = usage.cache_read_tokens or 0
@@ -3106,6 +3166,7 @@ class MatrixBot:
                 # _build_agent_callbacks so that builder's pinned key set — and the
                 # heartbeat/CLI paths that share it — stay unchanged.
                 callbacks['turn_progress'] = _turn_progress
+                callbacks['on_stream_reset'] = _stream_reset
 
                 # Arm the stall watchdog. Read defensively: many tests build bots
                 # with MagicMock agents, where a bare attribute read would yield a

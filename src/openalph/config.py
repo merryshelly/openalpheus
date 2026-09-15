@@ -62,6 +62,7 @@ class ProviderConfig:
     subagent_cache_keepalive: bool = False  # Refresh parent prompt cache during long subagent runs (Anthropic only)
     routing: dict | None = None  # OpenRouter provider routing preferences
     degen_detector: str | None = None  # streaming degeneration monitor mode override: off|warn|abort (provider-level takes precedence over agent-level; kdsn.241.21)
+    retry_enabled: bool = True  # mid-stream transport-error retry (kdsn.345)
 
 
 @dataclass
@@ -546,6 +547,11 @@ def load_config(path: Path) -> AgentConfig:
             _skip_provider(provider_key, "subagent_cache_keepalive must be a boolean")
             continue
 
+        retry_enabled = section_data.get("retry_enabled", True)
+        if not isinstance(retry_enabled, bool):
+            _skip_provider(provider_key, "retry_enabled must be a boolean")
+            continue
+
         routing = section_data.get("routing")
         if routing is not None and not isinstance(routing, dict):
             _skip_provider(provider_key, f"routing must be a table/dict, got: {type(routing).__name__}")
@@ -568,6 +574,7 @@ def load_config(path: Path) -> AgentConfig:
             subagent_cache_keepalive=subagent_cache_keepalive,
             routing=routing,
             degen_detector=provider_degen,
+            retry_enabled=retry_enabled,
         )
 
     # kdsn.292: zero providers is DEGRADED, not fatal — slash commands, the
