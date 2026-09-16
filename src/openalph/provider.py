@@ -1755,9 +1755,19 @@ def _build_openai_kwargs(
     _supports_penalties = provider_key not in ("google",)
     _supports_reasoning_extra = provider_key in ("openrouter", "macstudio")
     # Service identity (workspace-kdsn.348.2): lowercase base_url host of the
-    # provider block (None when base_url is unset — never a match, never a
-    # crash). The Synthetic branch below keys on THIS, not provider_key.
-    _syn_host = urlparse(base_url).hostname.lower() if base_url else None
+    # provider block (None when base_url is unset — legacy name-only
+    # deployment). urlparse on a SCHEMELESS base_url yields hostname=None
+    # (everything lands in path; config.py does no scheme validation) — map
+    # that to "" (never a match, never an AttributeError; audit DO-NOT-SHIP
+    # 2026-09-16) so a synthetic-NAMED mis-wired block trips the fail-loud
+    # warn below instead of crash-looping every LLM call. Trailing-dot FQDN
+    # form ("api.synthetic.new.") normalizes to the same host. The Synthetic
+    # branch below keys on THIS, not provider_key.
+    if base_url:
+        _h = urlparse(base_url).hostname
+        _syn_host = _h.rstrip(".").lower() if _h else ""
+    else:
+        _syn_host = None
     # OpenAI deprecated max_tokens in favor of max_completion_tokens (o1+, GPT-5+).
     # Google and OpenRouter still use max_tokens.
     _uses_max_completion_tokens = provider_key in ("openai",)

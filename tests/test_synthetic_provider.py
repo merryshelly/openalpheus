@@ -508,6 +508,38 @@ class TestSyntheticServiceIdentity:
                  if "reasoning_effort" in r.message and r.levelno >= logging.WARNING]
         assert len(warns) == 2, f"expected 2 per-account warnings, got {len(warns)}"
 
+    def test_schemeless_url_never_crashes(self, caplog):
+        """Audit finding (kdsn.348.2 qwen cold-read, DO-NOT-SHIP): urlparse on
+        a schemeless URL puts everything in path — .hostname is None, so
+        `.lower()` raised AttributeError on EVERY call through such a block.
+        config.py does no scheme validation. Contract: never raise; no host
+        match (no mapping); a synthetic-NAMED block with a schemeless URL
+        warns via the mis-wire check (it clearly MEANT Synthetic)."""
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(
+                **self._args("high", key="minirig",
+                             base_url="api.synthetic.new/openai/v1"))
+        assert self._effort(kw) is None
+        warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warns == [], f"unrelated block must stay silent: {[r.message for r in warns]}"
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            kw2 = _build_openai_kwargs(
+                **self._args("high", key="synthetic2",
+                             base_url="api.synthetic.new/openai/v1"))
+        assert self._effort(kw2) is None
+        assert any("synthetic2" in r.message for r in caplog.records), \
+            "synthetic-named schemeless block must warn (mis-wire)"
+
+    def test_trailing_dot_host_matches(self):
+        """Audit M-finding: 'https://api.synthetic.new./openai/v1' is a valid
+        FQDN form of the same host — normalize the trailing dot rather than
+        silently losing the mapping."""
+        kw = _build_openai_kwargs(
+            **self._args("high", key="acct2",
+                         base_url="https://api.synthetic.new./openai/v1"))
+        assert self._effort(kw) == "high"
+
     @pytest.mark.asyncio
     async def test_complete_threads_base_url_to_kwargs(self):
         """Call-site pin: the production openai path must PASS provider
