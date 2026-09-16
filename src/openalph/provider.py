@@ -14,6 +14,7 @@ from datetime import date, datetime, timezone
 from typing import AsyncGenerator
 import json
 import re
+from urllib.parse import urlparse
 import anthropic
 import httpx
 import openai
@@ -510,12 +511,32 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
 _VISION_WARNED: set[str] = set()
 
 # Synthetic reasoning_effort remaps already WARNed about (one warning per
-# (override-fragment, level) pair per process, never per message — the
-# fragment slot is None for the default map, so qwen3.8's max -> xhigh and
-# the default max -> high are DISTINCT warnings). House convention mirrors
+# (override-fragment, provider-key, level) triple per process, never per
+# message — the fragment slot is None for the default map, so qwen3.8's
+# max -> xhigh and the default max -> high are DISTINCT warnings). The
+# provider_key slot scopes the warning per ACCOUNT (kdsn.348.2): two
+# Synthetic accounts (e.g. [providers.synthetic] and [providers.synthetic2])
+# serving the same model each get their own remap warning instead of
+# account A's warning swallowing account B's. House convention mirrors
 # _VISION_WARNED / _warned_unpriced_anthropic. Tests only clear this set and
 # assert via caplog; its key shape is internal.
-_SYNTHETIC_EFFORT_WARNED: set[tuple[str | None, str]] = set()
+_SYNTHETIC_EFFORT_WARNED: set[tuple[str | None, str, str]] = set()
+
+# The SERVICE IDENTITY of the Synthetic provider (workspace-kdsn.348.2): the
+# reasoning_effort mapping in _build_openai_kwargs is keyed on this base_url
+# host — not the TOML block NAME. A second Synthetic account deployed fleet-
+# wide as [providers.synthetic2] (or any other block name) pointed at this
+# host gets the full mapping; pre-fix, a renamed block fell through the whole
+# elif chain and sent NO reasoning_effort (kdsn.271 silent reasoning-ON bug
+# class). The legacy block name 'synthetic' still matches as backward compat.
+_SYNTHETIC_HOST = "api.synthetic.new"
+
+# Provider blocks whose name SAYS Synthetic (re.fullmatch r"synthetic\d*")
+# but whose base_url host is NOT the Synthetic service, already WARNed about
+# (one warning per provider_key per process, never per message — a mis-wired
+# block, kdsn.348.2 fail-loud cross-check). House convention mirrors
+# _VISION_WARNED.
+_SYNTHETIC_IDENTITY_WARNED: set[str] = set()
 
 # Per-model reasoning_effort overrides for the Synthetic provider (kdsn.281
 # refinement, 2026-08-24). Fragment-keyed, case-insensitive substring match
@@ -1717,12 +1738,26 @@ def _build_openai_kwargs(
     routing: dict | None = None,
     provider_key: str = "",
     tool_choice: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
-    """Build kwargs for OpenAI chat completions API."""
+    """Build kwargs for OpenAI chat completions API.
+
+    ``base_url`` (kdsn.348.2): the provider block's configured base URL,
+    threaded through from the production call site. It is the SERVICE
+    IDENTITY for the Synthetic reasoning_effort branch: the branch is keyed
+    on the base_url host being api.synthetic.new (bead workspace-kdsn.348.2)
+    in addition to the legacy 'synthetic' block name, so a second Synthetic
+    account deployed under any block name gets the same mapping. None (unset)
+    is safe — the host check degrades to the legacy name match.
+    """
     # Provider capability flags — OpenRouter proxies handle unknown params gracefully,
     # but direct APIs (OpenAI, Google) reject params they don't support.
     _supports_penalties = provider_key not in ("google",)
     _supports_reasoning_extra = provider_key in ("openrouter", "macstudio")
+    # Service identity (workspace-kdsn.348.2): lowercase base_url host of the
+    # provider block (None when base_url is unset — never a match, never a
+    # crash). The Synthetic branch below keys on THIS, not provider_key.
+    _syn_host = urlparse(base_url).hostname.lower() if base_url else None
     # OpenAI deprecated max_tokens in favor of max_completion_tokens (o1+, GPT-5+).
     # Google and OpenRouter still use max_tokens.
     _uses_max_completion_tokens = provider_key in ("openai",)
@@ -1801,6 +1836,25 @@ def _build_openai_kwargs(
     # Build extra_body incrementally — reasoning and provider routing are
     # OpenRouter extensions, not part of the standard OpenAI API.
     extra_body = {}
+    # Fail-loud cross-check (kdsn.348.2): a block NAMED synthetic/synthetic2/
+    # ... pointed at a NON-Synthetic base_url host is almost certainly
+    # mis-wired — the effort mapping follows the URL, so this block gets NO
+    # reasoning_effort (silent reasoning-ON, kdsn.271 bug class). Warn once
+    # per provider_key. Silent cases: the host IS api.synthetic.new (block
+    # legitimately enters the branch via service identity) or the block has
+    # no base_url at all (legacy name-only deployment, name match still maps).
+    if (re.fullmatch(r"synthetic\d*", provider_key)
+            and _syn_host is not None
+            and _syn_host != _SYNTHETIC_HOST
+            and provider_key not in _SYNTHETIC_IDENTITY_WARNED):
+        _SYNTHETIC_IDENTITY_WARNED.add(provider_key)
+        logger.warning(
+            "provider block %r is named Synthetic but its base_url host %r "
+            "is not %s — the synthetic reasoning_effort mapping will NOT "
+            "apply to this block (reasoning stays at the server default); "
+            "check the block's name/URL wiring.",
+            provider_key, _syn_host, _SYNTHETIC_HOST,
+        )
     if thinking_level != "off" and _supports_reasoning_extra:
         extra_body["reasoning"] = {"effort": thinking_level}
     elif provider_key == "fireworks":
@@ -1810,9 +1864,17 @@ def _build_openai_kwargs(
         # 1:1 mapping, OA "off" -> "none". Always sent explicitly so the server
         # default (medium) can never silently override operator intent again.
         extra_body["reasoning_effort"] = "none" if thinking_level == "off" else thinking_level
-    elif provider_key == "synthetic":
+    elif provider_key == "synthetic" or _syn_host == _SYNTHETIC_HOST:
         # kdsn.281: Synthetic takes TOP-LEVEL reasoning_effort (like Fireworks),
         # never OpenRouter's nested reasoning.effort. Probed 2026-08-23
+        #
+        # Service identity (workspace-kdsn.348.2): entry is keyed on the
+        # SERVICE, not the TOML block NAME — legacy name match OR base_url
+        # host (urlparse, lowercased) exactly api.synthetic.new. A second
+        # Synthetic account deployed as [providers.synthetic2] gets the full
+        # mapping here; pre-fix it fell through the entire elif chain and
+        # sent NO reasoning_effort (the kdsn.271 silent reasoning-ON bug
+        # class). All behavior below is unchanged for every entry path.
         # (synthetic-probe4/5/6): none/low/medium/high -> 200; "max" -> 400
         # from the inference backend; literal "off" -> 400 from the gateway;
         # an omitted param silently defaults to reasoning-ON (kdsn.271 bug
@@ -1846,12 +1908,14 @@ def _build_openai_kwargs(
         # Warn-once per (map, level) when a level is remapped DOWNWARD in tier
         # (xhigh->high, max->high, max->xhigh). 1:1 mappings never warn —
         # including override xhigh->xhigh — and off->none is a disable-alias,
-        # not a tier drop. The (fragment, level) key keeps default and override
-        # remaps of the same level from swallowing each other's warning.
+        # not a tier drop. The (fragment, account, level) key keeps default
+        # and override remaps of the same level from swallowing each
+        # other's warning, and scopes the warning per account (kdsn.348.2).
         _req_tier = _TIER.get("none" if thinking_level == "off" else thinking_level)
         if (_req_tier is not None and _TIER.get(_syn_effort, -1) < _req_tier
-                and (_syn_frag, thinking_level) not in _SYNTHETIC_EFFORT_WARNED):
-            _SYNTHETIC_EFFORT_WARNED.add((_syn_frag, thinking_level))
+                and (_syn_frag, provider_key, thinking_level)
+                not in _SYNTHETIC_EFFORT_WARNED):
+            _SYNTHETIC_EFFORT_WARNED.add((_syn_frag, provider_key, thinking_level))
             logger.warning(
                 "Synthetic does not support reasoning_effort=%r; remapping to "
                 "%r (operator intent is lossy).", thinking_level, _syn_effort,
@@ -2268,6 +2332,7 @@ async def stream(
             routing=provider_cfg.routing,
             provider_key=provider_cfg.key,
             tool_choice=tool_choice,
+            base_url=provider_cfg.base_url,
         )
         
         # Add streaming-specific kwargs
