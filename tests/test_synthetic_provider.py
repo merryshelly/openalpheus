@@ -378,6 +378,169 @@ class TestSyntheticResolution:
 # Config acceptance lock — deploy shape (spec D1) must load cleanly
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# C5 — service-identity keying (workspace-kdsn.348.2)
+# ---------------------------------------------------------------------------
+
+class TestSyntheticServiceIdentity:
+    """The kdsn.281 effort branch must follow the SERVICE (base_url host
+    api.synthetic.new), not the TOML block NAME. A second Synthetic account
+    deployed as [providers.synthetic2] (second 5-pack subscription, bead
+    workspace-kdsn.348) must get the full mapping: off->none, low..high 1:1,
+    xhigh/max->high + warn-once, per-model overrides. Pre-fix behavior for a
+    renamed block was total fall-through: NO reasoning_effort sent, which is
+    the kdsn.271 silent reasoning-ON bug class. Advisor ruling 2026-09-16:
+    base_url is ground truth for 'this block speaks the Synthetic API';
+    name-keyed branches are a convention, not a fail-loud property."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_synthetic_warned(self):
+        provider_module._SYNTHETIC_EFFORT_WARNED.clear()
+        provider_module._SYNTHETIC_IDENTITY_WARNED.clear()
+        yield
+        provider_module._SYNTHETIC_EFFORT_WARNED.clear()
+        provider_module._SYNTHETIC_IDENTITY_WARNED.clear()
+
+    def _args(self, level, key="synthetic2", base_url=SYNTH_OPENAI_BASE,
+              model="hf:zai-org/GLM-5.2"):
+        return dict(
+            api_model=model,
+            system="sys",
+            provider_messages=[{"role": "user", "content": "hi"}],
+            provider_tools=None,
+            max_tokens=1024,
+            thinking_level=level,
+            quirks=[],
+            provider_key=key,
+            base_url=base_url,
+        )
+
+    def _effort(self, kw):
+        return kw.get("extra_body", {}).get("reasoning_effort")
+
+    def test_second_account_block_gets_default_map(self, caplog):
+        """Discriminating: provider_key='synthetic2' + synthetic base_url,
+        level 'max' -> 'high' + warn. Pre-fix: falls the whole elif chain,
+        sends nothing (silent reasoning-ON)."""
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(**self._args("max"))
+        assert self._effort(kw) == "high"
+        assert any(
+            "max" in r.message and "reasoning_effort" in r.message
+            for r in caplog.records
+        ), f"expected remap warning, got: {[r.message for r in caplog.records]}"
+
+    def test_off_maps_to_none_on_second_account(self):
+        kw = _build_openai_kwargs(**self._args("off"))
+        assert self._effort(kw) == "none"
+
+    def test_second_account_qwen_override_applies(self, caplog):
+        """Per-model overrides are inside the branch; a renamed block must
+        reach them too (xhigh 1:1 on qwen3.8, no warning)."""
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(
+                **self._args("xhigh", model="hf:Qwen/Qwen3.8-27B"))
+        assert self._effort(kw) == "xhigh"
+        warns = [r for r in caplog.records if "reasoning_effort" in r.message]
+        assert warns == [], f"unexpected remap warning: {[r.message for r in warns]}"
+
+    def test_url_identity_not_name_prefix(self):
+        """Identity comes from the URL host, not the name: an arbitrarily-
+        named block pointed at api.synthetic.new gets the map; 'synth2' does
+        NOT (name prefix matching is not the contract)."""
+        kw = _build_openai_kwargs(**self._args("high", key="anything-goes"))
+        assert self._effort(kw) == "high"
+        kw2 = _build_openai_kwargs(
+            **self._args("high", key="synth2",
+                         base_url="https://openrouter.ai/api/v1"))
+        assert self._effort(kw2) is None
+
+    def test_legacy_name_only_block_still_maps(self):
+        """Backward compat: a block named 'synthetic' with NO base_url keeps
+        the mapping (name OR url — existing deployments must not regress)."""
+        kw = _build_openai_kwargs(**self._args("off", key="synthetic",
+                                               base_url=None))
+        assert self._effort(kw) == "none"
+
+    def test_syntheticish_name_non_synthetic_url_warns(self, caplog):
+        """Fail-loud cross-check: a block named ^synthetic\\d*$ pointed at a
+        NON-synthetic URL warns once (operator almost certainly mis-wired);
+        mapping follows the URL, so no reasoning_effort is sent."""
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(
+                **self._args("high", key="synthetic2",
+                             base_url="https://local-rig.example/v1"))
+        assert self._effort(kw) is None
+        assert any("synthetic2" in r.message for r in caplog.records), \
+            f"expected name/URL mismatch warning: {[r.message for r in caplog.records]}"
+
+    def test_mismatch_warns_once(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                _build_openai_kwargs(
+                    **self._args("high", key="synthetic2",
+                                 base_url="https://local-rig.example/v1"))
+        warns = [r for r in caplog.records
+                 if "synthetic2" in r.message and r.levelno >= logging.WARNING]
+        assert len(warns) == 1, f"expected warn-once, got {len(warns)}"
+
+    def test_unrelated_block_silent(self, caplog):
+        """Control: an unrelated openai-type block (local rig, arbitrary URL,
+        non-synthetic name) is untouched — no reasoning_effort, no warnings."""
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(
+                **self._args("high", key="minirig",
+                             base_url="http://10.0.20.104:8000"))
+        assert self._effort(kw) is None
+        warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warns == [], f"unexpected warnings: {[r.message for r in warns]}"
+
+    def test_remap_warn_once_scoped_per_account(self, caplog):
+        """Two accounts serving the same model must EACH get exactly one
+        remap warning — account A's warning must not swallow account B's
+        (warn-set key includes the account identity)."""
+        with caplog.at_level(logging.WARNING):
+            _build_openai_kwargs(**self._args("max", key="synthetic"))
+            _build_openai_kwargs(**self._args("max", key="synthetic2"))
+            _build_openai_kwargs(**self._args("max", key="synthetic"))
+            _build_openai_kwargs(**self._args("max", key="synthetic2"))
+        warns = [r for r in caplog.records
+                 if "reasoning_effort" in r.message and r.levelno >= logging.WARNING]
+        assert len(warns) == 2, f"expected 2 per-account warnings, got {len(warns)}"
+
+    @pytest.mark.asyncio
+    async def test_complete_threads_base_url_to_kwargs(self):
+        """Call-site pin: the production openai path must PASS provider
+        base_url into _build_openai_kwargs — unit tests above construct it
+        directly and would stay green over a forgotten call-site thread."""
+        from unittest.mock import AsyncMock
+        from test_provider import (
+            make_config, make_provider, MockOpenAIStream,
+            mock_openai_stream_chunks,
+        )
+        from openalph.provider import complete
+        config = make_config(
+            providers={
+                "synthetic2": make_provider(
+                    key="synthetic2", type="openai", api_key="sk-test-2",
+                    base_url=SYNTH_OPENAI_BASE,
+                )
+            },
+            default_model="synthetic2/hf:moonshotai/Kimi-K3",
+        )
+        with patch("openalph.provider.openai.AsyncOpenAI") as MockClient:
+            client = MockClient.return_value
+            client.chat.completions.create = AsyncMock(
+                return_value=MockOpenAIStream(
+                    mock_openai_stream_chunks("hi", model="hf:moonshotai/Kimi-K3"))
+            )
+            await complete(config=config, system="sys",
+                           messages=[{"role": "user", "content": "hi"}])
+        kw = client.chat.completions.create.call_args.kwargs
+        assert "reasoning_effort" in kw.get("extra_body", {}), \
+            f"call path lost effort mapping for renamed block: {kw.get('extra_body')}"
+
+
 class TestSyntheticConfigAcceptance:
     def _write_toml(self, tmp_path, provider_block):
         path = tmp_path / "test.toml"
