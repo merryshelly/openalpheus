@@ -149,6 +149,14 @@ class TestCapabilitiesTable:
         assert model_supports_vision("google/gemini-3.5-flash", config) is True
         assert model_supports_vision("openrouter/meta/llama-4-maverick", config) is True
 
+    def test_glm53_flash_q4_no_vision_until_encoder_wired(self, tmp_path):
+        """macstudio capacity tier (2026-09-17, workspace-im7t.54): ds4 serves
+        GLM-5.3-Flash Q4 WITHOUT --vision in the prod plist, so the endpoint is
+        text-only and the lib must fail-closed False despite the model's
+        (staged, unserved) vision encoder file."""
+        config = _make_config(tmp_path)
+        assert model_supports_vision("macstudio/glm-5.3-flash-q4", config) is False
+
     def test_kimi_vision_true_probe_verified(self, tmp_path):
         """Live-probed 2026-08-22 (spec section 3.5): k2p6 + k3 ID'd red/blue PNGs."""
         config = _make_config(tmp_path)

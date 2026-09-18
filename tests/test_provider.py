@@ -1329,3 +1329,55 @@ class TestMidStreamTransportErrors:
             with pytest.raises(asyncio.CancelledError):
                 await complete(config=config, system="Test",
                                messages=[{"role": "user", "content": "Hi"}])
+
+
+class TestMacStudioGLMEffort:
+    """ds4-served GLM-5.3-Flash Q4 (macstudio capacity tier since 2026-09-17,
+    workspace-im7t.54): ds4 reads ONLY top-level reasoning_effort -- the nested
+    OpenRouter {"reasoning": {"effort": ...}} shape is ignored on the wire,
+    which is the kdsn.271 silent reasoning-ON class. The macstudio+GLM path
+    sends top-level identity for every OA level and "none" for off."""
+
+    def _args(self, **overrides):
+        defaults = dict(
+            api_model="macstudio/glm-5.3-flash-q4",
+            system="sys",
+            provider_messages=[{"role": "user", "content": "hi"}],
+            provider_tools=None,
+            max_tokens=1024,
+            thinking_level="medium",
+            quirks=[],
+            provider_key="macstudio",
+        )
+        defaults.update(overrides)
+        return defaults
+
+    def test_identity_map_all_levels(self):
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            kw = _build_openai_kwargs(**self._args(thinking_level=level))
+            assert kw["extra_body"]["reasoning_effort"] == level
+
+    def test_nested_reasoning_shape_never_sent(self):
+        kw = _build_openai_kwargs(**self._args(thinking_level="high"))
+        assert "reasoning" not in kw["extra_body"]
+
+    def test_off_sends_reasoning_none(self):
+        kw = _build_openai_kwargs(**self._args(thinking_level="off"))
+        assert kw["extra_body"]["reasoning_effort"] == "none"
+
+    def test_branch_scoped_not_to_swallow_synthetic_glm(self):
+        """hf:zai-org GLM on Synthetic keeps ITS override map
+        (workspace-lh3c.11: all six levels legal, 1:1). Both branches happen
+        to be identity here -- the test pins the synthetic override against
+        future regressions."""
+        kw = _build_openai_kwargs(**self._args(
+            api_model="hf:zai-org/glm-5.3-flash",
+            provider_key="synthetic", thinking_level="max"))
+        assert kw["extra_body"]["reasoning_effort"] == "max"
+
+    def test_capability_row_matches_prod_plist(self):
+        from openalph.provider import _MODEL_CAPABILITIES
+        rows = [r for r in _MODEL_CAPABILITIES if r[0] == "glm-5.3-flash-q4"]
+        assert len(rows) == 1
+        _, ctx, cap, vision = rows[0]
+        assert ctx == 1_048_576 and cap is None and vision is False

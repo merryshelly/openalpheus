@@ -492,6 +492,11 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("kimi-k2p6",   262_144, None, True),
     # Local
     ("deepseek-v4-flash", 1_048_576, None, False),
+    # macstudio capacity tier via ds4 since the 2026-09-17 cutover
+    # (workspace-im7t.54): GLM-5.3-Flash Q4_K, 320B/18B MoE, 1M ctx. The model is
+    # vision-capable but the prod plist serves WITHOUT --vision, so the endpoint
+    # is text-only and vision stays fail-closed False until the encoder is wired.
+    ("glm-5.3-flash-q4", 1_048_576, None, False),
     ("qwen38-27b-fp8", 262_144, None, True),   # blackwell SGLang replicas (vision verified 2026-08-26); MUST precede generic "qwen38"
     ("qwen38",      262_144, None, False),
     ("qwen3.8",     262_144, None, True),
@@ -776,6 +781,9 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("minimax-m3", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("deepseek-v4-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
+    # GLM family pattern (kdsn.241.3): penalties pinned to omit; temp/top_p left
+    # to vendor defaults, mirroring the hf:zai-org/glm-5.3-flash treatment.
+    ("glm-5.3-flash-q4", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("qwen38", SamplingProfile(temperature=1.0, top_p=0.95)),
 ]
 
@@ -1865,7 +1873,9 @@ def _build_openai_kwargs(
             "check the block's name/URL wiring.",
             provider_key, _syn_host, _SYNTHETIC_HOST,
         )
-    if thinking_level != "off" and _supports_reasoning_extra:
+    if (thinking_level != "off" and _supports_reasoning_extra
+            and not (provider_key == "macstudio"
+                     and "glm-5.3-flash-q4" in api_model.lower())):
         extra_body["reasoning"] = {"effort": thinking_level}
     elif provider_key == "fireworks":
         # kdsn.271: Fireworks takes TOP-LEVEL reasoning_effort (not OpenRouter's
@@ -1958,6 +1968,17 @@ def _build_openai_kwargs(
                 "%r (operator intent is lossy).", thinking_level, _bw_effort,
             )
         extra_body["reasoning_effort"] = _bw_effort
+    elif (provider_key == "macstudio"
+            and "glm-5.3-flash-q4" in api_model.lower()):
+        # GLM-5.3-Flash Q4_K via ds4 (capacity tier since 2026-09-17,
+        # workspace-im7t.54): ds4 applies ONLY top-level reasoning_effort -- the
+        # nested OpenRouter shape ("reasoning": {"effort": ...}) is ignored on
+        # the wire (ds4_server.c param parser; every eval gate sent it
+        # top-level). The generic branch above would be the kdsn.271 silent
+        # reasoning-ON class. Gate A3: none/low/medium/high/xhigh/max all legal
+        # on ds4 -> identity map; OA "off" -> "none". Always sent explicitly:
+        # an omitted param falls to the server default.
+        extra_body["reasoning_effort"] = "none" if thinking_level == "off" else thinking_level
     elif provider_key == "macstudio-qwen":
         # 2026-09-01 (SB steering): local llama.cpp qwen38 rig takes
         # TOP-LEVEL reasoning_effort (like Fireworks/Synthetic/blackwell),

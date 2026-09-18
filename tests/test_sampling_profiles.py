@@ -212,3 +212,20 @@ class TestSamplingProfileTemperatureTopP:
         assert "temperature" not in kw
         assert "top_p" not in kw
 
+
+class TestGLM53FlashQ4Profile:
+    """macstudio ds4 GLM-5.3-Flash Q4 (2026-09-17 cutover, workspace-im7t.54):
+    GLM family pattern -- penalties omitted, temp/top_p left to vendor
+    defaults (mirrors hf:zai-org/glm-5.3-flash). It must NOT inherit the
+    DeepSeek 1.0/0.95 pins through fragment-matching accidents."""
+
+    def test_penalties_omitted(self):
+        prof = _sampling_profile("macstudio/glm-5.3-flash-q4")
+        assert prof.frequency_penalty is None
+        assert prof.presence_penalty is None
+
+    def test_no_dsv4f_temp_pins_inherited(self):
+        prof = _sampling_profile("macstudio/glm-5.3-flash-q4")
+        assert prof.temperature is None
+        assert prof.top_p is None
+
