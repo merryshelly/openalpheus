@@ -87,6 +87,21 @@ def _build_user_content(text: str, config: AgentConfig, *, vision: bool) -> str 
                 image_bytes = image_path.read_bytes()
                 if image_bytes:
                     base64_data = base64.b64encode(image_bytes).decode("ascii")
+                    # Retain the matched [media:] tag as a text block
+                    # immediately before the image (workspace-kdsn.351).
+                    # Without it, an image-only received message expands to a
+                    # bare image block with ZERO text — no workspace path, no
+                    # task anchor — and models improvise from whatever path
+                    # is salient elsewhere in context. This mirrors the
+                    # view_image drain shape (frame_vision_batch keeps the
+                    # header + tags alongside the image blocks) and aligns
+                    # the live text layer with the JSONL/rebuild layer,
+                    # which always renders the raw tag (expansion is
+                    # live-only by design). The tag is tiny (~60 chars) and
+                    # its content is validated at the producers (path
+                    # containment + framing-char rejection), so no new
+                    # injection surface.
+                    content_blocks.append({"type": "text", "text": match.group(0)})
                     content_blocks.append({
                         "type": "image",
                         "media_type": mime_type,

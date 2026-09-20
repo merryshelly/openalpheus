@@ -157,6 +157,22 @@ class TestCapabilitiesTable:
         config = _make_config(tmp_path)
         assert model_supports_vision("macstudio/glm-5.3-flash-q4", config) is False
 
+    def test_glm53_flash_synthetic_silently_image_blind(self, tmp_path):
+        """workspace-kdsn.351 (2026-09-20): Synthetic's catalog claims
+        input_modalities=["text","image"] for GLM-5.3-Flash, but the served
+        deployment silently drops image parts (probes at 8x8 and 512x512, both
+        part orders: prompt_tokens stayed 26 -- text only -- and the model
+        hallucinated colors; same-gateway controls Kimi-K3/Qwen3.8-27B counted
+        the image tokens and answered correctly; URL ingress 400s). vision=True
+        here is worse than fail-closed: the [media:] tag is consumed and
+        replaced by a placeholder the model cannot use. Probes:
+        memory/projects/openalph/research/vision-anchor-2026-09/."""
+        config = _make_config(tmp_path)
+        for model in ("synthetic/hf:zai-org/GLM-5.3-Flash",
+                      "hf:zai-org/glm-5.3-flash",
+                      "synthetic2/hf:zai-org/GLM-5.3-Flash"):
+            assert model_supports_vision(model, config) is False, model
+
     def test_kimi_vision_true_probe_verified(self, tmp_path):
         """Live-probed 2026-08-22 (spec section 3.5): k2p6 + k3 ID'd red/blue PNGs."""
         config = _make_config(tmp_path)
@@ -447,6 +463,67 @@ class TestBuildUserContent:
         assert len(img_blocks) == 1
         all_text = " ".join(b["text"] for b in text_blocks)
         assert "audio/ogg" in all_text
+
+
+class TestMediaTagRetention:
+    """workspace-kdsn.351: an expanded image block must not consume its
+    [media:] tag — the tag text is retained as a text block immediately
+    before each expanded image. Image-only received messages otherwise carry
+    NO text at all: no workspace path, no task anchor (two 2026-09 incidents:
+    models improvised a system-prompt-salient path, memory/sb-schedule.md).
+    Mirrors the view_image drain shape (frame_vision_batch keeps header +
+    tags alongside the image), and aligns the live text layer with the
+    JSONL/rebuild layer, which always renders the raw tag."""
+
+    def test_tag_retained_before_expanded_image(self, tmp_path):
+        rel_path = _make_image(tmp_path)
+        config = _make_config(tmp_path)
+        tag = f"[media: {rel_path} (image/jpeg, 104 B)]"
+        result = _build_user_content(f"{tag}\nCheck this out", config, vision=True)
+        assert isinstance(result, list)
+        img_idx = next(i for i, b in enumerate(result) if b["type"] == "image")
+        tag_idx = next(i for i, b in enumerate(result)
+                       if b["type"] == "text" and tag in b["text"])
+        assert tag_idx < img_idx, "tag text must precede its image block"
+
+    def test_image_only_message_still_carries_tag_text(self, tmp_path):
+        """The incident shape: NO caption — result must not be a bare image
+        block; the tag text survives as the model's only textual anchor."""
+        rel_path = _make_image(tmp_path)
+        config = _make_config(tmp_path)
+        tag = f"[media: {rel_path} (image/jpeg, 104 B)]"
+        result = _build_user_content(tag, config, vision=True)
+        assert isinstance(result, list)
+        types = [b["type"] for b in result]
+        assert types == ["text", "image"], f"unexpected block shape: {result!r}"
+        assert result[0]["text"] == tag
+
+    def test_each_image_prefixed_by_its_own_tag(self, tmp_path):
+        rel1 = _make_image(tmp_path, name="a.jpg")
+        rel2 = _make_image(tmp_path, name="b.png")
+        config = _make_config(tmp_path)
+        tag1 = f"[media: {rel1} (image/jpeg, 104 B)]"
+        tag2 = f"[media: {rel2} (image/png, 104 B)]"
+        result = _build_user_content(f"{tag1}\n{tag2}", config, vision=True)
+        assert isinstance(result, list)
+        types = [b["type"] for b in result]
+        assert types == ["text", "image", "text", "image"], types
+        assert result[0]["text"] == tag1
+        assert result[2]["text"] == tag2
+
+    def test_rebuild_layer_stays_plain_text(self, tmp_path):
+        """The pre-existing asymmetry is intentional (expansion is live-only);
+        pin that tag retention did not change build_context behavior: stored
+        raw tag text rehydrates as plain text, unchanged."""
+        rel_path = _make_image(tmp_path)
+        from openalph.session import SessionLog
+        sl = SessionLog(workspace=tmp_path, agent_user_id="@sb:x")
+        tag = f"[media: {rel_path} (image/jpeg, 104 B)]"
+        sl.append(role="user", sender="@sb:x", room="!r:x", event_id=None,
+                  content=tag)
+        ctx = sl.build_context("!r:x")
+        assert isinstance(ctx[0]["content"], str)
+        assert ctx[0]["content"] == tag
 
     def test_caption_text_preserved(self, tmp_path):
         rel_path = _make_image(tmp_path)

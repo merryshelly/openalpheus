@@ -481,7 +481,18 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     # BEFORE the generic rows below: first-match-wins, and "hf:moonshotai/
     # kimi-k3" contains the generic fragment "kimi-k3".
     ("hf:moonshotai/kimi-k3",            524288, None, True),
-    ("hf:zai-org/glm-5.3-flash",         524288, None, True),
+    # workspace-kdsn.351 (2026-09-20): vision FALSE despite Synthetic's catalog
+    # claiming input_modalities=["text","image"] — the SERVED deployment
+    # silently drops image parts (probe: 8x8 and 512x512 solid-red PNG, both
+    # part orders, prompt_tokens stayed 26 = text only, answers hallucinated
+    # colors; same-gateway controls Kimi-K3 466pt / Qwen3.8-27B 321pt counted
+    # the image and answered "Red"; URL ingress 400s). vision=True is worse
+    # than fail-closed here: the [media:] tag is consumed and replaced by a
+    # placeholder the model cannot use. Re-probe + re-enable only after
+    # Synthetic fixes serving (their docs' vision aliases list Kimi-K3 and
+    # Qwen3.8-27B, NOT this model). Probes:
+    # memory/projects/openalph/research/vision-anchor-2026-09/
+    ("hf:zai-org/glm-5.3-flash",         524288, None, False),
     ("hf:zai-org/glm-5.2",               524288, None, False),
     ("hf:zai-org/glm-4.7-flash",         196608, None, False),
     ("hf:openai/gpt-oss",                131072, None, False),
@@ -576,7 +587,10 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
     # model level xhigh~max — pass 1:1 (harmless, honors "very heavy"
     # intent) but do not cite xhigh as a distinct tier. Probe quirk: "none"
     # responses leak a stray </thinking> tag into content (served-template
-    # artifact, not a blocker).
+    # artifact, not a blocker). NOTE (workspace-kdsn.351, 2026-09-20): that
+    # 2026-08-29 probe covered EFFORT ONLY, not vision — vision subsequently
+    # probed and the served deployment is image-blind (silently drops image
+    # parts); _MODEL_CAPABILITIES now fails closed False for vision.
     ("hf:zai-org/glm-5.3-flash", {
         "off": "none",
         "low": "low",
