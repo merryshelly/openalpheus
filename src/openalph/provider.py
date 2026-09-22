@@ -497,6 +497,14 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("hf:zai-org/glm-4.7-flash",         196608, None, False),
     ("hf:openai/gpt-oss",                131072, None, False),
     ("hf:nvidia/nvidia-nemotron-3-super", 262144, None, False),
+    # DeepSeek-V4.1-Flash (dsv41f onboarding, 2026-09-22): 512k per vendor
+    # docs + live /models metadata. Same metadata LIE class as glm-5.3-flash
+    # (kdsn.351): the catalog claims input_modalities=["text","image"] and
+    # the card description says "with vision", but the wire HTTP-500s on
+    # EVERY image_url request (3/3, 64x64 red PNG, empty error body) — the
+    # served Beta deployment is image-broken, worse than silent-drop. Fail
+    # closed False. Re-probe on any vendor GA announcement before flipping.
+    ("hf:deepseek-ai/deepseek-v4.1-flash", 524288, None, False),
     # Fireworks / open
     ("glm-5p2",   1_048_576, None, False),
     ("kimi-k3",     1_048_576, None, True),
@@ -592,6 +600,26 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
     # probed and the served deployment is image-blind (silently drops image
     # parts); _MODEL_CAPABILITIES now fails closed False for vision.
     ("hf:zai-org/glm-5.3-flash", {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    }),
+    # hf:deepseek-ai/DeepSeek-V4.1-Flash (dsv41f onboarding, wire-probed
+    # 2026-09-22): vendor /models metadata declares efforts none/low/high/
+    # xhigh/max (NO medium), yet "medium" 200s and behaves as the card
+    # default (121 reasoning chars vs baseline-no-param 120; low 0, high 162
+    # on the same trivial prompt) — so medium passes 1:1 like qwen3.8's
+    # undocumented-but-accepted levels. ALL SIX OA levels pass 1:1: none
+    # yields 0 reasoning chars (genuine off), max is ACCEPTED here (unlike
+    # the GLM-4.7 backend's 400). Tier differentiation above off/low is
+    # UNCHARACTERIZED at single-sample scale (xhigh 129ch vs high 162ch,
+    # non-monotonic) — do not cite xhigh as a distinct tier. If Synthetic
+    # later enforces the declared vocabulary, a medium/max 400 is loud and
+    # the fix is a one-line remap here.
+    ("hf:deepseek-ai/deepseek-v4.1-flash", {
         "off": "none",
         "low": "low",
         "medium": "medium",
@@ -790,6 +818,13 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     ("hf:moonshotai/kimi-k3", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("hf:zai-org/glm-5.3-flash", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("hf:zai-org/glm-5.2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    # DSV4.1-flash (2026-09-22): DeepSeek reasoning-family anti-collapse pin,
+    # mirroring the macstudio "deepseek-v4-flash" row (kdsn.241.3 lineage —
+    # temp 0.8 + no repeat penalty was the 2026-08-03 mode-collapse setup for
+    # long structured/reasoning transcripts). Penalties omitted (default-
+    # profile semantics; the wire accepts them, but no-penalty is the family
+    # invariant).
+    ("hf:deepseek-ai/deepseek-v4.1-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k3",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),

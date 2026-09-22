@@ -615,3 +615,130 @@ api_key = "sk-syn"
         p = cfg.providers["synthetic"]
         assert p.type == "anthropic"
         assert p.base_url == SYNTH_ANTH_BASE
+
+
+# ---------------------------------------------------------------------------
+# dsv41f onboarding — hf:deepseek-ai/DeepSeek-V4.1-Flash (2026-09-22)
+# ---------------------------------------------------------------------------
+
+class TestSyntheticDsv41f:
+    """DeepSeek-V4.1-Flash on Synthetic (512k window, vision fail-closed,
+    all-six effort levels 1:1, DSV4-family sampling pin).
+
+    Probe evidence (2026-09-22, via op-run, tmp/dsv41f-probe{,2,3}.py):
+      * Effort: vendor metadata declares [none, low, high, xhigh, max] (no
+        medium) yet ALL SIX OA levels 200 — none yields 0 reasoning chars
+        (genuine off), medium behaves as the card default (121ch vs
+        no-param baseline 120ch), max accepted (unlike GLM-4.7's 400).
+      * Vision: catalog metadata claims image input but the wire 500s on
+        every image_url request (3/3, 64x64 red PNG, empty body) — same
+        metadata-lie class as glm-5.3-flash (kdsn.351), fail closed False.
+      * Streaming: reasoning streams as delta.reasoning; include_usage
+        honored. Tools: tool_calls + tool-result loop OK. Transparent
+        prefix caching observed (1792/1973 cached on repeat) with
+        INTERMITTENT hit reporting (next identical call missed).
+      * reasoning_content accepted as assistant input field (replay OK).
+      * max_tokens=200000 tolerated (no output cap).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_synthetic_warned(self):
+        provider_module._SYNTHETIC_EFFORT_WARNED.clear()
+        yield
+        provider_module._SYNTHETIC_EFFORT_WARNED.clear()
+
+    def _args(self, level, model="hf:deepseek-ai/DeepSeek-V4.1-Flash",
+              key="synthetic", base_url=None):
+        return dict(
+            api_model=model,
+            system="sys",
+            provider_messages=[{"role": "user", "content": "hi"}],
+            provider_tools=None,
+            max_tokens=1024,
+            thinking_level=level,
+            quirks=[],
+            provider_key=key,
+            base_url=base_url,
+        )
+
+    def _effort(self, kw):
+        return kw.get("extra_body", {}).get("reasoning_effort")
+
+    # --- capabilities ---
+
+    def test_window_512k(self):
+        assert model_context_window("hf:deepseek-ai/DeepSeek-V4.1-Flash") == 524288
+
+    def test_fragment_case_insensitive(self):
+        assert model_context_window("hf:deepseek-ai/deepseek-v4.1-flash") == 524288
+
+    def test_vision_fail_closed(self):
+        """Catalog claims image input; wire 500s (3/3). vision=True would
+        consume [media:] tags into requests the gateway hard-fails."""
+        config = SimpleNamespace(model_aliases={}, model_vision={})
+        assert model_supports_vision("hf:deepseek-ai/DeepSeek-V4.1-Flash", config) is False
+
+    def test_no_fragment_collision_with_local_dsv4f(self):
+        """The parked macstudio row ('deepseek-v4-flash', 1M) must NOT match
+        the 4.1 string ('deepseek-v4.1-flash' — dot, not dash) and vice
+        versa: both keep their own windows."""
+        assert model_context_window("deepseek-v4-flash") == 1_048_576
+        assert model_context_window("hf:deepseek-ai/DeepSeek-V4.1-Flash") == 524288
+
+    # --- effort override: all six 1:1, zero remap warnings ---
+
+    @pytest.mark.parametrize("level,wire", [
+        ("off", "none"), ("low", "low"), ("medium", "medium"),
+        ("high", "high"), ("xhigh", "xhigh"), ("max", "max"),
+    ])
+    def test_all_six_levels_1to1(self, level, wire, caplog):
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(**self._args(level))
+        assert self._effort(kw) == wire
+        assert caplog.records == [], [r.message for r in caplog.records]
+
+    def test_second_account_same_map(self):
+        """synthetic2 (kdsn.348.2 service identity) reaches the override."""
+        kw = _build_openai_kwargs(
+            **self._args("max", key="synthetic2", base_url=SYNTH_OPENAI_BASE))
+        assert self._effort(kw) == "max"
+
+    def test_other_synthetic_models_keep_their_maps(self, caplog):
+        """Guard: glm-5.3-flash keeps all-six 1:1; plain GLM-5.2 keeps the
+        default xhigh/max->high collapse (warns)."""
+        config = None  # noqa: F841 (readability anchor)
+        kw = _build_openai_kwargs(**self._args("max", model="hf:zai-org/glm-5.3-flash"))
+        assert self._effort(kw) == "max"
+        with caplog.at_level(logging.WARNING):
+            kw = _build_openai_kwargs(**self._args("max", model="hf:zai-org/GLM-5.2"))
+        assert self._effort(kw) == "high"
+        assert any("max" in r.message for r in caplog.records)
+
+    # --- sampling pin ---
+
+    def test_sampling_pin_dsv4_family(self):
+        """temp=1.0/top_p=0.95 anti-collapse pin (kdsn.241.3 lineage);
+        penalties omitted."""
+        p = _sampling_profile("hf:deepseek-ai/DeepSeek-V4.1-Flash")
+        assert p.temperature == 1.0
+        assert p.top_p == 0.95
+        assert p.frequency_penalty is None
+        assert p.presence_penalty is None
+
+    # --- resolution locks ---
+
+    def test_alias_resolution(self):
+        cfg, model = resolve_model(
+            "dsv41f", {"synthetic": ProviderConfig(
+                key="synthetic", type="openai", api_key="sk-syn",
+                base_url=SYNTH_OPENAI_BASE, quirks=[])},
+            aliases={"dsv41f": "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"})
+        assert cfg.key == "synthetic"
+        assert model == "hf:deepseek-ai/DeepSeek-V4.1-Flash"
+
+    def test_alias_then_vision_fail_closed(self):
+        config = SimpleNamespace(
+            model_aliases={"dsv41f": "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"},
+            model_vision={},
+        )
+        assert model_supports_vision("dsv41f", config) is False
