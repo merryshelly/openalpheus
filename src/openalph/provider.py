@@ -380,8 +380,8 @@ class StreamEvent:
 def _supports_adaptive_thinking(model_id: str) -> bool:
     """Returns True for models that support adaptive thinking (type=adaptive + effort).
 
-    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, opus-5, sonnet-4-6, sonnet-5,
-    mythos, fable.
+    Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, opus-5, opus-5-5,
+    sonnet-4-6, sonnet-5, mythos, fable.
 
     "opus-5" is a distinct fragment from "opus-4-5"/etc (no "-4-" substring in
     common), so it cannot collide with the existing opus-4.x entries -- verified
@@ -400,6 +400,9 @@ def _supports_adaptive_thinking(model_id: str) -> bool:
         or "sonnet-5" in model_id
         or "opus-4-7" in model_id
         or "opus-4-8" in model_id
+        # opus-5-5 listed explicitly (2026-09-22) for self-documentation; the
+        # generic "opus-5" fragment below already substring-matches it.
+        or "opus-5-5" in model_id
         or "opus-5" in model_id
         or "mythos" in model_id
         or "fable" in model_id
@@ -469,6 +472,12 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("opus-4-6",  1_048_576, 128_000, True),
     ("opus-4-7",  1_048_576, 128_000, True),
     ("opus-4-8",  1_048_576, 128_000, True),
+    # opus-5-5 MUST precede the generic "opus-5" row: "opus-5" is a substring
+    # of "claude-opus-5-5" and first-match-wins (same trap as fable-5-1/fable).
+    # Onboarded 2026-09-22 (release day): 1M ctx, 128K output (Anthropic
+    # hard-400s over-cap -> clamp), vision, adaptive thinking always-on
+    # (default effort medium).
+    ("opus-5-5",  1_048_576, 128_000, True),
     ("opus-5",    1_048_576, 128_000, True),
     # fable-5-1 MUST precede the generic "fable" row: "fable" is a substring of
     # "claude-fable-5-1" and first-match-wins, so the explicit row pins 5.1's
@@ -891,6 +900,12 @@ CACHE_WRITE_1H_MULT = 2.0    # 1-hour cache write   = 2.0x base input
 _MODEL_PRICING: dict[str, dict] = {
     "anthropic": {
         "claude-opus-5":     {"input": 5.0,  "output": 25.0},
+        # Opus 5.5 (onboarded 2026-09-22, release day): $4/$20 base. Cache
+        # READS price at 0.05x base input ($0.20/MTok) — the SECOND Anthropic
+        # model off the uniform CACHE_READ_MULT (after fable-5-1's 0.025x).
+        # Cache WRITES stay standard (5m $5 = 1.25x, 1h $8 = 2.0x — verified
+        # against platform.claude.com opus-5-5/overview).
+        "claude-opus-5-5":   {"input": 4.0,  "output": 20.0, "cached_input": 0.20},
         "claude-opus-4-8":   {"input": 5.0,  "output": 25.0},
         "claude-opus-4-7":   {"input": 5.0,  "output": 25.0},
         "claude-opus-4-6":   {"input": 5.0,  "output": 25.0},
@@ -900,8 +915,9 @@ _MODEL_PRICING: dict[str, dict] = {
         "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0},
         "claude-fable-5":    {"input": 10.0, "output": 50.0},
         # Fable 5.1 (onboarded 2026-09-13): same token price as fable-5, but
-        # cache HITS price at 0.025x base input ($0.25/MTok) — the ONLY Anthropic
-        # model breaking the uniform CACHE_READ_MULT (all others 0.1x). Carried
+        # cache HITS price at 0.025x base input ($0.25/MTok) — breaking the
+        # uniform CACHE_READ_MULT (claude-opus-5-5 at 0.05x joined 2026-09-22;
+        # all other Anthropic models stay 0.1x). Carried
         # as a per-model absolute rate, same field convention as the fireworks
         # namespace. Cache WRITES stay standard (5m 1.25x / 1h 2.0x).
         "claude-fable-5-1":  {"input": 10.0, "output": 50.0, "cached_input": 0.25},
