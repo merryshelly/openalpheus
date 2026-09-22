@@ -618,7 +618,7 @@ api_key = "sk-syn"
 
 
 # ---------------------------------------------------------------------------
-# dsv41f onboarding — hf:deepseek-ai/DeepSeek-V4.1-Flash (2026-09-22)
+# syndsv41f onboarding — hf:deepseek-ai/DeepSeek-V4.1-Flash (2026-09-22)
 # ---------------------------------------------------------------------------
 
 class TestSyntheticDsv41f:
@@ -729,16 +729,16 @@ class TestSyntheticDsv41f:
 
     def test_alias_resolution(self):
         cfg, model = resolve_model(
-            "dsv41f", {"synthetic": ProviderConfig(
+            "syndsv41f", {"synthetic": ProviderConfig(
                 key="synthetic", type="openai", api_key="sk-syn",
                 base_url=SYNTH_OPENAI_BASE, quirks=[])},
-            aliases={"dsv41f": "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"})
+            aliases={"syndsv41f": "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"})
         assert cfg.key == "synthetic"
         assert model == "hf:deepseek-ai/DeepSeek-V4.1-Flash"
 
     def test_alias_then_vision_fail_closed(self):
         config = SimpleNamespace(
-            model_aliases={"dsv41f": "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"},
+            model_aliases={"syndsv41f": "synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash"},
             model_vision={},
         )
-        assert model_supports_vision("dsv41f", config) is False
+        assert model_supports_vision("syndsv41f", config) is False

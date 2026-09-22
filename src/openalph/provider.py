@@ -497,7 +497,7 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("hf:zai-org/glm-4.7-flash",         196608, None, False),
     ("hf:openai/gpt-oss",                131072, None, False),
     ("hf:nvidia/nvidia-nemotron-3-super", 262144, None, False),
-    # DeepSeek-V4.1-Flash (dsv41f onboarding, 2026-09-22): 512k per vendor
+    # DeepSeek-V4.1-Flash (syndsv41f onboarding, 2026-09-22): 512k per vendor
     # docs + live /models metadata. Same metadata LIE class as glm-5.3-flash
     # (kdsn.351): the catalog claims input_modalities=["text","image"] and
     # the card description says "with vision", but the wire HTTP-500s on
@@ -607,7 +607,7 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
         "xhigh": "xhigh",
         "max": "max",
     }),
-    # hf:deepseek-ai/DeepSeek-V4.1-Flash (dsv41f onboarding, wire-probed
+    # hf:deepseek-ai/DeepSeek-V4.1-Flash (syndsv41f onboarding, wire-probed
     # 2026-09-22): vendor /models metadata declares efforts none/low/high/
     # xhigh/max (NO medium), yet "medium" 200s and behaves as the card
     # default (121 reasoning chars vs baseline-no-param 120; low 0, high 162
