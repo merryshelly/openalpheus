@@ -131,15 +131,19 @@ def _resolve_user_id(session_log, fallback) -> str:
     return "agent"
 
 
-def _book(session_log, event: str, **fields) -> None:
-    """Fail-soft system-entry append. Never raises.
+def _book(session_log, event: str, **fields) -> bool:
+    """Fail-soft system-entry append. Never raises; returns whether the
+    write actually landed (a caller chaining idempotency marks — e.g. the
+    matrix `_turn_end` — must mark ONLY on True: a silently-failed booking
+    must not permanently suppress a later compensating one, remediation
+    re-audit F3).
 
     All-keyword `SessionLog.append` (the house shape: cache_warning at
     matrix.py:3133, subagent_dispatched at agent.py:1172) — kwargs land
     verbatim in the JSONL line after ts/role/sender/room/event_id.
     """
     if session_log is None:
-        return
+        return False
     try:
         session_log.append(
             role="system",
@@ -154,6 +158,8 @@ def _book(session_log, event: str, **fields) -> None:
             "turn ledger booking %s failed (non-fatal; the turn goes on)",
             event, exc_info=True,
         )
+        return False
+    return True
 
 
 def book_started(
@@ -191,14 +197,15 @@ def book_finished(
     error_type: str | None = None,
     stop_reason: str | None = None,
     usage: dict | None = None,
-) -> None:
-    """Book the turn's `turn.finished` entry (fail-soft).
+) -> bool:
+    """Book the turn's `turn.finished` entry (fail-soft; returns whether
+    the write landed).
 
     Carries the per-room `stop_reason` / `usage` from the agent's existing
     `_last_turn_usage`-seam accessors (no new counters — design §4); both
     are optional and dropped when unavailable/non-clean.
     """
-    _book(
+    return _book(
         session_log,
         "turn.finished",
         user_id=user_id,

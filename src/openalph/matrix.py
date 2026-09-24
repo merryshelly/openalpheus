@@ -1063,9 +1063,6 @@ class MatrixBot:
                 "duplicate _turn_end for finished turn %s in %s — no-op "
                 "(conclusion %s)", turn_id, room_id, conclusion)
             return
-        self._finished_turns[turn_id] = None
-        while len(self._finished_turns) > self._FINISHED_TURNS_CAP:
-            self._finished_turns.pop(next(iter(self._finished_turns)))
         elapsed_s = max(0.0, round(time.monotonic() - t0, 3))
         stop_reason = None
         try:
@@ -1081,7 +1078,7 @@ class MatrixBot:
                 usage = _usage
         except Exception:
             pass
-        turnbook.book_finished(
+        _booked = turnbook.book_finished(
             getattr(self, "session_log", None),
             user_id=getattr(getattr(self, "config", None), "user_id", None),
             room_id=room_id,
@@ -1093,6 +1090,15 @@ class MatrixBot:
             stop_reason=stop_reason,
             usage=usage,
         )
+        # F3 (remediation re-audit LOW): mark finished ONLY when the
+        # booking actually landed — a silently-failed write must not
+        # permanently suppress a later compensating booking. No await
+        # stands between the booking call and this mark, so there is no
+        # interleaving window for a duplicate _turn_end to slip through.
+        if _booked:
+            self._finished_turns[turn_id] = None
+            while len(self._finished_turns) > self._FINISHED_TURNS_CAP:
+                self._finished_turns.pop(next(iter(self._finished_turns)))
         # The every-turn plain m.notice line (design §4: no threshold, one
         # line, closed vocabulary, no red/green dependence). R8: by
         # default fired as a background task via the existing

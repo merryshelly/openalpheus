@@ -2282,6 +2282,19 @@ async def _execute_tool_inner(
         )
 
     if name == "declare_done":
+        # F2 (remediation re-audit MEDIUM): registry membership is NOT
+        # enablement — BUILTIN_TOOLS knows the name fleet-wide, so a Camp-B
+        # workspace (no declare_done.toml) must still get the Camp-B truth:
+        # the tool is not enabled for this run, full stop. The terminal
+        # steering text INVITES the model to call a tool it does not have.
+        if tools is not None and not any(t.name == "declare_done" for t in tools):
+            return ToolResult(
+                is_error=True,
+                content=(
+                    f"Unknown tool: {name}. Available tools: "
+                    f"{', '.join(sorted(t.name for t in tools))}"
+                ),
+            )
         # Declare-done (workspace-kdsn.350.3): terminal-only — a
         # declare_done call ends the turn at the agent.py DISPATCH SITE
         # (captured like the exec --submit-schema terminal tool) and is

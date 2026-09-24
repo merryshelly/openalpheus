@@ -708,18 +708,62 @@ class TestRemediationGrammar:
     @pytest.mark.asyncio
     async def test_declare_done_execute_branch_feedback(self, tmp_path):
         """P-R3 (3 models): if a declare_done call ever reaches normal tool
-        dispatch (mixed --submit-schema deployments), it gets a typed,
-        steering error — not 'Unknown tool'."""
-        from openalph.tools import execute_tool
+        dispatch (mixed --submit-schema deployments, tool ENABLED), it gets
+        a typed steering error — not 'Unknown tool'.
+        P-F2 (re-audit MEDIUM): but with the tool NOT enabled for the run
+        (Camp-B), the dispatch must behave exactly as the tools registry
+        says: 'Unknown tool' — the steering text must not invite calls to
+        a tool the model does not have."""
+        from openalph.tools import ToolDef, execute_tool
 
         config = AgentConfig(
             name="dd-exec-branch", default_model="default/claude-test",
             max_tokens=8192, providers={"default": _provider()},
             workspace=tmp_path,
         )
-        result = await execute_tool("declare_done", {}, {}, config)
+        # tool enabled for the run -> terminal-steering error
+        enabled = [ToolDef(name="declare_done", description="d",
+                           parameters={"type": "object", "properties": {}}, config={})]
+        result = await execute_tool("declare_done", {}, {}, config, tools=enabled)
         assert result.is_error
         assert "terminal" in result.content.lower()
+
+        # Camp-B: tool not enabled -> plain Unknown tool (registry truth)
+        disabled = [ToolDef(name="shell", description="d", parameters={}, config={})]
+        result2 = await execute_tool("declare_done", {}, {}, config, tools=disabled)
+        assert result2.is_error
+        assert "Unknown tool" in result2.content
+        assert "terminal" not in result2.content.lower()
+
+
+class TestRemediationBooking:
+    @pytest.mark.asyncio
+    async def test_failed_booking_does_not_suppress_later_booking(self, tmp_path):
+        """P-F3 (re-audit LOW, R2 ordering): the idempotency mark must be
+        set only when the booking actually landed — a silently-failed
+        turn.finished write must NOT permanently suppress a later
+        compensating _turn_end for the same turn."""
+        bot, agent = _prime_bot(tmp_path, "declared")
+
+        orig_append = bot.session_log.append
+        failed_once = {"done": False}
+
+        def flaky_append(*, role, **kwargs):
+            if (kwargs.get("event") == "turn.finished"
+                    and not failed_once["done"]):
+                failed_once["done"] = True
+                raise RuntimeError("transient ledger outage")
+            return orig_append(role=role, **kwargs)
+
+        bot.session_log.append = flaky_append
+        turn = bot._turn_begin(ROOM_ID, origin="user")
+
+        await bot._turn_end(ROOM_ID, turn, "declared")
+        assert _turn_events(bot, "turn.finished") == [], "write should have failed silently"
+
+        await bot._turn_end(ROOM_ID, turn, "declared")
+        finished = _turn_events(bot, "turn.finished")
+        assert len(finished) == 1, "failed booking permanently suppressed the retry"
 
 
 class TestRemediationExec:
@@ -738,6 +782,24 @@ class TestRemediationExec:
         obj = parse_single_json(out)
         assert code == 0
         assert "conclusion" not in obj
+
+    def test_exec_conclusion_omitted_for_junk_marker(self, tmp_path):
+        """P-F1 (re-audit HIGH): on a done run, a marker that is non-str OR
+        out-of-vocab OMITS the key — the exec contract is omission, never
+        fabrication (None -> 'undeclared' stays, E2). Junk and a genuine
+        Camp-B ending must be distinguishable."""
+        from test_cli_exec import make_agent_stub, make_config, parse_single_json, run_exec
+
+        for junk in ({"k": "v"}, "arbitrary prose"):
+            config = make_config(tmp_path)
+            agent = make_agent_stub(response_text="done")
+            agent.last_turn_declaration = MagicMock(return_value=junk)
+            out, _err, code = run_exec(
+                ["exec", "--agent", "test-agent", "--task-file", "-"],
+                config=config, agent=agent, stdin="task")
+            obj = parse_single_json(out)
+            assert code == 0
+            assert "conclusion" not in obj, f"junk marker {junk!r} fabricated a conclusion"
 
     def test_exec_conclusion_absent_on_error(self, tmp_path):
         """P-R4b (3 models): a crashed/error exec run must not be

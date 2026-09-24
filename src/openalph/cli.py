@@ -1349,16 +1349,21 @@ def cmd_exec(args):
                 _conclusion = None
             else:
                 if _conclusion is None:
-                    _conclusion = "undeclared"
-                elif not (isinstance(_conclusion, str)
-                          and _conclusion in turnbook.MARKER_VOCABULARY):
+                    result["conclusion"] = "undeclared"
+                elif isinstance(_conclusion, str) \
+                        and _conclusion in turnbook.MARKER_VOCABULARY:
+                    result["conclusion"] = _conclusion
+                else:
+                    # F1 (remediation re-audit HIGH): the contract is
+                    # OMISSION — non-str or out-of-vocabulary markers never
+                    # fabricate a taxonomy class. 'undeclared' is reserved
+                    # for a genuine Camp-B landing (marker None, pin E2);
+                    # junk stays silent, never written.
                     logger.warning(
                         "exec: out-of-taxonomy conclusion marker %r from "
-                        "%r — surfacing as 'undeclared'",
+                        "%r — omitting the conclusion field",
                         _conclusion, agent,
                     )
-                    _conclusion = "undeclared"
-                result["conclusion"] = _conclusion
     print(json.dumps(result), flush=True)
 
     if status == "done":
