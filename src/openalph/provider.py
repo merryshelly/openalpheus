@@ -874,6 +874,48 @@ def _cc_split(usage, attr: str) -> int | None:
 # key is deterministic — a hardcoded literal, never a per-process random value.
 SALT = "openalph-fireworks-affinity-v1"
 
+# Header name for the routing-key session-affinity stamp
+# (workspace-kdsn.353); overridable per provider via ``routing_key_header``.
+# Default-on for blackwell (SB ratification 2026-09-24) — see
+# _resolved_routing_key_header below.
+DEFAULT_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
+
+
+def session_affinity_key(room_id: str | None) -> str | None:
+    """Salted sha256(room_id) -> 32 lowercase hex chars, or None.
+
+    Single derivation for every session-affinity surface: the Fireworks
+    x-session-affinity hint (design #5) and the routing-key header stamp
+    (workspace-kdsn.353). SALT is a hardcoded literal, so a room's key is
+    deterministic across restarts and umbral boundaries, and distinct rooms
+    differ except at sha256-collision odds. Returns None when room_id is
+    falsy — callers must skip the stamp, never invent identity.
+    """
+    if not room_id:
+        return None
+    return hashlib.sha256((SALT + room_id).encode()).hexdigest()[:32]
+
+
+def _resolved_routing_key_header(provider_cfg) -> str | None:
+    """Resolve the routing-key header name for a provider (workspace-kdsn.353).
+
+    Returns the header name to stamp on /v1/chat/completions, or None when
+    the stamp is off. Blackwell is DEFAULT-ON (SB ratification 2026-09-24):
+    it gets X-SMG-Routing-Key with zero configuration. Any other
+    openai-compatible provider opts in with ``routing_key = true`` (config,
+    no code changes). An explicit ``routing_key = false`` is the kill flag —
+    it beats both the blackwell default and an explicit opt-in.
+    ``routing_key_header`` overrides the header name (value derivation is
+    unchanged). Fireworks is unaffected: it keeps its own x-session-affinity
+    path (``user`` body field + x-session-affinity header).
+    """
+    enabled = provider_cfg.routing_key
+    if enabled is None:
+        enabled = provider_cfg.key == "blackwell"
+    if not enabled:
+        return None
+    return provider_cfg.routing_key_header or DEFAULT_ROUTING_KEY_HEADER
+
 
 # ---- Session USD cost pricing (Anthropic only) --------------------------
 # Verified 2026-07-09 against platform.claude.com/docs/en/about-claude/pricing
@@ -2441,10 +2483,25 @@ async def stream(
         # stable backend. Never sent to real OpenAI / Google / codex-sidecar /
         # local (they may reject unknown fields; the routing hint is Fireworks-
         # specific). Output-safe: it only steers routing, never the completion.
-        if provider_cfg.key == "fireworks" and room_id:
-            affinity = hashlib.sha256((SALT + room_id).encode()).hexdigest()[:32]
+        if provider_cfg.key == "fireworks" and (affinity := session_affinity_key(room_id)):
             api_kwargs["user"] = affinity
             api_kwargs["extra_headers"] = {"x-session-affinity": affinity}
+
+        # Routing-key session-affinity stamp (workspace-kdsn.353):
+        # default-on for blackwell (SB ratification 2026-09-24), opt-in via
+        # ``routing_key = true`` for any other openai-compatible provider,
+        # kill flag ``routing_key = false``. Header-only — never a body
+        # field — so it stays invisible to the model and is never logged at
+        # info level (D1-clean). The value is the SAME salted
+        # sha256(room_id) derivation as the Fireworks hint above: stable
+        # across restarts, distinct per room. room_id=None -> no stamp
+        # (never invent identity). Merges into any existing extra_headers
+        # so both hint surfaces can coexist.
+        rk_header = _resolved_routing_key_header(provider_cfg)
+        if rk_header and (affinity := session_affinity_key(room_id)):
+            extra_headers = dict(api_kwargs.get("extra_headers") or {})
+            extra_headers[rk_header] = affinity
+            api_kwargs["extra_headers"] = extra_headers
 
         attempt = 0
         while True:

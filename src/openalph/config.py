@@ -63,6 +63,11 @@ class ProviderConfig:
     routing: dict | None = None  # OpenRouter provider routing preferences
     degen_detector: str | None = None  # streaming degeneration monitor mode override: off|warn|abort (provider-level takes precedence over agent-level; kdsn.241.21)
     retry_enabled: bool = True  # mid-stream transport-error retry (kdsn.345)
+    # Session-affinity routing-key header stamp (workspace-kdsn.353):
+    # None = provider default (blackwell ON, every other provider off);
+    # True = explicit opt-in; False = kill flag. Header-only, D1-clean.
+    routing_key: bool | None = None
+    routing_key_header: str | None = None  # header name override (None = X-SMG-Routing-Key)
 
 
 @dataclass
@@ -552,6 +557,17 @@ def load_config(path: Path) -> AgentConfig:
             _skip_provider(provider_key, "retry_enabled must be a boolean")
             continue
 
+        routing_key = section_data.get("routing_key")
+        if routing_key is not None and not isinstance(routing_key, bool):
+            _skip_provider(provider_key, "routing_key must be a boolean")
+            continue
+
+        routing_key_header = section_data.get("routing_key_header")
+        if routing_key_header is not None and (
+                not isinstance(routing_key_header, str) or not routing_key_header):
+            _skip_provider(provider_key, "routing_key_header must be a non-empty string")
+            continue
+
         routing = section_data.get("routing")
         if routing is not None and not isinstance(routing, dict):
             _skip_provider(provider_key, f"routing must be a table/dict, got: {type(routing).__name__}")
@@ -575,6 +591,8 @@ def load_config(path: Path) -> AgentConfig:
             routing=routing,
             degen_detector=provider_degen,
             retry_enabled=retry_enabled,
+            routing_key=routing_key,
+            routing_key_header=routing_key_header,
         )
 
     # kdsn.292: zero providers is DEGRADED, not fatal — slash commands, the
