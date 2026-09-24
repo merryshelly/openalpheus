@@ -1081,6 +1081,22 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
         "config": {
             "max_bytes": 5_242_880
         }
+    },
+    "declare_done": {
+        "description": (
+            "Declare that the work of the current turn is complete and end the turn. "
+            "Take NO arguments — call it with an empty object ({}). The call itself is "
+            "the signal; when it is called the turn ends cleanly and your accompanying "
+            "text is the final reply. NEVER put a summary or any other content inside "
+            "the arguments, NEVER signal completion with prose markers, and do NOT end "
+            "the turn with plain text while this tool is available — either keep "
+            "working or declare_done{} when the work is done."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        },
+        "config": {}
     }
 }
 

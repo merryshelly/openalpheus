@@ -236,6 +236,12 @@ class Agent:
         self._room_usage: dict[str, dict[str, int]] = {}
         self._last_turn_usage: dict[str, dict[str, int]] = {}
         self._last_stop_reason: dict[str, str] = {}
+        # Declare-done (workspace-kdsn.350.3): per-room landing state for the
+        # most recently ended turn — "declared" (terminal declare_done call),
+        # "undeclared" (second consecutive text-end with the tool available),
+        # "cap_exhausted" (iteration-cap forced-summary path). No key ==
+        # None: tool never registered in this room's turns / no turn yet.
+        self._last_declaration: dict[str, str] = {}
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
         # Pre-compute tool definition cost for token estimation.
@@ -840,6 +846,19 @@ class Agent:
         if room_id not in self._rooms:
             self._rooms[room_id] = []
         return self._rooms[room_id]
+
+    def last_turn_declaration(self, room_id: str) -> str | None:
+        """Report the most recently ended turn's declaration landing.
+
+        "declared" — the turn ended on a terminal declare_done call at the
+        dispatch site; "undeclared" — the model ended by plain text a second
+        consecutive time with declare_done available (the corrective fired,
+        then text again — judged unshapeable this turn); "cap_exhausted" —
+        the iteration-cap forced-summary path ended the turn (declaration
+        was impossible there). None — no landing recorded for this room yet
+        (declare_done never registered / no turn yet).
+        """
+        return self._last_declaration.get(room_id)
 
     def get_model(self, room_id: str = "_default") -> str:
         """Return the active model for a room, falling back to config default."""
@@ -1837,6 +1856,18 @@ class Agent:
                 _turn_saw_max_tokens = False
                 _clipped_output_tokens = 0
 
+                # Declare-done (workspace-kdsn.350.3): hold-back/corrective
+                # state for THIS turn. _corrective_fired bounds the harness
+                # corrective to at most ONE per turn; _declare_done_available
+                # gates the whole mechanic on the tool being in this turn's
+                # tool set (registration gate — absent tool = Camp-B
+                # behavior, no corrective ever fires). The forced-summary
+                # (iteration-cap) path sits after the loop and NEVER
+                # evaluates these.
+                _corrective_fired = False
+                _declare_done_available = any(
+                    t.name == "declare_done" for t in _turn_tools)
+
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
                     # Drain steering inbox at the top of every iteration (before API call).
@@ -2080,6 +2111,22 @@ class Agent:
                     if _tt is not None:
                         _terminal_name = _tt[0]
                         _terminal_strict = bool(_tt[1].config.get("strict"))
+                    else:
+                        # Declare-done (workspace-kdsn.350.3): terminal
+                        # semantics by TOOL IDENTITY — a discovered
+                        # declare_done tool is terminal the same way the
+                        # per-run exec terminal tool is. The per-run exec
+                        # terminal (above) keeps precedence; a run with both
+                        # registered behaves exactly as pre-350.3 (byte-
+                        # compatible). strict is read from the tool's config
+                        # (TOML overlay) so a future per-run overlay merge
+                        # can grammar-constrain declare_done without a code
+                        # change; core discovery yields {} -> False.
+                        for t in _turn_tools:
+                            if t.name == "declare_done":
+                                _terminal_name = "declare_done"
+                                _terminal_strict = bool(t.config.get("strict"))
+                                break
 
                     # Record start time for latency measurement
                     start_time = time.monotonic()
@@ -2506,6 +2553,33 @@ class Agent:
                                         "send_notice callback failed for "
                                         "length-stop notice", exc_info=True)
                             _length_stopped_notified = True
+                        # Declare-done (workspace-kdsn.350.3, design memo §3):
+                        # with declare_done in this turn's tool set, a text-only
+                        # response is NOT a turn ending. First such response:
+                        # HOLD it — append it as the in-context assistant
+                        # message (nothing is returned/delivered yet), fire the
+                        # ONE harness-authored corrective, and continue the loop
+                        # so the model can resume work or declare. Second
+                        # consecutive text-end: the model is judged unshapeable
+                        # this turn — book "undeclared" and fall through to the
+                        # normal return below. Tool absent (registration gate):
+                        # unchanged Camp-B return, marker untouched.
+                        if _declare_done_available:
+                            if not _corrective_fired:
+                                _corrective_fired = True
+                                history.append(assistant_msg)
+                                history.append({
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM: You ended your response with plain text "
+                                        "but did not declare completion. If the work is "
+                                        "complete, call declare_done{} to end the turn. "
+                                        "Otherwise, continue working and finish what you "
+                                        "started, then declare_done{} when it is done.]"
+                                    ),
+                                })
+                                continue
+                            self._last_declaration[room_id] = "undeclared"
                         # INVARIANT (RC1): assistant_msg must be history[-1] when matrix persists this turn after return.
                         history.append(assistant_msg)
                         self._last_stop_reason[room_id] = response.stop_reason
@@ -2650,6 +2724,14 @@ class Agent:
                                 except Exception as e:
                                     logger.warning("Tool call callback failed: %s", e)
                         self._terminal_submit = _tt_submit
+                        # Declare-done (workspace-kdsn.350.3): a terminal call
+                        # at the dispatch site IS the turn's declaration —
+                        # book the room's landing state for the marker API.
+                        # Covers both the discovered declare_done and the
+                        # per-run exec terminal tool (its declaration act);
+                        # nothing reads the marker pre-350.3, so this is
+                        # inert for the exec path.
+                        self._last_declaration[room_id] = "declared"
                         self._last_stop_reason[room_id] = response.stop_reason
                         # Spotter v1 (design §3): the turn is complete — same
                         # sync, fail-soft, history-non-mutating maybe_fire as
@@ -2865,6 +2947,12 @@ class Agent:
                         "Summary generation also failed — check logs for details."
                     )
 
+                # Declare-done (workspace-kdsn.350.3): cap exhaustion is its
+                # own ending class — declaration was impossible (the forced
+                # summary goes out with tools=None, so no declare_done call
+                # can arrive here). This path NEVER evaluates the hold-back
+                # corrective, which lives inside the loop above.
+                self._last_declaration[room_id] = "cap_exhausted"
                 history.append({"role": "assistant", "content": final_text})
                 self._last_stop_reason[room_id] = summary_response.stop_reason if summary_response else "max_iterations"
                 # Spotter v1 (design §3): the turn is complete — fire the monitor
