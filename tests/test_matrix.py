@@ -882,8 +882,10 @@ class TestErrorHandling:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        # Should send an error message (not crash)
-        bot.client.room_send.assert_awaited_once()
+        # Should send an error message (not crash). Two sends since
+        # kdsn.179: the every-turn ledger notice ("Turn ended — error
+        # (…)") lands first, then the error message.
+        assert bot.client.room_send.await_count == 2
 
     @pytest.mark.asyncio
     async def test_agent_error_does_not_crash_bot(self):
@@ -957,11 +959,17 @@ class TestErrorSanitization:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        bot.client.room_send.assert_awaited_once()
+        # kdsn.179: the every-turn ledger notice adds one send before the
+        # error message; the LAST call is still the (sanitized) error.
+        assert bot.client.room_send.await_count == 2
         sent_content = bot.client.room_send.call_args[0][2]
         sent_body = sent_content["body"]
         assert sensitive_msg not in sent_body
         assert "Internal error" in sent_body
+        # The new ledger-notice channel must be sanitized too (it carries
+        # only the exception class name — never the message).
+        first_content = bot.client.room_send.call_args_list[0][0][2]
+        assert sensitive_msg not in first_content["body"]
 
     @pytest.mark.asyncio
     async def test_heartbeat_error_does_not_leak_details(self):
@@ -1177,7 +1185,10 @@ class TestProviderErrorSurfacing:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        bot.client.room_send.assert_awaited_once()
+        # kdsn.179: the every-turn ledger notice ("Turn ended — error
+        # (provider)") lands first; the LAST call is still the provider
+        # error message.
+        assert bot.client.room_send.await_count == 2
         sent_content = bot.client.room_send.call_args[0][2]
         sent_body = sent_content["body"]
         assert "Provider error" in sent_body
@@ -1283,8 +1294,9 @@ class TestEmptyResponseGuard:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        # Warning message should have been sent
-        bot.client.room_send.assert_awaited_once()
+        # Warning message should have been sent. Two sends since kdsn.179:
+        # the warning, then the every-turn ledger notice.
+        assert bot.client.room_send.await_count == 2
 
     @pytest.mark.asyncio
     async def test_whitespace_response_sends_warning(self):
@@ -1304,7 +1316,8 @@ class TestEmptyResponseGuard:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        bot.client.room_send.assert_awaited_once()
+        # kdsn.179: warning + every-turn ledger notice.
+        assert bot.client.room_send.await_count == 2
 
     @pytest.mark.asyncio
     async def test_real_response_still_sent(self):
@@ -1324,7 +1337,8 @@ class TestEmptyResponseGuard:
         if hasattr(bot, "_background_tasks"):
             await asyncio.gather(*bot._background_tasks)
 
-        bot.client.room_send.assert_awaited_once()
+        # kdsn.179: response + every-turn ledger notice.
+        assert bot.client.room_send.await_count == 2
 
 # --- Timesense Command ---
 

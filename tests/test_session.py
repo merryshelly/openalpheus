@@ -585,12 +585,17 @@ class TestMatrixBotIntegration:
             await asyncio.gather(*bot._background_tasks)
 
         entries = bot.session_log.read(ROOM_ID)
-        # Should see: user → assistant(intent) → tool → assistant(final)
+        # Should see: user → system(turn.started) → assistant(intent) →
+        # tool → assistant(final) → system(turn.finished). The two ledger
+        # bookends are the kdsn.179 every-turn entries (shared turn_id;
+        # the stub agent reports no declaration -> conclusion
+        # "undeclared").
         roles = [e["role"] for e in entries]
-        assert roles == ["user", "assistant", "tool", "assistant"]
+        assert roles == ["user", "system", "assistant", "tool",
+                         "assistant", "system"]
 
         # Intent entry has tool_calls
-        intent = entries[1]
+        intent = entries[2]
         assert intent["role"] == "assistant"
         assert "tool_calls" in intent
         assert intent["tool_calls"][0]["name"] == "shell"
@@ -598,9 +603,16 @@ class TestMatrixBotIntegration:
         assert intent["content"] == "Let me check..."
 
         # Final entry is the text response
-        final = entries[3]
+        final = entries[4]
         assert final["role"] == "assistant"
         assert final["content"] == "System has been up 3 days."
+
+        # kdsn.179: the bookend pair shares one turn_id.
+        started = entries[1]
+        finished = entries[5]
+        assert started["event"] == "turn.started"
+        assert finished["event"] == "turn.finished"
+        assert started["turn_id"] == finished["turn_id"]
 
 
 class TestRehydrationRoundTrip:

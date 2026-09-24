@@ -54,20 +54,18 @@ The corrective drives follow-through; there is no "exactly one message" pin.
 """
 
 import asyncio
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from openalph.agent import Agent, ContextOverflowError
 from openalph.config import AgentConfig, ProviderConfig
-from openalph.matrix import MatrixBot
 from openalph.provider import ProviderError, Response, StreamEvent, ToolCall, Usage
 from openalph.tools import BUILTIN_TOOLS, ToolResult, discover_tools
 
 # Reuse the proven harnesses (same tests/ dir, rootdir on sys.path).
 from test_gapfill_trigger_dedup import (  # noqa: E402
-    AGENT_USER, USER, ROOM_ID, drain, gapfill_page, make_bot, make_event,
+    USER, ROOM_ID, drain, gapfill_page, make_bot, make_event,
     make_room, seed_prior_history,
 )
 
@@ -568,7 +566,7 @@ class TestExecConclusion:
         agent.last_turn_declaration = MagicMock(return_value="declared")
 
         out, _err, code = run_exec(
-            ["exec", "--task-file", "-"], config=config, agent=agent, stdin="task")
+            ["exec", "--agent", "test-agent", "--task-file", "-"], config=config, agent=agent, stdin="task")
         obj = parse_single_json(out)
         assert code == 0
         assert obj["conclusion"] == "declared"
@@ -583,7 +581,7 @@ class TestExecConclusion:
         agent.last_turn_declaration = MagicMock(return_value=None)
 
         out, _err, code = run_exec(
-            ["exec", "--task-file", "-"], config=config, agent=agent, stdin="task")
+            ["exec", "--agent", "test-agent", "--task-file", "-"], config=config, agent=agent, stdin="task")
         obj = parse_single_json(out)
         assert obj["conclusion"] == "undeclared"
 
@@ -596,6 +594,6 @@ class TestExecConclusion:
         agent.last_turn_declaration = MagicMock(return_value="cap_exhausted")
 
         out, _err, code = run_exec(
-            ["exec", "--task-file", "-"], config=config, agent=agent, stdin="task")
+            ["exec", "--agent", "test-agent", "--task-file", "-"], config=config, agent=agent, stdin="task")
         obj = parse_single_json(out)
         assert obj["conclusion"] == "cap_exhausted"

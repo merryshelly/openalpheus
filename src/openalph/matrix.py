@@ -52,6 +52,7 @@ from openalph.heartbeat import HeartbeatManager, parse_interval, format_interval
 from openalph.umbral import UmbralManager
 from openalph.tools import escape_system_reminder_tags, truncate_result
 from openalph.tools import subledger
+import openalph.turnbook as turnbook
 from openalph.callbacks import (
     build_callbacks,
     build_context_status,
@@ -558,6 +559,12 @@ class MatrixBot:
         self._active_turns: set[str] = set()
         self._advisor_results: dict[tuple, dict] = {}  # R5: keyed (room_id, call_id)
         self._subagent_results: dict[tuple, dict] = {}  # keyed (room_id, call_id)
+        # kdsn.179 (turn ledger): per-room TURN-TASK registry (room_id ->
+        # asyncio.Task of the funnel running the turn). `_cancel_current`
+        # uses it as a backstop cancellation seam; in production
+        # `agent.cancel()` cancels the SAME task, so the `cancelling()`
+        # guard there keeps this a no-op on the real path.
+        self._turn_tasks: dict[str, asyncio.Task] = {}
 
     async def _emit_provider_notice(self, room_id: str, error) -> None:
         """Send the ⚠️ Provider error notice with the kdsn.292 warn-once latch.
@@ -951,6 +958,130 @@ class MatrixBot:
         except Exception:
             logger.exception("Failed to send stall notice to %s", room_id)
 
+    # --- Declare-done turn ledger (workspace-kdsn.179) --------------------
+    # Every turn on every funnel books exactly one `turn.started` + one
+    # `turn.finished` system entry (shared per-turn turn_id) plus one plain
+    # every-turn m.notice line. The four funnels (live / heartbeat / umbral /
+    # subagent completion) all flow through exactly these two seams:
+    # `_process_message` (origin "user") and `_run_heartbeat_turn` (origin =
+    # turn_source — umbral and completion delegate to it), so no funnel is
+    # missed and no per-funnel duplication exists. Emission is fail-soft
+    # (never blocks the turn); a crash between bookends leaves a stale
+    # turn.started — absence of turn.finished IS the crash signal, so the
+    # funnels book on every handler branch and never on pre-handler paths.
+
+    def _turn_begin(self, room_id: str, *, origin: str,
+                    trigger_event_id: str | None = None):
+        """Book `turn.started` for the turn entering `room_id` NOW.
+
+        Returns the turn handle `(turn_id, t0, origin)` that `_turn_end`
+        finishes. Fail-soft by construction: this method NEVER raises — a
+        ledger outage must not block a turn.
+        """
+        turn_id = turnbook.new_turn_id()
+        t0 = time.monotonic()
+        agent_name = None
+        try:
+            _name = getattr(getattr(self.agent, "config", None), "name", None)
+            if isinstance(_name, str) and _name:
+                agent_name = _name
+        except Exception:
+            pass
+        turnbook.book_started(
+            getattr(self, "session_log", None),
+            user_id=getattr(getattr(self, "config", None), "user_id", None),
+            room_id=room_id,
+            turn_id=turn_id,
+            origin=origin,
+            agent_name=agent_name,
+            trigger_event_id=trigger_event_id,
+        )
+        # /stop backstop registry (see __init__): the funnel's OWN task.
+        # Lazy-init for __new__-built test bots (house pattern).
+        if not hasattr(self, "_turn_tasks"):
+            self._turn_tasks = {}
+        try:
+            self._turn_tasks[room_id] = asyncio.current_task()
+        except RuntimeError:
+            pass  # no running loop context — nothing to register
+        return (turn_id, t0, origin)
+
+    async def _turn_end(self, room_id: str, turn, conclusion: str,
+                        *, error_type: str | None = None) -> None:
+        """Book `turn.finished` + the every-turn m.notice line. Fail-soft.
+
+        `turn` is the handle from `_turn_begin`; `None` means the funnel
+        died before it booked a start — there is nothing to finish, and
+        fabricating one would falsify the ledger (never-fabricate rule).
+        """
+        if turn is None:
+            return
+        turn_id, t0, origin = turn
+        elapsed_s = max(0.0, round(time.monotonic() - t0, 3))
+        stop_reason = None
+        try:
+            _stop = self.agent.last_stop_reason(room_id)
+            if isinstance(_stop, str) and _stop:
+                stop_reason = _stop
+        except Exception:
+            pass
+        usage = None
+        try:
+            _usage = self.agent.last_turn_usage(room_id)
+            if isinstance(_usage, dict):
+                usage = _usage
+        except Exception:
+            pass
+        turnbook.book_finished(
+            getattr(self, "session_log", None),
+            user_id=getattr(getattr(self, "config", None), "user_id", None),
+            room_id=room_id,
+            turn_id=turn_id,
+            conclusion=conclusion,
+            origin=origin,
+            elapsed_s=elapsed_s,
+            error_type=error_type,
+            stop_reason=stop_reason,
+            usage=usage,
+        )
+        # The every-turn plain m.notice line (design §4: no threshold, one
+        # line, closed vocabulary, no red/green dependence). CANCELLED turns
+        # fire it as a bounded background task, F4-style: a cancel path must
+        # not await Matrix sends while the room's locks are still held — the
+        # whole point of the cancel is to unwedge the room immediately.
+        if conclusion == "cancelled":
+            try:
+                self._fire_background(
+                    self._send_turn_end_notice(room_id, conclusion, error_type))
+            except Exception:
+                logger.warning(
+                    "turn end notice scheduling failed in %s (non-fatal)",
+                    room_id, exc_info=True)
+        else:
+            try:
+                await self._send_turn_end_notice(room_id, conclusion, error_type)
+            except Exception:
+                logger.warning(
+                    "turn end notice failed in %s (non-fatal)",
+                    room_id, exc_info=True)
+
+    async def _send_turn_end_notice(self, room_id: str, conclusion: str,
+                                    error_type: str | None = None) -> None:
+        """Best-effort every-turn ledger notice. Never raises.
+
+        Plain `MatrixBot.send_notice` (one line, no fold) — NOT MatrixSinks:
+        the ledger line is ambient bookkeeping, not a tool-call collapse.
+        """
+        try:
+            await self.send_notice(
+                room_id, turnbook.turn_end_notice(conclusion, error_type))
+        except asyncio.CancelledError:
+            raise  # cancel propagates, never swallows
+        except Exception:
+            logger.warning(
+                "turn end notice failed in %s (non-fatal)", room_id,
+                exc_info=True)
+
     _CANCEL_TIMEOUT = 5  # seconds to wait for cancelled task before abandoning
 
     async def _cancel_current(self, room_id: str | None = None):
@@ -979,6 +1110,20 @@ class MatrixBot:
         task = None
         if hasattr(self.agent, "cancel"):
             task = self.agent.cancel(room_id) if room_id is not None else self.agent.cancel()
+
+        # kdsn.179: the funnels ALSO register their turn task per room
+        # (`_turn_tasks`, set by `_turn_begin`). In production that is the
+        # SAME task `agent.cancel()` just cancelled (the agent registers
+        # `asyncio.current_task()` for the room), so the `cancelling()`
+        # guard below keeps this a no-op on the real path — no double
+        # cancel, ever. With a stubbed/out-of-tree agent whose `cancel` is
+        # not a no-op (test doubles), this IS the cancellation, and it
+        # runs BEFORE any await so the guard is reliable.
+        _turn_tasks = getattr(self, "_turn_tasks", {}) or {}
+        for _rid in ([room_id] if room_id is not None else list(_turn_tasks)):
+            _tt = _turn_tasks.get(_rid)
+            if _tt is not None and not _tt.done() and not _tt.cancelling():
+                _tt.cancel()
 
         # Wait for the cancelled task to finish, but not forever.
         # If it doesn't die within _CANCEL_TIMEOUT, abandon it and move on.
@@ -2051,7 +2196,14 @@ class MatrixBot:
         # live path's _drain_steering_fn. A raise before arming leaves the
         # active-turn mark untouched (never added) and skips the final drain.
         _hb_drain = None
+        # kdsn.179: turn ledger handle, same guard pattern as _hb_drain —
+        # None means "no start was booked" and _turn_end no-ops (never
+        # fabricate a finish without a start). Covers heartbeat, umbral,
+        # and subagent-completion turns: all three delegate here.
+        _tb = None
         try:
+            _tb = self._turn_begin(
+                room_id, origin=turn_source or "heartbeat")
             await self._set_typing(room_id, True)
 
             # Resolve effort level: room override > config
@@ -2191,6 +2343,28 @@ class MatrixBot:
                         await self.send(room_id,
                             "⚠️ **Empty heartbeat response** — the model returned no content "
                             "after retry. This may indicate degeneration or a provider issue.")
+            # kdsn.179: success landing (marker-driven conclusion). The
+            # empty-response retry above is part of the SAME turn — one
+            # bookend pair per turn, not per handle_input call.
+            await self._turn_end(
+                room_id, _tb,
+                turnbook.conclusion_from_marker(self.agent, room_id))
+        except asyncio.CancelledError:
+            # kdsn.179: book 'cancelled' (zero awaits before the re-raise —
+            # the end notice rides a background task), then re-raise per
+            # the docstring contract (raises on error — caller handles).
+            await self._turn_end(room_id, _tb, "cancelled")
+            raise
+        except AgentOverflowError:
+            await self._turn_end(room_id, _tb, "overflow")
+            raise
+        except ProviderError:
+            await self._turn_end(room_id, _tb, "error", error_type="provider")
+            raise
+        except Exception as _exc:
+            _cls, _etype = turnbook.classify_error(_exc)
+            await self._turn_end(room_id, _tb, _cls, error_type=_etype)
+            raise
         finally:
             await self._set_typing(room_id, False)
             # kdsn.311 race rule (same as _process_message): final drain
@@ -2203,6 +2377,10 @@ class MatrixBot:
                     pass
             if hasattr(self, '_active_turns'):
                 self._active_turns.discard(room_id)
+            # kdsn.179: release the /stop turn-task registration on EVERY
+            # path (ownership check — see _process_message's outer finally).
+            if getattr(self, '_turn_tasks', {}).get(room_id) is asyncio.current_task():
+                self._turn_tasks.pop(room_id, None)
             # kdsn.330 D2: a terminal that landed during this turn's FINAL
             # model call was never drained (drain is pre-model-call) and
             # its fire was vetoed by the mark we just released — re-arm
@@ -3068,6 +3246,15 @@ class MatrixBot:
                 return await _raw_tool_intent(*args, **kwargs)
 
             try:
+                # Declare-done turn ledger (kdsn.179): book turn.started for
+                # THIS turn — the shared seam every funnel uses (see
+                # _turn_begin). Booked here, AFTER the gating/redelivery
+                # early-returns, so a suppressed delivery books nothing
+                # (no turn ran), and BEFORE handle_input so /stop mid-turn
+                # can match the in-flight turn_id. Never raises.
+                _turn = self._turn_begin(
+                    room_id, origin="user", trigger_event_id=_trigger_event_id)
+
                 # Resolve effort level: room override > config
                 _effort_override = getattr(self, '_room_effort', {}).get(room_id)
                 _cache_ttl = getattr(self, '_room_cache_ttl', {}).get(room_id)
@@ -3290,7 +3477,19 @@ class MatrixBot:
                         pass
                 except Exception:
                     pass
+                # Declare-done turn ledger (kdsn.179): the turn's landing, as
+                # reported by the agent's own marker (declared | undeclared |
+                # cap_exhausted; None -> undeclared). Booked LAST in the
+                # success path — any failure above takes an except branch,
+                # which books its own class instead.
+                await self._turn_end(
+                    room_id, _turn,
+                    turnbook.conclusion_from_marker(self.agent, room_id))
             except asyncio.CancelledError:
+                # Declare-done turn ledger (kdsn.179): book 'cancelled' with
+                # the SAME turn_id as the in-flight turn.started (fail-soft,
+                # zero awaits here — the notice rides a background task).
+                await self._turn_end(room_id, _turn, "cancelled")
                 # Distinguish the watchdog's cancel from an operator /stop or a
                 # process-shutdown cancel: only the former sets _stall_fired, and
                 # only the former explains itself in-room. ALWAYS re-raise so the
@@ -3320,16 +3519,24 @@ class MatrixBot:
                         room_id, _stall_minutes))
                 raise
             except AgentOverflowError as e:
+                # kdsn.179: book the loop-observed class BEFORE any user
+                # surface work (a notice-send failure below must not lose
+                # the ledger line; the booking itself is fail-soft).
+                await self._turn_end(room_id, _turn, "overflow")
                 logger.warning("Context overflow in %s: %s", room_id, e)
                 await self.send(room_id,
                     f"⚠️ **Context overflow** — ~{e.current_tokens:,} / "
                     f"{e.max_tokens:,} tokens. Start a new room to continue.")
             except ProviderError as e:
+                await self._turn_end(room_id, _turn, "error", error_type="provider")
                 code = f" ({e.status_code})" if e.status_code else ""
                 logger.warning("Provider error%s in %s: %s", code, room_id, e)
                 # kdsn.292: warn-once latch lives in _emit_provider_notice.
                 await self._emit_provider_notice(room_id, e)
-            except Exception:
+            except Exception as e:
+                # kdsn.179: generic agent error is an 'error' class booking.
+                _cls, _etype = turnbook.classify_error(e)
+                await self._turn_end(room_id, _turn, _cls, error_type=_etype)
                 # Agent error: send generic message to avoid leaking exception details
                 logger.exception("Agent error processing message in %s", room_id)
                 await self.send(room_id, "⚠️ Internal error — check agent logs for details.")
@@ -3348,6 +3555,11 @@ class MatrixBot:
                     pass
             if hasattr(self, '_active_turns'):
                 self._active_turns.discard(room_id)
+            # kdsn.179: release the /stop turn-task registration on EVERY
+            # path (ownership check — a successor turn for this room,
+            # possible in an overlap window, keeps its own entry).
+            if getattr(self, '_turn_tasks', {}).get(room_id) is asyncio.current_task():
+                self._turn_tasks.pop(room_id, None)
             # kdsn.330 D2: same turn-end re-arm as the heartbeat path —
             # a terminal that landed during this turn's FINAL model call
             # was never drained and its fire was vetoed by the mark we

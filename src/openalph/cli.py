@@ -1321,6 +1321,24 @@ def cmd_exec(args):
     # and exit codes are untouched.
     if filed_sink:
         result["filed_proposals"] = filed_sink
+    # Additive top-level `conclusion` (declare-done ledger seam,
+    # workspace-kdsn.179): the turn's landing, taken from the agent's
+    # own marker — "declared" | "undeclared" | "cap_exhausted" as-is; a
+    # None marker (tool unregistered / Camp-B text ending) surfaces as
+    # "undeclared" so downstream consumers stop guessing. ABSENT when the
+    # agent has no usable marker (pre-declare-done agents expose no such
+    # method; unprimed test stubs return a non-str MagicMock) — omission,
+    # not null, keeps every pre-declare-done result byte-identical.
+    # Existing fields, the `result` key semantics, and exit codes are
+    # untouched.
+    try:
+        _conclusion = agent.last_turn_declaration(room_id)
+    except Exception:
+        _conclusion = None
+    if _conclusion is None:
+        _conclusion = "undeclared"
+    if isinstance(_conclusion, str) and _conclusion:
+        result["conclusion"] = _conclusion
     print(json.dumps(result), flush=True)
 
     if status == "done":
