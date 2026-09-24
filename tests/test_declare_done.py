@@ -551,6 +551,214 @@ class TestTurnLedger:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# R — adversarial-audit remediation pins (tmp/code-audit/declare-done/
+#     reconciliation.md, 2026-09-24). Each fixes a convergent finding.
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestRemediationConcurrency:
+    @pytest.mark.asyncio
+    async def test_backstop_skips_agent_owned_task(self, tmp_path):
+        """P-R1 (HIGH, 2 models): /stop's _turn_tasks backstop must be a
+        genuine no-op when the agent owns the room's cancellation — under
+        the documented heartbeat/live overlap, the backstop register may
+        hold a DIFFERENT funnel task than the one agent.cancel targets,
+        and that unrelated task must NOT be cancelled."""
+        bot, agent = _prime_bot(tmp_path, "declared")
+        own_task = MagicMock()
+        own_task.done.return_value = True
+        agent._current_tasks = {ROOM_ID: own_task}
+        agent.cancel = MagicMock(return_value=own_task)
+        other = MagicMock()
+        other.done.return_value = False
+        other.cancelling.return_value = 0
+        bot._turn_tasks = {ROOM_ID: other}
+
+        await bot._cancel_current(ROOM_ID)
+
+        agent.cancel.assert_called()
+        other.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_notice_books_once(self, tmp_path):
+        """P-R2 (3 models): _turn_end is idempotent per turn_id. A cancel
+        landing while the success-path end-notice Matrix send is blocked
+        must NOT book a second turn.finished for the same turn."""
+        bot, agent = _prime_bot(tmp_path, "declared")
+        notice_gate = asyncio.Event()
+        hung_once = {"done": False}
+
+        async def hanging_notice(room_id, text):
+            # Hang ONLY on the FIRST ledger end-notice — activation/other
+            # notices pass through (the turn must reach the end-notice),
+            # and the cancelled-path's backgrounded notice must not re-hang
+            # (drain() would deadlock on it).
+            if str(text).startswith("Turn ended") and not hung_once["done"]:
+                hung_once["done"] = True
+                await notice_gate.wait()
+
+        bot.send_notice = AsyncMock(side_effect=hanging_notice)
+        task = asyncio.create_task(bot._process_message(
+            make_room(ROOM_ID), make_event(USER, "hi", "$e-cn"), "hi"))
+
+        for _ in range(200):
+            if _turn_events(bot, "turn.finished"):
+                break
+            await asyncio.sleep(0.01)
+        assert _turn_events(bot, "turn.finished"), "booking never landed"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await drain(bot)
+
+        finished = _turn_events(bot, "turn.finished")
+        assert len(finished) == 1
+
+    @pytest.mark.asyncio
+    async def test_error_turn_books_no_stale_telemetry(self, tmp_path):
+        """P-R5b (3 models): an error turn must not inherit the previous
+        turn's stop_reason / usage. When the agent reports nothing for
+        THIS turn, the fields are absent (not stale, not fabricated)."""
+        bot, agent = _prime_bot(tmp_path, "declared")
+        agent.handle_input = AsyncMock(side_effect=ProviderError("boom"))
+        agent.last_stop_reason = MagicMock(return_value=None)
+        agent.last_turn_usage = MagicMock(return_value=None)
+        await _run_user_turn(bot)
+        finished = _turn_events(bot, "turn.finished")[0]
+        assert finished["conclusion"] == "error"
+        assert not finished.get("stop_reason")
+        assert not finished.get("usage")
+
+    @pytest.mark.asyncio
+    async def test_bare_declare_no_empty_response_alarm(self, tmp_path):
+        """P-R7a (verified): a bare declare_done (declared, no text) is a
+        LEGITIMATE ending — the live funnel must not fire the
+        empty-response/degeneration alarm, and the ledger still books
+        'declared'."""
+        bot, agent = _prime_bot(tmp_path, "declared")
+        agent.handle_input = AsyncMock(return_value="")
+        await _run_user_turn(bot)
+        for call in bot.send.await_args_list:
+            assert "Empty" not in str(call), "bare declare triggered an empty-response alarm"
+        assert _turn_events(bot, "turn.finished")[0]["conclusion"] == "declared"
+
+    @pytest.mark.asyncio
+    async def test_bare_declare_no_heartbeat_retry(self, tmp_path):
+        """P-R7b (verified): same in the heartbeat funnel — a bare
+        declare_done must NOT trigger the full 'empty heartbeat response'
+        retry turn (exactly ONE handle_input call) nor the warning notice."""
+        bot, agent = _prime_bot(tmp_path, "declared")
+        agent.handle_input = AsyncMock(return_value="")
+        await bot._run_heartbeat_turn(ROOM_ID, "heartbeat content",
+                                      turn_source="heartbeat")
+        await drain(bot)
+        assert agent.handle_input.await_count == 1, "bare declare triggered the empty-response retry"
+
+
+class TestRemediationGrammar:
+    def test_no_corrective_on_final_iteration(self, tmp_path):
+        """P-R6 (divergent grade, verified): the corrective must not fire
+        on the FINAL loop iteration — it would (a) leak 'call declare_done{}'
+        into the tools=None forced-summary prompt and (b) convert a plain
+        text-end into a spurious cap_exhausted. Final-iteration text-end
+        returns the text, books 'undeclared', ONE model call, no sentinel."""
+        agent = _make_agent(tmp_path, max_iterations=1)
+        calls = []
+        result = _drive(agent, "r1", [_text_response("final text")], calls=calls)
+        assert result == "final text"
+        assert len(calls) == 1
+        assert _corrective_entries(agent, "r1") == []
+        assert agent.last_turn_declaration("r1") == "undeclared"
+        assert not any("[SYSTEM: Tool call limit reached." in str(m.get("content", ""))
+                       for m in agent.history("r1"))
+
+    def test_empty_text_end_no_corrective(self, tmp_path):
+        """P-R9c (1 model, verified plausible): an EMPTY text-end must not
+        trigger the hold-back (an empty assistant message followed by a
+        provider call is a 400-class risk) — it returns empty, books
+        'undeclared', no corrective."""
+        agent = _make_agent(tmp_path)
+        result = _drive(agent, "r1", [_text_response("")])
+        assert result == ""
+        assert _corrective_entries(agent, "r1") == []
+        assert agent.last_turn_declaration("r1") == "undeclared"
+
+    def test_turn_start_clears_stale_telemetry(self, tmp_path):
+        """P-R5a (3 models): handle_input clears the room's stop_reason /
+        usage registers at turn start, so a turn dying on its first call
+        leaves nothing stale to attribute."""
+        agent = _make_agent(tmp_path, declare_done=False)
+        result1 = _drive(agent, "r1", [_text_response("first")])
+        assert result1 == "first"
+        assert agent.last_stop_reason("r1") == "end_turn"
+        with patch("openalph.agent.stream", side_effect=ProviderError("boom")):
+            with pytest.raises(ProviderError):
+                asyncio.run(agent.handle_input("again", "r1"))
+        assert agent.last_stop_reason("r1") is None
+        assert not agent.last_turn_usage("r1")
+
+    def test_marker_closed_vocabulary(self):
+        """P-R9b (1 model): the ledger seam enforces its closed vocabulary —
+        an out-of-taxonomy marker reads as 'undeclared'."""
+        from openalph.turnbook import conclusion_from_marker
+
+        agent = MagicMock()
+        agent.last_turn_declaration = MagicMock(return_value="arbitrary prose")
+        assert conclusion_from_marker(agent, "room") == "undeclared"
+
+    @pytest.mark.asyncio
+    async def test_declare_done_execute_branch_feedback(self, tmp_path):
+        """P-R3 (3 models): if a declare_done call ever reaches normal tool
+        dispatch (mixed --submit-schema deployments), it gets a typed,
+        steering error — not 'Unknown tool'."""
+        from openalph.tools import execute_tool
+
+        config = AgentConfig(
+            name="dd-exec-branch", default_model="default/claude-test",
+            max_tokens=8192, providers={"default": _provider()},
+            workspace=tmp_path,
+        )
+        result = await execute_tool("declare_done", {}, {}, config)
+        assert result.is_error
+        assert "terminal" in result.content.lower()
+
+
+class TestRemediationExec:
+    def test_exec_conclusion_absent_without_marker_method(self, tmp_path):
+        """P-R4a (3 models): pre-declare-done agents (no usable marker)
+        get NO conclusion key — omission, per the back-compat contract."""
+        from test_cli_exec import make_agent_stub, make_config, parse_single_json, run_exec
+
+        config = make_config(tmp_path)
+        agent = make_agent_stub(response_text="done")
+        agent.last_turn_declaration = None  # non-callable ⇒ no usable marker
+
+        out, _err, code = run_exec(
+            ["exec", "--agent", "test-agent", "--task-file", "-"],
+            config=config, agent=agent, stdin="task")
+        obj = parse_single_json(out)
+        assert code == 0
+        assert "conclusion" not in obj
+
+    def test_exec_conclusion_absent_on_error(self, tmp_path):
+        """P-R4b (3 models): a crashed/error exec run must not be
+        misclassified as a grammar-class ending — no 'conclusion' field."""
+        from test_cli_exec import make_agent_stub, make_config, parse_single_json, run_exec
+
+        config = make_config(tmp_path)
+        agent = make_agent_stub(response_text="unreached")
+        agent.handle_input = AsyncMock(side_effect=ProviderError("infra gone"))
+        agent.last_turn_declaration = MagicMock(return_value=None)
+
+        out, _err, code = run_exec(
+            ["exec", "--agent", "test-agent", "--task-file", "-"],
+            config=config, agent=agent, stdin="task")
+        obj = parse_single_json(out)
+        assert code != 0
+        assert obj.get("status") != "done"
+        assert "conclusion" not in obj
+
+
+# ──────────────────────────────────────────────────────────────────────
 # E — exec conclusion seam (cli.py) · shared by .179 and .350.4
 # ──────────────────────────────────────────────────────────────────────
 
