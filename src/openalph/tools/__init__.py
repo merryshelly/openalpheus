@@ -2281,7 +2281,24 @@ async def _execute_tool_inner(
             agent_config=agent_config,
         )
 
-    if name == "shell":
+    if name == "declare_done":
+        # Declare-done (workspace-kdsn.350.3): terminal-only — a
+        # declare_done call ends the turn at the agent.py DISPATCH SITE
+        # (captured like the exec --submit-schema terminal tool) and is
+        # never executed. If a call ever reaches normal dispatch anyway
+        # (mixed --submit-schema deployments where the per-run terminal
+        # tool shadows it, or any future dispatch path), give the model a
+        # typed steering error naming the terminal semantics — NOT
+        # "Unknown tool", which would mislead it into thinking the tool
+        # doesn't exist.
+        return ToolResult(
+            is_error=True,
+            content=(
+                "declare_done is a terminal-only tool — it declares turn "
+                "completion; to end the turn, call it as your final action."
+            ),
+        )
+    elif name == "shell":
         from .shell import run_shell
         # Default cwd to workspace so relative paths match file tools
         shell_cwd = input.get("cwd")

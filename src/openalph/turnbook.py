@@ -45,6 +45,14 @@ def new_turn_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+#: Closed vocabulary of LANDING markers the agent's
+#: `last_turn_declaration(room_id)` may report (design §4 taxonomy,
+#: minus the funnel-booked classes overflow/cancelled/error/abandoned
+#: that no marker can carry). Shared by this ledger seam and the cli
+#: exec conclusion field so the two consumers cannot drift.
+MARKER_VOCABULARY = frozenset({"declared", "undeclared", "cap_exhausted"})
+
+
 def conclusion_from_marker(agent, room_id: str) -> str:
     """Map the agent's `last_turn_declaration(room_id)` marker to a
     closed-vocabulary conclusion.
@@ -52,9 +60,12 @@ def conclusion_from_marker(agent, room_id: str) -> str:
     "declared" | "undeclared" | "cap_exhausted" pass through as-is;
     `None` (tool unregistered / no declaration — Camp-B ending) maps to
     "undeclared": absence of declaration is always an anomaly class. A
-    missing method or a non-str result (e.g. a MagicMock auto-attribute
-    on a stub agent) degrades to "undeclared" too — a ledger booking must
-    never die on a marker read.
+    missing method, a raising call, a non-str result (e.g. a MagicMock
+    auto-attribute on a stub agent), or an OUT-OF-TAXONOMY string
+    (R9b: the closed vocabulary is enforced at the seam, never
+    trusted from the marker) all degrade to "undeclared" — a ledger
+    booking must never die on a marker read, and a malformed marker
+    must never fabricate a taxonomy class.
     """
     fn = getattr(agent, "last_turn_declaration", None)
     if not callable(fn):
@@ -67,8 +78,14 @@ def conclusion_from_marker(agent, room_id: str) -> str:
             room_id, exc_info=True,
         )
         return "undeclared"
-    if isinstance(marker, str) and marker:
+    if marker is None:
+        return "undeclared"
+    if isinstance(marker, str) and marker in MARKER_VOCABULARY:
         return marker
+    logger.warning(
+        "last_turn_declaration returned out-of-taxonomy marker %r for %s "
+        "(non-fatal); booking 'undeclared'", marker, room_id,
+    )
     return "undeclared"
 
 

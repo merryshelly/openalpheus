@@ -561,9 +561,15 @@ class MatrixBot:
         self._subagent_results: dict[tuple, dict] = {}  # keyed (room_id, call_id)
         # kdsn.179 (turn ledger): per-room TURN-TASK registry (room_id ->
         # asyncio.Task of the funnel running the turn). `_cancel_current`
-        # uses it as a backstop cancellation seam; in production
-        # `agent.cancel()` cancels the SAME task, so the `cancelling()`
-        # guard there keeps this a no-op on the real path.
+        # uses it as a backstop cancellation seam: in production
+        # `agent.cancel()` cancels the SAME task the agent registered in
+        # its own `_current_tasks`, so `_cancel_current` snapshots that
+        # agent register first (R1) and skips the backstop for any room
+        # the agent owns — under the documented heartbeat/live overlap
+        # this register may otherwise hold a DIFFERENT funnel task than
+        # the one agent.cancel targeted, and cancelling that unrelated
+        # task would kill work the stopped room did not start. The
+        # `cancelling()` guard is the second line of defence.
         self._turn_tasks: dict[str, asyncio.Task] = {}
 
     async def _emit_provider_notice(self, room_id: str, error) -> None:
@@ -1006,17 +1012,60 @@ class MatrixBot:
             pass  # no running loop context — nothing to register
         return (turn_id, t0, origin)
 
+    # R2 (adversarial-audit remediation): bounded per-bot record of turn_ids
+    # that already have a turn.finished landed, so a duplicate _turn_end for
+    # the same turn (the cancel-during-notice overlap — see below) is a
+    # no-op. Ordered dict as a capped set: newest at the end, oldest
+    # evicted first. Lazy-init for __new__-built test bots (house pattern).
+    _FINISHED_TURNS_CAP = 256
+
     async def _turn_end(self, room_id: str, turn, conclusion: str,
-                        *, error_type: str | None = None) -> None:
+                        *, error_type: str | None = None,
+                        background_notice: bool = True) -> None:
         """Book `turn.finished` + the every-turn m.notice line. Fail-soft.
 
         `turn` is the handle from `_turn_begin`; `None` means the funnel
         died before it booked a start — there is nothing to finish, and
         fabricating one would falsify the ledger (never-fabricate rule).
+
+        R2: idempotent per turn_id — a second _turn_end for an already
+        finished turn is a no-op (no booking, no notice). The interleaving
+        this exists for: the success path books turn.finished, then (with
+        background_notice=False — the live funnel) awaits the end-notice
+        send; a /stop cancel landing in that send raises into the funnel's
+        except-CancelledError branch, which books 'cancelled' for the SAME
+        handle. Without the guard that is a double turn.finished; with it,
+        the first booking wins and the duplicate is dropped.
+
+        R8 (scoped by the pinned send orderings): `background_notice`
+        (default True) fires the end-notice as a background task via
+        `_fire_background` — a retrying Matrix send (three attempts, each
+        able to wait out the client's network timeout) must not be awaited
+        where it would wedge the room's locks or the timer loop; the
+        ledger BOOKING stays synchronous and inline — only the wire send
+        is backgrounded. Callers pass background_notice=False where the
+        send ordering IS part of the pinned contract: the live success
+        path (the R2 pin encodes the cancel-landing-in-that-send overlap,
+        which requires the funnel task to be in the send) and the
+        error-class paths (the ledger line is pinned to land BEFORE the
+        user-facing error message — test_matrix ordering pins).
+        Backgrounded by default: the cancelled path (F4 — the cancel must
+        unwedge the room immediately) and the overflow / heartbeat
+        success paths (no pinned ordering behind them).
         """
         if turn is None:
             return
         turn_id, t0, origin = turn
+        if not hasattr(self, "_finished_turns"):
+            self._finished_turns = {}
+        if turn_id in self._finished_turns:
+            logger.debug(
+                "duplicate _turn_end for finished turn %s in %s — no-op "
+                "(conclusion %s)", turn_id, room_id, conclusion)
+            return
+        self._finished_turns[turn_id] = None
+        while len(self._finished_turns) > self._FINISHED_TURNS_CAP:
+            self._finished_turns.pop(next(iter(self._finished_turns)))
         elapsed_s = max(0.0, round(time.monotonic() - t0, 3))
         stop_reason = None
         try:
@@ -1045,11 +1094,20 @@ class MatrixBot:
             usage=usage,
         )
         # The every-turn plain m.notice line (design §4: no threshold, one
-        # line, closed vocabulary, no red/green dependence). CANCELLED turns
-        # fire it as a bounded background task, F4-style: a cancel path must
-        # not await Matrix sends while the room's locks are still held — the
-        # whole point of the cancel is to unwedge the room immediately.
-        if conclusion == "cancelled":
+        # line, closed vocabulary, no red/green dependence). R8: by
+        # default fired as a background task via the existing
+        # _fire_background (cancelled [F4], overflow, heartbeat success —
+        # no pinned send ordering behind them, and a retrying Matrix send
+        # must not wedge the room's session lock / the timer loop); the
+        # ledger booking above stays synchronous — only the wire send is
+        # backgrounded. background_notice=False keeps the inline await
+        # where the ordering is pinned: the live success path (the R2 pin
+        # encodes the cancel-landing-in-that-send overlap, which requires
+        # the funnel task to be in the send — backgrounding it would also
+        # hang the pin's drain() on its deliberately hanging first notice)
+        # and the error-class paths (the ledger line must land BEFORE the
+        # user-facing error message — test_matrix ordering pins).
+        if background_notice:
             try:
                 self._fire_background(
                     self._send_turn_end_notice(room_id, conclusion, error_type))
@@ -1107,20 +1165,42 @@ class MatrixBot:
         # fallback, where there is no requesting room.
         room = room_id if room_id is not None else self._current_room
 
+        # R1 (adversarial-audit remediation): snapshot the agent's OWN
+        # cancel register BEFORE calling agent.cancel(). Under the
+        # documented heartbeat/live overlap the `_turn_tasks` entry may
+        # hold a DIFFERENT funnel task than the one agent.cancel targets
+        # (e.g. a concurrent heartbeat funnel registered for the same
+        # room after the live turn's agent-side entry — or the reverse),
+        # and backstop-cancelling that unrelated task from a live-room
+        # /stop would kill work this room did not start (inv. 7). A room
+        # the agent itself registered owns its own cancellation — the
+        # backstop must be a genuine no-op for it. isinstance-guarded:
+        # stub agents' auto-MagicMock `_current_tasks` is not a dict and
+        # must not qualify (their backstop behaviour is unchanged).
+        _agent_owned_rooms = None
+        _agent_own_tasks = getattr(self.agent, "_current_tasks", None)
+        if isinstance(_agent_own_tasks, dict):
+            _agent_owned_rooms = set(_agent_own_tasks)
+
         task = None
         if hasattr(self.agent, "cancel"):
             task = self.agent.cancel(room_id) if room_id is not None else self.agent.cancel()
 
-        # kdsn.179: the funnels ALSO register their turn task per room
-        # (`_turn_tasks`, set by `_turn_begin`). In production that is the
-        # SAME task `agent.cancel()` just cancelled (the agent registers
-        # `asyncio.current_task()` for the room), so the `cancelling()`
-        # guard below keeps this a no-op on the real path — no double
-        # cancel, ever. With a stubbed/out-of-tree agent whose `cancel` is
-        # not a no-op (test doubles), this IS the cancellation, and it
-        # runs BEFORE any await so the guard is reliable.
+        # kdsn.179 (R1-refined): the funnels ALSO register their turn task
+        # per room (`_turn_tasks`, set by `_turn_begin`). In production
+        # that is the SAME task `agent.cancel()` just cancelled (the agent
+        # registers `asyncio.current_task()` for the room), so the R1
+        # agent-owned-room skip above keeps this a no-op on the real path
+        # — and the `cancelling()` guard below is the second line of
+        # defence for the overlap windows where the register holds a
+        # task the agent did not target. With a stubbed/out-of-tree agent
+        # whose `cancel` is not a no-op (test doubles, no real
+        # `_current_tasks` dict), this IS the cancellation, and it runs
+        # BEFORE any await so the guard is reliable.
         _turn_tasks = getattr(self, "_turn_tasks", {}) or {}
         for _rid in ([room_id] if room_id is not None else list(_turn_tasks)):
+            if _agent_owned_rooms is not None and _rid in _agent_owned_rooms:
+                continue  # agent owns this room's cancellation — no backstop
             _tt = _turn_tasks.get(_rid)
             if _tt is not None and not _tt.done() and not _tt.cancelling():
                 _tt.cancel()
@@ -2317,6 +2397,20 @@ class MatrixBot:
                         "(API returned `stop_reason: refusal`). Content policy "
                         "restrictions were triggered. Consider switching models "
                         "with `/model`.")
+                elif (turnbook.conclusion_from_marker(self.agent, room_id)
+                      == "declared"):
+                    # R7 (adversarial-audit remediation): a bare
+                    # declare_done during a heartbeat — the turn DECLARED
+                    # with no text — is a legitimate ending: skip the full
+                    # 'empty heartbeat response' retry turn (exactly ONE
+                    # handle_input per turn) and the warning notice. The
+                    # marker check is getattr-tolerant via the existing
+                    # ledger seam (stub agents degrade to 'undeclared', so
+                    # the retry still fires for them). The ledger books
+                    # 'declared' at _turn_end below.
+                    logger.info(
+                        "Bare declare_done during heartbeat in %s — no "
+                        "empty-response retry", room_id)
                 else:
                     # Model did tool work but returned empty text.  Retry once
                     # with a nudge — the model sees its own tool results in
@@ -2346,6 +2440,9 @@ class MatrixBot:
             # kdsn.179: success landing (marker-driven conclusion). The
             # empty-response retry above is part of the SAME turn — one
             # bookend pair per turn, not per handle_input call.
+            # R8: the end-notice is backgrounded (default) — nothing is
+            # pinned behind it on this funnel, and the timer loop must
+            # not block on a retrying Matrix send.
             await self._turn_end(
                 room_id, _tb,
                 turnbook.conclusion_from_marker(self.agent, room_id))
@@ -2359,11 +2456,16 @@ class MatrixBot:
             await self._turn_end(room_id, _tb, "overflow")
             raise
         except ProviderError:
-            await self._turn_end(room_id, _tb, "error", error_type="provider")
+            # R8 scoped: inline (background_notice=False) — mirrors the
+            # live error paths, where the ledger line lands before the
+            # caller's user-facing error notice (pinned ordering).
+            await self._turn_end(room_id, _tb, "error", error_type="provider",
+                                 background_notice=False)
             raise
         except Exception as _exc:
             _cls, _etype = turnbook.classify_error(_exc)
-            await self._turn_end(room_id, _tb, _cls, error_type=_etype)
+            await self._turn_end(room_id, _tb, _cls, error_type=_etype,
+                                 background_notice=False)
             raise
         finally:
             await self._set_typing(room_id, False)
@@ -3056,6 +3158,17 @@ class MatrixBot:
         - Session logging
         - Agent processing with tool visibility
         - Response sending
+        - Turn ledger bookends (kdsn.179): exactly ONE turn.started + ONE
+          turn.finished per turn (idempotent per turn_id — a duplicate
+          end-booking from a cancel landing on the success-path end-notice
+          send is a no-op, R2) plus the every-turn m.notice line. The
+          success path books LAST in the success path and awaits its
+          notice inline; every error-class path books its class in its
+          except branch and backgrounds the notice (R8) so no error path
+          blocks the room's lock on a retrying Matrix send. A bare
+          declare_done (declared, no text) is a legitimate ending: no
+          empty-response alarm (R7a) — the marker check is getattr-tolerant
+          via turnbook.conclusion_from_marker.
 
         Args:
             room: Matrix room object
@@ -3245,6 +3358,14 @@ class MatrixBot:
                 _turn_progress()
                 return await _raw_tool_intent(*args, **kwargs)
 
+            # kdsn.179: turn ledger handle, pre-initialized so the
+            # except-CancelledError branch can never hit an
+            # UnboundLocalError if the try body is interrupted before the
+            # booking is assigned — same guard pattern as the heartbeat
+            # funnel's `_tb = None` / `_hb_drain = None`. None means "no
+            # start was booked" and _turn_end no-ops (never fabricate a
+            # finish without a start).
+            _turn = None
             try:
                 # Declare-done turn ledger (kdsn.179): book turn.started for
                 # THIS turn — the shared seam every funnel uses (see
@@ -3444,6 +3565,19 @@ class MatrixBot:
                             "(API returned `stop_reason: refusal`). This usually means content "
                             "policy restrictions were triggered. Try rephrasing, or switch "
                             "models with `/model`.")
+                    elif (turnbook.conclusion_from_marker(self.agent, room_id)
+                          == "declared"):
+                        # R7 (adversarial-audit remediation): a bare
+                        # declare_done — the turn DECLARED with no
+                        # accompanying text — is a LEGITIMATE ending, not
+                        # an empty response: skip the alarm, send nothing.
+                        # The marker check is getattr-tolerant via the
+                        # existing ledger seam (pre-declare-done agents and
+                        # stub agents degrade to 'undeclared' / a warning,
+                        # so the alarm still fires for them).
+                        logger.info(
+                            "Bare declare_done in %s — declared with no text; "
+                            "no empty-response alarm", room_id)
                     else:
                         logger.warning("Empty response from agent in %s — not sending", room_id)
                         await self.send(room_id,
@@ -3482,9 +3616,14 @@ class MatrixBot:
                 # cap_exhausted; None -> undeclared). Booked LAST in the
                 # success path — any failure above takes an except branch,
                 # which books its own class instead.
+                #
+                # background_notice=False (the live funnel's one inline
+                # await): the R2 idempotency guard covers the cancel that
+                # lands in this send — see _turn_end's docstring.
                 await self._turn_end(
                     room_id, _turn,
-                    turnbook.conclusion_from_marker(self.agent, room_id))
+                    turnbook.conclusion_from_marker(self.agent, room_id),
+                    background_notice=False)
             except asyncio.CancelledError:
                 # Declare-done turn ledger (kdsn.179): book 'cancelled' with
                 # the SAME turn_id as the in-flight turn.started (fail-soft,
@@ -3528,15 +3667,25 @@ class MatrixBot:
                     f"⚠️ **Context overflow** — ~{e.current_tokens:,} / "
                     f"{e.max_tokens:,} tokens. Start a new room to continue.")
             except ProviderError as e:
-                await self._turn_end(room_id, _turn, "error", error_type="provider")
+                # R8 scoped: background_notice=False — the every-turn
+                # ledger line is pinned to land BEFORE the user-facing
+                # provider-error message (test_matrix ordering pins); the
+                # overflow/cancelled paths below have no such ordering
+                # contract and background their notices instead.
+                await self._turn_end(room_id, _turn, "error", error_type="provider",
+                                     background_notice=False)
                 code = f" ({e.status_code})" if e.status_code else ""
                 logger.warning("Provider error%s in %s: %s", code, room_id, e)
                 # kdsn.292: warn-once latch lives in _emit_provider_notice.
                 await self._emit_provider_notice(room_id, e)
             except Exception as e:
                 # kdsn.179: generic agent error is an 'error' class booking.
+                # R8 scoped: background_notice=False — the ledger line is
+                # pinned to land BEFORE the user-facing error message
+                # (test_matrix ordering pins).
                 _cls, _etype = turnbook.classify_error(e)
-                await self._turn_end(room_id, _turn, _cls, error_type=_etype)
+                await self._turn_end(room_id, _turn, _cls, error_type=_etype,
+                                     background_notice=False)
                 # Agent error: send generic message to avoid leaking exception details
                 logger.exception("Agent error processing message in %s", room_id)
                 await self.send(room_id, "⚠️ Internal error — check agent logs for details.")

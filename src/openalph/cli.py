@@ -1322,23 +1322,43 @@ def cmd_exec(args):
     if filed_sink:
         result["filed_proposals"] = filed_sink
     # Additive top-level `conclusion` (declare-done ledger seam,
-    # workspace-kdsn.179): the turn's landing, taken from the agent's
-    # own marker — "declared" | "undeclared" | "cap_exhausted" as-is; a
-    # None marker (tool unregistered / Camp-B text ending) surfaces as
-    # "undeclared" so downstream consumers stop guessing. ABSENT when the
-    # agent has no usable marker (pre-declare-done agents expose no such
-    # method; unprimed test stubs return a non-str MagicMock) — omission,
-    # not null, keeps every pre-declare-done result byte-identical.
+    # workspace-kdsn.179) — OMISSION CONTRACT (adversarial-audit R4):
+    # - ABSENT unless the run landed cleanly (status == "done") — a
+    #   crashed/failed/error run must NOT be classified as a grammar-class
+    #   ending; its marker (if any) is not a turn landing.
+    # - ABSENT when the agent has no usable marker (method missing or
+    #   non-callable: pre-declare-done agents, unprimed stubs) — omission,
+    #   not null, keeps every pre-declare-done result byte-identical.
+    # - ABSENT when the marker call raises or returns a non-str
+    #   (defensive: the marker is the agent's own report; anything
+    #   unparseable is omitted, never fabricated).
+    # - On the done path: "declared" | "cap_exhausted" pass through; a
+    #   None marker (tool unregistered / Camp-B text ending) surfaces as
+    #   "undeclared" so downstream consumers stop guessing; an
+    #   out-of-taxonomy string degrades to "undeclared" (closed
+    #   vocabulary, R9b — same MARKER_VOCABULARY as the ledger seam).
     # Existing fields, the `result` key semantics, and exit codes are
     # untouched.
-    try:
-        _conclusion = agent.last_turn_declaration(room_id)
-    except Exception:
-        _conclusion = None
-    if _conclusion is None:
-        _conclusion = "undeclared"
-    if isinstance(_conclusion, str) and _conclusion:
-        result["conclusion"] = _conclusion
+    if status == "done":
+        from openalph import turnbook  # closed-vocabulary constant (R9b)
+        _marker_fn = getattr(agent, "last_turn_declaration", None)
+        if callable(_marker_fn):
+            try:
+                _conclusion = _marker_fn(room_id)
+            except Exception:
+                _conclusion = None
+            else:
+                if _conclusion is None:
+                    _conclusion = "undeclared"
+                elif not (isinstance(_conclusion, str)
+                          and _conclusion in turnbook.MARKER_VOCABULARY):
+                    logger.warning(
+                        "exec: out-of-taxonomy conclusion marker %r from "
+                        "%r — surfacing as 'undeclared'",
+                        _conclusion, agent,
+                    )
+                    _conclusion = "undeclared"
+                result["conclusion"] = _conclusion
     print(json.dumps(result), flush=True)
 
     if status == "done":

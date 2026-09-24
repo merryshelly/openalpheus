@@ -1619,6 +1619,15 @@ class Agent:
             self._room_locks[room_id] = asyncio.Lock()
         async with self._room_locks[room_id]:
             self._current_tasks[room_id] = asyncio.current_task()
+            # Declare-done ledger (kdsn.179, audit R5): clear the room's
+            # PER-TURN telemetry at turn start — the registers are
+            # turn-scoped ("the last COMPLETED turn's"), so a turn that
+            # dies before any provider call must not leave the previous
+            # turn's stop_reason / usage in place to be attributed to it.
+            # Post-turn reads stay valid: both are SET at turn end (and
+            # per-call by _record_turn_usage) AFTER this pop.
+            self._last_stop_reason.pop(room_id, None)
+            self._last_turn_usage.pop(room_id, None)
             history = self.history(room_id)
             try:
                 # Build user content (may expand image media tags when the
@@ -2564,8 +2573,24 @@ class Agent:
                         # this turn — book "undeclared" and fall through to the
                         # normal return below. Tool absent (registration gate):
                         # unchanged Camp-B return, marker untouched.
+                        #
+                        # R9c: the hold-back requires NON-EMPTY text — an empty
+                        # text-end held back would append an empty assistant
+                        # message and then make another provider call, a
+                        # 400-class risk (e.g. Anthropic empty text blocks).
+                        # Empty text-ends fall through: "undeclared", no
+                        # corrective, no empty assistant message in the
+                        # hold-back. R6: the corrective must not fire on the
+                        # FINAL loop iteration — holding there would leak the
+                        # hold-back prompt into the tools=None forced-summary
+                        # turn and convert a plain text-end into a spurious
+                        # cap_exhausted (the `continue` falls past the loop
+                        # into the cap path). Final-iteration text-ends fall
+                        # through and book "undeclared".
                         if _declare_done_available:
-                            if not _corrective_fired:
+                            if ((final_text or "").strip()
+                                    and not _corrective_fired
+                                    and iteration < self.config.max_iterations - 1):
                                 _corrective_fired = True
                                 history.append(assistant_msg)
                                 history.append({
@@ -2728,9 +2753,13 @@ class Agent:
                         # at the dispatch site IS the turn's declaration —
                         # book the room's landing state for the marker API.
                         # Covers both the discovered declare_done and the
-                        # per-run exec terminal tool (its declaration act);
-                        # nothing reads the marker pre-350.3, so this is
-                        # inert for the exec path.
+                        # per-run exec terminal tool (its declaration act).
+                        # The marker is read at turn end by the ledger seams:
+                        # the matrix funnels (turnbook.conclusion_from_marker
+                        # into the turn.finished entry) and the cli exec
+                        # conclusion field — so this booking is how a
+                        # declared landing reaches both on EVERY path,
+                        # exec included.
                         self._last_declaration[room_id] = "declared"
                         self._last_stop_reason[room_id] = response.stop_reason
                         # Spotter v1 (design §3): the turn is complete — same
