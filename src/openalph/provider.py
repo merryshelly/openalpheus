@@ -917,6 +917,68 @@ def _resolved_routing_key_header(provider_cfg) -> str | None:
     return provider_cfg.routing_key_header or DEFAULT_ROUTING_KEY_HEADER
 
 
+# Header name for the per-session SGLang metrics-labels stamp (im7t.36.38).
+# THE PREFIX IS LOAD-BEARING: sgl-router 0.3.2 forwards ONLY an allowlist
+# plus the ``x-request-id-`` prefix on the typed OpenAI chat path
+# (header_utils.rs::should_forward_request_header). Renaming this header
+# silently kills fleet-wide Grafana session attribution — pinned by test.
+DEFAULT_METRICS_LABELS_HEADER = "x-request-id-oa-labels"
+
+
+def _resolved_metrics_labels_header(provider_cfg) -> str | None:
+    """Resolve the metrics-labels header name for a provider (im7t.36.38).
+
+    Mirrors _resolved_routing_key_header exactly: blackwell is DEFAULT-ON
+    (SB ratification 2026-09-25); any other openai-compatible provider opts
+    in with ``metrics_labels = true``; an explicit ``metrics_labels = false``
+    is the kill flag and beats both the blackwell default and an explicit
+    opt-in. ``metrics_labels_header`` overrides the header name (value
+    semantics unchanged). Returns None when the stamp is off.
+    """
+    enabled = provider_cfg.metrics_labels
+    if enabled is None:
+        enabled = provider_cfg.key == "blackwell"
+    if not enabled:
+        return None
+    return provider_cfg.metrics_labels_header or DEFAULT_METRICS_LABELS_HEADER
+
+
+_METRICS_LABEL_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_METRICS_LABEL_KEY_WARNED: set[str] = set()
+
+
+def _coerce_metrics_labels(value) -> dict[str, str] | None:
+    """Validate/normalize an explicit per-call metrics-labels dict.
+
+    A dict becomes {str(key): str(val)} where keys must be valid Prometheus
+    label names (unknown keys are silently dropped server-side by the
+    SGLang allowlist — warn-once here instead of shipping garbage), None
+    values are DROPPED (never stringified to the literal "None"), and empty
+    keys/values are dropped. Anything else (non-dict, or an empty result)
+    returns None so the caller falls through to room_id derivation or
+    skips the stamp as appropriate. Never raises — a bad per-call kwarg
+    must not crash a live turn (warn-tier, not error-tier).
+    """
+    if not isinstance(value, dict):
+        return None
+    out = {}
+    for k, v in value.items():
+        k_s = str(k)
+        if not _METRICS_LABEL_KEY_RE.match(k_s):
+            if k_s not in _METRICS_LABEL_KEY_WARNED:
+                _METRICS_LABEL_KEY_WARNED.add(k_s)
+                logger.warning(
+                    "metrics-labels: dropping invalid Prometheus label key %r",
+                    k_s)
+            continue
+        if v is None:
+            continue
+        v_s = str(v)
+        if k_s and v_s:
+            out[k_s] = v_s
+    return out or None
+
+
 # ---- Session USD cost pricing (Anthropic only) --------------------------
 # Verified 2026-07-09 against platform.claude.com/docs/en/about-claude/pricing
 # (official Anthropic docs); re-verified 2026-09-13 (fable-5.1 + sonnet-5).
@@ -2262,6 +2324,7 @@ async def stream(
     thinking: str | None = None,
     cache_ttl: str | None = None,
     room_id: str | None = None,
+    metrics_labels: dict | None = None,
     tool_choice: str | None = None,
     strict: bool = False,
     hardened: bool = False,
@@ -2502,6 +2565,34 @@ async def stream(
             extra_headers = dict(api_kwargs.get("extra_headers") or {})
             extra_headers[rk_header] = affinity
             api_kwargs["extra_headers"] = extra_headers
+
+        # Per-session metrics-labels stamp (im7t.36.38): a compact JSON dict
+        # {"agent": <config.name>, "session": <room id / exec --room label>,
+        #  "kind": "main"|"sub"} sent as ONE header on /v1/chat/completions
+        # for SGLang's tokenizer-metrics custom-labels hook (replica flags:
+        # --tokenizer-metrics-custom-labels-header + allowlist, live on the
+        # rig since 2026-09-25). Blackwell DEFAULT-ON (SB ratification);
+        # opt-in ``metrics_labels = true`` elsewhere; kill flag
+        # ``metrics_labels = false``. Header-only — never a body field — so
+        # it stays invisible to the model and is never logged (D1-clean).
+        # Identity: an EXPLICIT metrics_labels kwarg wins (the subagent
+        # dispatch passes the parent session + kind="sub" here — the
+        # kdsn.353 invariant that subs stay ROUTING-unkeyed (deflectable) is
+        # preserved because the parent room travels ONLY in this header,
+        # never in room_id). Otherwise derived from room_id + agent name;
+        # never invent identity (room_id=None + no kwarg -> no stamp).
+        ml_header = _resolved_metrics_labels_header(provider_cfg)
+        if ml_header:
+            _labels = _coerce_metrics_labels(metrics_labels)
+            if _labels is None and (room_id and getattr(config, "name", None)):
+                _labels = {"agent": config.name,
+                           "session": room_id,
+                           "kind": "main"}
+            if _labels:
+                extra_headers = dict(api_kwargs.get("extra_headers") or {})
+                extra_headers[ml_header] = json.dumps(
+                    _labels, separators=(",", ":"))
+                api_kwargs["extra_headers"] = extra_headers
 
         attempt = 0
         while True:
@@ -2750,6 +2841,7 @@ async def complete(
     thinking: str | None = None,
     cache_ttl: str | None = None,
     room_id: str | None = None,
+    metrics_labels: dict | None = None,
     tool_choice: str | None = None,
     strict: bool = False,
     hardened: bool = False,
@@ -2776,6 +2868,7 @@ async def complete(
         thinking=thinking,
         cache_ttl=cache_ttl,
         room_id=room_id,
+        metrics_labels=metrics_labels,
         tool_choice=tool_choice,
         strict=strict,
         hardened=hardened,

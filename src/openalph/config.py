@@ -26,6 +26,20 @@ class ConfigError(Exception):
 
 # System-wide config directory for per-agent TOML files
 CONFIG_DIR = Path("/etc/openalph/agents")
+
+# Header names that provider-level *_header override knobs must never reuse
+# (im7t.36.38 audit M1): each knob stamps a DIFFERENT header in one merged
+# extra_headers dict, and last-writer-wins means a collision silently
+# clobbers the coexisting stamp (or auth) while every test stays green.
+# kdsn.353's routing_key_header gets the same guard — same bug shape.
+# Compared case-insensitively (HTTP header names are case-insensitive).
+RESERVED_HEADER_NAMES = frozenset({
+    "authorization",
+    "content-type",
+    "x-smg-routing-key",
+    "x-session-affinity",
+    "x-request-id-oa-labels",
+})
 # Canonical shared-dir path (created by install.sh; referenced by
 # admin.py new-agent setup and handoff.py durable-set containment —
 # kdsn.322.16: the durable-set guard mirrors the two-root OS sandbox,
@@ -68,6 +82,14 @@ class ProviderConfig:
     # True = explicit opt-in; False = kill flag. Header-only, D1-clean.
     routing_key: bool | None = None
     routing_key_header: str | None = None  # header name override (None = X-SMG-Routing-Key)
+    # Per-session SGLang metrics-labels header stamp (im7t.36.38):
+    # None = provider default (blackwell ON, every other provider off);
+    # True = explicit opt-in; False = kill flag. Header-only, D1-clean.
+    metrics_labels: bool | None = None
+    # Header name override (None = x-request-id-oa-labels — the
+    # x-request-id-* prefix is LOAD-BEARING: sgl-router 0.3.2 Only forwards
+    # an allowlist plus that prefix on the typed chat path).
+    metrics_labels_header: str | None = None
 
 
 @dataclass
@@ -567,6 +589,33 @@ def load_config(path: Path) -> AgentConfig:
                 not isinstance(routing_key_header, str) or not routing_key_header):
             _skip_provider(provider_key, "routing_key_header must be a non-empty string")
             continue
+        if routing_key_header is not None and \
+                routing_key_header.lower() in RESERVED_HEADER_NAMES:
+            _skip_provider(
+                provider_key,
+                f"routing_key_header must not collide with a reserved "
+                f"header name ({sorted(RESERVED_HEADER_NAMES)})")
+            continue
+
+        # Metrics-labels header stamp knobs (im7t.36.38) — same discipline
+        # as the routing_key pair above (fail-loud at config load).
+        metrics_labels = section_data.get("metrics_labels")
+        if metrics_labels is not None and not isinstance(metrics_labels, bool):
+            _skip_provider(provider_key, "metrics_labels must be a boolean")
+            continue
+
+        metrics_labels_header = section_data.get("metrics_labels_header")
+        if metrics_labels_header is not None and (
+                not isinstance(metrics_labels_header, str) or not metrics_labels_header):
+            _skip_provider(provider_key, "metrics_labels_header must be a non-empty string")
+            continue
+        if metrics_labels_header is not None and \
+                metrics_labels_header.lower() in RESERVED_HEADER_NAMES:
+            _skip_provider(
+                provider_key,
+                f"metrics_labels_header must not collide with a reserved "
+                f"header name ({sorted(RESERVED_HEADER_NAMES)})")
+            continue
 
         routing = section_data.get("routing")
         if routing is not None and not isinstance(routing, dict):
@@ -593,6 +642,8 @@ def load_config(path: Path) -> AgentConfig:
             retry_enabled=retry_enabled,
             routing_key=routing_key,
             routing_key_header=routing_key_header,
+            metrics_labels=metrics_labels,
+            metrics_labels_header=metrics_labels_header,
         )
 
     # kdsn.292: zero providers is DEGRADED, not fatal — slash commands, the

@@ -529,7 +529,8 @@ class TestSubagentAnchor:
         payloads = []
 
         async def _complete(*, config=None, system=None, messages=None,
-                            tools=None, max_tokens=None, thinking=None):
+                            tools=None, max_tokens=None, thinking=None,
+                            metrics_labels=None):
             payloads.append(list(messages))
             if len(payloads) == 1:
                 return tool_response(usage_in=2000)
@@ -555,7 +556,8 @@ class TestSubagentAnchor:
         payloads = []
 
         async def _complete(*, config=None, system=None, messages=None,
-                            tools=None, max_tokens=None, thinking=None):
+                            tools=None, max_tokens=None, thinking=None,
+                            metrics_labels=None):
             payloads.append(list(messages))
             if len(payloads) == 1:
                 return tool_response(usage_in=10)

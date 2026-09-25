@@ -203,14 +203,17 @@ class TestKillFlag:
 
     @pytest.mark.asyncio
     async def test_routing_key_false_disables_blackwell_default(self):
-        """Explicit routing_key=false is the kill flag (beats the default)."""
+        """Explicit routing_key=false is the kill flag (beats the default).
+        Asserts the ROUTING-KEY header is absent — extra_headers itself may
+        legitimately exist (the im7t.36.38 metrics-labels stamp is a
+        separate default-on knob for blackwell)."""
         config = make_config(providers={
             "blackwell": make_provider(key="blackwell", routing_key=False),
         })
         client = await _drive_stream(config, room_id=ROOM)
 
         kw = client.chat.completions.create.call_args.kwargs
-        assert "extra_headers" not in kw
+        assert DEFAULT_ROUTING_KEY_HEADER not in kw.get("extra_headers", {})
 
     @pytest.mark.asyncio
     async def test_kill_flag_beats_header_override(self):

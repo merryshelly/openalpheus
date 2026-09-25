@@ -867,7 +867,7 @@ class TestSubagentVisionDrain:
         )]
 
     def _fake_complete(self, captured, final="I see the image"):
-        async def _complete(*, config, system, messages, tools, max_tokens, thinking=None):
+        async def _complete(*, config, system, messages, tools, max_tokens, thinking=None, metrics_labels=None):
             captured.append([dict(m) for m in messages])
             if len(captured) == 1:
                 return Response(

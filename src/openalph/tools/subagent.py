@@ -211,8 +211,9 @@ async def run_subagent(
         max_iterations: Max tool-call iterations (default: MAX_ITERATIONS)
         call_id: Optional identifier for cross-referencing logs (default: generated from timestamp)
         parent_room_id: Optional parent Matrix room id, recorded in the flight
-            recorder transcript header for cross-referencing only — never
-            used for execution/dispatch decisions.
+            recorder transcript header and carried in the metrics-labels
+            header (im7t.36.38 sub attribution). Never reused as the sub's
+            own room_id — subs stay routing-unkeyed per kdsn.353.
         effort: Optional reasoning effort for the sub (kdsn.305.14). One of
             _EFFORT_LEVELS; None (param omitted) defaults to "medium". The
             sub path never consults config [agent] thinking — this param is
@@ -299,6 +300,15 @@ async def run_subagent(
                 f.write(json.dumps(entry) + "\n")
         except Exception as transcript_exc:
             logger.warning("Failed to write subagent flight recorder transcript: %s", transcript_exc)
+
+    # im7t.36.38: per-request SGLang attribution — the sub's provider calls
+    # carry {"agent", "session": <parent room>, "kind": "sub"} in the
+    # metrics-labels header. The parent room travels ONLY here, never in
+    # room_id: subs stay routing-unkeyed (kdsn.353 deflectability) while
+    # remaining attributable to their parent session in Grafana.
+    _sub_metrics_labels = {"agent": config.name, "kind": "sub"}
+    if parent_room_id:
+        _sub_metrics_labels["session"] = parent_room_id
 
     def _usage_snapshot() -> dict:
         """Point-in-time token usage snapshot for the flight recorder's final entry."""
@@ -605,6 +615,8 @@ async def run_subagent(
                 max_tokens=max_tokens,
                 # kdsn.305.14: always explicit — config.thinking bypassed.
                 thinking=effective_effort,
+                # im7t.36.38: sub attribution labels (never room_id).
+                metrics_labels=_sub_metrics_labels,
             )
             # Milestone: a real provider response came back.
             _milestone("provider_response")
@@ -913,6 +925,8 @@ async def run_subagent(
                 # kdsn.305.14: breaker summary round trip carries the same
                 # effective effort (A8).
                 thinking=effective_effort,
+                # im7t.36.38: same sub attribution labels (never room_id).
+                metrics_labels=_sub_metrics_labels,
             )
             # Milestone: the summary round trip is a real provider response too.
             _milestone("provider_response")

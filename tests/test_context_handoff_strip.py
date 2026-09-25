@@ -1119,7 +1119,8 @@ class TestSubSeamRealPath:
                 stop_reason="tool_use")
 
         async def fake_complete(config, system, messages, tools=None,
-                                max_tokens=None, thinking=None):
+                                max_tokens=None, thinking=None,
+                                metrics_labels=None):
             seen.append([dict(m) for m in messages])
             if len(seen) == 1:
                 return _tool_resp()
