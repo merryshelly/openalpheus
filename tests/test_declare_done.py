@@ -593,7 +593,7 @@ class TestRemediationConcurrency:
             # notices pass through (the turn must reach the end-notice),
             # and the cancelled-path's backgrounded notice must not re-hang
             # (drain() would deadlock on it).
-            if str(text).startswith("Turn ended") and not hung_once["done"]:
+            if "Turn ended" in str(text) and not hung_once["done"]:
                 hung_once["done"] = True
                 await notice_gate.wait()
 
@@ -867,3 +867,37 @@ class TestExecConclusion:
             ["exec", "--agent", "test-agent", "--task-file", "-"], config=config, agent=agent, stdin="task")
         obj = parse_single_json(out)
         assert obj["conclusion"] == "cap_exhausted"
+
+
+class TestLedgerNoticeIcons:
+    """SB 2026-09-25: the every-turn end notice carries a prepended,
+    shape-distinct icon per conclusion class (visual consistency with
+    tool-call notices; no red/green dependence — the shape IS the key)."""
+
+    def test_declared_icon(self):
+        from openalph.turnbook import turn_end_notice
+        assert turn_end_notice("declared") == "🏁 Turn ended — declared"
+
+    def test_full_vocabulary(self):
+        from openalph.turnbook import turn_end_notice, CONCLUSION_ICONS
+        for cls, icon in CONCLUSION_ICONS.items():
+            line = turn_end_notice(cls)
+            assert line.startswith(icon + " Turn ended — " + cls), (cls, line)
+
+    def test_vocabulary_is_closed_for_ledger_classes(self):
+        from openalph.turnbook import CONCLUSION_ICONS
+        assert set(CONCLUSION_ICONS) == {
+            "declared", "undeclared", "cap_exhausted", "overflow",
+            "cancelled", "error", "abandoned"}
+        assert len(set(CONCLUSION_ICONS.values())) == 7
+
+    def test_error_type_suffix_preserved(self):
+        from openalph.turnbook import turn_end_notice
+        assert turn_end_notice("error", "provider") ==             "❌ Turn ended — error (provider)"
+
+    def test_out_of_vocabulary_conclusion_is_visibly_anomalous(self):
+        from openalph.turnbook import turn_end_notice
+        line = turn_end_notice("bogus_class")
+        assert line.startswith("❓ "), line
+        assert "bogus_class" in line
+

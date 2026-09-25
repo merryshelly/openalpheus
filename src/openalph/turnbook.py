@@ -106,14 +106,32 @@ def classify_error(exc: BaseException) -> tuple[str, str | None]:
     return ("error", type(exc).__name__)
 
 
+# Prepended per-conclusion shapes for the end notice (SB 2026-09-25):
+# visual consistency with the house tool-call notices (each class reads
+# as a tool-call line at a glance). Shape-distinct, no red/green
+# dependence — the SHAPE (with the word) IS the key, not the color.
+CONCLUSION_ICONS = {
+    "declared": "🏁",       # finish flag — clean terminal act
+    "undeclared": "⚠️",  # the anomaly class
+    "cap_exhausted": "⏳",      # iteration budget exhausted
+    "overflow": "⚡",           # context breach
+    "cancelled": "⛔",          # operator / control-path stop
+    "error": "❌",              # provider / unknown exception
+    "abandoned": "👻",      # stale started, found later — ghost
+}
+
+
 def turn_end_notice(conclusion: str, error_type: str | None = None) -> str:
     """The ONE plain every-turn m.notice line (matrix house notice channel).
 
-    Closed vocabulary: the line is the fixed prefix + the conclusion word
-    (+ the error_type for the error class). No elapsed threshold, no
-    red/green dependence — the word IS the status.
+    Closed vocabulary: conclusion-shape icon + fixed prefix + the
+    conclusion word (+ the error_type for the error class). No elapsed
+    threshold, no red/green dependence — the word IS the status. An
+    out-of-vocabulary conclusion would be a bug: it renders with the ❓
+    anomaly icon so it is visibly wrong rather than silently un-decorated.
     """
-    line = f"Turn ended — {conclusion}"
+    icon = CONCLUSION_ICONS.get(conclusion, "❓")
+    line = f"{icon} Turn ended — {conclusion}"
     if error_type:
         line += f" ({error_type})"
     return line
