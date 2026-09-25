@@ -141,11 +141,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "agent's config sets injection_defense = false.")
     p.add_argument("--submit-schema", default=None,
                    help="JSON Schema file (forced-tool shape: name/strict/"
-                        "description/input_schema) for a TERMINAL tool: the "
-                        "named tool is exposed for this run and a call to it "
-                        "ends the turn — its arguments become the result "
-                        "JSON line's top-level `result` field (additive). "
-                        "No call -> no `result` field (caller decides).")
+                        "description/input_schema) merged INTO the "
+                        "declare_done terminal tool for this run: a valid "
+                        "declaration ends the turn — its (coerced, "
+                        "validated) payload becomes the result JSON line's "
+                        "top-level `result` field. A schema run ending "
+                        "without a successful declaration FAILS (exit 1, "
+                        "no `result` field).")
 
     return parser.parse_args(argv)
 
