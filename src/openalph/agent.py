@@ -57,6 +57,9 @@ _JSON_TYPE_CHECKS = {
     "boolean": lambda v: isinstance(v, bool),
     "object": lambda v: isinstance(v, dict),
     "array": lambda v: isinstance(v, list),
+    # Audit F-G: "null" is a satisfiable keyword — a nullable field
+    # (["string","null"]) validates when the value IS None.
+    "null": lambda v: v is None,
 }
 
 # ds4-style lenient string booleans -> real bool (the cairn
@@ -64,6 +67,20 @@ _JSON_TYPE_CHECKS = {
 # string "true"). Only applied when the property's DECLARED type is boolean.
 _LENIENT_TRUE_STRINGS = {"true", "1", "yes"}
 _LENIENT_FALSE_STRINGS = {"false", "0", "no"}
+
+
+def _declared_type_list(t):
+    """Audit F-A (defense in depth): normalize a property's declared type
+    to a list of type keywords — or None when the shape is unusable
+    (not a str, or a list with any non-str member). The dispatch site
+    must NEVER raise on a schema of the wrong shape: the loader
+    (_exec_validate_run_schema) is the gate, and this is the belt — a
+    mis-shaped declaration is SKIPPED (honest pass), never a crash."""
+    if isinstance(t, str):
+        return [t]
+    if isinstance(t, list) and all(isinstance(x, str) for x in t):
+        return t
+    return None
 
 
 def _coerce_terminal_payload(payload, schema):
@@ -75,19 +92,33 @@ def _coerce_terminal_payload(payload, schema):
     openalph_exec adapter's _normalize_submit_result:
       - a string is coerced to a bool (true/1/yes -> True, false/0/no ->
         False) ONLY when the property's declared type is "boolean";
-      - a stringified-JSON value is parsed to an object ONLY when the
-        declared type is "object" (and the parse yields a dict), to a list
-        ONLY when the declared type is "array".
-    Everything else is left untouched — unnormalizable values fall through
-    to honest validation rejection (never fabricated).
+      - a stringified-JSON value is parsed to an object when "object" is
+        a declared type (and the parse yields a dict), to a list when
+        "array" is a declared type — INDEPENDENT branches (audit F-F), so
+        a property declared ["object","array"] coerces a stringified
+        array as well as a stringified object.
+    A coercion json.loads failure of ANY class (audit F-E — ValueError,
+    RecursionError on pathologically deep nesting, ...) leaves the value
+    un-coercible -> honest validation rejection, never an exception out.
+    Everything else is left untouched — unnormalizable values fall
+    through to honest validation rejection (never fabricated).
 
     Validation enforces the run schema's `required` field presence and the
-    DECLARED property types (string/integer/number/boolean/object/array;
-    a type keyword list is honored as "any of"). It deliberately does NOT
-    enforce `additionalProperties` — the core zero-payload declare_done
-    (schema properties: {}) must stay fully tolerant (stray args accepted,
-    the absence-of-call-only core contract), while overlay run schemas get
-    real field validation.
+    DECLARED property types (string/integer/number/boolean/object/array/
+    null; a type keyword list is honored as "any of"). It deliberately
+    does NOT enforce `additionalProperties` — overlay run schemas get
+    real field validation, while the core zero-payload declare_done path
+    never reaches this helper at all (the dispatch site keeps its
+    pre-350.4 raw capture for discovered declare_done, audit F-B).
+
+    Defense in depth (audit F-A): the loader (_exec_validate_run_schema)
+    is the schema gate, but the loop must additionally survive any
+    mis-shaped schema that reaches it by another path — a `required`
+    that is not a list of strings is skipped (never char- or
+    key-iterated), a property `type` that is not a str or list of strs
+    is skipped, a non-dict `properties` degrades to "no declared
+    fields". NO exception class (TypeError included) may raise from
+    this function.
 
     Returns (coerced_payload, None) on success, (None, [error, ...]) on
     failure — each error names the offending field and the expected type.
@@ -102,10 +133,8 @@ def _coerce_terminal_payload(payload, schema):
         spec = props.get(key)
         if not isinstance(spec, dict) or not isinstance(value, str):
             continue
-        types = spec.get("type")
-        if isinstance(types, str):
-            types = [types]
-        if not isinstance(types, list):
+        types = _declared_type_list(spec.get("type"))
+        if types is None:
             continue
         if "boolean" in types and "string" not in types:
             lowered = value.strip().lower()
@@ -113,27 +142,40 @@ def _coerce_terminal_payload(payload, schema):
                 out[key] = True
             elif lowered in _LENIENT_FALSE_STRINGS:
                 out[key] = False
-        elif "object" in types and "string" not in types:
+        # Audit F-F: independent branches (NOT an elif ladder) — each
+        # declared non-string type gets its coercion attempt. A value
+        # that parses as JSON can only be an object OR an array, so at
+        # most one branch assigns.
+        if "object" in types and "string" not in types:
             try:
                 parsed = json.loads(value)
-            except ValueError:
+            except Exception:
+                # Audit F-E: ANY parse failure (not just ValueError)
+                # leaves the value un-coercible.
                 parsed = None
             if isinstance(parsed, dict):
                 out[key] = parsed
-        elif "array" in types and "string" not in types:
+        if "array" in types and "string" not in types:
             try:
                 parsed = json.loads(value)
-            except ValueError:
+            except Exception:
                 parsed = None
             if isinstance(parsed, list):
                 out[key] = parsed
+    # Audit F-A (defense in depth): `required` is iterated ONLY if it is
+    # a list of strings — never char-iterating a bare string (the
+    # gate-inversion the audit demonstrated), never key-iterating a dict.
+    required = schema.get("required")
+    if not (isinstance(required, list)
+            and all(isinstance(r, str) for r in required)):
+        required = []
     errors = []
-    for req in (schema.get("required") or []):
+    for req in required:
         if req not in out:
             spec = props.get(req)
             t = spec.get("type") if isinstance(spec, dict) else None
-            if isinstance(t, list):
-                t = " | ".join(t)
+            types = _declared_type_list(t)
+            t = " | ".join(types) if types is not None else t
             errors.append(
                 f"missing required field '{req}'"
                 + (f" (expected {t})" if t else ""))
@@ -141,15 +183,17 @@ def _coerce_terminal_payload(payload, schema):
         spec = props.get(key)
         if not isinstance(spec, dict):
             continue
-        t = spec.get("type")
-        if t is None:
+        declared = spec.get("type")
+        types = _declared_type_list(declared)
+        if types is None:
+            # Mis-shaped declaration (defense in depth): skip the check
+            # — honest pass, never a raise.
             continue
-        types = t if isinstance(t, list) else [t]
         if any(_JSON_TYPE_CHECKS.get(k) is not None
                and _JSON_TYPE_CHECKS[k](value) for k in types):
             continue
         errors.append(
-            f"field '{key}': expected {t}, got {type(value).__name__}")
+            f"field '{key}': expected {declared}, got {type(value).__name__}")
     if errors:
         return None, errors
     return out, None
@@ -2242,26 +2286,40 @@ class Agent:
                         _terminal_strict = bool(_tdef.config.get("strict"))
                         _terminal_schema = _tdef.parameters
                     else:
-                        # Declare-done (workspace-kdsn.350.3): terminal
-                        # semantics by TOOL IDENTITY — a discovered
-                        # declare_done tool is terminal the same way the
-                        # per-run exec terminal tool is. The per-run exec
-                        # terminal (above) keeps precedence; a run with both
+                        # Declare-done (workspace-kdsn.350.3; audit F-B
+                        # post-.350.4): terminal semantics by TOOL
+                        # IDENTITY — a discovered declare_done tool is
+                        # terminal the same way the per-run exec
+                        # terminal tool is. The per-run exec terminal
+                        # (above) keeps precedence; a run with both
                         # registered behaves exactly as pre-350.3 (byte-
-                        # compatible). strict is read from the tool's config
-                        # (TOML overlay) so a per-run overlay merge can
-                        # grammar-constrain declare_done without a code
-                        # change; core discovery yields {} -> False. The
-                        # zero-payload core schema (properties: {}) makes
-                        # the dispatch-site validation a no-op — the core
-                        # tolerance contract (stray args accepted) holds.
+                        # compatible). strict is read from the tool's
+                        # config (TOML overlay) so a per-run overlay
+                        # merge can grammar-constrain declare_done
+                        # without a code change; core discovery yields
+                        # {} -> False.
+                        #
+                        # RAW CAPTURE (pre-350.4 semantics restored —
+                        # audit F-B): _terminal_schema is left None for
+                        # the discovered declare_done — the core
+                        # zero-payload path skips dispatch-site
+                        # validation entirely (the pre-.350.4 contract:
+                        # the core seat stays schema-free). A non-dict
+                        # ToolCall.input (the provider arguments:"null"
+                        # class) is captured VERBATIM and ends the turn
+                        # declared — no "payload must be a JSON object"
+                        # rejection loop. The zero-payload tolerance
+                        # contract (stray args accepted) holds by
+                        # construction: nothing checks.
                         for t in _turn_tools:
                             if t.name == "declare_done":
                                 _terminal_name = "declare_done"
                                 _tdef = t
                                 _terminal_strict = bool(t.config.get("strict"))
-                                _terminal_schema = t.parameters
                                 break
+                    # Defense in depth for the per-run branch (the loader
+                    # guarantees a dict; a non-dict parameters from any
+                    # other path degrades to raw capture, never a crash).
                     if not isinstance(_terminal_schema, dict):
                         _terminal_schema = None
 

@@ -642,6 +642,70 @@ def _exec_bounded_detail(detail: str) -> str:
     return detail[:_EXEC_DETAIL_MAX]
 
 
+# Audit F-A (HIGH): the JSON type keywords the dispatch-site validation
+# gate understands — the loader's known-keyword set. A run schema whose
+# property types fall outside this set is malformed and fails loud at
+# load (never reaches the wire to silently no-op or invert the gate).
+_EXEC_SCHEMA_TYPE_KEYWORDS = (
+    "string", "integer", "number", "boolean", "object", "array", "null",
+)
+
+
+def _exec_validate_run_schema(input_schema: dict, path: str) -> None:
+    """Structurally validate a --submit-schema run schema (audit F-A).
+
+    The dispatch-site gate (_coerce_terminal_payload in agent.py)
+    iterates `required` and reads each property's `type`. A schema of
+    the wrong INNER shape would not just miss validation — it would
+    INVERT the gate: a bare-string `required` is char-iterated (garbage
+    payloads pass, real payloads fail with per-letter errors), a
+    dict-shaped property `type` raises TypeError into the loop, a
+    non-dict `properties` silently no-ops every check. The loader is
+    the single point a run schema enters the process (per-run, never
+    cached), so it is the gate's gate: fail loud here, before any model
+    call (same contract as the missing-name check).
+
+    Accepted inner shapes: `properties` absent or a dict of name ->
+    dict spec; a spec's `type` absent, a known keyword
+    (string|integer|number|boolean|object|array|null), or a list of
+    known keywords; `required` absent or a list of strings. Any other
+    shape is a ValueError naming the path.
+    """
+    def _known_type(t):
+        if isinstance(t, str):
+            return t in _EXEC_SCHEMA_TYPE_KEYWORDS
+        if isinstance(t, list):
+            return all(
+                isinstance(x, str) and x in _EXEC_SCHEMA_TYPE_KEYWORDS
+                for x in t)
+        return False
+
+    props = input_schema.get("properties")
+    if props is not None and not isinstance(props, dict):
+        raise ValueError(
+            f"Submit schema 'input_schema.properties' must be an object "
+            f"(map of property name -> spec): {path}")
+    if isinstance(props, dict):
+        for pname, spec in props.items():
+            if not isinstance(spec, dict):
+                raise ValueError(
+                    f"Submit schema property '{pname}' must be an object: "
+                    f"{path}")
+            t = spec.get("type")
+            if t is not None and not _known_type(t):
+                raise ValueError(
+                    f"Submit schema property '{pname}' has unknown type "
+                    f"{t!r} (expected one of "
+                    f"{', '.join(_EXEC_SCHEMA_TYPE_KEYWORDS)}, or a list "
+                    f"of them): {path}")
+    required = input_schema.get("required")
+    if required is not None and not (
+            isinstance(required, list)
+            and all(isinstance(r, str) for r in required)):
+        raise ValueError(
+            f"Submit schema 'required' must be a list of strings: {path}")
+
+
 def _resolve_exec_tools(names: list[str]) -> list:
     """Resolve --tools names against the BUILTIN_TOOLS registry.
 
@@ -690,9 +754,14 @@ def _exec_load_submit_schema(path: str):
 
     Fail-loud contract (same as --task-file / --system-prompt-file):
     unreadable file, non-JSON, non-object JSON, missing/blank `name`,
-    or missing/non-object `input_schema` all raise (FileNotFoundError /
+    missing/non-object `input_schema`, or a structurally malformed run
+    schema (audit F-A: non-dict `properties`, non-dict property spec,
+    unknown/mis-shaped property `type` keyword, non-list or
+    non-string-list `required`) all raise (FileNotFoundError /
     ValueError naming the path) and the caller maps them to stderr +
-    exit 1 BEFORE any model call — a bad schema burns nothing.
+    exit 1 BEFORE any model call — a bad schema burns nothing, and a
+    malformed schema can never reach the dispatch site to invert the
+    validation gate.
     """
     from openalph.tools import ToolDef
 
@@ -716,6 +785,10 @@ def _exec_load_submit_schema(path: str):
     if not isinstance(input_schema, dict):
         raise ValueError(
             f"Submit schema missing 'input_schema' object: {path}")
+    # Audit F-A (HIGH): the dispatch-site gate iterates `required` and
+    # reads property `type`s — validate the INNER shape NOW (fail loud)
+    # so a malformed schema can never invert the gate at runtime.
+    _exec_validate_run_schema(input_schema, path)
     description = data.get("description")
     if not isinstance(description, str) or not description:
         description = ""
@@ -1148,12 +1221,25 @@ def cmd_exec(args):
         agent._terminal_submit = None
         if agent.tools is None:
             agent.tools = []
-        for i, t in enumerate(agent.tools):
+        # Single wire def (audit F-C): the incoming list may carry
+        # DUPLICATES (e.g. --tools declare_done,declare_done —
+        # _resolve_exec_tools does not de-dup). The final inventory must
+        # contain EXACTLY ONE declare_done: the merged overlay def takes
+        # the first occurrence's position, and every further duplicate
+        # is dropped.
+        _kept = []
+        _replaced = False
+        for t in agent.tools:
             if t.name == "declare_done":
-                agent.tools[i] = terminal_tool[1]
-                break
-        else:
-            agent.tools.append(terminal_tool[1])
+                if not _replaced:
+                    _kept.append(terminal_tool[1])
+                    _replaced = True
+                # further duplicates: dropped
+            else:
+                _kept.append(t)
+        if not _replaced:
+            _kept.append(terminal_tool[1])
+        agent.tools = _kept
 
     # file_ticket per-run filing sink (Stigmergy Decision 18, bead
     # workspace-e2uh.162): a PER-RUN list — created on the fresh agent here

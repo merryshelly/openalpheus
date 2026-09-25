@@ -18,9 +18,10 @@ value, and ends the loop cleanly (status "done", exit 0 — equivalent to a
 natural turn end, NOT an error). The captured arguments become a top-level
 `"result"` field on the exec result JSON line (additive: every existing field
 and exit code is untouched), and the terminal call appears in `tool_trace`
-like any tool call (provenance). When the model ends WITHOUT calling the
-terminal tool, behavior is exactly today's — no `result` field; the CALLER
-decides whether a missing result is a failure.
+like any tool call (provenance). When the model ends WITHOUT a successful
+terminal declaration, the overlay payload contract is unsatisfied
+(kdsn.350.4): the run reports status "failed", exit 1, NO `result` key and
+NO `conclusion` key (R4 omission) — the cause rides the `detail` field.
 
 Determinism/guards: the terminal tool is per-run state (registered at exec
 start on the fresh Agent, never cached across runs); the flag composes with

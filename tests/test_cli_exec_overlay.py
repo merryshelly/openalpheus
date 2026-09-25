@@ -51,6 +51,8 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from openalph.provider import Response, ToolCall, Usage
 from openalph.tools import ToolDef
 
@@ -699,3 +701,362 @@ class TestOverlayExecResult:
         assert obj["status"] == "infra"
         assert "result" not in obj
         assert "conclusion" not in obj
+
+
+# ---------------------------------------------------------------------------
+# AUDIT REMEDIATION (3-model adversarial audit, reconciliation.md):
+# hardening pins written RED-first (F-A, F-B, F-C, F-E, F-F, F-G).
+# ---------------------------------------------------------------------------
+
+
+def _write_loader_schema(tmp_path, input_schema, name="submit_x"):
+    """Write a forced-tool-shaped schema file with the given input_schema
+    (the F-A loader pins vary the INNER shape of input_schema)."""
+    p = tmp_path / "loader_schema.json"
+    p.write_text(json.dumps({
+        "name": name, "strict": True, "description": "d",
+        "input_schema": input_schema,
+    }))
+    return p
+
+
+# ---------------------------------------------------------------------------
+# F-A layer 1: the LOADER structurally validates the run schema — a
+# malformed schema fails loud (ValueError, the existing _fail(...,1)
+# path) instead of inverting the dispatch-site validation gate.
+# ---------------------------------------------------------------------------
+
+
+class TestOverlaySchemaLoaderHardening:
+    def test_required_bare_string_fails_loud(self, tmp_path):
+        """`"required": "accepted"` (bare string) must NOT load: the
+        dispatch site would char-iterate it (the gate-inversion the
+        audit demonstrated — garbage passes, real payloads fail)."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": {"accepted": {"type": "boolean"}},
+            "required": "accepted",
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_required_dict_fails_loud(self, tmp_path):
+        """`"required": {"a": 1}` (a mapping) must NOT load — `required`
+        is a list of strings or absent, nothing else."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": {"a": 1},
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_required_non_string_member_fails_loud(self, tmp_path):
+        """A `required` list with a non-string member is malformed JSON
+        Schema (required: array of unique strings) — fail loud."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["accepted", 1],
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_properties_not_dict_fails_loud(self, tmp_path):
+        """Non-dict `properties` (here: a bare string) must NOT load —
+        today it silently no-ops the gate (no type checks, ever)."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": "accepted",
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_property_spec_not_dict_fails_loud(self, tmp_path):
+        """Each property spec must be an object — a bare string spec is
+        malformed and must fail loud, not be skipped."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": {"accepted": "boolean"},
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_unknown_type_keyword_fails_loud(self, tmp_path):
+        """An unknown type keyword ("str" is not a JSON keyword) must NOT
+        load — the gate would never type-check that field."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": {"accepted": {"type": "str"}},
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_unknown_type_in_list_fails_loud(self, tmp_path):
+        """A type keyword LIST containing an unknown keyword fails loud
+        (a list of known keywords is the only accepted list form)."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": {"accepted": {"type": ["string", "maybe"]}},
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_type_wrong_shape_fails_loud(self, tmp_path):
+        """A dict-shaped `type` must NOT load — today it reaches the
+        dispatch loop and raises TypeError (unhashable dict) on the
+        first terminal call."""
+        from openalph.cli import _exec_load_submit_schema
+
+        p = _write_loader_schema(tmp_path, {
+            "type": "object",
+            "properties": {"accepted": {"type": {"a": 1}}},
+        })
+        with pytest.raises(ValueError):
+            _exec_load_submit_schema(str(p))
+
+    def test_valid_schema_with_null_and_list_types_still_loads(self, tmp_path):
+        """Carryover + over-strictness guard: a valid schema — including
+        a `null` keyword and a type-keyword list (both legal) — still
+        loads with its input_schema verbatim."""
+        from openalph.cli import _exec_load_submit_schema
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "note": {"type": ["string", "null"]},
+                "accepted": {"type": "boolean"},
+            },
+            "required": ["accepted"],
+        }
+        p = _write_loader_schema(tmp_path, schema)
+        name, td = _exec_load_submit_schema(str(p))
+        assert name == "declare_done"
+        assert td.parameters == schema
+
+
+# ---------------------------------------------------------------------------
+# F-A layer 2 (defense-in-depth) + F-E + F-F + F-G: the dispatch-site
+# helper NEVER raises on a degenerate schema / parse failure — it either
+# returns honest errors or passes honestly.
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceTerminalPayloadHardening:
+    def test_required_bare_string_skipped_never_char_iterated(self):
+        """`required` that is a bare string is SKIPPED (not char-iterated):
+        the payload validates honestly — no spurious 'missing required
+        field' errors for the letters of the string."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload(
+            {"accepted": True},
+            {"properties": {}, "required": "accepted"})
+        assert errors is None
+        assert out == {"accepted": True}
+
+    def test_required_dict_skipped(self):
+        """`required` that is a mapping is SKIPPED (never key-iterated)."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload({}, {"required": {"a": 1}})
+        assert errors is None
+        assert out == {}
+
+    def test_required_non_string_list_skipped(self):
+        """A `required` list with a non-string member is SKIPPED as a
+        whole (no 'missing required field 1' nonsense)."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload({}, {"required": [1]})
+        assert errors is None
+        assert out == {}
+
+    def test_type_wrong_shape_skipped_never_raises(self):
+        """A dict-shaped property `type` is SKIPPED — no exception class
+        (TypeError included) may escape the helper; the field passes
+        honestly (undeclared-effective type)."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload(
+            {"x": 5}, {"properties": {"x": {"type": {"a": 1}}}})
+        assert errors is None
+        assert out == {"x": 5}
+
+    def test_type_list_with_non_str_member_skipped(self):
+        """A type list containing a non-string member is SKIPPED (not a
+        str, not a list of strs) — honest pass, no raise."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload(
+            {"x": 5}, {"properties": {"x": {"type": [1, 2]}}})
+        assert errors is None
+        assert out == {"x": 5}
+
+    def test_properties_not_dict_still_safe(self):
+        """Non-dict `properties` degrades to 'no declared fields' (the
+        existing guard) — a payload passes honestly with no checks."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload(
+            {"a": 1}, {"properties": "a"})
+        assert errors is None
+        assert out == {"a": 1}
+
+    def test_recursion_error_in_json_loads_is_rejection(self):
+        """F-E — ANY exception class out of the coercion json.loads
+        (here: RecursionError, via a string nested beyond the json
+        parser's ~10000-level nesting cap) must land as un-coercible
+        -> honest validation rejection (None, errors) — NEVER an
+        exception escaping into the loop.
+
+        Note: this interpreter's C-accelerated json parser caps nesting
+        at its own S_MAX_DEPTH (~10000) and does NOT recurse into
+        Python frames, so a reduced sys.setrecursionlimit cannot induce
+        the RecursionError (verified empirically); depth 11000 is used
+        instead, which raises RecursionError under BOTH the C and the
+        pure-Python parsers. See REPORT §5 (deviation)."""
+        from openalph.agent import _coerce_terminal_payload
+
+        deep = "[" * 11000 + "]" * 11000
+        schema = {"properties": {"data": {"type": "object"}}}
+        out, errors = _coerce_terminal_payload({"data": deep}, schema)
+        assert out is None
+        assert errors, "deep-string field must be rejected (not coerced)"
+        assert any("data" in e for e in errors)
+
+    def test_any_of_object_array_coerces_stringified_array(self):
+        """F-F — a property declared `["object", "array"]` (any-of) with
+        a stringified ARRAY value must be coerced to the list: the
+        coercion branches are independent (boolean, then object, then
+        array), not an elif ladder that only tries the first listed
+        non-string type."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload(
+            {"v": "[1, 2]"},
+            {"properties": {"v": {"type": ["object", "array"]}}})
+        assert errors is None
+        assert out == {"v": [1, 2]}
+
+    def test_null_type_validates_none_value(self):
+        """F-G — `"null"` is a satisfiable type keyword: a field
+        declared `["string", "null"]` with the value None validates."""
+        from openalph.agent import _coerce_terminal_payload
+
+        out, errors = _coerce_terminal_payload(
+            {"v": None},
+            {"properties": {"v": {"type": ["string", "null"]}}})
+        assert errors is None
+        assert out == {"v": None}
+
+
+# ---------------------------------------------------------------------------
+# F-B: the CORE (discovered, zero-payload) declare_done keeps pre-350.4
+# raw capture — non-dict ToolCall.input captured verbatim, turn ends
+# declared. Overlay runs still validate (carried by the existing
+# TestOverlayAgentLoop pins, which must stay green).
+# ---------------------------------------------------------------------------
+
+
+class TestOverlayHardeningLoop:
+    def test_discovered_declare_done_non_dict_input_captured_raw(self,
+                                                                  tmp_path):
+        """F-B (agent level) — a DISCOVERED declare_done (no
+        agent._terminal_tool — the core zero-payload path) called with a
+        NON-DICT input (the provider `arguments: "null"` class) is
+        captured VERBATIM as _terminal_submit and ends the turn
+        declared: exactly ONE model call, no typed validation error, no
+        loop continuation — pre-350.4 semantics restored."""
+        agent = _agent(tmp_path)
+        core = ToolDef(
+            name="declare_done",
+            description="Declare the turn complete (core zero-payload).",
+            parameters={"type": "object", "properties": {}},
+            config={},
+        )
+        agent.tools = [core]
+        agent._terminal_submit = None
+
+        with (
+            patch("openalph.agent.stream",
+                  side_effect=_stream_responses([
+                      _tool_use_response([ToolCall(id="c1",
+                                                   name="declare_done",
+                                                   input="null")]),
+                  ])),
+            patch("openalph.agent.complete", new_callable=AsyncMock),
+            patch("openalph.agent.execute_tool", side_effect=_exec_tool_stub()),
+        ):
+            calls = []
+
+            async def on_tc(call_id, name, input_data, result, is_error):
+                calls.append((call_id, name, is_error))
+
+            result = asyncio.run(agent.handle_input(
+                "go", "r1", on_tool_call=on_tc))
+
+        # Captured VERBATIM: the raw non-dict value (not None, not a
+        # dict, not a validation error).
+        assert agent._terminal_submit == "null"
+        assert agent.last_turn_declaration("r1") == "declared"
+        # Exactly one model call (a second scripted pop would
+        # StopIteration — the loop did NOT continue on a fake error),
+        # closed without an error result.
+        assert calls == [("c1", "declare_done", False)]
+        hist = agent.history("r1")
+        assert [m.get("role") for m in hist] == ["user", "assistant", "tool"]
+        assert hist[-1]["tool_call_id"] == "c1"
+        assert hist[-1].get("is_error") is False
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# F-C: a single wire def under duplicate inputs —
+# --tools declare_done,declare_done still yields exactly ONE
+# declare_done after the overlay merge (the merged overlay def).
+# ---------------------------------------------------------------------------
+
+
+class TestOverlayHardeningCli:
+    def test_duplicate_declare_done_tools_single_wire_def(self, tmp_path):
+        """F-C — `--tools declare_done,declare_done` (a duplicated
+        incoming list — _resolve_exec_tools does not de-dup) with
+        --submit-schema yields EXACTLY ONE declare_done on the final
+        wire: the merged overlay def (run schema as input_schema,
+        terminal config) — no duplicate left behind by the
+        first-occurrence replace."""
+        config = make_config(tmp_path)
+        p = write_cairn_schema(tmp_path)
+        agent = make_agent_stub()
+        task = tmp_path / "t.md"
+        task.write_text("t")
+
+        # The stub never declares -> exit 1 (ruling 5); the merged wire
+        # is installed pre-turn, which is what this test pins.
+        _, _, code = run_exec(
+            ["exec", "--agent", "w", "--task-file", str(task),
+             "--tools", "declare_done,declare_done",
+             "--submit-schema", str(p)],
+            config=config, agent=agent,
+        )
+        assert code == 1
+        names = [t.name for t in agent.tools]
+        assert names.count("declare_done") == 1, f"wire names: {names}"
+        td = agent.tools[names.index("declare_done")]
+        assert td.parameters == CAIRN_SCHEMA["input_schema"]
+        assert td.config.get("terminal") is True
