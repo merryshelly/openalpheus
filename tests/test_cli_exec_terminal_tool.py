@@ -1,5 +1,12 @@
 """Tests for the exec TERMINAL-TOOL mechanism (Stigmergy Decision 18,
-bead workspace-e2uh.152).
+bead workspace-e2uh.152; overlay-merged in workspace-kdsn.350.4).
+
+kdsn.350.4 migration note: the per-run schema tool is no longer a
+separately-named ToolDef appended alongside the others — the run schema
+merges INTO declare_done (one wire name, always declare_done, run schema
+as input_schema), and a schema run that ends without a successful
+declaration fails (exit 1 / status failed / no result key). The legacy
+pins below were updated accordingly (itemized in the bead REPORT).
 
 The station-contract primitive: `openalph exec --submit-schema <path>` loads a
 forced-tool-shaped JSON schema ({"name", "strict", "description",
@@ -140,21 +147,25 @@ class TestExecSubmitSchemaParse:
 
 class TestExecSubmitSchemaLoad:
     def test_valid_schema_loads(self, tmp_path):
-        """Happy path: forced-tool-shaped JSON -> (name, ToolDef) where the
-        ToolDef carries the schema's input_schema verbatim (the provider
-        grammar-constrains required fields) and a config marking it terminal
-        with the schema's `strict` honored."""
+        """Happy path: forced-tool-shaped JSON -> ("declare_done",
+        ToolDef) — the overlay-merged wire def (workspace-kdsn.350.4,
+        design memo §6): always named declare_done, carrying the
+        schema's input_schema verbatim (the provider grammar-constrains
+        required fields) and a config marking it terminal with the
+        schema's `strict` honored; the schema's own name survives as
+        config["run_schema_name"] provenance only."""
         from openalph.cli import _exec_load_submit_schema
 
         p = write_schema(tmp_path)
         name, td = _exec_load_submit_schema(str(p))
-        assert name == "submit_validation"
+        assert name == "declare_done"
         assert isinstance(td, ToolDef)
-        assert td.name == "submit_validation"
+        assert td.name == "declare_done"
         assert td.parameters == SUBMIT_SCHEMA["input_schema"]
         assert td.description == SUBMIT_SCHEMA["description"]
         assert td.config.get("terminal") is True
         assert td.config.get("strict") is True
+        assert td.config.get("run_schema_name") == SUBMIT_SCHEMA["name"]
 
     def test_strict_false_preserved(self, tmp_path):
         """`strict` is the schema's, not an operator assumption: a
@@ -225,9 +236,10 @@ class TestExecSubmitSchemaInstall:
                    for t in agent.tools)
 
     def test_terminal_tool_registered_on_agent(self, tmp_path):
-        """--submit-schema registers (name, terminal ToolDef) on the FRESH
-        agent (per-run state, never cached across runs): name from the
-        schema's `name` field, ToolDef with the schema's input_schema and a
+        """--submit-schema registers ("declare_done", terminal ToolDef) on
+        the FRESH agent (per-run state, never cached across runs): the
+        canonical wire name (kdsn.350.4 — the schema's own `name` field is
+        provenance only), ToolDef with the schema's input_schema and a
         terminal config."""
         config = make_config(tmp_path)
         p = write_schema(tmp_path)
@@ -253,31 +265,36 @@ class TestExecSubmitSchemaInstall:
         agent = built["agent"]
         assert agent._terminal_tool is not None
         name, td = agent._terminal_tool
-        assert name == "submit_validation"
-        assert td.name == "submit_validation"
+        assert name == "declare_done"
+        assert td.name == "declare_done"
         assert td.parameters == SUBMIT_SCHEMA["input_schema"]
         assert td.config.get("terminal") is True
         assert td.config.get("strict") is True
 
     def test_exposed_to_model_via_tools(self, tmp_path):
-        """The named tool is EXPOSED to the model: it is appended to the
-        agent's tool inventory (tools_arg goes to the provider as-is)."""
+        """The merged declare_done is EXPOSED to the model: it is placed
+        on the agent's tool inventory (tools_arg goes to the provider
+        as-is) — exactly one terminal tool, per kdsn.350.4."""
         config = make_config(tmp_path)
         p = write_schema(tmp_path)
         agent = make_agent_stub()
         task = tmp_path / "t.md"
         task.write_text("t")
 
+        # The stub never declares -> the run ends undeclared: exit 1 /
+        # failed (kdsn.350.4 ruling 5) — the wire is installed pre-turn,
+        # which is what this test pins.
         stdout, _, code = run_exec(
             ["exec", "--agent", "w", "--task-file", str(task),
              "--submit-schema", str(p)],
             config=config, agent=agent,
         )
-        assert code == 0
+        assert code == 1
         names = [t.name for t in agent.tools]
-        assert "submit_validation" in names
-        # Appended exactly once; the rest of the inventory is untouched.
-        assert names.count("submit_validation") == 1
+        assert "declare_done" in names
+        # Exactly one terminal tool on the wire (the merged def); the
+        # rest of the inventory is untouched.
+        assert names.count("declare_done") == 1
 
     def test_union_with_tools_flag(self, tmp_path):
         """The flag composes with --tools as a UNION: the resolved builtins
@@ -297,10 +314,11 @@ class TestExecSubmitSchemaInstall:
              "--tools", "shell,file_read", "--submit-schema", str(p)],
             config=config, agent=agent,
         )
-        assert code == 0
+        # The stub never declares -> exit 1 (kdsn.350.4 ruling 5).
+        assert code == 1
         names = [t.name for t in agent.tools]
         assert "shell" in names and "file_read" in names
-        assert "submit_validation" in names
+        assert "declare_done" in names
 
     def test_union_without_tools_flag(self, tmp_path):
         """Without --tools the terminal tool is the ONLY tool installed
@@ -312,11 +330,13 @@ class TestExecSubmitSchemaInstall:
         task = tmp_path / "t.md"
         task.write_text("t")
 
-        run_exec(["exec", "--agent", "w", "--task-file", str(task),
-                  "--submit-schema", str(p)],
-                 config=config, agent=agent)
+        # The stub never declares -> exit 1 (kdsn.350.4 ruling 5).
+        _, _, code = run_exec(["exec", "--agent", "w", "--task-file", str(task),
+                               "--submit-schema", str(p)],
+                              config=config, agent=agent)
+        assert code == 1
         names = [t.name for t in agent.tools]
-        assert names == ["submit_validation"]
+        assert names == ["declare_done"]
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +397,7 @@ class TestExecSubmitSchemaResult:
             if on_tool_call is not None:
                 # The real loop fires the callback with the captured
                 # arguments; the stub reports the same shape.
-                await on_tool_call("c1", "submit_validation", args_dict,
+                await on_tool_call("c1", "declare_done", args_dict,
                                    "submitted", False)
             agent._terminal_submit = args_dict
             return "SUBMISSION ACK"
@@ -401,7 +421,7 @@ class TestExecSubmitSchemaResult:
         # (False only for terminal-batch not-executed calls); a terminal call is
         # by definition executed.
         assert {
-            "name": "submit_validation",
+            "name": "declare_done",
             "is_error": False,
             "executed": True,
         } in obj["tool_trace"]
@@ -411,9 +431,10 @@ class TestExecSubmitSchemaResult:
 
     def test_no_submit_no_result_field(self, tmp_path):
         """The model ends WITHOUT calling the terminal tool (text-only
-        stop): behavior is exactly today's — NO `result` field (the caller
-        decides whether a missing result is a failure), status done,
-        exit 0."""
+        stop): kdsn.350.4 ruling 5 — the overlay payload contract is
+        unsatisfied: status "failed", exit 1, NO `result` field, NO
+        `conclusion` field (R4 omission — the run did not land "done"),
+        and the cause rides the existing `detail` field."""
         config = make_config(tmp_path)
         p = write_schema(tmp_path)
         agent = make_agent_stub(response_text="just text, no submission")
@@ -425,11 +446,13 @@ class TestExecSubmitSchemaResult:
              "--submit-schema", str(p)],
             config=config, agent=agent,
         )
-        assert code == 0
+        assert code == 1
         obj = parse_single_json(stdout)
         assert "result" not in obj
-        assert obj["status"] == "done"
+        assert "conclusion" not in obj
+        assert obj["status"] == "failed"
         assert obj["content"] == "just text, no submission"
+        assert "declare_done" in obj["detail"]
         assert obj["tool_trace"] == []
 
     def test_result_absent_without_flag(self, tmp_path):
@@ -517,11 +540,15 @@ def _stream_responses(responses):
 
 
 def _submit_call(args, cid="call_submit"):
-    return ToolCall(id=cid, name="submit_validation", input=args)
+    # kdsn.350.4: the wire name is always declare_done (the run schema is
+    # its input_schema; the schema file's own name is provenance only).
+    return ToolCall(id=cid, name="declare_done", input=args)
 
 
 def _terminal_tooldef():
-    return ToolDef(name="submit_validation",
+    # The merged overlay wire def (kdsn.350.4): named declare_done, run
+    # schema as input_schema, terminal config with the schema's strict.
+    return ToolDef(name="declare_done",
                    description="Submit the station's validation verdict.",
                    parameters=SUBMIT_SCHEMA["input_schema"],
                    config={"terminal": True, "strict": True})
@@ -544,7 +571,7 @@ class TestAgentTerminalTool:
         in the on_tool_call trace with its arguments, and a tool result is
         appended to history (no orphan tool_calls)."""
         agent = _agent(tmp_path)
-        agent._terminal_tool = ("submit_validation", _terminal_tooldef())
+        agent._terminal_tool = ("declare_done", _terminal_tooldef())
         args_dict = {"verdict": "pass", "score": 97}
 
         with (
@@ -565,7 +592,7 @@ class TestAgentTerminalTool:
 
         assert result is not None  # returned, not raised
         # Provenance: exactly the terminal call, no errors, args captured.
-        assert calls == [("call_submit", "submit_validation", args_dict, False)]
+        assert calls == [("call_submit", "declare_done", args_dict, False)]
         # History: user, assistant-with-tool-call, tool-result (closed).
         hist = agent.history("r1")
         assert [m.get("role") for m in hist] == ["user", "assistant", "tool"]
@@ -576,7 +603,7 @@ class TestAgentTerminalTool:
         byte-for-byte today's behavior — no terminal state is produced and
         no extra model call is made."""
         agent = _agent(tmp_path)
-        agent._terminal_tool = ("submit_validation", _terminal_tooldef())
+        agent._terminal_tool = ("declare_done", _terminal_tooldef())
 
         with (
             patch("openalph.agent.stream",
@@ -602,7 +629,7 @@ class TestAgentTerminalTool:
         shapes stay byte-identical to pre-Decision-18 (parity pinned in
         tests/test_forced_tool.py::TestParity)."""
         agent = _agent(tmp_path)
-        agent._terminal_tool = ("submit_validation", _terminal_tooldef())
+        agent._terminal_tool = ("declare_done", _terminal_tooldef())
         with (
             patch("openalph.agent.stream",
                   side_effect=_stream_responses([_text_response("ok")]))
@@ -629,7 +656,7 @@ class TestAgentTerminalTool:
         second turn behaves exactly as a pre-Decision-18 turn (no strict
         kwarg, no terminal handling)."""
         agent = _agent(tmp_path)
-        agent._terminal_tool = ("submit_validation", _terminal_tooldef())
+        agent._terminal_tool = ("declare_done", _terminal_tooldef())
         with (
             patch("openalph.agent.stream",
                   side_effect=_stream_responses([
@@ -657,17 +684,17 @@ class TestAgentTerminalTool:
 
     def test_tools_composition_normal_then_terminal(self, tmp_path):
         """--tools composition: a NORMAL builtin (shell) and the terminal
-        tool are both exposed; the model calls shell on turn 1 (real
-        execution, result fed back) and submit_validation on turn 2 —
-        exactly two model calls, the loop ends on the terminal call, and
-        the trace shows BOTH calls in order."""
+        tool (the merged declare_done, kdsn.350.4) are both exposed; the
+        model calls shell on turn 1 (real execution, result fed back) and
+        declare_done on turn 2 — exactly two model calls, the loop ends
+        on the terminal call, and the trace shows BOTH calls in order."""
         agent = _agent(tmp_path)
         # Mirror cmd_exec: the resolved --tools builtins are installed AND
-        # the terminal tool is APPENDED (union).
+        # the merged overlay terminal tool is on the wire (overlay merge).
         _tdef = _terminal_tooldef()
         agent.tools = [ToolDef(name="shell", description="s",
                                parameters={}, config={}), _tdef]
-        agent._terminal_tool = ("submit_validation", _tdef)
+        agent._terminal_tool = ("declare_done", _tdef)
         args_dict = {"verdict": "pass", "score": 42}
 
         with (
@@ -693,11 +720,11 @@ class TestAgentTerminalTool:
         # (union with --tools, wire level).
         for call_kwargs in mock_stream.call_args_list:
             sent = {t.name for t in call_kwargs.kwargs["tools"]}
-            assert sent == {"shell", "submit_validation"}
+            assert sent == {"shell", "declare_done"}
         # shell executed (turn 1), terminal captured (turn 2), loop ended.
         assert calls == [
             ("c1", "shell", {"command": "ls"}, False),
-            ("call_submit", "submit_validation", args_dict, False),
+            ("call_submit", "declare_done", args_dict, False),
         ]
         # History: user, asst(shell), tool(shell result), asst(submit),
         # tool(submit result) — both tool calls closed, no orphan.
@@ -721,7 +748,7 @@ class TestAgentTerminalTool:
         'cap before submit' is, by construction, the model calling a NORMAL
         tool and exhausting the budget.)"""
         agent = _agent(tmp_path, max_iterations=1)
-        agent._terminal_tool = ("submit_validation", _terminal_tooldef())
+        agent._terminal_tool = ("declare_done", _terminal_tooldef())
         agent.tools = [ToolDef(name="shell", description="s",
                                parameters={}, config={})]
         # Two model calls: the capped NORMAL tool call (not the terminal

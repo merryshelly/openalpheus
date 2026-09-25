@@ -671,7 +671,7 @@ def _resolve_exec_tools(names: list[str]) -> list:
 
 
 def _exec_load_submit_schema(path: str):
-    """Load a --submit-schema file into (name, terminal ToolDef).
+    """Load a --submit-schema file into ("declare_done", merged ToolDef).
 
     Stigmergy Decision 18 (bead workspace-e2uh.152): the station-contract
     primitive. The file is a forced-tool-shaped JSON schema — the same
@@ -679,10 +679,14 @@ def _exec_load_submit_schema(path: str):
     ({"name", "strict", "description", "input_schema"}, e.g. stigmergy's
     submit_validation) — because that is the shape the provider
     grammar-constrains via _convert_tools_for_provider's `strict` path
-    (kdsn.304). The returned ToolDef carries a config the loop's terminal
-    check recognizes: `terminal=True` (never execute — capture and end
-    the turn) and `strict` (the schema's own value, honored per-call by
-    Agent.handle_input).
+    (kdsn.304). Overlay merge (workspace-kdsn.350.4, design memo §6):
+    the returned ToolDef is the merged WIRE def — always named
+    `declare_done`, with the run schema as its input_schema (the
+    schema's own `name` is provenance only, kept in
+    config["run_schema_name"]). The config carries the loop's terminal
+    check: `terminal=True` (never execute — capture and end the turn),
+    `strict` (the schema's own value, honored per-call by
+    Agent.handle_input), and `run_schema_name`.
 
     Fail-loud contract (same as --task-file / --system-prompt-file):
     unreadable file, non-JSON, non-object JSON, missing/blank `name`,
@@ -715,11 +719,17 @@ def _exec_load_submit_schema(path: str):
     description = data.get("description")
     if not isinstance(description, str) or not description:
         description = ""
-    return name, ToolDef(
-        name=name,
+    # Overlay merge (workspace-kdsn.350.4, design memo §6): the run schema
+    # merges INTO declare_done — exactly ONE terminal tool per exec run,
+    # always named declare_done, with the run schema as its input_schema
+    # (and its description). The schema's own `name` never reaches the
+    # wire; it is retained as config["run_schema_name"] provenance only.
+    return "declare_done", ToolDef(
+        name="declare_done",
         description=description,
         parameters=input_schema,
-        config={"terminal": True, "strict": bool(data.get("strict"))},
+        config={"terminal": True, "strict": bool(data.get("strict")),
+                "run_schema_name": name},
     )
 
 
@@ -1117,12 +1127,19 @@ def cmd_exec(args):
     if resolved_tools is not None:
         agent.tools = resolved_tools
 
-    # --submit-schema (Stigmergy Decision 18, bead workspace-e2uh.152):
-    # expose the terminal tool to the model for this run. PER-RUN state —
-    # registered on the fresh agent here and never cached, so concurrent
-    # or repeated exec runs cannot leak one run's schema into another.
-    # Union with --tools: the terminal tool is APPENDED to whatever the
-    # agent already carries (resolved builtins, or nothing). The loop's
+    # --submit-schema (Stigmergy Decision 18, bead workspace-e2uh.152;
+    # overlay-merged in workspace-kdsn.350.4, design memo §6): expose the
+    # terminal tool to the model for this run. PER-RUN state — registered
+    # on the fresh agent here and never cached, so concurrent or repeated
+    # exec runs cannot leak one run's schema into another. Exactly ONE
+    # terminal tool on the wire, ALWAYS named declare_done, with the run
+    # schema merged in as its input_schema. If the run's tool set already
+    # carries the core zero-payload declare_done (workspace toml / --tools),
+    # the merged overlay ToolDef REPLACES it in place; otherwise it is
+    # appended (Camp-B exec preserved: a schema run always exposes
+    # declare_done regardless of workspace). The old append-of-a-separate-
+    # named-ToolDef path is retired — two coexisting terminal tools is the
+    # fragmented-endings class the canonical grammar kills. The loop's
     # tool-dispatch site (agent.py) recognizes the terminal config: a
     # call to it is captured (no execution — there is no implementation),
     # provenanced via on_tool_call, and ends the turn cleanly.
@@ -1131,7 +1148,12 @@ def cmd_exec(args):
         agent._terminal_submit = None
         if agent.tools is None:
             agent.tools = []
-        agent.tools.append(terminal_tool[1])
+        for i, t in enumerate(agent.tools):
+            if t.name == "declare_done":
+                agent.tools[i] = terminal_tool[1]
+                break
+        else:
+            agent.tools.append(terminal_tool[1])
 
     # file_ticket per-run filing sink (Stigmergy Decision 18, bead
     # workspace-e2uh.162): a PER-RUN list — created on the fresh agent here
@@ -1288,6 +1310,27 @@ def cmd_exec(args):
         ceiling_trip = "driver_turns"
         status = "failed"
 
+    # Overlay failure (workspace-kdsn.350.4, design memo §6): a
+    # --submit-schema run that ended WITHOUT a successful terminal
+    # declaration (undeclared text ending, cap, corrective-exhausted) has
+    # an unsatisfied payload contract -> status "failed", exit 1, NO
+    # `result` key (the key is only set below when a dict was captured).
+    # The `conclusion` key stays omitted — the R4 contract admits it only
+    # on status=="done" (this run did not land cleanly); the cause rides
+    # the existing `detail` field. Loop-observed endings (failed / infra /
+    # wedged set above or in the exception path) keep their existing exit
+    # codes: this check fires only while the run still reads "done".
+    if terminal_tool is not None and status == "done":
+        try:
+            _overlay_submit = agent._terminal_submit
+        except AttributeError:
+            _overlay_submit = None
+        if not isinstance(_overlay_submit, dict):
+            status = "failed"
+            detail = ("overlay payload contract unsatisfied: the turn "
+                      "ended without a successful declare_done "
+                      "declaration")
+
     result = {
         "status": status,
         "content": content,
@@ -1299,14 +1342,18 @@ def cmd_exec(args):
         "detail": detail,
     }
     # Additive top-level `result` (Stigmergy Decision 18, bead
-    # workspace-e2uh.152): present ONLY when a terminal tool was registered
-    # for this run AND the model called it — then it is the captured
-    # arguments dict (the episode's return value, taken from
+    # workspace-e2uh.152; overlay-merged in workspace-kdsn.350.4): present
+    # ONLY when a terminal tool was registered for this run AND a terminal
+    # declaration was captured — then it is the captured (coerced) payload
+    # dict (the episode's return value, taken from
     # agent._terminal_submit which the agent loop sets at the tool-dispatch
-    # site). No terminal tool, or the model ended without calling it
-    # (text-only stop, iteration cap, relay deny — a deny is NOT a terminal
-    # call), the field is ABSENT and the caller decides whether a missing
-    # result is a failure. Existing fields and exit codes are untouched.
+    # site after the overlay validation passed). No terminal tool, or the
+    # run ended without a successful declaration (text-only stop,
+    # iteration cap, relay deny — a deny is NOT a terminal call; an invalid
+    # payload never lands here), the field is ABSENT. In a --submit-schema
+    # run the absence is a FAILURE (the mapping above: failed / exit 1);
+    # without the flag it is pre-Decision-18 behavior. Existing fields and
+    # exit codes otherwise untouched.
     if terminal_tool is not None:
         try:
             _submit = agent._terminal_submit

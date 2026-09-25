@@ -44,6 +44,117 @@ _TOOL_CALL_OVERHEAD_CHARS = 80   # {"type":"tool_use","id":"...","name":"...","i
 _TOOL_RESULT_OVERHEAD_CHARS = 80  # {"type":"tool_result","tool_use_id":"...","content":}
 
 
+# --- Terminal-payload coercion + validation (exec overlay merge,
+#     workspace-kdsn.350.4, design memo §6) -------------------------------
+
+# JSON-schema type keyword -> python type check for the terminal payload
+# validation. `integer` rejects bool (json.dumps(True) is a 1, but a bool
+# standing in for a counter is the ds4-leniency class — honest rejection).
+_JSON_TYPE_CHECKS = {
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+}
+
+# ds4-style lenient string booleans -> real bool (the cairn
+# _normalize_submit_result pattern, spike step3: ds4 served accepted as the
+# string "true"). Only applied when the property's DECLARED type is boolean.
+_LENIENT_TRUE_STRINGS = {"true", "1", "yes"}
+_LENIENT_FALSE_STRINGS = {"false", "0", "no"}
+
+
+def _coerce_terminal_payload(payload, schema):
+    """Coerce ds4-style loose payload shapes, then validate against the run
+    schema (the exec --submit-schema overlay, design memo §6 — the one place
+    the coerce-then-validate-then-retry contract survives per DQ1).
+
+    Coercion is schema-driven and safe-only, mirroring the cairn
+    openalph_exec adapter's _normalize_submit_result:
+      - a string is coerced to a bool (true/1/yes -> True, false/0/no ->
+        False) ONLY when the property's declared type is "boolean";
+      - a stringified-JSON value is parsed to an object ONLY when the
+        declared type is "object" (and the parse yields a dict), to a list
+        ONLY when the declared type is "array".
+    Everything else is left untouched — unnormalizable values fall through
+    to honest validation rejection (never fabricated).
+
+    Validation enforces the run schema's `required` field presence and the
+    DECLARED property types (string/integer/number/boolean/object/array;
+    a type keyword list is honored as "any of"). It deliberately does NOT
+    enforce `additionalProperties` — the core zero-payload declare_done
+    (schema properties: {}) must stay fully tolerant (stray args accepted,
+    the absence-of-call-only core contract), while overlay run schemas get
+    real field validation.
+
+    Returns (coerced_payload, None) on success, (None, [error, ...]) on
+    failure — each error names the offending field and the expected type.
+    """
+    if not isinstance(payload, dict):
+        return None, [f"payload must be a JSON object, got {type(payload).__name__}"]
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+    out = dict(payload)
+    for key, value in out.items():
+        spec = props.get(key)
+        if not isinstance(spec, dict) or not isinstance(value, str):
+            continue
+        types = spec.get("type")
+        if isinstance(types, str):
+            types = [types]
+        if not isinstance(types, list):
+            continue
+        if "boolean" in types and "string" not in types:
+            lowered = value.strip().lower()
+            if lowered in _LENIENT_TRUE_STRINGS:
+                out[key] = True
+            elif lowered in _LENIENT_FALSE_STRINGS:
+                out[key] = False
+        elif "object" in types and "string" not in types:
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                out[key] = parsed
+        elif "array" in types and "string" not in types:
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                out[key] = parsed
+    errors = []
+    for req in (schema.get("required") or []):
+        if req not in out:
+            spec = props.get(req)
+            t = spec.get("type") if isinstance(spec, dict) else None
+            if isinstance(t, list):
+                t = " | ".join(t)
+            errors.append(
+                f"missing required field '{req}'"
+                + (f" (expected {t})" if t else ""))
+    for key, value in out.items():
+        spec = props.get(key)
+        if not isinstance(spec, dict):
+            continue
+        t = spec.get("type")
+        if t is None:
+            continue
+        types = t if isinstance(t, list) else [t]
+        if any(_JSON_TYPE_CHECKS.get(k) is not None
+               and _JSON_TYPE_CHECKS[k](value) for k in types):
+            continue
+        errors.append(
+            f"field '{key}': expected {t}, got {type(value).__name__}")
+    if errors:
+        return None, errors
+    return out, None
+
+
 def _build_user_content(text: str, config: AgentConfig, *, vision: bool) -> str | list[dict]:
     """Build user message content, expanding image media tags when the room's
     active model supports vision.
@@ -2116,10 +2227,20 @@ class Agent:
                     # the terminal call's arguments are schema-faithful.
                     _terminal_name = None
                     _terminal_strict = False
+                    _terminal_schema = None
                     _tt = getattr(self, "_terminal_tool", None)
                     if _tt is not None:
+                        # Per-run exec terminal (Stigmergy Decision 18;
+                        # overlay-merged in workspace-kdsn.350.4 — always
+                        # named declare_done with the run schema as its
+                        # input_schema). The def's parameters ARE the run
+                        # schema: the dispatch site coerces (ds4-leniency
+                        # normalization, design memo §6) and validates
+                        # against it before capturing.
                         _terminal_name = _tt[0]
-                        _terminal_strict = bool(_tt[1].config.get("strict"))
+                        _tdef = _tt[1]
+                        _terminal_strict = bool(_tdef.config.get("strict"))
+                        _terminal_schema = _tdef.parameters
                     else:
                         # Declare-done (workspace-kdsn.350.3): terminal
                         # semantics by TOOL IDENTITY — a discovered
@@ -2128,14 +2249,21 @@ class Agent:
                         # terminal (above) keeps precedence; a run with both
                         # registered behaves exactly as pre-350.3 (byte-
                         # compatible). strict is read from the tool's config
-                        # (TOML overlay) so a future per-run overlay merge
-                        # can grammar-constrain declare_done without a code
-                        # change; core discovery yields {} -> False.
+                        # (TOML overlay) so a per-run overlay merge can
+                        # grammar-constrain declare_done without a code
+                        # change; core discovery yields {} -> False. The
+                        # zero-payload core schema (properties: {}) makes
+                        # the dispatch-site validation a no-op — the core
+                        # tolerance contract (stray args accepted) holds.
                         for t in _turn_tools:
                             if t.name == "declare_done":
                                 _terminal_name = "declare_done"
+                                _tdef = t
                                 _terminal_strict = bool(t.config.get("strict"))
+                                _terminal_schema = t.parameters
                                 break
+                    if not isinstance(_terminal_schema, dict):
+                        _terminal_schema = None
 
                     # Record start time for latency measurement
                     start_time = time.monotonic()
@@ -2666,7 +2794,8 @@ class Agent:
                             logger.warning("Tool intent callback failed: %s", e)
 
                     # TERMINAL tool (Stigmergy Decision 18, bead
-                    # workspace-e2uh.152): a call to the run's registered
+                    # workspace-e2uh.152; overlay-merged in
+                    # workspace-kdsn.350.4): a call to the run's registered
                     # terminal tool is the episode's return value — there is
                     # NO implementation to run. The check sits at the
                     # tool-dispatch site: AFTER the assistant tool-call
@@ -2674,18 +2803,43 @@ class Agent:
                     # is provenanced exactly like a normal tool call —
                     # counted, logged, on_tool_intent'd, and reported via
                     # on_tool_call, which is how the exec-level tool_trace
-                    # picks it up) and BEFORE any tool execution. A tool
+                    # picks it up) and BEFORE any tool execution.
+                    #
+                    # Overlay validation (design memo §6): in a per-run
+                    # overlay (the merged declare_done carrying the run
+                    # schema), the FIRST terminal call's payload is coerced
+                    # (ds4-leniency normalization — string "true"/"false"
+                    # -> bool, stringified-JSON -> object/list, per the
+                    # cairn _normalize_submit_result pattern) and validated
+                    # against the run schema (required fields, declared
+                    # types) BEFORE capture. On failure the offending call
+                    # gets a typed ERROR ToolResult naming the offending
+                    # field(s) + expected type; the turn does NOT end,
+                    # `_terminal_submit` stays unset, no `declared` booking
+                    # — the loop CONTINUES (a valid re-call ends it with
+                    # the coerced dict captured). Repetition is bounded by
+                    # the iteration cap and is INDEPENDENT of the one-shot
+                    # undeclared-text-end corrective (separate counters —
+                    # this is validation, not the corrective). A tool
                     # result is appended for every call in the batch so
                     # history has no orphan tool_calls (RC1-consistent).
-                    # Then the turn ends CLEANLY — the text-return path
-                    # (final stop_reason recorded, spotter fires, return),
-                    # not an error. Iteration cap is unaffected: this is
-                    # inside the loop, so a run that burns all turns before
-                    # submitting still falls through to the cap sentinel +
-                    # forced summary (a relay deny never reaches this site —
-                    # it raises out of stream/complete).
+                    # On success the turn ends CLEANLY — the text-return
+                    # path (final stop_reason recorded, spotter fires,
+                    # return), not an error. Iteration cap is unaffected:
+                    # this is inside the loop, so a run that burns all
+                    # turns before submitting still falls through to the
+                    # cap sentinel + forced summary (a relay deny never
+                    # reaches this site — it raises out of stream/complete).
                     if _terminal_name is not None and any(
                             tc.name == _terminal_name for tc in active_tool_calls):
+                        _tt_terminal = next(
+                            tc for tc in active_tool_calls
+                            if tc.name == _terminal_name)
+                        if _terminal_schema is not None:
+                            _tt_coerced, _tt_errors = _coerce_terminal_payload(
+                                _tt_terminal.input, _terminal_schema)
+                        else:
+                            _tt_coerced, _tt_errors = _tt_terminal.input, None
                         self._record_tool_calls(room_id, len(active_tool_calls))
                         if room_id not in self._room_tool_counts:
                             self._room_tool_counts[room_id] = {}
@@ -2701,7 +2855,8 @@ class Agent:
                             _tt_logged.append({
                                 "name": tc.name,
                                 "input": tc.input,
-                                "is_error": False,
+                                "is_error": bool(_tt_errors)
+                                and tc is _tt_terminal,
                             })
                         self._log_turn(
                             room_id=room_id,
@@ -2720,12 +2875,52 @@ class Agent:
                                 await on_cache_status(usage, self.get_model(room_id))
                             except Exception:
                                 logger.error("on_cache_status callback failed", exc_info=True)
+                        if _tt_errors:
+                            # Overlay validation failure: typed ERROR result
+                            # naming the offending field(s) + expected type;
+                            # batchmates are provenanced + closed (no
+                            # orphan) but NOT executed; NO capture, NO
+                            # declaration booking — the loop continues and
+                            # a valid re-call ends the turn.
+                            _tt_error_content = (
+                                "declare_done payload invalid: "
+                                + "; ".join(_tt_errors)
+                                + " Fix the payload and call declare_done "
+                                "again.")
+                            for tc in active_tool_calls:
+                                if tc is _tt_terminal:
+                                    _tt_result_content = _tt_error_content
+                                    _tt_result_is_error = True
+                                else:
+                                    _tt_result_content = (
+                                        "not executed: terminal payload "
+                                        "invalid, declaration pending")
+                                    _tt_result_is_error = False
+                                history.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": wrap_tool_result(
+                                        _tt_result_content, tc.name, tc.id),
+                                    "is_error": _tt_result_is_error,
+                                })
+                                if on_tool_call:
+                                    try:
+                                        await on_tool_call(
+                                            tc.id, tc.name, tc.input,
+                                            _tt_result_content,
+                                            _tt_result_is_error,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Tool call callback failed: %s", e)
+                            continue
                         _tt_submit = None
                         for tc in active_tool_calls:
                             if tc.name == _terminal_name:
                                 # First terminal call in the batch wins; the
-                                # arguments dict IS the episode's return value.
-                                _tt_submit = tc.input
+                                # COERCED, validated payload IS the episode's
+                                # return value.
+                                _tt_submit = _tt_coerced
                                 _tt_result_content = "submitted"
                             else:
                                 # Non-terminal calls in the same batch are
