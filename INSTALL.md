@@ -97,7 +97,7 @@ Minimum 500 MB free (hard fail). Recommended 2 GB+ (Docker images ~500 MB, works
 ## 2. Quick Install
 
 ```bash
-curl -fsSL https://codeberg.org/merryshelly/openalpheus/raw/branch/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/merryshelly/openalpheus/main/install.sh | sudo bash
 ```
 
 What it does: (1) auto-installs missing system dependencies (curl, jq, Docker, Caddy, etc.) and verifies prerequisites, (2) installs OpenAlpheus into `/opt/openalph-venv/`, (3) deploys tuwunel via Docker, (4) configures TLS via Caddy, (5) creates Matrix accounts, (6) creates your agent (Unix user + workspace + systemd unit), (7) serves Cinny web client.
