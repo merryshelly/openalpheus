@@ -173,6 +173,12 @@ class AgentConfig:
     # loop holds both per-room locks with no socket, no room output and no log
     # above DEBUG, so nothing raises and the room silently looks dead.
     turn_stall_timeout_seconds: float = 900
+    # cairn-eval .61.22: soft wall-clock deadline for the deadline-winddown
+    # reminder (two-phase task timer, wall-clock axis) - the turn-elapsed
+    # seconds at which the boundary reminder fires (once per turn).
+    # 0 = no deadline -> trigger silent (chat paths stay 0 -> fleet-silent);
+    # armed per-run via `openalph exec --soft-deadline N`.
+    soft_deadline_seconds: float = 0
     thinking: str = "off"
     temperature: float | None = None
     top_p: float | None = None

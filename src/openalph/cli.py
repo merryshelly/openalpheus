@@ -125,6 +125,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    default=None, help="Reasoning effort (card-native values)")
     p.add_argument("--max-turns", type=int, default=None,
                    help="Override max tool-call iterations for this run")
+    p.add_argument("--soft-deadline", type=int, default=None,
+                   help="Soft wall-clock deadline in seconds for this run: "
+                        "at this much turn elapsed time the "
+                        "deadline-winddown reminder fires (once per turn)")
     p.add_argument("--tools", default=None,
                    help="Comma-separated builtin tool names (bypasses workspace discovery)")
     p.add_argument("--room", default=None,
@@ -1149,6 +1153,8 @@ def cmd_exec(args):
         config = replace(config, default_model=args.model)
     if args.max_turns is not None:
         config = replace(config, max_iterations=args.max_turns)
+    if args.soft_deadline is not None:
+        config = replace(config, soft_deadline_seconds=args.soft_deadline)
     # The Spotter is an autonomous monitor that fires its own complete()
     # calls (spotter_model) around turns. A worker dispatch is ONE
     # deterministic handle_input metered against the capability's

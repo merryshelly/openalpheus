@@ -107,6 +107,14 @@ class ReminderState:
     # fresh row stands).
     handoff_epoch_index: int = 0
     handoff_epoch_ts: str = ""
+    # Deadline winddown (cairn-eval .61.22): the wall-clock axis of the
+    # two-phase task timer. The tool-loop-boundary site populates these;
+    # every other construction flows the defaults, and
+    # deadline_seconds == 0 == no deadline known -> silent skip (the
+    # available_tokens convention: fewer nudges, never false urgency;
+    # also keeps existing constructions valid).
+    elapsed_seconds: float = 0.0
+    deadline_seconds: float = 0.0
 
 
 @dataclass
@@ -158,6 +166,7 @@ class ReminderEngine:
         self._ladder_model: str | None = None
         # Per-turn state
         self._t4_fired_this_turn: bool = False  # T4: once per turn
+        self._deadline_fired_this_turn: bool = False  # deadline-winddown: once per turn
         # kdsn.298: model-keyed orientation flag (spec MED-1 — also cleared in
         # reset(); rehydrate() calls reset() first, so a stale value surviving
         # reset would wrongly suppress a deserved fire).
@@ -288,6 +297,33 @@ class ReminderEngine:
                     detail=f"tier={fired_tier}",
                     text=_LADDER_TEXT[fired_tier].format(remaining=remaining),
                 ))
+
+        # Deadline winddown (cairn-eval .61.22) - tool_loop_boundary only,
+        # once per turn (D4: _deadline_fired_this_turn latch, cleared by
+        # reset_turn() and reset() - the T4 seam).  The wall-clock axis of
+        # the two-phase task timer: the turn has reached its soft budget
+        # (D3: inclusive at the exact deadline).  deadline_seconds == 0 =
+        # no deadline known -> silent skip (the available_tokens
+        # convention).  After the context ladder, before T4 (D8: both may
+        # fire at the same boundary - reminders dilute but never
+        # conflict).  NOT rehydratable (D9): the latch is per-turn by
+        # definition - a serialized entry from a previous session must
+        # not consume it.
+        if (state.evaluation_point == "tool_loop_boundary"
+                and state.deadline_seconds > 0
+                and state.elapsed_seconds >= state.deadline_seconds
+                and not self._deadline_fired_this_turn):
+            self._deadline_fired_this_turn = True
+            results.append(Reminder(
+                trigger="deadline-winddown",
+                text=(
+                    f"Task deadline winddown: {int(state.elapsed_seconds)}s "
+                    f"elapsed of a {int(state.deadline_seconds)}s budget - "
+                    "the hard kill fires at the deadline. Converge now: "
+                    "finish the task, checkpoint working state, and be "
+                    "ready to stop cleanly."
+                ),
+            ))
 
         # Context handoff — handoff-checkpoint (kdsn.322 spec §3.2/§3.3,
         # supersedes the legacy warning trigger).  Fires at BOTH evaluation
@@ -512,7 +548,10 @@ class ReminderEngine:
                 # is the epoch's last orientation — spec §4.4). Guarded: an
                 # entry lacking detail preserves any known-good earlier one.
                 self._oriented_model = entry["detail"]
-            # T4 is per-turn — not rehydrated across sessions
+            # T4 and deadline-winddown are per-turn - not rehydrated
+            # across sessions (D9: a serialized deadline-winddown entry
+            # is informational only - it must not latch this session's
+            # per-turn flag).
         # D11: the latch is armed under UNKNOWN model identity — the first
         # populated turn-start evaluation re-arms to current reality.
         self._ladder_model = None
@@ -529,6 +568,7 @@ class ReminderEngine:
         self._checkpoint_fired = False
         self._runway_fired = False
         self._t4_fired_this_turn = False
+        self._deadline_fired_this_turn = False
         # Ladder re-arm (D7): umbral = new session, all tiers re-arm.
         self._ladder_fired = 0
         self._ladder_model = None
@@ -541,3 +581,4 @@ class ReminderEngine:
         reset_turn() deliberately does NOT touch it.
         """
         self._t4_fired_this_turn = False
+        self._deadline_fired_this_turn = False

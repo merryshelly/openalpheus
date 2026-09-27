@@ -440,6 +440,10 @@ class Agent:
         self._truncation_retry = False
         # R1-4: Per-room reminder engines (replaces shared _reminder_engine)
         self._reminder_engines: dict[str, ReminderEngine] = {}
+        # cairn-eval .61.22: per-room monotonic baseline stamped at each
+        # handle_input turn start - the deadline-winddown reminder's
+        # elapsed clock (the boundary site computes now - baseline).
+        self._turn_started_at: dict[str, float] = {}
         # Per-room per-tool-name call counts (session scope)
         self._room_tool_counts: dict[str, dict[str, int]] = {}
         # R1-1: Per-room read registries for file_write guard
@@ -809,6 +813,7 @@ class Agent:
         """
         _gc_cfg = self.config.context
         available = self._effective_available(limit)
+        _turn_started = self._turn_started_at.get(room_id)
         return ReminderState(
             evaluation_point="tool_loop_boundary",
             iteration=iteration,
@@ -832,6 +837,12 @@ class Agent:
                 int(available * _gc_cfg.checkpoint_pct / 100)
                 if _gc_cfg.handoff_enabled else 0),
             handoff_runway_fraction=self._gc_runway_cached(room_id),
+            # cairn-eval .61.22: wall-clock axis - elapsed since this
+            # turn's baseline (missing key = 0.0 -> silent, the fail-safe
+            # direction: fewer nudges, never false urgency).
+            elapsed_seconds=(time.monotonic() - _turn_started
+                             if _turn_started is not None else 0.0),
+            deadline_seconds=self.config.soft_deadline_seconds,
         )
 
     async def _gc_hard_tier(self, room_id: str, callbacks: dict | None, *,
@@ -1774,6 +1785,10 @@ class Agent:
             self._room_locks[room_id] = asyncio.Lock()
         async with self._room_locks[room_id]:
             self._current_tasks[room_id] = asyncio.current_task()
+            # cairn-eval .61.22: per-turn monotonic baseline for the
+            # deadline-winddown elapsed clock - set at every turn start
+            # (including single-turn exec).
+            self._turn_started_at[room_id] = time.monotonic()
             # Declare-done ledger (kdsn.179, audit R5): clear the room's
             # PER-TURN telemetry at turn start — the registers are
             # turn-scoped ("the last COMPLETED turn's"), so a turn that
