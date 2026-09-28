@@ -73,6 +73,7 @@ def make_response(status_code=200, content=b"AUDIO", json_data=None, text=None):
         content.decode("utf-8", "replace") if isinstance(content, bytes) else ""
     )
     resp.json = MagicMock(return_value=json_data)
+    resp.headers = {"content-type": "audio/mpeg"}
     resp.raise_for_status = MagicMock()
     if status_code >= 400:
         resp.raise_for_status.side_effect = httpx.HTTPStatusError(
@@ -81,7 +82,34 @@ def make_response(status_code=200, content=b"AUDIO", json_data=None, text=None):
     return resp
 
 
-def make_client(responses=None, side_effect=None, repeat=None):
+def stream_cm(resp, chunk_size=0):
+    """Async context manager over a mocked response exposing aiter_bytes().
+
+    The tool reads response bodies with a bounded stream (so a hostile or broken
+    endpoint cannot OOM the process), so the mock must model the streaming API.
+    """
+    payload = resp.content if isinstance(resp.content, (bytes, bytearray)) else b""
+    # The tool reads raw bytes and parses JSON itself, so a mocked JSON response
+    # must arrive as the serialized body (json_data wins over the placeholder
+    # `content` an audio-oriented helper defaults to).
+    json_value = getattr(getattr(resp, "json", None), "return_value", None)
+    if json_value is not None:
+        import json as _json
+        payload = _json.dumps(json_value).encode("utf-8")
+    size = chunk_size or max(len(payload), 1)
+
+    async def _aiter():
+        for i in range(0, len(payload), size):
+            yield payload[i:i + size]
+
+    resp.aiter_bytes = _aiter
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+def make_client(responses=None, side_effect=None, repeat=None, chunk_size=0):
     """Patched httpx.AsyncClient instance.
 
     responses: consumed in order (one per request).
@@ -89,11 +117,11 @@ def make_client(responses=None, side_effect=None, repeat=None):
     """
     client = AsyncMock()
     if side_effect is not None:
-        client.post = AsyncMock(side_effect=side_effect)
+        client.stream = MagicMock(side_effect=side_effect)
     elif repeat is not None:
-        client.post = AsyncMock(side_effect=lambda *a, **k: repeat)
+        client.stream = MagicMock(side_effect=lambda *a, **k: stream_cm(repeat, chunk_size))
     elif responses is not None:
-        client.post = AsyncMock(side_effect=list(responses))
+        client.stream = MagicMock(side_effect=[stream_cm(r, chunk_size) for r in responses])
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
     return client
@@ -380,7 +408,7 @@ async def test_repeated_identical_text_does_not_clobber(tmp_path):
 
 
 def posted_bodies(client):
-    return [call.kwargs["json"] for call in client.post.await_args_list]
+    return [call.kwargs["json"] for call in client.stream.call_args_list]
 
 
 @pytest.mark.asyncio
@@ -430,7 +458,7 @@ async def test_param_overrides_config_voice_and_speed(tmp_path):
 async def test_post_targets_configured_endpoint(tmp_path):
     client = make_client(responses=[make_response()])
     await run_tts(tmp_path, client=client)
-    assert client.post.await_args_list[0].args[0] == ENDPOINT
+    assert client.stream.call_args_list[0].args[1] == ENDPOINT
 
 
 @pytest.mark.asyncio
@@ -502,7 +530,7 @@ async def test_chunk_tokens_zero_disables_chunking(tmp_path):
         fake_ffmpeg=fake, chunk_tokens=0,
     )
     assert result.is_error is False
-    assert client.post.await_count == 1
+    assert client.stream.call_count == 1
     assert not log.exists()
 
 
@@ -520,7 +548,7 @@ async def test_multi_chunk_concatenates_in_order(tmp_path):
     ])
     result = await run_tts(tmp_path, text=text, client=client, fake_ffmpeg=fake, chunk_tokens=6)
     assert result.is_error is False
-    assert client.post.await_count == 3
+    assert client.stream.call_count == 3
     out = list((tmp_path / "media" / "tts").glob("*.mp3"))[0]
     assert out.read_bytes() == b"AAABBBCCC"
     assert "3 chunks" in result.content
@@ -693,7 +721,9 @@ async def test_send_to_room_without_callback_still_reports_the_file(tmp_path):
     result = await run_tts(tmp_path, client=client, send_to_room=True, callback=None)
     assert result.is_error is False
     assert "media/tts/" in result.content
-    assert "sent to room" not in result.content
+    # An explicit send request that could not be honoured must SAY so (the bare
+    # success marker "; sent to room" must not appear).
+    assert "NOT sent" in result.content
 
 
 @pytest.mark.asyncio

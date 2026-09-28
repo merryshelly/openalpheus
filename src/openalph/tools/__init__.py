@@ -2373,8 +2373,21 @@ async def _execute_tool_inner(
     if name in ("file_read", "file_write", "file_edit", "file_patch", "send_media",
                 "grep", "glob", "stt") and "path" in input:
         file_path = input["path"]
-        if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
-            input["path"] = str(agent_config.workspace / file_path)
+        # The model can send ANY JSON type here. Guard before any path operation:
+        # os.path.isabs() raises TypeError on a non-str, and a str workspace would
+        # make the `/` join raise too. Neither may escape into the agent turn --
+        # every failure at this boundary is an is_error ToolResult with steering.
+        if not isinstance(file_path, str):
+            return ToolResult(
+                content=(f"{name} error: invalid path (expected str, got "
+                         f"{type(file_path).__name__})"),
+                is_error=True,
+            )
+        # An empty/whitespace path is left untouched so the tool's own
+        # "path is empty" steer fires instead of resolving to the workspace dir.
+        if file_path.strip() and not os.path.isabs(file_path) \
+                and getattr(agent_config, "workspace", None) is not None:
+            input["path"] = str(Path(agent_config.workspace) / file_path)
 
     # Normalize path to resolved form for registry keys (symlinks, .., relative spellings)
     # so that read via relative and write via absolute always hit the same registry entry.

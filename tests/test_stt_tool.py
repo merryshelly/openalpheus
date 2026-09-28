@@ -66,6 +66,7 @@ def make_response(status_code=200, content=b"", json_data=None, text=None):
     resp.content = content
     resp.text = text if text is not None else content.decode("utf-8", "replace")
     resp.json = MagicMock(return_value=json_data)
+    resp.headers = {"content-type": "application/json"}
     resp.raise_for_status = MagicMock()
     if status_code >= 400:
         resp.raise_for_status.side_effect = httpx.HTTPStatusError(
@@ -74,12 +75,39 @@ def make_response(status_code=200, content=b"", json_data=None, text=None):
     return resp
 
 
-def make_client(responses=None, side_effect=None):
+def stream_cm(resp, chunk_size=0):
+    """Async context manager over a mocked response exposing aiter_bytes().
+
+    The tool reads response bodies with a bounded stream (so a broken endpoint
+    cannot OOM the process), so the mock models the streaming API.
+    """
+    payload = resp.content if isinstance(resp.content, (bytes, bytearray)) else b""
+    # The tool reads raw bytes and parses JSON itself, so a mocked JSON response
+    # must arrive as the serialized body (json_data wins over the placeholder
+    # `content` an audio-oriented helper defaults to).
+    json_value = getattr(getattr(resp, "json", None), "return_value", None)
+    if json_value is not None:
+        import json as _json
+        payload = _json.dumps(json_value).encode("utf-8")
+    size = chunk_size or max(len(payload), 1)
+
+    async def _aiter():
+        for i in range(0, len(payload), size):
+            yield payload[i:i + size]
+
+    resp.aiter_bytes = _aiter
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+def make_client(responses=None, side_effect=None, chunk_size=0):
     client = AsyncMock()
     if side_effect is not None:
-        client.post = AsyncMock(side_effect=side_effect)
+        client.stream = MagicMock(side_effect=side_effect)
     elif responses is not None:
-        client.post = AsyncMock(side_effect=list(responses))
+        client.stream = MagicMock(side_effect=[stream_cm(r, chunk_size) for r in responses])
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
     return client
@@ -110,7 +138,7 @@ async def run_stt(tmp_path, path, client=None, **overrides):
 
 
 def posted(client, index=0):
-    return client.post.await_args_list[index].kwargs
+    return client.stream.call_args_list[index].kwargs
 
 
 # --- registry defaults -------------------------------------------------------
@@ -261,7 +289,7 @@ async def test_multipart_file_field_and_mime(tmp_path):
     assert name == "voice.ogg"
     assert payload == b"OGGDATA"
     assert mime == "audio/ogg"
-    assert client.post.await_args_list[0].args[0] == ENDPOINT
+    assert client.stream.call_args_list[0].args[1] == ENDPOINT
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ tests/test_speech_chunk.py.
 
 import asyncio
 import hashlib
+import json
 import mimetypes
 import os
 import re
@@ -226,6 +227,76 @@ def _error(msg):
     return ToolResult(content=msg, is_error=True)
 
 
+# Chunking floors (post-audit, 2026-09-28): chunk_tokens is config-only, so a typo
+# must not be able to turn one call into thousands of requests or an unbounded run.
+_MIN_CHUNK_CHARS = 8
+_MAX_CHUNKS = 64
+
+# STT response/transcript bounds (the service is untrusted input).
+_MAX_SEGMENT_TEXT_CHARS = 500
+
+
+def _content_type(resp):
+    """Response content-type as a str, or "" when absent/unusable (mocks, weird SDKs)."""
+    headers = getattr(resp, "headers", None)
+    try:
+        value = headers.get("content-type") if headers is not None else None
+    except Exception:
+        value = None
+    return value if isinstance(value, str) and value else ""
+
+
+async def _read_bounded(resp, limit):
+    """Read at most ``limit`` bytes from a STREAMING response.
+
+    The endpoint is untrusted input: buffering the whole body before checking its
+    size lets one oversized (or endless) response OOM the agent process. Mirrors
+    web.py's stream-with-a-cap idiom. A stream that dies mid-read is not an error
+    here -- the caller's own checks (empty / too large / not-audio) handle it.
+    """
+    buf = bytearray()
+    try:
+        async for piece in resp.aiter_bytes():
+            if not isinstance(piece, (bytes, bytearray)):
+                continue
+            buf.extend(piece)
+            if len(buf) >= limit:
+                break
+    except Exception:
+        pass
+    return bytes(buf[:limit])
+
+
+def _unlink_quietly(path):
+    """Best-effort removal -- never let cleanup mask the real error."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _reserve_output_path(out_dir, base):
+    """Atomically reserve ``<out_dir>/<base>[-N].mp3`` (O_EXCL) and return the path.
+
+    Reservation (rather than a check-then-write exists() loop) means two concurrent
+    calls with identical text in the same second can never select the same name.
+    The reserved file is empty; the caller either fills it (single chunk) or
+    os.replace()s the ffmpeg result over it, and unlinks it on every failure path.
+    """
+    for suffix in range(0, 1000):
+        name = base + ("" if suffix == 0 else f"-{suffix}") + ".mp3"
+        candidate = os.path.join(out_dir, name)
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            continue
+        except OSError:
+            return None
+        os.close(fd)
+        return candidate
+    return None
+
+
 def _resolve_workspace(agent_config):
     """agent_config.workspace as a str path, or None if unusable.
 
@@ -273,6 +344,7 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
     timeout = tc.get("timeout", 120.0)
     max_input_chars = tc.get("max_input_chars", 20000)
     max_audio_bytes = tc.get("max_audio_bytes", 20971520)
+    max_total_audio_bytes = tc.get("max_total_audio_bytes", 104857600)
     output_dir = tc.get("output_dir", "media/tts")
 
     # Invalid param types are an error, never a raise.
@@ -286,6 +358,14 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
     if not isinstance(max_audio_bytes, (int, float)) or isinstance(max_audio_bytes, bool) \
             or max_audio_bytes <= 0:
         return _error("tts error: invalid max_audio_bytes (expected a positive number)")
+    if not isinstance(max_total_audio_bytes, (int, float)) \
+            or isinstance(max_total_audio_bytes, bool) or max_total_audio_bytes <= 0:
+        return _error("tts error: invalid max_total_audio_bytes (expected a positive number)")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        return _error(
+            f"tts error: invalid timeout (expected a positive number of seconds, "
+            f"got {timeout!r}) -- fix timeout in workspace/tools/tts.toml"
+        )
 
     # Unconfigured endpoint is the first steer an agent should hit.
     if not endpoint:
@@ -335,28 +415,53 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
         return _error(f"tts error: invalid normalize (expected bool, got {type(resolved_normalize).__name__})")
     if isinstance(chunk_tokens, bool) or not isinstance(chunk_tokens, int):
         return _error(f"tts error: invalid chunk_tokens (expected int, got {type(chunk_tokens).__name__})")
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-        return _error(f"tts error: invalid timeout (expected a number, got {type(timeout).__name__})")
     if not isinstance(model, str):
         model = ""
     if not isinstance(ffmpeg_path, str) or not ffmpeg_path:
         return _error(f"tts error: invalid ffmpeg_path (expected str, got {type(ffmpeg_path).__name__})")
     if not isinstance(output_dir, str) or not output_dir:
         return _error("tts error: invalid output_dir (expected a non-empty str)")
+    # Containment: an absolute or `..`-bearing output_dir would silently write (and
+    # mkdir) outside the documented root and report a misleading relative path.
+    if os.path.isabs(output_dir) or ".." in output_dir.replace("\\", "/").split("/"):
+        return _error(
+            "tts error: invalid output_dir (must be workspace-relative with no '..') "
+            "-- fix output_dir in workspace/tools/tts.toml"
+        )
 
     workspace = _resolve_workspace(agent_config)
     if workspace is None:
         return _error("tts error: agent_config.workspace is required to resolve the output path")
 
-    normalized = normalize(text) if resolved_normalize else text
-    chunk_chars = int(chunk_tokens) * 4
+    if resolved_normalize:
+        # The normalizer calls int() on digit runs; CPython caps str->int at 4300
+        # digits, and `text` legitimately embeds untrusted content (logs, pasted
+        # data). A raise here would escape into the agent turn.
+        try:
+            normalized = normalize(text)
+        except Exception as e:
+            return _error(
+                f"tts error: cannot normalize this text ({type(e).__name__}: {e}) -- "
+                "pass normalize_text=false to speak it verbatim"
+            )
+    else:
+        normalized = text
+    # chunk_tokens <= 0 means "no chunking"; otherwise floor the chunk size so a
+    # typo cannot spawn thousands of requests.
+    chunk_chars = 0 if chunk_tokens <= 0 else max(int(chunk_tokens) * 4, _MIN_CHUNK_CHARS)
     chunks = chunk_text(normalized, chunk_chars)
     if not chunks:
         return _error("tts error: text is empty")
+    if len(chunks) > _MAX_CHUNKS:
+        return _error(
+            f"tts error: text would need {len(chunks)} chunks (limit {_MAX_CHUNKS}) -- "
+            "raise chunk_tokens in workspace/tools/tts.toml or shorten the text"
+        )
 
     # Fetch every chunk BEFORE writing anything: a failed first chunk must
     # not leave a partial file behind.
     audio = []
+    total_bytes = 0
     try:
         async with httpx.AsyncClient(timeout=timeout, verify=_ssl_context) as client:
             for chunk in chunks:
@@ -365,24 +470,52 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
                     body["model"] = model
                 if resolved_voice:
                     body["voice"] = resolved_voice
-                resp = await client.post(endpoint, json=body)
-                if not (200 <= resp.status_code < 300):
-                    snippet = resp.content[:200].decode("utf-8", "replace")
+                async with client.stream("POST", endpoint, json=body) as resp:
+                    if not (200 <= resp.status_code < 300):
+                        snippet = (await _read_bounded(resp, 200)).decode("utf-8", "replace")
+                        return _error(
+                            f"tts error: service error HTTP {resp.status_code} "
+                            f"from {endpoint}: {snippet}"
+                        )
+                    content_type = _content_type(resp)
+                    # One byte past the cap is enough to reject it -- the body is
+                    # never fully buffered.
+                    data = await _read_bounded(resp, max_audio_bytes + 1)
+                if len(data) > max_audio_bytes:
                     return _error(
-                        f"tts error: service error HTTP {resp.status_code} "
-                        f"from {endpoint}: {snippet}"
-                    )
-                data = resp.content
-                if data.strip().startswith(b"{"):
-                    return _error(
-                        "tts error: service returned a JSON error body instead of audio"
+                        f"tts error: audio body too large (> max_audio_bytes="
+                        f"{max_audio_bytes}) from {endpoint}"
                     )
                 if len(data) == 0:
                     return _error(f"tts error: service returned 0 bytes of audio from {endpoint}")
-                if len(data) > max_audio_bytes:
+                # Body SHAPE beats the declared type: a service that answers with an
+                # error document under a 2xx status is exactly the failure this guards.
+                head = data.lstrip()[:1]
+                if head == b"{":
                     return _error(
-                        f"tts error: audio body too large ({len(data)} bytes > "
-                        f"max_audio_bytes={max_audio_bytes})"
+                        "tts error: service returned a JSON error body instead of audio"
+                    )
+                if head in (b"[", b"<"):
+                    snippet = data[:200].decode("utf-8", "replace")
+                    return _error(
+                        "tts error: service returned non-audio content instead of audio "
+                        f"({snippet})"
+                    )
+                if content_type:
+                    media_type = content_type.split(";")[0].strip().lower()
+                    if media_type.startswith("text/") or media_type in (
+                        "application/json", "application/xml", "text/xml",
+                        "application/xhtml+xml",
+                    ):
+                        return _error(
+                            f"tts error: service returned {media_type} instead of audio"
+                        )
+                total_bytes += len(data)
+                if total_bytes > max_total_audio_bytes:
+                    return _error(
+                        f"tts error: total audio exceeds max_total_audio_bytes="
+                        f"{max_total_audio_bytes} after {len(audio) + 1} chunks -- shorten "
+                        "the text or raise max_total_audio_bytes in workspace/tools/tts.toml"
                     )
                 audio.append(data)
     except httpx.TimeoutException:
@@ -400,15 +533,18 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
     except OSError as e:
         return _error(f"tts error: cannot create output directory {out_dir}: {e}")
     base = f"{stamp}-{digest}"
-    out_path = os.path.join(out_dir, base + ".mp3")
-    suffix = 1
-    while os.path.exists(out_path):
-        out_path = os.path.join(out_dir, f"{base}-{suffix}.mp3")
-        suffix += 1
+    out_path = _reserve_output_path(out_dir, base)
+    if out_path is None:
+        return _error(f"tts error: cannot allocate a unique output path in {out_dir}")
+
+    def _fail_reserved(msg):
+        """Failure AFTER the output path was reserved: never leave the file behind."""
+        _unlink_quietly(out_path)
+        return _error(msg)
 
     try:
         if len(audio) == 1:
-            # Single chunk: write straight, never invoke ffmpeg.
+            # Single chunk: write straight into the reservation, never invoke ffmpeg.
             with open(out_path, "wb") as f:
                 f.write(audio[0])
         else:
@@ -421,35 +557,50 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
                         with open(part_path, "wb") as pf:
                             pf.write(part_data)
                         lf.write(f"file '{os.path.abspath(part_path)}'\n")
+                # ffmpeg writes inside tmp_dir and the result is committed with
+                # os.replace, so a failed or timed-out concat cannot leave a partial
+                # .mp3 at the final path.
+                out_tmp = os.path.join(tmp_dir, "out.mp3")
                 try:
                     proc = await asyncio.create_subprocess_exec(
                         ffmpeg_path, "-f", "concat", "-safe", "0",
-                        "-i", list_path, "-c", "copy", "-y", out_path,
+                        "-i", list_path, "-c", "copy", "-y", out_tmp,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
                 except FileNotFoundError:
-                    return _error(
+                    return _fail_reserved(
                         f"tts error: ffmpeg not found ({ffmpeg_path!r}) -- set "
                         "ffmpeg_path in workspace/tools/tts.toml"
+                    )
+                except OSError as e:
+                    return _fail_reserved(
+                        f"tts error: cannot execute ffmpeg ({ffmpeg_path!r}): {e} -- set "
+                        "ffmpeg_path in workspace/tools/tts.toml to an executable ffmpeg"
                     )
                 try:
                     _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
                 except asyncio.TimeoutError:
                     proc.kill()
                     await proc.wait()
-                    return _error(
+                    return _fail_reserved(
                         f"tts error: ffmpeg concatenation timed out after {timeout}s"
                     )
+                except asyncio.CancelledError:
+                    # Cancellation (turn-stall watchdog, /stop) must not orphan ffmpeg.
+                    proc.kill()
+                    await proc.wait()
+                    raise
                 if proc.returncode != 0:
                     detail = (stderr or b"").decode("utf-8", "replace")[-300:]
-                    return _error(
+                    return _fail_reserved(
                         f"tts error: concatenation failed (exit {proc.returncode}): {detail}"
                     )
+                os.replace(out_tmp, out_path)
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
     except OSError as e:
-        return _error(f"tts error: cannot write {out_path}: {e}")
+        return _fail_reserved(f"tts error: cannot write {out_path}: {e}")
 
     rel_path = os.path.relpath(out_path, workspace)
     count = len(audio)
@@ -466,6 +617,9 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
             send_result = await send_media(
                 path=str(out_path),
                 caption=resolved_caption,
+                # Couple the upload cap to the real file-size bound, so raising the
+                # audio caps cannot produce a "synthesized but cannot send" dead end.
+                max_upload_bytes=max_total_audio_bytes,
                 upload_callback=upload_callback,
             )
         except Exception as e:
@@ -473,9 +627,13 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
             return _error(f"{content} (send to room failed: {e})")
         if send_result.is_error:
             if upload_callback is None:
-                # No callback: the room send is a no-op by design; synthesis
-                # succeeded and the file is on disk, so this is not an error.
-                pass
+                # No callback: synthesis succeeded and the file is on disk, so this is
+                # not an error -- but the caller asked for a room post and did not get
+                # one, so say so explicitly instead of reporting a bare success.
+                content = (
+                    f"{content} (NOT sent to room: no room delivery available in this "
+                    "context -- use send_media with this path instead)"
+                )
             else:
                 return _error(f"{content} (send to room failed: {send_result.content})")
         elif upload_callback is not None:
@@ -517,6 +675,8 @@ async def stt(path, language=None, prompt=None, timestamps=False,
     cfg_language = tc.get("language", "")
     cfg_prompt = tc.get("prompt", "")
     max_bytes = tc.get("max_bytes", 104857600)
+    max_response_bytes = tc.get("max_response_bytes", 10485760)
+    max_transcript_chars = tc.get("max_transcript_chars", 50000)
 
     # Invalid param types are an error, never a raise.
     if not isinstance(path, str):
@@ -540,8 +700,18 @@ async def stt(path, language=None, prompt=None, timestamps=False,
             "stt error: no endpoint configured -- set endpoint in "
             "workspace/tools/stt.toml"
         )
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-        return _error(f"stt error: invalid timeout (expected a number, got {type(timeout).__name__})")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        return _error(
+            f"stt error: invalid timeout (expected a positive number of seconds, "
+            f"got {timeout!r}) -- fix timeout in workspace/tools/stt.toml"
+        )
+    if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, (int, float)) \
+            or max_response_bytes <= 0:
+        return _error("stt error: invalid max_response_bytes (expected a positive number)")
+    if isinstance(max_transcript_chars, bool) \
+            or not isinstance(max_transcript_chars, (int, float)) \
+            or max_transcript_chars <= 0:
+        return _error("stt error: invalid max_transcript_chars (expected a positive number)")
     if not isinstance(cfg_language, str):
         return _error(f"stt error: invalid language (expected str, got {type(cfg_language).__name__})")
     if not isinstance(cfg_prompt, str):
@@ -549,16 +719,38 @@ async def stt(path, language=None, prompt=None, timestamps=False,
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, (int, float)) or max_bytes <= 0:
         return _error("stt error: invalid max_bytes (expected a positive number)")
 
-    # Resolve the path: media tag first, then absolute / workspace-relative.
-    tag = _MEDIA_TAG_RE.search(path)
-    path_str = tag.group(1) if tag else path.strip()
-    if not path_str:
+    # Resolve the path. A pasted `[media: ...]` tag is honoured only when the token it
+    # yields actually resolves to a file; otherwise the literal string wins, so a
+    # filename that merely CONTAINS "[media:" is never hijacked.
+    raw = path.strip()
+    if not raw:
         return _error("stt error: path is empty")
     workspace = _resolve_workspace(agent_config)
-    if not os.path.isabs(path_str):
-        if workspace is None:
-            return _error("stt error: agent_config.workspace is required to resolve a relative path")
-        path_str = os.path.join(workspace, path_str)
+    tag = _MEDIA_TAG_RE.search(raw)
+    candidates = []
+    if tag:
+        candidates.append(tag.group(1))
+    if raw not in candidates:
+        candidates.append(raw)
+    if workspace is None and not any(os.path.isabs(c) for c in candidates):
+        return _error(
+            "stt error: agent_config.workspace is required to resolve a relative path"
+        )
+
+    def _resolve(candidate):
+        if os.path.isabs(candidate) or workspace is None:
+            return candidate
+        return os.path.join(workspace, candidate)
+
+    path_str = None
+    for candidate in candidates:
+        resolved = _resolve(candidate)
+        if resolved and os.path.isfile(resolved):
+            path_str = resolved
+            break
+    if path_str is None:
+        # Nothing resolved -- steer on the literal the caller supplied.
+        path_str = _resolve(candidates[-1])
 
     if not os.path.exists(path_str):
         return _error(f"stt error: file not found: {path_str}")
@@ -599,23 +791,33 @@ async def stt(path, language=None, prompt=None, timestamps=False,
 
     try:
         async with httpx.AsyncClient(timeout=timeout, verify=_ssl_context) as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 endpoint,
                 files={"file": (filename, audio_bytes, guessed_mime)},
                 data=scalars,
-            )
+            ) as resp:
+                if not (200 <= resp.status_code < 300):
+                    snippet = (await _read_bounded(resp, 200)).decode("utf-8", "replace")
+                    return _error(
+                        f"stt error: service error HTTP {resp.status_code} from "
+                        f"{endpoint}: {snippet}"
+                    )
+                # Bounded read: the response is untrusted and must not be buffered
+                # whole before the cap is applied.
+                body = await _read_bounded(resp, max_response_bytes + 1)
     except httpx.TimeoutException:
         return _error(f"stt error: timed out contacting STT endpoint {endpoint}")
     except (httpx.ConnectError, httpx.HTTPError, OSError):
         return _error(f"stt error: cannot reach STT endpoint {endpoint}")
 
-    if not (200 <= resp.status_code < 300):
-        snippet = resp.content[:200].decode("utf-8", "replace")
+    if len(body) > max_response_bytes:
         return _error(
-            f"stt error: service error HTTP {resp.status_code} from {endpoint}: {snippet}"
+            f"stt error: response body too large (> max_response_bytes="
+            f"{max_response_bytes}) from {endpoint}"
         )
     try:
-        data = resp.json()
+        data = json.loads(body.decode("utf-8", "replace"))
     except Exception:
         return _error('stt error: malformed response (expected {"text": ...})')
     if not isinstance(data, dict) or not isinstance(data.get("text"), str):
@@ -625,12 +827,25 @@ async def stt(path, language=None, prompt=None, timestamps=False,
     if not transcript.strip():
         return ToolResult(content="stt: empty transcript", is_error=False)
 
+    # The transcript is untrusted service output: cap it with a visible marker
+    # rather than letting a runaway response reach the model's context.
+    if len(transcript) > max_transcript_chars:
+        removed = len(transcript) - int(max_transcript_chars)
+        transcript = transcript[:int(max_transcript_chars)] + (
+            f"\n[transcript truncated: {removed} chars removed -- raise "
+            "max_transcript_chars in workspace/tools/stt.toml]"
+        )
+
     if not resolved_timestamps:
         return ToolResult(content=transcript, is_error=False)
 
     # timestamps=True: language header line + transcript + [segments] block
     # (one "[<start>-<end>] <text>" line per segment, capped, stripped text).
-    lines = [f"[stt: language={resolved_language or 'auto'}]"]
+    # The DETECTED language is preferred over the requested one -- auto-detection
+    # is the reason to ask for verbose output in the first place.
+    detected = data.get("language")
+    detected = detected if isinstance(detected, str) and detected else (resolved_language or "auto")
+    lines = [f"[stt: language={detected}]"]
     lines.append(transcript)
     lines.append("[segments]")
     segments = data.get("segments")
@@ -641,6 +856,8 @@ async def stt(path, language=None, prompt=None, timestamps=False,
         start = seg.get("start", 0)
         end = seg.get("end", 0)
         seg_text = str(seg.get("text", "")).strip()
+        if len(seg_text) > _MAX_SEGMENT_TEXT_CHARS:
+            seg_text = seg_text[:_MAX_SEGMENT_TEXT_CHARS] + "[...truncated]"
         lines.append(f"[{start}-{end}] {seg_text}")
     if len(segments) > _MAX_SEGMENT_LINES:
         lines.append(f"[segments truncated: showing {_MAX_SEGMENT_LINES} of {len(segments)}]")

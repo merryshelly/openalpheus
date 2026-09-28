@@ -117,23 +117,47 @@ def _tool_config(agent, name):
     return next(t.config for t in agent.tools if t.name == name)
 
 
+def stream_cm(resp, chunk_size=0):
+    """Async context manager over a mocked response exposing aiter_bytes()."""
+    payload = resp.content if isinstance(resp.content, (bytes, bytearray)) else b""
+    # The tool reads raw bytes and parses JSON itself, so a mocked JSON response
+    # must arrive as the serialized body (json_data wins over the placeholder
+    # `content` an audio-oriented helper defaults to).
+    json_value = getattr(getattr(resp, "json", None), "return_value", None)
+    if json_value is not None:
+        import json as _json
+        payload = _json.dumps(json_value).encode("utf-8")
+    size = chunk_size or max(len(payload), 1)
+
+    async def _aiter():
+        for i in range(0, len(payload), size):
+            yield payload[i:i + size]
+
+    resp.aiter_bytes = _aiter
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
 def make_client(responses=None, side_effect=None):
     client = AsyncMock()
     if side_effect is not None:
-        client.post = AsyncMock(side_effect=side_effect)
+        client.stream = MagicMock(side_effect=side_effect)
     elif responses is not None:
-        client.post = AsyncMock(side_effect=list(responses))
+        client.stream = MagicMock(side_effect=[stream_cm(r) for r in responses])
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
     return client
 
 
-def make_response(status_code=200, content=b"AUDIO", json_data=None):
+def make_response(status_code=200, content=b"AUDIO", json_data=None, headers=None):
     resp = MagicMock()
     resp.status_code = status_code
     resp.content = content
     resp.text = content.decode("utf-8", "replace")
     resp.json = MagicMock(return_value=json_data)
+    resp.headers = headers if headers is not None else {}
     resp.raise_for_status = MagicMock()
     if status_code >= 400:
         resp.raise_for_status.side_effect = httpx.HTTPStatusError(
@@ -223,7 +247,8 @@ async def test_cli_mode_without_callbacks_reports_the_file(tmp_path):
         )
     assert result.is_error is False, result.content
     assert "media/tts/" in result.content
-    assert "sent to room" not in result.content
+    # An explicit send request that could not be honoured must say so.
+    assert "NOT sent" in result.content
 
 
 @pytest.mark.asyncio
@@ -247,7 +272,7 @@ async def test_stt_through_real_dispatch_and_workspace_join(tmp_path):
         )
     assert result.is_error is False, result.content
     assert result.content == "Hi Merry."
-    sent = client.post.await_args_list[0].kwargs
+    sent = client.stream.call_args_list[0].kwargs
     assert sent["data"]["prompt"] == "Merry and SB."
     assert sent["files"]["file"][1] == b"OGG-NOTE"
 
