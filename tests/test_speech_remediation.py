@@ -535,3 +535,55 @@ async def test_leading_media_tag_still_parses(tmp_path):
     assert result.is_error is False
     sent = client.stream.call_args_list[0].kwargs
     assert sent["files"]["file"][1] == b"TAGGED"
+
+
+# --- RE-AUDIT findings (the remediation's own new defects) -------------------
+
+
+@pytest.mark.asyncio
+async def test_concat_temp_dir_is_on_the_output_filesystem(tmp_path):
+    """os.replace cannot cross a mount boundary: /tmp is tmpfs on diodeli-class hosts.
+
+    The concat temp dir must live INSIDE the output directory (same filesystem as the
+    final path), or every multi-chunk utterance fails with EXDEV in production while
+    passing in tests (pytest's tmp_path happens to be under /tmp).
+    """
+    fake, log = make_fake_ffmpeg(tmp_path)
+    client = make_client(responses=[
+        make_response(content=b"AAA"), make_response(content=b"BBB"),
+        make_response(content=b"CCC"), make_response(content=b"DDD"),
+    ])
+    result = await run_tts(tmp_path, text="First sentence here. Second sentence here.",
+                           client=client, fake_ffmpeg=fake, chunk_tokens=6)
+    assert result.is_error is False, result.content
+    argv = log.read_text().split("\n")
+    listfile = argv[argv.index("-i") + 1]
+    out_dir = str(tmp_path / "media" / "tts")
+    assert listfile.startswith(out_dir), (
+        f"concat temp dir {listfile!r} is not inside the output dir {out_dir!r} "
+        "(cross-device os.replace)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_truncated_stream_is_not_accepted_as_success(tmp_path):
+    """A mid-body transport failure must error, never yield a partial MP3 as success."""
+    resp = make_response(content=b"x" * 5000)
+
+    async def _aiter():
+        yield b"x" * 1000
+        raise httpx.RemoteProtocolError("peer closed connection without sending body")
+
+    resp.aiter_bytes = _aiter
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    client = AsyncMock()
+    client.stream = MagicMock(return_value=cm)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    result = await run_tts(tmp_path, client=client)
+    assert result.is_error is True, f"truncated audio accepted as success: {result.content}"
+    out_dir = tmp_path / "media" / "tts"
+    assert not out_dir.exists() or not list(out_dir.glob("*.mp3"))

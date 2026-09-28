@@ -246,13 +246,18 @@ def _content_type(resp):
     return value if isinstance(value, str) and value else ""
 
 
-async def _read_bounded(resp, limit):
+async def _read_bounded(resp, limit, tolerate_failure=True):
     """Read at most ``limit`` bytes from a STREAMING response.
 
     The endpoint is untrusted input: buffering the whole body before checking its
     size lets one oversized (or endless) response OOM the agent process. Mirrors
-    web.py's stream-with-a-cap idiom. A stream that dies mid-read is not an error
-    here -- the caller's own checks (empty / too large / not-audio) handle it.
+    web.py's stream-with-a-cap idiom.
+
+    ``tolerate_failure=False`` lets a mid-stream transport failure propagate, so a
+    TRUNCATED body can never be mistaken for a complete one -- a partial MP3 passes
+    every size/shape check and would otherwise be written and reported as success.
+    The tolerant mode stays for the error-snippet path, where we only quote the first
+    200 bytes of a body that may legitimately die mid-read.
     """
     buf = bytearray()
     try:
@@ -263,7 +268,8 @@ async def _read_bounded(resp, limit):
             if len(buf) >= limit:
                 break
     except Exception:
-        pass
+        if not tolerate_failure:
+            raise
     return bytes(buf[:limit])
 
 
@@ -479,8 +485,11 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
                         )
                     content_type = _content_type(resp)
                     # One byte past the cap is enough to reject it -- the body is
-                    # never fully buffered.
-                    data = await _read_bounded(resp, max_audio_bytes + 1)
+                    # never fully buffered, and a mid-stream failure propagates
+                    # rather than yielding a silently-truncated MP3.
+                    data = await _read_bounded(
+                        resp, max_audio_bytes + 1, tolerate_failure=False
+                    )
                 if len(data) > max_audio_bytes:
                     return _error(
                         f"tts error: audio body too large (> max_audio_bytes="
@@ -548,7 +557,11 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
             with open(out_path, "wb") as f:
                 f.write(audio[0])
         else:
-            tmp_dir = tempfile.mkdtemp(prefix="openalph-tts-")
+            # The temp dir MUST live on the same filesystem as out_path: os.replace
+            # cannot cross a mount boundary (/tmp is tmpfs on this host, the workspace
+            # is on the root device), and a cross-device commit would fail with EXDEV
+            # for every multi-chunk utterance.
+            tmp_dir = tempfile.mkdtemp(prefix=".openalph-tts-", dir=out_dir)
             try:
                 list_path = os.path.join(tmp_dir, "concat.txt")
                 with open(list_path, "w", encoding="utf-8") as lf:
@@ -587,9 +600,11 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
                         f"tts error: ffmpeg concatenation timed out after {timeout}s"
                     )
                 except asyncio.CancelledError:
-                    # Cancellation (turn-stall watchdog, /stop) must not orphan ffmpeg.
+                    # Cancellation (turn-stall watchdog, /stop) must not orphan ffmpeg
+                    # nor leave the empty reserved output file behind.
                     proc.kill()
                     await proc.wait()
+                    _unlink_quietly(out_path)
                     raise
                 if proc.returncode != 0:
                     detail = (stderr or b"").decode("utf-8", "replace")[-300:]
@@ -805,7 +820,9 @@ async def stt(path, language=None, prompt=None, timestamps=False,
                     )
                 # Bounded read: the response is untrusted and must not be buffered
                 # whole before the cap is applied.
-                body = await _read_bounded(resp, max_response_bytes + 1)
+                body = await _read_bounded(
+                    resp, max_response_bytes + 1, tolerate_failure=False
+                )
     except httpx.TimeoutException:
         return _error(f"stt error: timed out contacting STT endpoint {endpoint}")
     except (httpx.ConnectError, httpx.HTTPError, OSError):
