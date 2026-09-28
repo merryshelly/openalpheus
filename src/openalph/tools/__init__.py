@@ -543,6 +543,131 @@ BUILTIN_TOOLS: dict[str, dict[str, Any]] = {
             "transport_path": None
         }
     },
+    "tts": {
+        "description": (
+            "Speak text as a voice note: synthesizes MP3 audio via the configured speech "
+            "service, writes it into the workspace, and optionally posts it to the room. "
+            "IMPORTANT: the service endpoint is configured in workspace/tools/tts.toml — "
+            "if it is unset the call fails with steering text. Text normalization "
+            "(versions, CVEs, IPs, ports, acronyms) and sentence-boundary chunking with "
+            "ffmpeg concatenation are done FOR you: NEVER pre-normalize, NEVER chunk by "
+            "hand, and NEVER shell out to curl/ffmpeg for speech. Audio bytes are never "
+            "returned — you get the workspace-relative file path. "
+            "Use send_to_room=True to answer a voice note with a voice note in one call "
+            "(OPERATOR.md: match the medium). "
+            "NOT for reading audio (use stt) and NOT for uploading an arbitrary file "
+            "(use send_media)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "Text to speak. Normalized by default; long text is chunked and "
+                        "concatenated automatically."
+                    )
+                },
+                "voice": {
+                    "type": "string",
+                    "description": (
+                        "Voice preset override (e.g. af_heart, bm_george). Omit to use "
+                        "the voice configured in workspace/tools/tts.toml."
+                    )
+                },
+                "speed": {
+                    "type": "number",
+                    "description": "Playback speed multiplier (default from config, usually 1.0)."
+                },
+                "normalize_text": {
+                    "type": "boolean",
+                    "description": (
+                        "Override the config's `normalize` setting for this call. Set "
+                        "false only when the literal text must be spoken."
+                    )
+                },
+                "send_to_room": {
+                    "type": "boolean",
+                    "description": (
+                        "Post the generated audio to the current room as an audio message "
+                        "(default false — set true for a voice-note reply)."
+                    )
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional caption/filename used when send_to_room is true."
+                }
+            },
+            "required": ["text"]
+        },
+        "config": {
+            "endpoint": "",
+            "model": "",
+            "voice": "",
+            "speed": 1.0,
+            "normalize": True,
+            "chunk_tokens": 200,
+            "ffmpeg_path": "ffmpeg",
+            "timeout": 120.0,
+            "max_input_chars": 20000,
+            "max_audio_bytes": 20971520,
+            "output_dir": "media/tts",
+        }
+    },
+    "stt": {
+        "description": (
+            "Transcribe an audio file to text via the configured speech-to-text service. "
+            "IMPORTANT: the service endpoint is configured in workspace/tools/stt.toml — "
+            "if it is unset the call fails with steering text. `path` accepts a "
+            "workspace-relative or absolute path, OR a pasted `[media: ...]` tag copied "
+            "straight out of an inbound message (the tag is parsed for you). "
+            "Pass `prompt` as a natural sentence naming the people and products involved "
+            "when you know the vocabulary — Whisper mishears proper nouns and homophones "
+            "(measured: 'Merry' transcribed as 'Mary'); pass prompt=\"off\" to disable "
+            "biasing. NEVER shell out to curl for transcription. "
+            "NOT for images (use view_image) and NOT for generating speech (use tts)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Audio file: workspace-relative path, absolute path, or a pasted "
+                        "`[media: media/<hash>/<file> (mime, size)]` tag."
+                    )
+                },
+                "language": {
+                    "type": "string",
+                    "description": (
+                        "ISO 639-1 hint (e.g. es). Omit for auto-detection, which works well."
+                    )
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "Biasing vocabulary as a natural sentence (e.g. \"Merry and SB "
+                        "work on OpenAlph and Kokoro.\"). \"off\" disables biasing."
+                    )
+                },
+                "timestamps": {
+                    "type": "boolean",
+                    "description": (
+                        "Return the detected language and a timestamped [segments] listing "
+                        "in addition to the transcript (default false)."
+                    )
+                }
+            },
+            "required": ["path"]
+        },
+        "config": {
+            "endpoint": "",
+            "timeout": 300.0,
+            "language": "",
+            "prompt": "",
+            "max_bytes": 104857600,
+        }
+    },
     "web_search": {
         "description": (
             "Search the web via Brave Search and return ranked results with title, URL, and snippet. "
@@ -2246,7 +2371,7 @@ async def _execute_tool_inner(
     # rejected legitimate shared reads. Do not reintroduce it — see
     # memory/projects/openalph/session-brief-next.md (kdsn.252).
     if name in ("file_read", "file_write", "file_edit", "file_patch", "send_media",
-                "grep", "glob") and "path" in input:
+                "grep", "glob", "stt") and "path" in input:
         file_path = input["path"]
         if not os.path.isabs(file_path) and hasattr(agent_config, "workspace"):
             input["path"] = str(agent_config.workspace / file_path)
@@ -2773,6 +2898,30 @@ async def _execute_tool_inner(
             caption=input.get("caption"),
             max_upload_bytes=tool_config.get("max_upload_bytes", 20_971_520),
             upload_callback=callbacks.get("send_media") if callbacks else None,
+        )
+    elif name == "tts":
+        from .speech import tts
+        result = await tts(
+            text=input["text"],
+            voice=input.get("voice"),
+            speed=input.get("speed"),
+            normalize_text=input.get("normalize_text"),
+            send_to_room=input.get("send_to_room", False),
+            caption=input.get("caption"),
+            tool_config=tool_config,
+            agent_config=agent_config,
+            callbacks=callbacks,
+        )
+    elif name == "stt":
+        from .speech import stt
+        result = await stt(
+            path=input["path"],
+            language=input.get("language"),
+            prompt=input.get("prompt"),
+            timestamps=input.get("timestamps", False),
+            tool_config=tool_config,
+            agent_config=agent_config,
+            callbacks=callbacks,
         )
     elif name == "view_image":
         from .vision import view_image
