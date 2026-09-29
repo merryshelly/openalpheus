@@ -660,9 +660,12 @@ async def tts(text, voice=None, speed=None, normalize_text=None, send_to_room=Fa
 # --- STT transcription -------------------------------------------------------
 
 # Pasted media tag, e.g. "[media: media/ab12/note.ogg (audio/ogg, 45KB)]" --
-# possibly embedded in a sentence. Extract the first whitespace-delimited
-# token after "[media:".
-_MEDIA_TAG_RE = re.compile(r"\[media:\s*(\S+)")
+# possibly embedded in a sentence. The path runs to the trailing "(mime, size)]",
+# NOT to the first whitespace: Matrix clients name voice notes "Voice message"
+# (space, no extension), so a whitespace-delimited path group silently failed the
+# most common case in the fleet. A bare tag with no parenthetical is accepted too.
+_MEDIA_TAG_RE = re.compile(r"\[media:\s*(.+?)\s*\((?:[^()]*)\)\s*\]")
+_MEDIA_TAG_BARE_RE = re.compile(r"\[media:\s*([^\]]+?)\s*\]")
 _MAX_SEGMENT_LINES = 200
 
 
@@ -741,7 +744,7 @@ async def stt(path, language=None, prompt=None, timestamps=False,
     if not raw:
         return _error("stt error: path is empty")
     workspace = _resolve_workspace(agent_config)
-    tag = _MEDIA_TAG_RE.search(raw)
+    tag = _MEDIA_TAG_RE.search(raw) or _MEDIA_TAG_BARE_RE.search(raw)
     candidates = []
     if tag:
         candidates.append(tag.group(1))

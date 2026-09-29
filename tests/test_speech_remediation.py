@@ -587,3 +587,52 @@ async def test_truncated_stream_is_not_accepted_as_success(tmp_path):
     assert result.is_error is True, f"truncated audio accepted as success: {result.content}"
     out_dir = tmp_path / "media" / "tts"
     assert not out_dir.exists() or not list(out_dir.glob("*.mp3"))
+
+
+# --- im7t.68.1: spaced / extensionless voice-note filenames (wonmun bug report) ---
+# Matrix clients name voice notes "Voice message" by default -- a space and no
+# extension. A whitespace-delimited path group silently failed the common case.
+
+
+@pytest.mark.parametrize("name", ["Voice message", "Voice message (1)", "My note"])
+@pytest.mark.asyncio
+async def test_media_tag_with_spaced_extensionless_name_parses(tmp_path, name):
+    rel = f"media/8d85f1c8fe636e62/{name}"
+    audio_file(tmp_path, rel=rel, data=b"SPACED")
+    client = make_client(responses=[make_response(json_data={"text": "ok"})])
+    patcher, _ = patch_httpx(client)
+    with patcher:
+        result = await execute_tool(
+            "stt", {"path": f"[media: {rel} (audio/ogg, 60.0 KB)]"},
+            {"endpoint": STT_ENDPOINT}, make_agent_config(tmp_path),
+        )
+    assert result.is_error is False, result.content
+    assert client.stream.call_args_list[0].kwargs["files"]["file"][1] == b"SPACED"
+
+
+@pytest.mark.asyncio
+async def test_media_tag_with_spaced_name_embedded_in_sentence(tmp_path):
+    rel = "media/8d85f1c8fe636e62/Voice message"
+    audio_file(tmp_path, rel=rel, data=b"EMBEDDED")
+    client = make_client(responses=[make_response(json_data={"text": "ok"})])
+    patcher, _ = patch_httpx(client)
+    with patcher:
+        result = await execute_tool(
+            "stt", {"path": f"please transcribe [media: {rel} (audio/ogg, 60.0 KB)]"},
+            {"endpoint": STT_ENDPOINT}, make_agent_config(tmp_path),
+        )
+    assert result.is_error is False, result.content
+
+
+@pytest.mark.asyncio
+async def test_bare_media_tag_without_parenthetical_parses(tmp_path):
+    rel = "media/8d85f1c8fe636e62/Voice message"
+    audio_file(tmp_path, rel=rel, data=b"BARE")
+    client = make_client(responses=[make_response(json_data={"text": "ok"})])
+    patcher, _ = patch_httpx(client)
+    with patcher:
+        result = await execute_tool(
+            "stt", {"path": f"[media: {rel}]"},
+            {"endpoint": STT_ENDPOINT}, make_agent_config(tmp_path),
+        )
+    assert result.is_error is False, result.content
