@@ -149,13 +149,16 @@ class TestCapabilitiesTable:
         assert model_supports_vision("google/gemini-3.5-flash", config) is True
         assert model_supports_vision("openrouter/meta/llama-4-maverick", config) is True
 
-    def test_glm53_flash_q4_no_vision_until_encoder_wired(self, tmp_path):
-        """macstudio capacity tier (2026-09-17, workspace-im7t.54): ds4 serves
-        GLM-5.3-Flash Q4 WITHOUT --vision in the prod plist, so the endpoint is
-        text-only and the lib must fail-closed False despite the model's
-        (staged, unserved) vision encoder file."""
+    def test_macstudio_no_vision_until_encoder_wired(self, tmp_path):
+        """macstudio capacity tier (workspace-im7t.64): ds4 serves the live
+        DeepSeek-V4.1-Flash WITHOUT --vision in the prod plist, so the endpoint
+        is text-only and the lib must fail-closed False despite the model's
+        (staged, unserved) vision encoder. Same for the parked llama.cpp
+        full-GLM-5.3 artifact and the GLM-5.3-Flash Q4_K rollback row."""
         config = _make_config(tmp_path)
+        assert model_supports_vision("macstudio/deepseek-v4.1-flash", config) is False
         assert model_supports_vision("macstudio/glm-5.3-flash-q4", config) is False
+        assert model_supports_vision("macstudio/glm-5.3-iq4xs", config) is False
 
     def test_glm53_flash_synthetic_silently_image_blind(self, tmp_path):
         """workspace-kdsn.351 (2026-09-20): Synthetic's catalog claims

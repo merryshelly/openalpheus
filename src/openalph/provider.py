@@ -520,11 +520,19 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("kimi-k2p6",   262_144, None, True),
     # Local
     ("deepseek-v4-flash", 1_048_576, None, False),
-    # macstudio capacity tier via ds4 since the 2026-09-17 cutover
-    # (workspace-im7t.54): GLM-5.3-Flash Q4_K, 320B/18B MoE, 1M ctx. The model is
-    # vision-capable but the prod plist serves WITHOUT --vision, so the endpoint
-    # is text-only and vision stays fail-closed False until the encoder is wired.
+    # macstudio capacity tier via ds4 (workspace-im7t.64): DeepSeek-V4.1-Flash
+    # Q4 (763B total / 24B-active MoE) since the 2026-09-28 cutover; ctx 1M
+    # live-verified (/v1/models context_length 1048576). The ds4 build stages a
+    # vision encoder but the prod plist serves text-only -> vision fail-closed
+    # False until the encoder is wired into a plist.
+    ("deepseek-v4.1-flash", 1_048_576, None, False),
+    # macstudio ROLLBACK rows — no fleet alias points at either since im7t.64;
+    # retained so a rollback flip needs no provider.py edit. `glm-5.3-flash-q4`
+    # is the ds4 GLM-5.3-Flash Q4_K artifact; `glm-5.3-iq4xs` is the parked
+    # llama.cpp full-GLM-5.3 window (786K — 1M measured 464.7 GiB vs the 460.8
+    # GiB wired limit; see the mac-studio README).
     ("glm-5.3-flash-q4", 1_048_576, None, False),
+    ("glm-5.3-iq4xs", 786_432, None, False),
     ("qwen38-27b-fp8", 262_144, None, True),   # blackwell SGLang replicas (vision verified 2026-08-26); MUST precede generic "qwen38"
     ("qwen38",      262_144, None, False),
     ("qwen3.8",     262_144, None, True),
@@ -839,8 +847,17 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("minimax-m3", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("deepseek-v4-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
+    # macstudio local V4.1-Flash via ds4 (workspace-im7t.64): the DSV4.1
+    # family anti-collapse pin (temp 1.0 / top_p 0.95, penalties omitted),
+    # matching the hf:deepseek-ai/deepseek-v4.1-flash row. ds4's own server
+    # defaults are 1.0 / 1.0 / min_p 0.05 (ds4.h) and it honors top-level
+    # temperature/top_p/min_p/top_k; min_p + top_k are deliberately left to the
+    # server. The 2026-09-28 gate battery measured THROUGHPUT (sampling-
+    # insensitive), so it is no evidence against 0.95.
+    ("deepseek-v4.1-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
     # GLM family pattern (kdsn.241.3): penalties pinned to omit; temp/top_p left
     # to vendor defaults, mirroring the hf:zai-org/glm-5.3-flash treatment.
+    # ROLLBACK row (im7t.64): kept for the parked GLM/ds4 artifact.
     ("glm-5.3-flash-q4", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("qwen38", SamplingProfile(temperature=1.0, top_p=0.95)),
 ]
@@ -2043,8 +2060,7 @@ def _build_openai_kwargs(
             provider_key, _syn_host, _SYNTHETIC_HOST,
         )
     if (thinking_level != "off" and _supports_reasoning_extra
-            and not (provider_key == "macstudio"
-                     and "glm-5.3-flash-q4" in api_model.lower())):
+            and provider_key != "macstudio"):
         extra_body["reasoning"] = {"effort": thinking_level}
     elif provider_key == "fireworks":
         # kdsn.271: Fireworks takes TOP-LEVEL reasoning_effort (not OpenRouter's
@@ -2137,16 +2153,20 @@ def _build_openai_kwargs(
                 "%r (operator intent is lossy).", thinking_level, _bw_effort,
             )
         extra_body["reasoning_effort"] = _bw_effort
-    elif (provider_key == "macstudio"
-            and "glm-5.3-flash-q4" in api_model.lower()):
-        # GLM-5.3-Flash Q4_K via ds4 (capacity tier since 2026-09-17,
-        # workspace-im7t.54): ds4 applies ONLY top-level reasoning_effort -- the
-        # nested OpenRouter shape ("reasoning": {"effort": ...}) is ignored on
-        # the wire (ds4_server.c param parser; every eval gate sent it
-        # top-level). The generic branch above would be the kdsn.271 silent
-        # reasoning-ON class. Gate A3: none/low/medium/high/xhigh/max all legal
-        # on ds4 -> identity map; OA "off" -> "none". Always sent explicitly:
-        # an omitted param falls to the server default.
+    elif provider_key == "macstudio":
+        # Mac Studio :8000 via ds4 (capacity tier; DeepSeek-V4.1-Flash since the
+        # 2026-09-28 cutover, GLM-5.3-Flash before it — workspace-im7t.64).
+        # ENGINE-scoped, not model-scoped: this block fronts exactly one ds4
+        # engine, and for /v1/chat/completions ds4 applies ONLY top-level
+        # reasoning_effort. The nested OpenRouter shape ("reasoning":
+        # {"effort": ...}) is parsed solely by ds4's Responses-API parser, so on
+        # chat completions it is silently ignored — the kdsn.271 silent-
+        # reasoning-ON class. REVISIT if a non-ds4 engine ever serves this port.
+        # Gate A3 (GLM) and the 2026-09-28 V4.1 gate battery: none/low/medium/
+        # high/xhigh/max all legal on ds4 -> identity map; OA "off" -> "none".
+        # Always sent explicitly: an omitted param falls to the server default.
+        # (ds4 also honors chat_template_kwargs.enable_thinking, but a TOP-LEVEL
+        # enable_thinking is silently ignored — V4.1 gate 4.)
         extra_body["reasoning_effort"] = "none" if thinking_level == "off" else thinking_level
     elif provider_key == "macstudio-qwen":
         # 2026-09-01 (SB steering): local llama.cpp qwen38 rig takes

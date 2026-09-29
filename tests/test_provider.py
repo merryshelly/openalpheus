@@ -941,7 +941,16 @@ class TestDSV4FEffortPrefix:
     """DeepSeek-V4-Flash effort support (workspace-im7t.9.13): DSv4's
     reasoning_effort is a text-prefix mechanism (no API param; the baked
     llama.cpp template has no effort handling), so OA injects the vendor's
-    prefix text for high/xhigh/max and sends explicit effort="none" for off."""
+    prefix text for high/xhigh/max and sends explicit effort="none" for off.
+
+    workspace-im7t.64 note: the macstudio effort branch is now keyed on the
+    PROVIDER (one ds4 engine behind :8000), not on a model string, so this
+    provider always sends TOP-LEVEL reasoning_effort and never the nested
+    `reasoning: {effort}` shape. That is the correct shape for llama.cpp too
+    (it reads top-level reasoning_effort -- 2026-08-03 finding) and the only
+    shape ds4 reads on /v1/chat/completions. The prefix injection below is
+    unchanged: it is keyed on the model string alone, independent of provider.
+    The DSv4F model itself is PARKED (weights retained, not served)."""
 
     def _args(self, **overrides):
         defaults = dict(
@@ -963,7 +972,9 @@ class TestDSV4FEffortPrefix:
         assert sysmsg["role"] == "system"
         assert sysmsg["content"].startswith("Reasoning Effort: Absolute maximum")
         assert sysmsg["content"].endswith("sys")
-        assert kw["extra_body"]["reasoning"] == {"effort": "high"}
+        # top-level effort (im7t.64); the nested shape is never sent to macstudio
+        assert kw["extra_body"]["reasoning_effort"] == "high"
+        assert "reasoning" not in kw["extra_body"]
 
     def test_max_and_xhigh_inject_beyond_maximum_prefix(self):
         for level in ("max", "xhigh"):
@@ -983,12 +994,18 @@ class TestDSV4FEffortPrefix:
         assert kw["extra_body"]["reasoning_effort"] == "none"
         assert kw["messages"][0]["content"] == "sys"
 
-    def test_off_other_models_send_nothing(self):
-        """Non-DSv4F models keep the old behavior: off = no reasoning field."""
-        kw = _build_openai_kwargs(**self._args(
-            api_model="macstudio/mlx-community/MiniMax-M3-4bit",
-            thinking_level="off"))
-        assert "extra_body" not in kw
+    def test_off_sends_top_level_none_for_every_macstudio_model(self):
+        """im7t.64: the branch is ENGINE-scoped, so off sends top-level
+        reasoning_effort="none" for ANY model string on this provider -- the
+        live V4.1 seat, a rollback GLM string, or a dormant manually-started
+        llama.cpp model. Always explicit: an omitted param falls to the server
+        default. Never the nested shape."""
+        for model in ("macstudio/deepseek-v4-flash",
+                      "macstudio/mlx-community/MiniMax-M3-4bit"):
+            kw = _build_openai_kwargs(**self._args(
+                api_model=model, thinking_level="off"))
+            assert kw["extra_body"]["reasoning_effort"] == "none"
+            assert "reasoning" not in kw["extra_body"]
 
     def test_caller_messages_not_mutated(self):
         msgs = [{"role": "user", "content": "hi"}]
@@ -1331,16 +1348,19 @@ class TestMidStreamTransportErrors:
                                messages=[{"role": "user", "content": "Hi"}])
 
 
-class TestMacStudioGLMEffort:
-    """ds4-served GLM-5.3-Flash Q4 (macstudio capacity tier since 2026-09-17,
-    workspace-im7t.54): ds4 reads ONLY top-level reasoning_effort -- the nested
-    OpenRouter {"reasoning": {"effort": ...}} shape is ignored on the wire,
-    which is the kdsn.271 silent reasoning-ON class. The macstudio+GLM path
-    sends top-level identity for every OA level and "none" for off."""
+class TestMacStudioDs4Effort:
+    """ds4-served macstudio capacity tier (workspace-im7t.64: DeepSeek-V4.1-Flash
+    since the 2026-09-28 cutover, GLM-5.3-Flash before it). ds4 reads ONLY
+    top-level reasoning_effort for /v1/chat/completions -- the nested OpenRouter
+    {"reasoning": {"effort": ...}} shape is parsed only by ds4's Responses-API
+    parser and is otherwise ignored on the wire, which is the kdsn.271 silent
+    reasoning-ON class. The branch is keyed on the PROVIDER (one ds4 engine
+    behind :8000), so it holds for the live model string and every rollback
+    string alike. Sends top-level identity for every OA level and "none" off."""
 
     def _args(self, **overrides):
         defaults = dict(
-            api_model="macstudio/glm-5.3-flash-q4",
+            api_model="macstudio/deepseek-v4.1-flash",
             system="sys",
             provider_messages=[{"role": "user", "content": "hi"}],
             provider_tools=None,
@@ -1375,9 +1395,22 @@ class TestMacStudioGLMEffort:
             provider_key="synthetic", thinking_level="max"))
         assert kw["extra_body"]["reasoning_effort"] == "max"
 
+    def test_branch_holds_for_rollback_model_strings(self):
+        """The effort branch is ENGINE-scoped (provider_key), not keyed on a
+        model string: a rollback flip to the parked GLM artifact must not
+        silently fall through to the nested-shape branch (kdsn.271 class)."""
+        kw = _build_openai_kwargs(**self._args(
+            api_model="macstudio/glm-5.3-flash-q4", thinking_level="high"))
+        assert kw["extra_body"]["reasoning_effort"] == "high"
+        assert "reasoning" not in kw["extra_body"]
+
     def test_capability_row_matches_prod_plist(self):
         from openalph.provider import _MODEL_CAPABILITIES
-        rows = [r for r in _MODEL_CAPABILITIES if r[0] == "glm-5.3-flash-q4"]
-        assert len(rows) == 1
-        _, ctx, cap, vision = rows[0]
+        rows = {r[0]: r for r in _MODEL_CAPABILITIES}
+        _, ctx, cap, vision = rows["deepseek-v4.1-flash"]
         assert ctx == 1_048_576 and cap is None and vision is False
+        # rollback rows retained so a flip needs no provider.py edit
+        _, gctx, gcap, gvision = rows["glm-5.3-flash-q4"]
+        assert gctx == 1_048_576 and gcap is None and gvision is False
+        _, ictx, icap, ivision = rows["glm-5.3-iq4xs"]
+        assert ictx == 786_432 and icap is None and ivision is False

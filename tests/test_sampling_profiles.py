@@ -213,18 +213,29 @@ class TestSamplingProfileTemperatureTopP:
         assert "top_p" not in kw
 
 
-class TestGLM53FlashQ4Profile:
-    """macstudio ds4 GLM-5.3-Flash Q4 (2026-09-17 cutover, workspace-im7t.54):
-    GLM family pattern -- penalties omitted, temp/top_p left to vendor
-    defaults (mirrors hf:zai-org/glm-5.3-flash). It must NOT inherit the
-    DeepSeek 1.0/0.95 pins through fragment-matching accidents."""
+class TestMacStudioDs4SamplingProfiles:
+    """macstudio ds4 capacity tier (workspace-im7t.64): the LIVE seat is
+    DeepSeek-V4.1-Flash and takes the DSV4.1 family anti-collapse pin
+    (temp 1.0 / top_p 0.95, penalties omitted), matching the
+    hf:deepseek-ai/deepseek-v4.1-flash row. The parked GLM artifact keeps the
+    GLM family pattern (penalties omitted, temp/top_p left to vendor defaults)
+    and must NOT inherit the DeepSeek pins through fragment-matching accidents.
+    First-match substring ordering is safe here: "deepseek-v4-flash" is not a
+    substring of "deepseek-v4.1-flash" (dash vs dot)."""
 
-    def test_penalties_omitted(self):
+    def test_live_v41_gets_family_pin(self):
+        prof = _sampling_profile("macstudio/deepseek-v4.1-flash")
+        assert prof.temperature == 1.0
+        assert prof.top_p == 0.95
+        assert prof.frequency_penalty is None
+        assert prof.presence_penalty is None
+
+    def test_rollback_glm_penalties_omitted(self):
         prof = _sampling_profile("macstudio/glm-5.3-flash-q4")
         assert prof.frequency_penalty is None
         assert prof.presence_penalty is None
 
-    def test_no_dsv4f_temp_pins_inherited(self):
+    def test_rollback_glm_does_not_inherit_dsv4f_pins(self):
         prof = _sampling_profile("macstudio/glm-5.3-flash-q4")
         assert prof.temperature is None
         assert prof.top_p is None
