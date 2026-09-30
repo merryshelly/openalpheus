@@ -56,6 +56,7 @@ post_ok in that case.
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -244,6 +245,68 @@ def _run_checker(plan, content: str, path: str) -> tuple[str, str]:
     return _run_subprocess_checker(binary, args, content, suffix=suffix, real_path=path)
 
 
+def _parse_proc_umask(text: str) -> int | None:
+    """The ``Umask:`` field of /proc/self/status content, or None.
+
+    Anything that is not a plain in-range octal value returns None so the
+    caller takes the fallback path rather than trusting it: ``int("-1", 8)``
+    is -1, and ``0o666 & ~-1 == 0o000`` would create a file nobody can read —
+    the exact incident class this mode handling exists to prevent.
+    """
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "Umask:":
+            # Exact shape rather than int()'s tolerance: int(x, 8) also accepts
+            # a leading "+", embedded underscores and non-ASCII decimal digits,
+            # each of which would be trusted as though the kernel wrote it.
+            if not re.fullmatch(r"[0-7]{1,4}", parts[1]):
+                return None
+            value = int(parts[1], 8)
+            return value if value <= 0o777 else None
+    return None
+
+
+def _read_proc_umask() -> int | None:
+    """The process umask from /proc/self/status, or None if unreadable.
+
+    Deliberately a READ. The classic ``os.umask(0)``/restore idiom sets the
+    process umask to 0 for the duration of the call, and any file created in
+    that window (another thread, a library) would land world-writable — a
+    permissions helper must not open a permissions hole. Linux publishes the
+    value, so it can be read without being touched.
+    """
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as fh:
+            return _parse_proc_umask(fh.read())
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+_UMASK_FALLBACK_WARNED = False
+
+
+def _process_umask() -> int:
+    """The process umask, degrading to 0o022 when it cannot be read.
+
+    A file's MODE is cosmetic next to the write itself, so an unreadable
+    /proc must never refuse a write: warn once and fall back to the common
+    default. OA runs under systemd on Linux, where /proc/self/status is
+    always present — the fallback is a last-resort guard, not a supported
+    configuration.
+    """
+    global _UMASK_FALLBACK_WARNED
+    umask = _read_proc_umask()
+    if umask is None:
+        if not _UMASK_FALLBACK_WARNED:
+            _UMASK_FALLBACK_WARNED = True
+            logger.warning(
+                "Could not read the process umask from /proc/self/status; "
+                "new files will be created 0o640 (0o666 & ~0o027)."
+            )
+        return 0o022
+    return umask
+
+
 def _write_now(path: str, content: str) -> None:
     """The ONE place a validated write reaches disk (single point of truth).
 
@@ -254,7 +317,15 @@ def _write_now(path: str, content: str) -> None:
     file, the tmp is ``os.chmod``'d to that file's PRIOR mode before the
     replace — a fresh ``NamedTemporaryFile`` defaults to 0o600, which would
     otherwise silently reset an existing file's permissions on every write
-    that goes through this seam. The tmp is unlinked on ANY failure path
+    that goes through this seam. A NEW file (no prior mode) is chmod'd to
+    ``0o666 & ~(umask | 0o007)`` instead — the mode a plain ``open(path, "w")``
+    would have produced, minus the world bits — because the tempfile's 0o600
+    is an artifact of the temp file, not a mode anybody asked for; leaving it
+    made every agent-created file owner-only regardless of the unit's UMask
+    (workspace-kdsn.357). World bits are clamped off because this seam also
+    runs from shells, the CLI and tests, where a permissive umask would
+    otherwise publish agent-written files to every local user.
+    The tmp is unlinked on ANY failure path
     (tempfile creation, write, fsync, chmod, or the replace itself), so a
     failed write never leaves an orphan tmp file, and the real path — if it
     already existed — is left byte-identical.
@@ -323,9 +394,18 @@ def _write_now(path: str, content: str) -> None:
     parent = os.path.dirname(os.path.abspath(target_path)) or os.sep
     os.makedirs(parent, exist_ok=True)
 
+    # A target that vanishes between this check and the write is treated as a
+    # new file rather than failing the write (the mirror of R13's TOCTOU
+    # handling in _validated_write) — so the vanished case lands the new-file
+    # mode instead of raising FileNotFoundError out of the seam. The reverse
+    # race (a target appearing after this stat) is supplanted by the replace —
+    # standard rename semantics — at the new-file mode, which is never more
+    # permissive than the umask intent.
     prior_mode: int | None = None
-    if os.path.exists(target_path):
+    try:
         prior_mode = stat.S_IMODE(os.stat(target_path).st_mode)
+    except FileNotFoundError:
+        prior_mode = None
 
     suffix = Path(target_path).suffix or None
     tmp_path: str | None = None
@@ -341,6 +421,15 @@ def _write_now(path: str, content: str) -> None:
 
         if prior_mode is not None:
             os.chmod(tmp_path, prior_mode)
+        else:
+            # New file: land what a plain open(path, "w") would have produced
+            # — 0o666 masked by the process umask (the service units set
+            # UMask=0027, so 0o640) — with world bits clamped off so a
+            # permissive ambient umask degrades to group-only, never world.
+            # Without this, the tempfile's 0o600 made every agent-created file
+            # owner-only and broke any reader that is a different Unix user
+            # (workspace-kdsn.357).
+            os.chmod(tmp_path, 0o666 & ~(_process_umask() | 0o007))
 
         os.replace(tmp_path, target_path)
     except Exception:
