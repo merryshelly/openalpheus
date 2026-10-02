@@ -2050,15 +2050,18 @@ class Agent:
                 # Declare-done (workspace-kdsn.350.16, design memo §3
                 # amendment #2, D2): hold-back memory for THIS turn.
                 # _held_text is the text held back at the hold-back (the
-                # turn's last text at that point); _hold_iteration the loop
-                # iteration that held it. A bare terminal declaration on the
-                # iteration IMMEDIATELY after the hold-back returns the held
-                # text (not ""); a hold-back superseded by further work does
-                # not stand as the final reply (adjacency check at the
-                # terminal dispatch site). Turn that emitted no text: both
-                # stay None -> "" is honest.
+                # turn's last text at that point) — the pending held report.
+                # The supersession rule keys on WORK, not on loop iteration
+                # parity (finding B): _held_text is cleared at exactly ONE
+                # site — the tool-execution path, right after the gather
+                # that runs the tool coroutines — so a hold-back followed by
+                # real tool work does not stand as the final reply, while
+                # harness-internal retries that execute no tool (the
+                # empty-max_tokens thinking recovery, the overlay-validation
+                # retry) leave it set. A bare terminal declaration with
+                # _held_text still set returns the held text (not ""); a
+                # turn that emitted no text stays None -> "" is honest.
                 _held_text = None
-                _hold_iteration = None
 
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
@@ -2807,11 +2810,11 @@ class Agent:
                                     and iteration < self.config.max_iterations - 1):
                                 _corrective_fired = True
                                 # kdsn.350.16 (amendment #2, D2): remember the
-                                # held text + the iteration that held it so a
-                                # bare declaration on the NEXT iteration can
-                                # return it as the turn's reply.
+                                # held text so a bare terminal declaration
+                                # with no work since the hold-back can return
+                                # it as the turn's reply. Cleared at the one
+                                # tool-execution site (finding B).
                                 _held_text = final_text
-                                _hold_iteration = iteration
                                 # kdsn.350.16 (amendment #2, D1): delivery is
                                 # decoupled from declaration — on non-streaming
                                 # transports (heartbeat/umbral) the held text
@@ -2835,12 +2838,12 @@ class Agent:
                                 history.append({
                                     "role": "user",
                                     "content": (
-                                        "[SYSTEM: Your previous message was "
-                                        "delivered to the operator. You ended "
-                                        "with plain text but did not declare "
+                                        "[SYSTEM: Your previous message is "
+                                        "this turn's reply and has been kept "
+                                        "— do NOT repeat it. You ended with "
+                                        "plain text but did not declare "
                                         "completion. If the work is complete, "
-                                        "call declare_done{} to end the turn "
-                                        "— do NOT repeat your message. "
+                                        "call declare_done{} to end the turn. "
                                         "Otherwise, continue working and "
                                         "finish what you started, then "
                                         "declare_done{} when it is done.]"
@@ -3078,18 +3081,18 @@ class Agent:
                         self._fire_spotter_turn_completion(
                             room_id, history, _turn_source, callbacks)
                         # kdsn.350.16 (amendment #2, D2): a bare declaration
-                        # on the iteration IMMEDIATELY after a hold-back
-                        # returns the HELD text, not "" (the held report IS
-                        # the turn's reply). _hold_iteration == iteration - 1
-                        # is the "not superseded" rule: further work between
-                        # the hold-back and the declaration means the held
-                        # text was an announcement, not a report, and does
-                        # not stand. A turn that emitted no text (_held_text
-                        # None) still returns "".
+                        # with no WORK since the hold-back returns the HELD
+                        # text, not "" (the held report IS the turn's reply).
+                        # The supersession rule keys on work, not on loop
+                        # parity (finding B): _held_text is cleared only at
+                        # the tool-execution site, so a hold-back followed
+                        # by real tool work is an announcement, not a
+                        # report, and does not stand, while harness-internal
+                        # retries that execute no tool preserve it. A turn
+                        # that emitted no text (_held_text None) still
+                        # returns "".
                         _tt_text = accumulated_text or response.content
-                        if (not (_tt_text or "").strip()
-                                and _held_text
-                                and _hold_iteration == iteration - 1):
+                        if not (_tt_text or "").strip() and _held_text:
                             _tt_text = _held_text
                         return _tt_text
 
@@ -3178,6 +3181,18 @@ class Agent:
                                 with contextlib.suppress(asyncio.CancelledError):
                                     await _ka_task
                                 logger.info("cache keepalive disarmed in %s", room_id)
+
+                    # Declare-done (workspace-kdsn.350.16, amendment #2, D2,
+                    # finding B): the ONE site where real tool work executes.
+                    # A held report that precedes actual work is an
+                    # announcement, not the turn's final reply — clear the
+                    # pending held text now (before the tool results are
+                    # appended to history) so a later bare declaration cannot
+                    # resurrect it. Harness-internal retries (the
+                    # empty-max_tokens thinking recovery, the
+                    # overlay-validation continue) never reach here and thus
+                    # never supersede the held report.
+                    _held_text = None
 
                     # Track total tool calls (aggregate + per-tool-name + per-turn)
                     self._record_tool_calls(room_id, len(active_tool_calls))

@@ -507,8 +507,13 @@ class BulkDelivery:
 
     async def deliver(self, text: str):
         """D1 seam: send the held text now, and record it so the turn-end
-        send does not duplicate it (D3)."""
+        send does not duplicate it (D3). Idempotent against its own record:
+        re-firing the same text (e.g. the retry turn's fresh hold-back in the
+        empty-response funnel, finding A) sends nothing — the tracker already
+        delivered exactly this text."""
         if not text or not text.strip():
+            return
+        if self._delivered and (self._delivered_text or "").strip() == text.strip():
             return
         await self.bot.send(self.room_id, text)
         self._delivered = True
@@ -2476,6 +2481,16 @@ class MatrixBot:
                     logger.info(
                         "Bare declare_done during heartbeat in %s — no "
                         "empty-response retry", room_id)
+                elif bulk_delivery._delivered:
+                    # Finding A (adversarial-audit remediation): the D1 seam
+                    # already delivered this turn's held text — a retry would
+                    # re-run the hold-back (fresh corrective per turn) and
+                    # post the report a second time. There is nothing to
+                    # recover: skip the empty-response retry entirely.
+                    logger.info(
+                        "Empty heartbeat response in %s but content already "
+                        "delivered via the D1 seam — no empty-response retry",
+                        room_id)
                 else:
                     # Model did tool work but returned empty text.  Retry once
                     # with a nudge — the model sees its own tool results in
@@ -2496,7 +2511,16 @@ class MatrixBot:
                     )
                     if retry and retry.strip():
                         self._persist_assistant_turn(room_id, content=retry)
-                        await self.send(room_id, retry)
+                        # Finding A (adversarial-audit remediation): the
+                        # retry send goes through the SAME shared duplicate
+                        # rule as the primary turn-end send — if the retry
+                        # turn's text was already delivered by the D1 seam
+                        # (or matches what the primary turn delivered), do
+                        # not post it again.
+                        if _needs_send(
+                                bulk_delivery._delivered,
+                                bulk_delivery._delivered_text, retry):
+                            await self.send(room_id, retry)
                     else:
                         logger.warning("Empty heartbeat response in %s after retry — giving up", room_id)
                         await self.send(room_id,

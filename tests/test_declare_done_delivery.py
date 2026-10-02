@@ -69,8 +69,11 @@ from test_declare_done import (  # noqa: E402
 )
 from test_gapfill_trigger_dedup import (  # noqa: E402
     ROOM_ID,
-    gapfill_page,
+    USER,
     drain,
+    gapfill_page,
+    make_event,
+    make_room,
 )
 
 ROOM_A = ROOM_ID
@@ -91,8 +94,10 @@ def _delivery_recorder():
     return seen, _deliver
 
 
-def _drive_cb(agent, room_id, responses, callbacks=None, text="do the thing"):
-    """`_drive` with a caller-supplied callbacks dict (the D1 seam rides it)."""
+def _drive_cb(agent, room_id, responses, callbacks=None, text="do the thing",
+              thinking=None):
+    """`_drive` with a caller-supplied callbacks dict (the D1 seam rides it) and
+    an optional thinking level (the empty-max_tokens recovery needs thinking on)."""
     with (
         patch("openalph.agent.stream",
               side_effect=_stream_responses(responses)),
@@ -101,7 +106,8 @@ def _drive_cb(agent, room_id, responses, callbacks=None, text="do the thing"):
               side_effect=_exec_tool_stub(shell="ok")),
     ):
         return asyncio.run(
-            agent.handle_input(text, room_id, callbacks=callbacks))
+            agent.handle_input(text, room_id, callbacks=callbacks,
+                               thinking=thinking))
 
 
 def _make_heartbeat_bot(tmp_path):
@@ -318,10 +324,19 @@ class TestBareDeclarationReturnsHeldText:
 
 
 class TestCorrectiveWording:
-    def test_corrective_states_the_text_was_delivered(self, tmp_path):
-        """D5: the corrective must tell the model its text landed — that is
-        what stops the live-path re-emit duplicate, and what makes a bare
-        declaration a correct response rather than a losing move."""
+    def test_corrective_is_transport_truthful(self, tmp_path):
+        """D5 — SPEC REFINED by the 2026-10-02 adversarial audit (findings E,
+        3/3 auditors). The original D5 required the corrective to state the text
+        "was delivered" — but on exec/`cli chat` the D1 seam is deliberately
+        unwired, so nothing has been delivered when the corrective fires, and on
+        wired transports the send may have failed and been swallowed. One fixed
+        string therefore cannot be truthful on all transports, and a false
+        "delivered" claim is load-bearing: it is what licenses the model to omit
+        its report. The spec is corrected to a claim that is true everywhere —
+        the text is the turn's reply and is kept.
+
+        This pin asserts the corrected spec: names the tool, forbids repetition,
+        and does NOT claim delivery."""
         agent = _make_agent(tmp_path)
         _drive_cb(agent, "r1", [
             _text_response(REPORT),
@@ -331,12 +346,13 @@ class TestCorrectiveWording:
         entries = _corrective_entries(agent, "r1")
         assert len(entries) == 1
         body = str(entries[0]["content"]).lower()
-        assert "delivered" in body, (
-            "the corrective must state that the text was delivered (D5)")
-        assert "repeat" in body, (
-            "the corrective must tell the model not to repeat the text (D5)")
         assert "declare_done" in body, (
             "the corrective must still name the terminal tool")
+        assert "repeat" in body, (
+            "the corrective must tell the model not to repeat the text (D5)")
+        assert "delivered" not in body, (
+            "the corrective must NOT claim delivery — false on exec/chat and "
+            "after a swallowed seam failure (D5 as refined, finding E)")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -410,3 +426,105 @@ class TestHeartbeatDeliveryRealPath:
         assert len(_hits(bodies, "All systems nominal")) == 1, (
             f"a declared heartbeat turn must deliver its report once; sent bodies={bodies!r}")
         assert agent.last_turn_declaration(ROOM_A) == "declared"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# REMEDIATION PINS — 2026-10-02 adversarial audit of 6a090dab
+# (tmp/code-audit/declare-done-delivery/AUDIT-REPORT.md, findings A / B / G)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestAuditFindingA_RetryDoubleDelivery:
+    @pytest.mark.asyncio
+    async def test_heartbeat_retry_does_not_duplicate_the_delivered_report(self, tmp_path):
+        """FINDING A (GLM HIGH, Kimi HIGH — both reproduced it; orchestrator-
+        verified at matrix.py:2499 and 2485-2493). The empty-response retry
+        re-runs handle_input with the SAME callbacks dict — hence the same live
+        seam and the same BulkDelivery — and sends the retry text
+        UNCONDITIONALLY, with no _needs_send gate; the retry turn also carries a
+        fresh corrective, so its hold-back posts the text a second time.
+
+        The room must see the report exactly ONCE across the whole two-call
+        funnel run. Fix-shape agnostic: passes either by skipping the retry when
+        the turn already delivered, or by gating the retry send on the shared
+        predicate — both leave exactly one copy."""
+        bot, agent = _make_heartbeat_bot(tmp_path)
+        await _run_heartbeat(bot, [
+            _text_response(REPORT),   # hold-back → the D1 seam delivers REPORT
+            _text_response(""),       # silent end → 'undeclared' → funnel retries
+            _text_response(REPORT, tool_calls=[_declare_call()],
+                           stop_reason="tool_use"),  # the retry turn
+        ])
+        bodies = _sent_bodies(bot)
+        assert len(_hits(bodies, "All systems nominal")) == 1, (
+            "the report must reach the room exactly once across the "
+            f"empty-response retry (finding A); sent bodies={bodies!r}")
+
+
+class TestAuditFindingB_AdjacencyIsNotIndexParity:
+    def test_held_text_survives_a_harness_internal_retry(self, tmp_path):
+        """FINDING B (3/3 auditors; orchestrator-verified at agent.py:2550).
+        The D2 substitution was gated on `_hold_iteration == iteration - 1`, but
+        the empty-max_tokens thinking recovery consumes an iteration with NO
+        superseding work — it executes no tool and appends no work to history.
+        A bare declaration after it must still return the held report: the rule
+        is "no WORK since the hold-back", not "the immediately next iteration".
+
+        The overlay-validation retry (agent.py:2993) is the same class and is
+        covered by the same mechanism — the re-audit should confirm it."""
+        agent = _make_agent(tmp_path)
+        result = _drive_cb(agent, "r1", [
+            _text_response(REPORT),                        # hold-back
+            _text_response("", stop_reason="max_tokens"),  # thinking-burn → retry
+            _text_response("", tool_calls=[_declare_call()],
+                           stop_reason="tool_use"),         # bare declare
+        ], thinking="high")
+        assert result == REPORT, (
+            "a harness-internal retry between the hold-back and the declaration "
+            "must not supersede the held report (finding B)")
+        assert agent.last_turn_declaration("r1") == "declared"
+
+    def test_real_tool_work_still_supersedes_the_held_text(self, tmp_path):
+        """FINDING B regression guard: the fix keys on WORK, not on the absence
+        of a declaration. A hold-back followed by a real tool call is an
+        ANNOUNCEMENT, not a report — a later bare declaration must NOT return
+        it. (The original intent of the adjacency rule, which the fix must
+        preserve; see also the pre-existing pin of the same shape.)"""
+        agent = _make_agent(tmp_path)
+        result = _drive_cb(agent, "r1", [
+            _text_response("I'm going to check the logs."),
+            _text_response("", tool_calls=[_shell_call()],
+                           stop_reason="tool_use"),
+            _text_response("", tool_calls=[_declare_call()],
+                           stop_reason="tool_use"),
+        ])
+        assert result == "", (
+            "real tool work between the hold-back and the declaration must "
+            "still supersede the held text (finding B guard)")
+        assert agent.last_turn_declaration("r1") == "declared"
+
+
+class TestAuditFindingG_LiveCallSite:
+    @pytest.mark.asyncio
+    async def test_live_funnel_call_site_does_not_wire_the_seam(self, tmp_path):
+        """FINDING G (Kimi, Qwen). The original live-path pin asserted the
+        BUILDER default — `_build_agent_callbacks(ROOM_A, None)` called directly
+        — and never exercised `_process_message`'s real call site, so a
+        regression that started passing a BulkDelivery on the live path would
+        have passed it while double-posting every held report in live rooms.
+        This pin captures the callbacks the live funnel actually hands to
+        handle_input."""
+        bot, agent = _make_heartbeat_bot(tmp_path)
+        captured = {}
+
+        async def _spy(text, room_id="_default", **kw):
+            captured.update(kw)
+            return "ok"
+
+        agent.handle_input = _spy
+        await bot._process_message(
+            make_room(ROOM_A), make_event(USER, "hi", "$e-live"), "hi")
+        await drain(bot)
+        assert "deliver_turn_text" not in (captured.get("callbacks") or {}), (
+            "the live (streaming) path must not wire the delivery seam at its "
+            "real call site (finding G)")
