@@ -2047,6 +2047,19 @@ class Agent:
                 _declare_done_available = any(
                     t.name == "declare_done" for t in _turn_tools)
 
+                # Declare-done (workspace-kdsn.350.16, design memo §3
+                # amendment #2, D2): hold-back memory for THIS turn.
+                # _held_text is the text held back at the hold-back (the
+                # turn's last text at that point); _hold_iteration the loop
+                # iteration that held it. A bare terminal declaration on the
+                # iteration IMMEDIATELY after the hold-back returns the held
+                # text (not ""); a hold-back superseded by further work does
+                # not stand as the final reply (adjacency check at the
+                # terminal dispatch site). Turn that emitted no text: both
+                # stay None -> "" is honest.
+                _held_text = None
+                _hold_iteration = None
+
                 # Tool loop: continue calling LLM until we get a text response
                 for iteration in range(self.config.max_iterations):
                     # Drain steering inbox at the top of every iteration (before API call).
@@ -2793,15 +2806,44 @@ class Agent:
                                     and not _corrective_fired
                                     and iteration < self.config.max_iterations - 1):
                                 _corrective_fired = True
+                                # kdsn.350.16 (amendment #2, D2): remember the
+                                # held text + the iteration that held it so a
+                                # bare declaration on the NEXT iteration can
+                                # return it as the turn's reply.
+                                _held_text = final_text
+                                _hold_iteration = iteration
+                                # kdsn.350.16 (amendment #2, D1): delivery is
+                                # decoupled from declaration — on non-streaming
+                                # transports (heartbeat/umbral) the held text
+                                # would otherwise be destroyed (the bare
+                                # declaration the corrective invites returns
+                                # ""). Fail-soft: a transport failure is logged
+                                # and swallowed, the turn is otherwise
+                                # unchanged. The live path does NOT wire this
+                                # (streaming owns delivery); exec does NOT
+                                # (no mid-turn channel — D2 carries it).
+                                _deliver_fn = (callbacks or {}).get(
+                                    "deliver_turn_text")
+                                if _deliver_fn:
+                                    try:
+                                        await _deliver_fn(final_text)
+                                    except Exception:
+                                        logger.warning(
+                                            "deliver_turn_text callback failed",
+                                            exc_info=True)
                                 history.append(assistant_msg)
                                 history.append({
                                     "role": "user",
                                     "content": (
-                                        "[SYSTEM: You ended your response with plain text "
-                                        "but did not declare completion. If the work is "
-                                        "complete, call declare_done{} to end the turn. "
-                                        "Otherwise, continue working and finish what you "
-                                        "started, then declare_done{} when it is done.]"
+                                        "[SYSTEM: Your previous message was "
+                                        "delivered to the operator. You ended "
+                                        "with plain text but did not declare "
+                                        "completion. If the work is complete, "
+                                        "call declare_done{} to end the turn "
+                                        "— do NOT repeat your message. "
+                                        "Otherwise, continue working and "
+                                        "finish what you started, then "
+                                        "declare_done{} when it is done.]"
                                     ),
                                 })
                                 continue
@@ -3035,7 +3077,21 @@ class Agent:
                         # the text-return path (RC1 holds).
                         self._fire_spotter_turn_completion(
                             room_id, history, _turn_source, callbacks)
-                        return accumulated_text or response.content
+                        # kdsn.350.16 (amendment #2, D2): a bare declaration
+                        # on the iteration IMMEDIATELY after a hold-back
+                        # returns the HELD text, not "" (the held report IS
+                        # the turn's reply). _hold_iteration == iteration - 1
+                        # is the "not superseded" rule: further work between
+                        # the hold-back and the declaration means the held
+                        # text was an announcement, not a report, and does
+                        # not stand. A turn that emitted no text (_held_text
+                        # None) still returns "".
+                        _tt_text = accumulated_text or response.content
+                        if (not (_tt_text or "").strip()
+                                and _held_text
+                                and _hold_iteration == iteration - 1):
+                            _tt_text = _held_text
+                        return _tt_text
 
                     # Execute tool calls in parallel
                     tool_coros = []

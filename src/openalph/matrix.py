@@ -492,6 +492,39 @@ class StreamingDelivery:
         self._last_edit_len = 0
 
 
+class BulkDelivery:
+    """Delivery tracker for the non-streaming Matrix transports (heartbeat,
+    umbral, subagent-completion). StreamingDelivery owns the live path; this is
+    its bulk counterpart. Same `_delivered`/`_delivered_text` contract so the
+    turn-end duplicate predicate is SHARED, not duplicated
+    (design-memo §3 amendment #2, D1/D3)."""
+
+    def __init__(self, bot: 'MatrixBot', room_id: str):
+        self.bot = bot
+        self.room_id = room_id
+        self._delivered = False
+        self._delivered_text = ""
+
+    async def deliver(self, text: str):
+        """D1 seam: send the held text now, and record it so the turn-end
+        send does not duplicate it (D3)."""
+        if not text or not text.strip():
+            return
+        await self.bot.send(self.room_id, text)
+        self._delivered = True
+        self._delivered_text = text
+
+
+def _needs_send(delivered: bool, delivered_text: str, response: str) -> bool:
+    """The ONE turn-end duplicate rule (amendment #2 D3): send iff there is
+    text and the transport has not already delivered exactly that text."""
+    if not response or not response.strip():
+        return False
+    if not delivered:
+        return True
+    return (delivered_text or "").strip() != response.strip()
+
+
 class MatrixBot:
     """Matrix client wrapping an OpenAlph Agent.
 
@@ -1836,7 +1869,10 @@ class MatrixBot:
 
         return _tool_notice, _tool_intent
 
-    def _build_agent_callbacks(self, room_id: str, turn_source: str | None) -> dict:
+    def _build_agent_callbacks(
+        self, room_id: str, turn_source: str | None,
+        bulk_delivery: 'BulkDelivery | None' = None,
+    ) -> dict:
         """Build the reminder/registry/identity callbacks for handle_input (R1 refactor).
 
         Used by BOTH _process_message and _run_heartbeat_turn so the wiring
@@ -1881,6 +1917,15 @@ class MatrixBot:
         _sl = getattr(self, 'session_log', None)
         if _sl is not None:
             callbacks["log_subagent_event"] = self._make_subagent_event_log(_sl)
+
+        # kdsn.350.16 (amendment #2, D1): the delivery seam rides the SAME
+        # construction seam. Non-streaming room transports (heartbeat/umbral —
+        # one funnel, _run_heartbeat_turn) pass their BulkDelivery so the held
+        # text is delivered AT the hold-back; the live path passes none
+        # (streaming owns live delivery — wiring it would double-post) and
+        # exec does not (no mid-turn channel; D2 carries the text).
+        if bulk_delivery is not None:
+            callbacks["deliver_turn_text"] = bulk_delivery.deliver
 
         return callbacks
 
@@ -2345,7 +2390,15 @@ class MatrixBot:
                 content = f"[{_ts}] {content}"
 
             # R1 refactor: use shared _build_agent_callbacks for identical wiring
-            callbacks = self._build_agent_callbacks(room_id, turn_source)
+            # kdsn.350.16 (amendment #2, D1/D3): the non-streaming funnel
+            # (heartbeat, umbral, subagent-completion) wires the delivery
+            # seam — the hold-back delivers the held text NOW — and the
+            # turn-end send below uses the shared duplicate predicate so a
+            # declaration that re-emits the same text posts it once, not
+            # twice.
+            bulk_delivery = BulkDelivery(self, room_id)
+            callbacks = self._build_agent_callbacks(
+                room_id, turn_source, bulk_delivery=bulk_delivery)
 
             # kdsn.311: steering works on heartbeat/umbral turns too. Arm the
             # SAME active-turn mark + drain seam as the live path so /steer
@@ -2393,7 +2446,13 @@ class MatrixBot:
             )
             if response and response.strip():
                 self._persist_assistant_turn(room_id, content=response)
-                await self.send(room_id, response)
+                # kdsn.350.16 (amendment #2, D3): the SHARED duplicate rule —
+                # the D1 seam may have already delivered exactly this text at
+                # the hold-back; do not post it twice.
+                if _needs_send(
+                        bulk_delivery._delivered,
+                        bulk_delivery._delivered_text, response):
+                    await self.send(room_id, response)
             else:
                 _stop = self.agent.last_stop_reason(room_id)
                 if _stop == "refusal":
@@ -3554,13 +3613,18 @@ class MatrixBot:
                 # Append assistant response to session log
                 if response and response.strip():
                     self._persist_assistant_turn(room_id, content=response)
-                    # Send if streaming didn't deliver, or if the response
-                    # differs from what was streamed (e.g. tool-limit summary
-                    # generated after the last streamed tool-call text).
-                    if not streaming._delivered:
-                        await self.send(room_id, response)
-                    elif streaming._delivered_text.strip() != response.strip():
-                        logger.info("Response differs from streamed content — sending separately")
+                    # kdsn.350.16 (amendment #2, D3): the SHARED duplicate
+                    # rule (the live path's existing _delivered_text
+                    # comparison, factored so it cannot drift from the
+                    # non-streaming funnel's): send iff there is text and
+                    # streaming did not already deliver exactly that text
+                    # (e.g. a tool-limit summary generated after the last
+                    # streamed tool-call text is still sent).
+                    if _needs_send(
+                            streaming._delivered,
+                            streaming._delivered_text, response):
+                        if streaming._delivered:
+                            logger.info("Response differs from streamed content — sending separately")
                         await self.send(room_id, response)
                 else:
                     _stop = self.agent.last_stop_reason(room_id)
