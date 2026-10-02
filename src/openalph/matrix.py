@@ -2309,6 +2309,22 @@ class MatrixBot:
 
         return _thinking_delta, _flush_pending
 
+    def _held_text_stands(self, room_id: str) -> bool:
+        """Whether the agent's held report still stands as this turn's reply.
+
+        getattr-tolerant and STRICT (`is True`): stub / MagicMock agents
+        must degrade to False, never to a truthy mock, so their
+        empty-response retry is preserved. See the agent-side clearing
+        site for the supersession rule (re-audit finding 1).
+        """
+        accessor = getattr(self.agent, "held_text_stands", None)
+        if not callable(accessor):
+            return False
+        try:
+            return accessor(room_id) is True
+        except Exception:
+            return False
+
     async def _run_heartbeat_turn(self, room_id: str, content: str, *, turn_source: str | None = None) -> None:
         """Execute a heartbeat/umbral turn: activate room, process input, deliver response.
 
@@ -2481,7 +2497,8 @@ class MatrixBot:
                     logger.info(
                         "Bare declare_done during heartbeat in %s — no "
                         "empty-response retry", room_id)
-                elif bulk_delivery._delivered:
+                elif (bulk_delivery._delivered
+                      and self._held_text_stands(room_id)):
                     # Finding A (adversarial-audit remediation): the D1 seam
                     # already delivered this turn's held text — a retry would
                     # re-run the hold-back (fresh corrective per turn) and

@@ -504,6 +504,43 @@ class TestAuditFindingB_AdjacencyIsNotIndexParity:
         assert agent.last_turn_declaration("r1") == "declared"
 
 
+class TestReauditFinding1_SupersededDeliveryMustNotDisableRetry:
+    @pytest.mark.asyncio
+    async def test_superseded_delivery_does_not_disable_the_retry(self, tmp_path):
+        """RE-AUDIT FINDING 1 (Kimi MEDIUM, reproduced by its auditor against
+        the real funnel; orchestrator-traced). The remediation's skip branch
+        (`elif bulk_delivery._delivered:`) fires whenever the D1 seam delivered
+        ANYWHERE in the primary turn — including when that delivery was a
+        pre-work ANNOUNCEMENT that the turn's own supersession rule then
+        revoked. Reachable sequence:
+
+          announcement ("I'll check the logs now.") -> hold-back -> seam posts it
+          -> real tool work (supersedes the held text) -> degenerate EMPTY text
+          end (books 'undeclared') -> the funnel must STILL run the
+          empty-response retry, because the turn's actual result was never
+          produced. The retry's own comment describes exactly this case
+          ("Model did tool work but returned empty text. Retry once with a
+          nudge."). Pre-remediation the retry recovered the report; the skip
+          branch silently lost it — the room kept only the announcement plus an
+          'undeclared' notice.
+
+        The skip must key on UNSURPERSED delivery, not on delivery having
+        happened at all."""
+        bot, agent = _make_heartbeat_bot(tmp_path)
+        await _run_heartbeat(bot, [
+            _text_response("I'll check the logs now."),   # hold-back → seam posts it
+            _text_response("", tool_calls=[_shell_call()],
+                           stop_reason="tool_use"),        # real work → supersedes
+            _text_response(""),                            # degenerate empty end → undeclared
+            _text_response(REPORT, tool_calls=[_declare_call()],
+                           stop_reason="tool_use"),        # the retry turn's report
+        ])
+        bodies = _sent_bodies(bot)
+        assert len(_hits(bodies, "All systems nominal")) == 1, (
+            "a SUPERSEDED announcement must not disable the empty-response retry — "
+            f"the post-work report must reach the room (re-audit finding 1); sent bodies={bodies!r}")
+
+
 class TestAuditFindingG_LiveCallSite:
     @pytest.mark.asyncio
     async def test_live_funnel_call_site_does_not_wire_the_seam(self, tmp_path):

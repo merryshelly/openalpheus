@@ -397,6 +397,12 @@ class Agent:
         # "cap_exhausted" (iteration-cap forced-summary path). No key ==
         # None: tool never registered in this room's turns / no turn yet.
         self._last_declaration: dict[str, str] = {}
+        # Re-audit finding 1: whether the turn's held report still stands
+        # as its final reply. Set at the hold-back, cleared when real tool
+        # work executes. The empty-response funnel consults it so a
+        # SUPERSEDED announcement cannot disable the retry that recovers
+        # the turn's real result.
+        self._last_held_stands: dict[str, bool] = {}
         # Discover tools from workspace/tools/ directory
         self.tools = discover_tools(config.workspace)
         # Pre-compute tool definition cost for token estimation.
@@ -1025,6 +1031,18 @@ class Agent:
         (declare_done never registered / no turn yet).
         """
         return self._last_declaration.get(room_id)
+
+    def held_text_stands(self, room_id: str) -> bool:
+        """Whether the turn's held report still stands as its final reply.
+
+        False once real tool work has executed since the hold-back (the
+        supersession rule — see the clearing site in the tool-execution
+        path), and False for a turn that never held anything. The
+        empty-response funnel consults this so a superseded announcement
+        does not disable the retry that recovers the turn's real result
+        (re-audit finding 1).
+        """
+        return self._last_held_stands.get(room_id, False)
 
     def get_model(self, room_id: str = "_default") -> str:
         """Return the active model for a room, falling back to config default."""
@@ -1798,6 +1816,7 @@ class Agent:
             # per-call by _record_turn_usage) AFTER this pop.
             self._last_stop_reason.pop(room_id, None)
             self._last_turn_usage.pop(room_id, None)
+            self._last_held_stands[room_id] = False
             history = self.history(room_id)
             try:
                 # Build user content (may expand image media tags when the
@@ -2815,6 +2834,9 @@ class Agent:
                                 # it as the turn's reply. Cleared at the one
                                 # tool-execution site (finding B).
                                 _held_text = final_text
+                                # Re-audit finding 1: the held report
+                                # stands until real work executes.
+                                self._last_held_stands[room_id] = True
                                 # kdsn.350.16 (amendment #2, D1): delivery is
                                 # decoupled from declaration — on non-streaming
                                 # transports (heartbeat/umbral) the held text
@@ -3193,6 +3215,10 @@ class Agent:
                     # overlay-validation continue) never reach here and thus
                     # never supersede the held report.
                     _held_text = None
+                    # Re-audit finding 1: record the supersession so the
+                    # empty-response funnel can tell a still-standing
+                    # report from a revoked announcement.
+                    self._last_held_stands[room_id] = False
 
                     # Track total tool calls (aggregate + per-tool-name + per-turn)
                     self._record_tool_calls(room_id, len(active_tool_calls))
