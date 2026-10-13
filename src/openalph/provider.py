@@ -381,7 +381,7 @@ def _supports_adaptive_thinking(model_id: str) -> bool:
     """Returns True for models that support adaptive thinking (type=adaptive + effort).
 
     Supported: opus-4-5, opus-4-6, opus-4-7, opus-4-8, opus-5, opus-5-5,
-    sonnet-4-6, sonnet-5, mythos, fable.
+    sonnet-4-6, sonnet-5 (covers sonnet-5-5), haiku-5-5, mythos, fable.
 
     "opus-5" is a distinct fragment from "opus-4-5"/etc (no "-4-" substring in
     common), so it cannot collide with the existing opus-4.x entries -- verified
@@ -398,6 +398,10 @@ def _supports_adaptive_thinking(model_id: str) -> bool:
         or "opus-4-6" in model_id
         or "sonnet-4-6" in model_id
         or "sonnet-5" in model_id
+        # haiku-5-5 (2026-10-13): first adaptive haiku — haiku-4-5 stays on
+        # the legacy budget path; "haiku-5-5" cannot substring-collide
+        # with "haiku-4-5".
+        or "haiku-5-5" in model_id
         or "opus-4-7" in model_id
         or "opus-4-8" in model_id
         # opus-5-5 listed explicitly (2026-09-22) for self-documentation; the
@@ -466,8 +470,19 @@ def _thinking_budget(level: str, base_max_tokens: int, model_max_tokens: int) ->
 # substring-collide with "qwen38" (the blind coder build).
 _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     # Anthropic
+    # Haiku 5.5 (onboarded 2026-10-13, workspace-kdsn.362): 1M ctx,
+    # 128K output (vs haiku-4-5's 200K/64K), vision, adaptive thinking
+    # always-on (default effort medium). UNIQUE on pricing: first tiered
+    # Anthropic model (see _MODEL_PRICING "tiers").
+    ("haiku-5-5",  1_048_576, 128_000, True),
     ("haiku-4-5",  200_000,   64_000, True),
     ("sonnet-4-6", 200_000,  128_000, True),
+    # sonnet-5-5 MUST precede the generic "sonnet-5" row (first-match
+    # wins; "sonnet-5" is a substring of "claude-sonnet-5-5" — same trap
+    # as opus-5-5). Onboarded 2026-10-13 (workspace-kdsn.362): 1M ctx,
+    # 128K output (hard-400 -> clamp), vision, adaptive thinking always-on
+    # (default effort high).
+    ("sonnet-5-5", 1_048_576, 128_000, True),
     ("sonnet-5",  1_048_576, 128_000, True),
     ("opus-4-6",  1_048_576, 128_000, True),
     ("opus-4-7",  1_048_576, 128_000, True),
@@ -502,6 +517,17 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     # Qwen3.8-27B, NOT this model). Probes:
     # memory/projects/openalph/research/vision-anchor-2026-09/
     ("hf:zai-org/glm-5.3-flash",         524288, None, False),
+    # hf:zai-org/glm-5.3 (non-flash; onboarded 2026-10-13,
+    # workspace-kdsn.362): 524288 served on BOTH Synthetic accounts
+    # (vendor /models), TEXT ONLY (catalog input_modalities=["text"] —
+    # the first GLM catalog whose vision claim matches the wire, after
+    # glm-5.3-flash and dsv41f metadata lies; fail-closed False agrees).
+    # Wire-probed same day: tools, streaming reasoning deltas,
+    # reasoning_content replay, over-cap max_tokens (70000 vs card
+    # max_output_length 65536) tolerated -> output cap None. MUST sit
+    # AFTER the "-flash" row: "hf:zai-org/glm-5.3" is a substring of
+    # "hf:zai-org/glm-5.3-flash" and first-match-wins.
+    ("hf:zai-org/glm-5.3",               524288, None, False),
     ("hf:zai-org/glm-5.2",               524288, None, False),
     ("hf:zai-org/glm-4.7-flash",         196608, None, False),
     ("hf:openai/gpt-oss",                131072, None, False),
@@ -620,6 +646,32 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
         "off": "none",
         "low": "low",
         "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    }),
+    # hf:zai-org/glm-5.3 non-flash (workspace-kdsn.362, wire-probed
+    # 2026-10-13, tmp/glm53-probe/): vendor /models declares efforts
+    # low/high/max. All six OA levels return 200, BUT "none" AND "low"
+    # are PATHOLOGICAL on this served deployment — both burned the full
+    # token budget supplied on reasoning with EMPTY content and
+    # finish_reason=length on a 'reply with exactly: OK' probe (verified
+    # at 2000 max_tokens; termination at larger budgets was not observed
+    # in-flight), while medium/high/xhigh/max stop normally (~55-160
+    # reasoning tokens — inverted vs the declared vocabulary; a
+    # served-template coercion quirk, and unlike glm-5.3-flash where
+    # "none" genuinely zeroes). Sending "none" from a thinking=off call
+    # would return empty content after a full-budget burn — map
+    # off/low/medium to "high" (vendor-declared, smallest sane tier)
+    # with the standard non-identity warn-once. xhigh passed 1:1 per the
+    # glm-5.3-flash convention (accepted; coercion above "high"
+    # uncharacterized — max reasoned LESS than high in probes, so do not
+    # cite xhigh/max as distinct tiers above high); max is card-native
+    # 1:1. MUST sit AFTER the "-flash" entry (substring, first-match-wins).
+    ("hf:zai-org/glm-5.3", {
+        "off": "high",
+        "low": "high",
+        "medium": "high",
         "high": "high",
         "xhigh": "xhigh",
         "max": "max",
@@ -834,6 +886,10 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     # must not depend on default-profile accident.
     ("hf:moonshotai/kimi-k3", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("hf:zai-org/glm-5.3-flash", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
+    # hf:zai-org/glm-5.3 non-flash (kdsn.362, 2026-10-13): same kdsn.241.3
+    # GLM family invariant — penalties omitted. MUST sit AFTER the flash
+    # row (substring; first-match-wins). id: "hf:zai-org/glm-5.3".
+    ("hf:zai-org/glm-5.3",        SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("hf:zai-org/glm-5.2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     # DSV4.1-flash (2026-09-22): DeepSeek reasoning-family anti-collapse pin,
     # mirroring the macstudio "deepseek-v4-flash" row (kdsn.241.3 lineage —
@@ -1047,6 +1103,26 @@ _MODEL_PRICING: dict[str, dict] = {
         # the intro $2/$10 is the standard price (vendor pricing page, verified
         # 2026-09-13). The former effective-date schedule is removed; rates are
         # flat $2/$10 for every call date.
+        # Sonnet 5.5 (onboarded 2026-10-13, workspace-kdsn.362): $2/$10
+        # flat. Cache READS $0.10/MTok = 0.05x base — the THIRD Anthropic
+        # model off uniform CACHE_READ_MULT (fable-5-1 0.025x, opus-5-5
+        # 0.05x; vendor pricing page 2026-10-13: "0.05x on Claude Opus 5.5
+        # and Claude Sonnet 5.5"). Cache WRITES stay standard (5m $2.50 =
+        # 1.25x, 1h $4 = 2.0x).
+        "claude-sonnet-5-5": {"input": 2.0,  "output": 10.0, "cached_input": 0.10},
+        # Haiku 5.5 (onboarded 2026-10-13, workspace-kdsn.362): FIRST
+        # tiered-price Anthropic model — per-REQUEST prompt length
+        # (input + cache reads + cache writes, per the vendor doc)
+        # STRICTLY OVER 100,000 tokens pays the high tier ($0.50/$2.50),
+        # else the low tier ($0.10/$0.50). Cache reads are 0.1x tier base
+        # at BOTH tiers ($0.01 / $0.05) so uniform CACHE_READ_MULT applies
+        # — deliberately no cached_input pin. Writes 1.25x/2.0x of tier
+        # base ("$0.125/$0.20 and $0.625/$1" on the vendor table).
+        "claude-haiku-5-5":  {"tiers": {
+            "threshold_prompt_tokens": 100_000,
+            "low":  {"input": 0.10, "output": 0.50},
+            "high": {"input": 0.50, "output": 2.50},
+        }},
         "claude-sonnet-5":   {"input": 2.0,  "output": 10.0},
     },
     "fireworks": {
@@ -1171,6 +1247,18 @@ def compute_cost(model: str, usage: Usage, *, cache_ttl_fallback: str = "1h",
         else:
             logger.debug("cost: unpriced (unlisted in %r namespace) model %r", ns, model)
         return _unpriced()
+
+    # Tiered pricing (Haiku 5.5, kdsn.362): rates depend on THIS
+    # request's prompt length — strictly over the threshold pays the high
+    # tier; the prompt total counts input + cache reads + cache writes,
+    # per the vendor doc ("a request whose prompt is over 100,000 tokens
+    # pays higher prices... counts all of its input tokens, including
+    # cache reads and cache writes").
+    if "tiers" in entry:
+        tiers = entry["tiers"]
+        prompt_total = in_tok + cache_read + cc_total
+        tier_key = "high" if prompt_total > tiers["threshold_prompt_tokens"] else "low"
+        entry = tiers[tier_key]
 
     rates = _resolve_rates(entry, now)
     in_rate = rates["input"]
