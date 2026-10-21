@@ -543,6 +543,13 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     # genuinely silences (0 reasoning chars), all six OA levels 1:1 (see
     # _SYNTHETIC_EFFORT_OVERRIDES). MUST precede the base row: the base id is
     # a substring of the -1017 id, first-match-wins.
+    # Infinite Mode (workspace-im7t.82, wire-probed 2026-10-21
+    # tmp/infinite-probe/): Synthetic's free/slow background tier. The
+    # 'infinite:small:vision' alias resolves vendor-side to plain
+    # DeepSeek-V4.1-Flash, whose served deployment is image-broken (see the
+    # base row below) despite the "vision" label in the alias name. Fail
+    # closed False. Sits first among the Synthetic rows by convention.
+    ("infinite:", 524288, None, False),
     ("hf:deepseek-ai/deepseek-v4.1-flash-1017", 524288, None, True),
     # DeepSeek-V4.1-Flash (syndsv41f onboarding, 2026-09-22): 512k per vendor
     # docs + live /models metadata. Same metadata LIE class as glm-5.3-flash
@@ -631,6 +638,18 @@ _SYNTHETIC_IDENTITY_WARNED: set[str] = set()
 # xhigh passes through 1:1 (card-native, measured), and max — NOT card-native
 # — ceiling-maps to xhigh with a warn-once.
 _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
+    # Infinite Mode (workspace-im7t.82, wire-probed 2026-10-21): ALL SIX
+    # levels return 200 on the infinite endpoint (probe1 A/B + probe3
+    # effort matrix); "none" genuinely silences (0 reasoning tokens).
+    # 1:1 — no remap warn, unlike the generic default map.
+    ("infinite:", {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    }),
     ("hf:qwen/qwen3.8", {
         "off": "none",
         "low": "low",
@@ -930,6 +949,9 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     # top_p to 1.0 ONLY (base card: "0.95 or 1.0"; benchmark table published
     # against 1.0), so the snapshot follows ITS card, not the family's
     # 0731-lineage 0.95 anti-collapse pin. temp 1.0 both cards.
+    # Infinite Mode (workspace-im7t.82): same DeepSeek anti-collapse pin as
+    # the base dsv41f row — the infinite alias serves the same backend model.
+    ("infinite:", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("hf:deepseek-ai/deepseek-v4.1-flash-1017", SamplingProfile(temperature=1.0, top_p=1.0)),
     ("hf:deepseek-ai/deepseek-v4.1-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
@@ -1167,6 +1189,13 @@ _MODEL_PRICING: dict[str, dict] = {
         "kimi-k3":    {"input": 3.00, "output": 15.00, "cached_input": 0.30},
         "kimi-k2p6":  {"input": 0.95, "output": 4.00,  "cached_input": 0.16},
         "glm-5p2":    {"input": 1.40, "output": 4.40,  "cached_input": 0.14},
+    },
+    # Infinite Mode (workspace-im7t.82): free tier — PRICED at zero, never
+    # unpriced (unpriced tokens pollute the /status caveat bucket). The
+    # endpoint caches prompts (created_cache_tokens wire-probed);
+    # cached_input 0.0 keeps cache reads off the missing-rate warn path.
+    "synthetic-inf": {
+        "infinite:small:vision": {"input": 0.0, "output": 0.0, "cached_input": 0.0},
     },
 }
 
