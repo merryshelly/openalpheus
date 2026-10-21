@@ -532,6 +532,18 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     ("hf:zai-org/glm-4.7-flash",         196608, None, False),
     ("hf:openai/gpt-oss",                131072, None, False),
     ("hf:nvidia/nvidia-nemotron-3-super", 262144, None, False),
+    # DeepSeek-V4.1-Flash-1017 (workspace-kdsn.366, wire-probed 2026-10-21):
+    # the 10/17 snapshot, SUPERSEDING the base snapshot below (aliases
+    # syndsv41f/syn2dsv41f re-pointed same day). 512K on BOTH accounts, card
+    # max_output_length 65536 with over-cap max_tokens (70000) tolerated ->
+    # output cap None. VISION WORKS (third GLM/DSV-family catalog vision
+    # claim, first true one: 64x64 solid-red PNG -> "Red", prompt_tokens
+    # counted the image — probe tmp/kdsn366/) — a credible claim after two
+    # prior lies (kdsn.351, the base snapshot's 3x HTTP-500). Effort: NONE
+    # genuinely silences (0 reasoning chars), all six OA levels 1:1 (see
+    # _SYNTHETIC_EFFORT_OVERRIDES). MUST precede the base row: the base id is
+    # a substring of the -1017 id, first-match-wins.
+    ("hf:deepseek-ai/deepseek-v4.1-flash-1017", 524288, None, True),
     # DeepSeek-V4.1-Flash (syndsv41f onboarding, 2026-09-22): 512k per vendor
     # docs + live /models metadata. Same metadata LIE class as glm-5.3-flash
     # (kdsn.351): the catalog claims input_modalities=["text","image"] and
@@ -688,6 +700,23 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
     # non-monotonic) — do not cite xhigh as a distinct tier. If Synthetic
     # later enforces the declared vocabulary, a medium/max 400 is loud and
     # the fix is a one-line remap here.
+    # hf:deepseek-ai/DeepSeek-V4.1-Flash-1017 (workspace-kdsn.366,
+    # wire-probed 2026-10-21, tmp/kdsn366/): ALL SIX OA levels 200 and
+    # terminate on a bounded budget; "none" genuinely silences (0 reasoning
+    # chars, completion counter still runs); medium works despite being
+    # absent from the declared vocab (99 reasoning chars on the probe
+    # prompt); volumes monotonic-ish at single-sample (max 272 > high 147 ~
+    # xhigh 152 > medium 99) — do not cite xhigh as distinct from high
+    # without a battery. Same all-six-1:1 map as the base snapshot it
+    # supersedes.
+    ("hf:deepseek-ai/deepseek-v4.1-flash-1017", {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    }),
     ("hf:deepseek-ai/deepseek-v4.1-flash", {
         "off": "none",
         "low": "low",
@@ -897,6 +926,7 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     # long structured/reasoning transcripts). Penalties omitted (default-
     # profile semantics; the wire accepts them, but no-penalty is the family
     # invariant).
+    ("hf:deepseek-ai/deepseek-v4.1-flash-1017", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("hf:deepseek-ai/deepseek-v4.1-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k3",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
