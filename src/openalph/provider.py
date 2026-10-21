@@ -926,7 +926,11 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     # long structured/reasoning transcripts). Penalties omitted (default-
     # profile semantics; the wire accepts them, but no-penalty is the family
     # invariant).
-    ("hf:deepseek-ai/deepseek-v4.1-flash-1017", SamplingProfile(temperature=1.0, top_p=0.95)),
+    # kdsn.366 (SB poke 2026-10-21): the -1017 card's sampling table narrows
+    # top_p to 1.0 ONLY (base card: "0.95 or 1.0"; benchmark table published
+    # against 1.0), so the snapshot follows ITS card, not the family's
+    # 0731-lineage 0.95 anti-collapse pin. temp 1.0 both cards.
+    ("hf:deepseek-ai/deepseek-v4.1-flash-1017", SamplingProfile(temperature=1.0, top_p=1.0)),
     ("hf:deepseek-ai/deepseek-v4.1-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("glm-5p2",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("kimi-k3",    SamplingProfile(frequency_penalty=None, presence_penalty=None)),

@@ -77,7 +77,9 @@ class TestDs1017SamplingAndEffort:
         profs = {f: p for f, p in _SAMPLING_PROFILES}
         p = profs[SNAP]
         assert p.temperature == 1.0
-        assert p.top_p == 0.95
+        # follows the -1017 card (top_p 1.0 only), not the base row's 0.95
+        assert p.top_p == 1.0
+        assert profs[BASE].top_p == 0.95
         assert p.frequency_penalty is None
         assert p.presence_penalty is None
 
