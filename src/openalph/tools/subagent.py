@@ -6,6 +6,7 @@ a circuit breaker limit (default 100 iterations).
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -14,12 +15,64 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from openalph.provider import complete, compute_cost
+from openalph.provider import ProviderError, compute_cost
+from openalph.provider import stream as _provider_stream
 from openalph.tools import ToolDef, ToolResult, truncate_result, wrap_tool_result
 from openalph.config import AgentConfig
 from openalph.handoff import apply_handoff_to_messages
 
 logger = logging.getLogger("openalph.subagent")
+
+# im7t.83: per-run poke slot for the sub streaming wrapper. Set by
+# run_subagent to a no-op-safe callable that resets the PARENT's stall
+# watchdog; read per stream event by complete(). ContextVar => per-task
+# isolation (concurrent background subs never see each other's poke).
+_SUB_PROGRESS_POKE: contextvars.ContextVar = contextvars.ContextVar(
+    "sub_progress_poke", default=None)
+
+
+async def _sub_reset_nop(_info):
+    """kdsn.345 display-reset seam for sub calls: subs have no room display
+    to reset, so the reset is a no-op — its PRESENCE is what arms the
+    provider-level midstream retry."""
+    return None
+
+
+async def complete(*, config, system, messages, tools, max_tokens, thinking,
+                   metrics_labels=None, **_ignored):
+    """im7t.83: sub LLM entry — STREAMS.
+
+    Replaces the direct provider.complete() binding at the SAME module-level
+    name and call shape, so the sub loop's call sites and every test patching
+    'openalph.tools.subagent.complete' keep working unchanged. Streams because
+    Synthetic Infinite Mode (workspace-im7t.80-.82) requires stream:true;
+    collects the done-event Response; arms the kdsn.345 midstream retry via
+    _sub_reset_nop; pokes the parent stall watchdog once per stream event via
+    _SUB_PROGRESS_POKE (raw reset — deliberately NOT _milestone, whose
+    documented contract is completions/tool-iterations). Raises ProviderError
+    if the stream ends without a done event (the sub loop's existing failure
+    handling keys on it).
+    """
+    poke = _SUB_PROGRESS_POKE.get()
+    final = None
+    async for evt in _provider_stream(
+        config=config, system=system, messages=messages, tools=tools,
+        max_tokens=max_tokens, thinking=thinking,
+        metrics_labels=metrics_labels,
+        on_stream_reset=_sub_reset_nop,
+    ):
+        if callable(poke):
+            try:
+                _res = poke()
+                if asyncio.iscoroutine(_res):
+                    _res.close()
+            except Exception:
+                logger.debug("subagent stream poke raised (ignored)", exc_info=True)
+        if evt.type == "done":
+            final = evt.response
+    if final is None:
+        raise ProviderError("sub stream ended without a done event")
+    return final
 
 # BUG-3: the schema, config default and docstring all say 100, but the real
 # fallback used to be this module constant at 200 -- double the documented cap
@@ -502,6 +555,21 @@ async def run_subagent(
     # or the returned ToolResult, and a raising/missing hook (headless + CLI
     # callers have none) must never turn a good sub run into an error.
     _progress_cb = (callbacks or {}).get("turn_progress")
+
+    def _stream_poke():
+        # im7t.83: raw watchdog reset per stream event — deliberately not
+        # _milestone (its contract is completions/iterations). Same
+        # coroutine-closing safety as _milestone.
+        if not callable(_progress_cb):
+            return
+        try:
+            _res = _progress_cb()
+            if asyncio.iscoroutine(_res):
+                _res.close()
+        except Exception:
+            logger.debug("subagent stream poke hook raised (ignored)", exc_info=True)
+
+    _poke_token = _SUB_PROGRESS_POKE.set(_stream_poke)
 
     def _milestone(what: str) -> None:
         if not callable(_progress_cb):
@@ -1008,3 +1076,7 @@ async def run_subagent(
         # before returning (same key, same frozen counter values), so the
         # sync result stays byte-identical.
         _write_subagent_bridge()
+        # im7t.83: clear the sub streaming poke slot on ALL exits (this
+        # top-level finally is the guaranteed path — it also runs on
+        # CancelledError, which the `except Exception` above does not catch).
+        _SUB_PROGRESS_POKE.reset(_poke_token)

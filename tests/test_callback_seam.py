@@ -102,6 +102,9 @@ _EXPECTED_CALLBACK_KEYS = frozenset({
     "subagent_results",
     "heartbeat",
     "umbral",
+    # im7t.83: no-op midstream-retry arming seam (bead amends the
+    # wire format by design).
+    "on_stream_reset",
     # context-GC (workspace-kdsn.305): boundary application + project declaration
     "apply_handoff_boundary",
     "set_active_project",
@@ -146,7 +149,7 @@ class TestCallbacksDictKeys:
         """kdsn.290: wire format grew 15 → 17 with the raw timer managers."""
         bot = _make_bot()
         cb = bot._build_agent_callbacks("!room:server", None)
-        assert len(cb) == 20  # kdsn.330: +subagent_terminal_notify
+        assert len(cb) == 21  # kdsn.330: +subagent_terminal_notify; im7t.83: +on_stream_reset
 
     def test_manager_keys_carry_bot_managers(self):
         """kdsn.290: callbacks["heartbeat"]/["umbral"] forward bot.heartbeat /

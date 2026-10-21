@@ -545,10 +545,12 @@ def build_callbacks(
 
     Agent-state callbacks read directly from *agent*.  Side-effect callbacks
     delegate to *sinks* (a CommsSinks implementation).  Returns a dict with
-    the 17 keys the tools layer expects — plus an 18th, `log_spotter_flag`,
-    when the owning agent carries a real SpotterManager (Spotter v1, design
-    §9: the delivery-time I1 JSONL seam). Agents without a wired spotter
-    (pre-Spotter / transport-less) keep the historical 17-key wire format.
+    the 18 keys the tools layer expects (im7t.83 adds the no-op
+    `on_stream_reset` default, arming the kdsn.345 midstream retry on
+    headless/CLI paths) — plus a 19th, `log_spotter_flag`, when the owning
+    agent carries a real SpotterManager (Spotter v1, design §9: the
+    delivery-time I1 JSONL seam). Agents without a wired spotter
+    (pre-Spotter / transport-less) keep the 18-key wire format.
     """
 
     async def _context_status_callback():
@@ -610,6 +612,12 @@ def build_callbacks(
         except AttributeError:
             pass
 
+    async def _stream_reset_nop(_info):
+        # im7t.83: headless/CLI paths arm the kdsn.345 midstream retry via a
+        # no-op reset (no display state to restore). matrix.py overrides this
+        # key with the real StreamingDelivery reset seam by assignment.
+        return None
+
     _callbacks = {
         "send_media": _send_media_callback,
         "on_redaction": _redaction_callback,
@@ -631,6 +639,10 @@ def build_callbacks(
         # them via callbacks["heartbeat"] / callbacks["umbral"].
         "heartbeat": heartbeat,
         "umbral": umbral,
+        # im7t.83: no-op default so sub/CLI paths arm the kdsn.345
+        # midstream retry; matrix.py replaces it with the real display
+        # reset seam by assignment.
+        "on_stream_reset": _stream_reset_nop,
     }
 
     # 18th key — Spotter v1 delivery-time JSONL seam (design §9). Conditional
