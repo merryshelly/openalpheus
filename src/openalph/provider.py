@@ -504,6 +504,16 @@ _MODEL_CAPABILITIES: list[tuple[str, int | None, int | None, bool]] = [
     # Fireworks for the same weights (Kimi-K3: 512K vs 1M). These rows must sit
     # BEFORE the generic rows below: first-match-wins, and "hf:moonshotai/
     # kimi-k3" contains the generic fragment "kimi-k3".
+    # hf:moonshotai/Kimi-K3.1-Pro (onboarded 2026-11-04, wire-probed on
+    # BOTH Synthetic accounts, tmp/k31-probe/): served at 524288 like K3
+    # (vendor /models; the 1M card window is vendor-platform, not served).
+    # Vision REAL (256x256 solid-red PNG: prompt_tokens 208 vs 99 text-only
+    # baseline, answered "Red"; baseline "Unknown" — acct1+acct2), unlike the
+    # kdsn.351 metadata-lie class. Over-cap max_tokens (70000 vs card
+    # max_output_length 65536) tolerated -> output cap None (glm-5.3 class).
+    # MUST sit BEFORE the kimi-k3 row: "hf:moonshotai/kimi-k3" is a substring
+    # of this fragment and first-match-wins.
+    ("hf:moonshotai/kimi-k3.1-pro",      524288, None, True),
     ("hf:moonshotai/kimi-k3",            524288, None, True),
     # workspace-kdsn.351 (2026-09-20): vision FALSE despite Synthetic's catalog
     # claiming input_modalities=["text","image"] — the SERVED deployment
@@ -703,6 +713,24 @@ _SYNTHETIC_EFFORT_OVERRIDES: list[tuple[str, dict[str, str]]] = [
         "off": "high",
         "low": "high",
         "medium": "high",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+    }),
+    # hf:moonshotai/Kimi-K3.1-Pro (wire-probed 2026-11-04, BOTH accounts,
+    # tmp/k31-probe/): vendor /models declares efforts low/high/max, but ALL
+    # SIX OA levels return 200 and terminate normally on a trivial prompt
+    # (reasoning tokens acct1 none/low/med/high/xhigh/max = 6/10/14/24/30/13;
+    # acct2 10/11/27/24/25/34). "none" is SANE here (UNLIKE glm-5.3
+    # non-flash's pathological empty-content budget burn) — tiny token count,
+    # clean stop, correct content. xhigh passed 1:1 per the glm-5.3-flash
+    # convention: accepted at the wire, but do NOT cite xhigh as a distinct
+    # tier above high — differentiation is non-monotonic at single-sample
+    # scale (acct1 max 13 < xhigh 30). All levels 1:1.
+    ("hf:moonshotai/kimi-k3.1-pro", {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
         "high": "high",
         "xhigh": "xhigh",
         "max": "max",
@@ -932,6 +960,11 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     # substring-match the Fireworks "glm-5p2" fragment (dot vs p), so synthetic
     # IDs need their own explicit pins — the kdsn.241.3 no-penalty invariant
     # must not depend on default-profile accident.
+    # Kimi-K3.1-Pro on Synthetic (2026-11-04): Kimi family no-penalty
+    # invariant (kdsn.241.3 lineage) — penalties omitted, temp/top_p left to
+    # served defaults, mirroring the K3 row. MUST sit BEFORE the kimi-k3 row
+    # (substring; first-match-wins).
+    ("hf:moonshotai/kimi-k3.1-pro", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("hf:moonshotai/kimi-k3", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("hf:zai-org/glm-5.3-flash", SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     # hf:zai-org/glm-5.3 non-flash (kdsn.362, 2026-10-13): same kdsn.241.3
