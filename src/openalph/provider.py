@@ -2518,6 +2518,111 @@ def _midstream_retry_due(on_stream_reset, attempt, provider_cfg) -> bool:
     )
 
 
+# kdsn.368 — OpenAI SDK 2.26.0 raises BASE openai.APIError when a 200 SSE
+# response carries a top-level {"error": ...} object (exc.body = the error
+# value itself: a mapping or a string). The diagnostic for that path is
+# structured, whitelisted, and bounded — never a raw dump: unknown body
+# branches, request content, and request/response headers must never reach
+# journald. Strings are credential-redacted BEFORE truncation (a truncated
+# live secret escaping a cut is worse than a split redaction marker) and
+# bounded head+tail so a trailing error detail survives a giant prefix.
+_SSE_BODY_DIAG_FIELDS = ("code", "message", "type", "param", "request_id", "id")
+_DIAG_TEXT_CAP = 1000
+
+
+def _diag_redact(text: str) -> str:
+    """Redact credential-shaped content (kdsn.368 diagnostics).
+
+    Reuses the tooling security primitives; the local import keeps provider
+    import coupling minimal. The _API_KEY_PATTERN pass is a backstop for
+    short sk- keys the structured pattern list may not recognise.
+    """
+    from openalph.tools.security import redact_credentials
+    redacted = redact_credentials(text)[0]
+    return _API_KEY_PATTERN.sub("[REDACTED]", redacted)
+
+
+def _diag_bound(text: str, cap: int = _DIAG_TEXT_CAP) -> str:
+    """Credential-redact, then bound a diagnostic string to ~cap chars.
+
+    Head+tail bounding: a head-only cut of a giant prefix would discard the
+    actually-useful trailing error detail (and the control characters the
+    JSON layer escapes). Redaction runs FIRST so truncation can never move
+    a live secret outside a redaction marker — the worst case is a split
+    marker, which carries no secret.
+    """
+    redacted = _diag_redact(text)
+    if len(redacted) <= cap:
+        return redacted
+    head, tail = cap * 4 // 5, cap // 5
+    return f"{redacted[:head]}...[truncated {len(redacted) - cap} char(s)]...{redacted[-tail:]}"
+
+
+def _openai_stream_api_error_record(e: openai.APIError, stream_count: int) -> dict:
+    """Build the single structured WARNING record for a raw streaming
+    APIError (kdsn.368).
+
+    Only whitelisted scalar body fields are surfaced; unknown, nested, or
+    non-scalar body shapes are recorded as a type + omission flag, never as
+    values. The request ID comes from the exception (when a subclass or
+    caller exposes one) or the whitelisted body field — never from request
+    headers.
+    """
+    body = e.body
+    record: dict = {
+        "exception": type(e).__name__,
+        "stream": f"after {stream_count} chunk(s)",
+        "body_type": type(body).__name__,
+        "request_id": getattr(e, "request_id", None),
+    }
+    if isinstance(body, dict):
+        surfaced = 0
+        for field in _SSE_BODY_DIAG_FIELDS:
+            value = body.get(field)
+            if isinstance(value, str) and value:
+                record[field] = _diag_bound(value)
+                surfaced += 1
+            elif isinstance(value, (int, float, bool)):
+                record[field] = value
+                surfaced += 1
+        if surfaced == 0:
+            record["body_omitted"] = True
+    elif isinstance(body, str) and body.strip():
+        record["body"] = _diag_bound(body)
+    else:
+        # None, list, or another unexpected body shape: type + omission only.
+        record["body_omitted"] = True
+    # An exception-level request_id (APIStatusError subclasses expose one; a
+    # caller may set it on a base APIError) wins over the body's.
+    if getattr(e, "request_id", None):
+        record["request_id"] = e.request_id
+    return record
+
+
+def _openai_stream_api_error_message(e: openai.APIError) -> str:
+    """User-surfaceable SINGLE-LINE message for a raw streaming APIError
+    (kdsn.368).
+
+    Prefers real upstream text — the mapping body's message, or the body
+    string itself when the SDK fell back to its generic streaming message —
+    then bounds, redacts, and flattens it. Unsupported bodies get a concise
+    generic line. Never infers an HTTP status from SSE error fields
+    (status_code stays None).
+    """
+    generic = "Provider stream error: upstream reported an error without details"
+    body = e.body
+    if isinstance(body, dict):
+        text = body.get("message")
+    elif isinstance(body, str):
+        text = body
+    else:
+        return generic
+    if not (isinstance(text, str) and text.strip()):
+        return generic
+    single_line = re.sub(r"[\x00-\x1f\x7f]+", " ", _diag_bound(text)).strip()
+    return f"Provider stream error: {single_line}" if single_line else generic
+
+
 async def stream(
     config: AgentConfig,
     system: str,
@@ -2990,6 +3095,21 @@ async def stream(
                 raise ProviderError("Provider request timed out") from e
             except openai.APIConnectionError as e:
                 raise ProviderError("Provider unreachable — connection failed") from e
+            except openai.APIError as e:
+                # kdsn.368: BASE openai.APIError — OpenAI SDK 2.26.0 raises it
+                # from the SSE parser when a 200 response carries a top-level
+                # {"error": ...} object (body = the error value; the legacy
+                # APIStatusError/APITimeoutError/APIConnectionError catches
+                # above are untouched). Diagnostics + wrap ONLY — never a
+                # retry: exactly one request was issued, so the kdsn.345
+                # epilogue below stays unreachable and on_stream_reset is
+                # never fired from this path.
+                record = _openai_stream_api_error_record(e, _stream_count)
+                logger.warning(
+                    "openai stream APIError %s: %s",
+                    record["stream"], json.dumps(record, ensure_ascii=True),
+                )
+                raise ProviderError(_openai_stream_api_error_message(e)) from e
             except httpx.TimeoutException as e:
                 if _stream_count == 0:
                     raise ProviderError("Provider timed out before streaming any data") from e
