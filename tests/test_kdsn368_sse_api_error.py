@@ -235,6 +235,21 @@ async def test_unsupported_body_shapes_fail_closed(caplog, body):
 
 
 @pytest.mark.asyncio
+async def test_nonstring_message_shape_is_explicit_without_contents(caplog):
+    """A non-string message is represented by type, not mistaken for absent."""
+    caplog.set_level(logging.WARNING, logger="openalph.provider")
+    error = direct_error({"code": "worker_down", "message": {"prompt": PRIVATE_PROMPT}})
+    wrapped, _, _ = await consume_direct_error(error)
+
+    assert str(wrapped) == GENERIC
+    _, record = api_record(caplog)
+    assert record["code"] == "worker_down"
+    assert record["message_nonstring"] == "dict"
+    assert "message_present" not in record
+    assert_canaries_absent(caplog.text, str(wrapped))
+
+
+@pytest.mark.asyncio
 async def test_long_unicode_body_bounded_and_generic_surface_is_single_line(caplog):
     """Huge prose + Unicode separators cannot flood logs or forge room lines."""
     caplog.set_level(logging.WARNING, logger="openalph.provider")
@@ -316,6 +331,7 @@ async def test_safe_numeric_metadata_is_retained(caplog):
     assert record["code"] == 529
     assert record["id"] == 123456789
     assert str(wrapped) == GENERIC
+    assert wrapped.status_code is None, "never infer HTTP status from SSE code"
 
 
 @pytest.mark.asyncio
@@ -342,8 +358,25 @@ async def test_serializer_failure_still_raises_provider_error(caplog):
 
     assert str(wrapped) == GENERIC
     assert wrapped.__cause__ is error
-    assert "diagnostic serialization failed" in caplog.text
+    assert "diagnostic capture failed" in caplog.text
     assert "forced serialization failure" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_record_builder_failure_still_raises_provider_error(caplog):
+    """The fail-safe covers record construction, not only JSON serialization."""
+    caplog.set_level(logging.WARNING, logger="openalph.provider")
+    error = direct_error({"code": "worker_down"})
+    with patch(
+        "openalph.provider._openai_stream_api_error_record",
+        side_effect=RuntimeError(PRIVATE_DEBUG_VALUE),
+    ):
+        wrapped, _, _ = await consume_direct_error(error)
+
+    assert str(wrapped) == GENERIC
+    assert wrapped.__cause__ is error
+    assert "diagnostic capture failed (RuntimeError)" in caplog.text
+    assert_canaries_absent(caplog.text, str(wrapped))
 
 
 @pytest.mark.asyncio

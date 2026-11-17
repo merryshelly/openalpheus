@@ -35,6 +35,7 @@ class ProviderError(Exception):
         super().__init__(message)
         self.status_code = status_code
 
+
 class ProviderUnavailableError(ProviderError):
     """Raised (pre-network) when a model resolves to a provider that was not
     loaded at startup — it was skipped-with-reason during config load, or was
@@ -2635,6 +2636,11 @@ def _openai_stream_api_error_record(e: openai.APIError, stream_count: int) -> di
             record["message_present"] = True
             record["message_chars"] = len(message)
             retained = True
+        elif message is not None:
+            # Distinguish an omitted non-string message from no message at
+            # all; retain only the local type name, never its contents.
+            record["message_nonstring"] = type(message).__name__
+            retained = True
     elif isinstance(body, str):
         # Same contract for a bare string error body: presence + length only.
         record["body_present"] = True
@@ -3139,17 +3145,17 @@ async def stream(
                 # echo prompts/credentials and must never cross it); the
                 # original exception rides as __cause__ and no HTTP status is
                 # inferred from SSE error fields (status_code stays None).
-                record = _openai_stream_api_error_record(e, _stream_count)
                 try:
+                    record = _openai_stream_api_error_record(e, _stream_count)
                     payload = json.dumps(record, ensure_ascii=True, allow_nan=False)
-                except (TypeError, ValueError) as exc:
-                    # Final fail-safe: a record-serialization failure must
-                    # never escape as a replacement exception. Log ONLY a
-                    # bounded notice (exception type — never its message or
-                    # repr) and still raise the generic ProviderError from
-                    # the original APIError.
+                except Exception as exc:
+                    # Final fail-safe: a record-construction/serialization
+                    # failure must never escape as a replacement exception.
+                    # Log ONLY a bounded type name (never its message/repr or
+                    # traceback) and still raise from the original APIError.
+                    # BaseException — including CancelledError — is untouched.
                     logger.warning(
-                        "kdsn.368 diagnostic serialization failed (%s)",
+                        "kdsn.368 diagnostic capture failed (%s)",
                         type(exc).__name__,
                     )
                 else:
