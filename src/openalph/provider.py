@@ -9,6 +9,7 @@ import asyncio
 import copy
 import hashlib
 import logging
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import AsyncGenerator
@@ -33,7 +34,6 @@ class ProviderError(Exception):
     def __init__(self, message: str, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
-
 
 class ProviderUnavailableError(ProviderError):
     """Raised (pre-network) when a model resolves to a provider that was not
@@ -2520,107 +2520,138 @@ def _midstream_retry_due(on_stream_reset, attempt, provider_cfg) -> bool:
 
 # kdsn.368 — OpenAI SDK 2.26.0 raises BASE openai.APIError when a 200 SSE
 # response carries a top-level {"error": ...} object (exc.body = the error
-# value itself: a mapping or a string). The diagnostic for that path is
-# structured, whitelisted, and bounded — never a raw dump: unknown body
-# branches, request content, and request/response headers must never reach
-# journald. Strings are credential-redacted BEFORE truncation (a truncated
-# live secret escaping a cut is worse than a split redaction marker) and
-# bounded head+tail so a trailing error detail survives a giant prefix.
-_SSE_BODY_DIAG_FIELDS = ("code", "message", "type", "param", "request_id", "id")
-_DIAG_TEXT_CAP = 1000
+# value itself: a mapping or a string). Trust contract is FAIL-CLOSED:
+# free-form upstream prose (a mapping "message", a bare string body, any
+# repr) can echo prompts or carry unrecognized credentials, so it is NEVER
+# placed in journald or ProviderError — not even redacted, truncated, or
+# digested. The diagnostic is a STRUCTURED PROJECTION: only conservatively
+# validated scalar code/type/param/request_id/id metadata is retained
+# verbatim; free-form fields are represented by presence + character count
+# only. Request content and request/response headers are never read.
+_GENERIC_STREAM_ERROR = (
+    "Provider stream error: upstream returned an error (diagnostics logged)"
+)
+# Metadata identifiers must be bounded, format-valid, and conservative:
+# no whitespace, no control or Unicode line-separator characters, no
+# free-form punctuation. Anything else is dropped, never coerced or
+# truncated into a partial value.
+_DIAG_ID_PATTERN = re.compile(r"[A-Za-z0-9._:\-]{1,128}")
+# Huge integers are dropped WITHOUT stringifying (a 5000-digit int must
+# never be repr'd into a log record); floats must be finite (NaN/Infinity
+# are not valid JSON).
+_DIAG_INT_LIMIT = 2 ** 63
 
 
-def _diag_redact(text: str) -> str:
-    """Redact credential-shaped content (kdsn.368 diagnostics).
+def _diag_identifier_is_safe(value: str) -> bool:
+    """Side-effect-free credential-shape check over an ALREADY BOUNDED
+    identifier (kdsn.368).
 
-    Reuses the tooling security primitives; the local import keeps provider
-    import coupling minimal. The _API_KEY_PATTERN pass is a backstop for
-    short sk- keys the structured pattern list may not recognise.
+    Deliberately does NOT use the event-logging redact_credentials(): that
+    emits one WARNING per match (log flood on hostile bodies) and is meant
+    for prose we never log anyway. The local import keeps provider coupling
+    minimal; _API_KEY_PATTERN is a backstop for short sk- keys the shared
+    pattern list may not recognise.
     """
-    from openalph.tools.security import redact_credentials
-    redacted = redact_credentials(text)[0]
-    return _API_KEY_PATTERN.sub("[REDACTED]", redacted)
+    from openalph.tools.security import CREDENTIAL_PATTERNS
+    if _API_KEY_PATTERN.search(value):
+        return False
+    return not any(
+        pattern["pattern"].search(value) for pattern in CREDENTIAL_PATTERNS
+    )
 
 
-def _diag_bound(text: str, cap: int = _DIAG_TEXT_CAP) -> str:
-    """Credential-redact, then bound a diagnostic string to ~cap chars.
+def _diag_safe_identifier(value) -> str | None:
+    """Return ``value`` only if it is a bounded, format-valid metadata
+    identifier that is not credential-shaped; otherwise None (kdsn.368).
 
-    Head+tail bounding: a head-only cut of a giant prefix would discard the
-    actually-useful trailing error detail (and the control characters the
-    JSON layer escapes). Redaction runs FIRST so truncation can never move
-    a live secret outside a redaction marker — the worst case is a split
-    marker, which carries no secret.
+    Fail-closed: unsupported, oversized, whitespace/control-bearing, or
+    credential-shaped values are DROPPED — never coerced, repr'd, or
+    truncated into a partial value.
     """
-    redacted = _diag_redact(text)
-    if len(redacted) <= cap:
-        return redacted
-    head, tail = cap * 4 // 5, cap // 5
-    return f"{redacted[:head]}...[truncated {len(redacted) - cap} char(s)]...{redacted[-tail:]}"
+    if not isinstance(value, str) or not _DIAG_ID_PATTERN.fullmatch(value):
+        return None
+    if not _diag_identifier_is_safe(value):
+        return None
+    return value
+
+
+def _diag_safe_number(value):
+    """Return ``value`` only if it is a JSON-safe finite number within a
+    sane magnitude; otherwise None (kdsn.368).
+
+    Huge ints are dropped WITHOUT stringifying; NaN/±Infinity are dropped
+    so the record is always strict-JSON parseable.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value if -_DIAG_INT_LIMIT < value < _DIAG_INT_LIMIT else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return None
 
 
 def _openai_stream_api_error_record(e: openai.APIError, stream_count: int) -> dict:
     """Build the single structured WARNING record for a raw streaming
     APIError (kdsn.368).
 
-    Only whitelisted scalar body fields are surfaced; unknown, nested, or
-    non-scalar body shapes are recorded as a type + omission flag, never as
-    values. The request ID comes from the exception (when a subclass or
-    caller exposes one) or the whitelisted body field — never from request
-    headers.
+    Structured projection, fail-closed: only conservatively validated scalar
+    ``code``/``type``/``param``/``request_id``/``id`` values are retained
+    verbatim; the free-form mapping ``message`` and bare string bodies are
+    represented by presence + character count ONLY (never content, never a
+    digest). Unsupported body shapes (None, list, nested mappings) or a
+    mapping whose every field fails validation record a type + omission
+    flag. The request ID comes from the exception attribute (when a
+    subclass or caller exposes one) or the whitelisted body field, through
+    the same fail-closed validator — never from request/response headers.
     """
     body = e.body
     record: dict = {
         "exception": type(e).__name__,
         "stream": f"after {stream_count} chunk(s)",
         "body_type": type(body).__name__,
-        "request_id": getattr(e, "request_id", None),
+        "request_id": None,
     }
+    retained = False
     if isinstance(body, dict):
-        surfaced = 0
-        for field in _SSE_BODY_DIAG_FIELDS:
+        for field in ("code", "type", "param", "id"):
             value = body.get(field)
-            if isinstance(value, str) and value:
-                record[field] = _diag_bound(value)
-                surfaced += 1
-            elif isinstance(value, (int, float, bool)):
-                record[field] = value
-                surfaced += 1
-        if surfaced == 0:
-            record["body_omitted"] = True
-    elif isinstance(body, str) and body.strip():
-        record["body"] = _diag_bound(body)
-    else:
-        # None, list, or another unexpected body shape: type + omission only.
-        record["body_omitted"] = True
-    # An exception-level request_id (APIStatusError subclasses expose one; a
-    # caller may set it on a base APIError) wins over the body's.
-    if getattr(e, "request_id", None):
-        record["request_id"] = e.request_id
-    return record
-
-
-def _openai_stream_api_error_message(e: openai.APIError) -> str:
-    """User-surfaceable SINGLE-LINE message for a raw streaming APIError
-    (kdsn.368).
-
-    Prefers real upstream text — the mapping body's message, or the body
-    string itself when the SDK fell back to its generic streaming message —
-    then bounds, redacts, and flattens it. Unsupported bodies get a concise
-    generic line. Never infers an HTTP status from SSE error fields
-    (status_code stays None).
-    """
-    generic = "Provider stream error: upstream reported an error without details"
-    body = e.body
-    if isinstance(body, dict):
-        text = body.get("message")
+            if isinstance(value, str):
+                safe = _diag_safe_identifier(value)
+            else:
+                safe = _diag_safe_number(value)
+            if safe is not None:
+                record[field] = safe
+                retained = True
+        request_id = _diag_safe_identifier(body.get("request_id"))
+        if request_id is not None:
+            record["request_id"] = request_id
+            retained = True
+        message = body.get("message")
+        if isinstance(message, str):
+            # Presence + length only: the prose itself — which may echo
+            # prompts or carry unrecognized credentials — is never logged,
+            # not even redacted or digested.
+            record["message_present"] = True
+            record["message_chars"] = len(message)
+            retained = True
     elif isinstance(body, str):
-        text = body
-    else:
-        return generic
-    if not (isinstance(text, str) and text.strip()):
-        return generic
-    single_line = re.sub(r"[\x00-\x1f\x7f]+", " ", _diag_bound(text)).strip()
-    return f"Provider stream error: {single_line}" if single_line else generic
+        # Same contract for a bare string error body: presence + length only.
+        record["body_present"] = True
+        record["body_chars"] = len(body)
+        retained = True
+    # An exception-level request_id (APIStatusError subclasses expose one; a
+    # caller may set it on a base APIError) wins over the body's — but only
+    # through the same fail-closed validator.
+    attr_request_id = _diag_safe_identifier(getattr(e, "request_id", None))
+    if attr_request_id is not None:
+        record["request_id"] = attr_request_id
+        retained = True
+    if not retained:
+        # None/list/nested-map bodies, or a mapping whose every field failed
+        # validation: type + omission flag only.
+        record["body_omitted"] = True
+    return record
 
 
 async def stream(
@@ -3100,16 +3131,32 @@ async def stream(
                 # from the SSE parser when a 200 response carries a top-level
                 # {"error": ...} object (body = the error value; the legacy
                 # APIStatusError/APITimeoutError/APIConnectionError catches
-                # above are untouched). Diagnostics + wrap ONLY — never a
-                # retry: exactly one request was issued, so the kdsn.345
-                # epilogue below stays unreachable and on_stream_reset is
-                # never fired from this path.
+                # above are untouched). Structured-projection diagnostics +
+                # generic wrap ONLY — never a retry: exactly one request was
+                # issued, so the kdsn.345 epilogue below stays unreachable and
+                # on_stream_reset is never fired from this path. The room
+                # surface is a fixed generic single line (upstream prose can
+                # echo prompts/credentials and must never cross it); the
+                # original exception rides as __cause__ and no HTTP status is
+                # inferred from SSE error fields (status_code stays None).
                 record = _openai_stream_api_error_record(e, _stream_count)
-                logger.warning(
-                    "openai stream APIError %s: %s",
-                    record["stream"], json.dumps(record, ensure_ascii=True),
-                )
-                raise ProviderError(_openai_stream_api_error_message(e)) from e
+                try:
+                    payload = json.dumps(record, ensure_ascii=True, allow_nan=False)
+                except (TypeError, ValueError) as exc:
+                    # Final fail-safe: a record-serialization failure must
+                    # never escape as a replacement exception. Log ONLY a
+                    # bounded notice (exception type — never its message or
+                    # repr) and still raise the generic ProviderError from
+                    # the original APIError.
+                    logger.warning(
+                        "kdsn.368 diagnostic serialization failed (%s)",
+                        type(exc).__name__,
+                    )
+                else:
+                    logger.warning(
+                        "openai stream APIError %s: %s", record["stream"], payload
+                    )
+                raise ProviderError(_GENERIC_STREAM_ERROR) from e
             except httpx.TimeoutException as e:
                 if _stream_count == 0:
                     raise ProviderError("Provider timed out before streaming any data") from e
