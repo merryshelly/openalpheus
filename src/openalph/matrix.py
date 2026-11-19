@@ -2654,6 +2654,39 @@ class MatrixBot:
             logger.exception("Heartbeat processing error in %s", room_id)
             await self.send(room_id, "⚠️ Heartbeat error — check agent logs for details.")
 
+    async def _umbral_failure_stop(self, room_id: str) -> str:
+        """Best-effort umbral stop after an archive/wipe/reseed failure.
+
+        kdsn.370 pass-2: umbral.stop() removes the in-memory timer state and
+        then persists the timer table; the same disk condition that caused
+        the failure can make that persist raise. Catch the stop OSError
+        SEPARATELY (a stop failure must never suppress the failure alert) and
+        return the truthful alert fragment: "umbral stopped" only when
+        stop() actually succeeded, an explicit unconfirmed-deactivation note
+        otherwise. The stop failure is logged, not re-raised.
+        """
+        try:
+            await self.umbral.stop(room_id)
+            return "umbral stopped"
+        except OSError as e:
+            logger.critical(
+                "Umbral stop failed for %s: %s — deactivation unconfirmed",
+                room_id, e)
+            return ("umbral deactivation could not be confirmed "
+                    "(in-memory timer stopped; the timer may return after restart)")
+
+    async def _umbral_failure_send(self, room_id: str, message: str) -> None:
+        """Best-effort failure alert; preserve the original logged error."""
+        try:
+            await self.send(room_id, message)
+        except (OSError, RuntimeError) as e:
+            # send/send_notice normalize retry exhaustion to RuntimeError;
+            # neither delivery channel type may mask the primary failure.
+            logger.critical(
+                "Umbral failure alert delivery failed for %s: %s — "
+                "original failure already recorded; alert unavailable",
+                room_id, e, exc_info=True)
+
     async def _inject_umbral(self, room_id: str) -> None:
         """Execute an umbral turn: heartbeat + context rotation."""
         _d = self.umbral.directive_for(room_id) if self.umbral else None
@@ -2689,6 +2722,17 @@ class MatrixBot:
             await self.send(room_id, "⚠️ Umbral turn error — check agent logs. Archiving context.")
 
         # Archive + wipe regardless of turn success (failed turns still consume context)
+        # kdsn.370 pass-2 phase discriminator: _phase names the durable step
+        # that last SUCCEEDED (archive -> archive_done -> wipe_done ->
+        # reseed_done -> reset_done). The OSError handler below dispatches
+        # solely on it, so a failure is reported according to the step that
+        # raised it — archive failure (session preserved, never wiped),
+        # wipe failure after a completed archive (active session on-disk
+        # state uncertain), reseed append failure after archive+wipe
+        # (rotation incomplete), or in-memory reset failure after a durable
+        # reseed — never as a generic "nothing to rotate". No extra
+        # transaction machinery.
+        _phase = "archive"
         try:
             # kdsn.330 R13/D6: pre-archive truthfulness — the archive must
             # carry the FULL dispatch lifecycle, so BEFORE archive():
@@ -2761,8 +2805,50 @@ class MatrixBot:
                 # see the add above).
                 if _umbral_owned_mark:
                     self._active_turns.discard(room_id)
+            # kdsn.370: snapshot the room's EXPLICIT effective per-room
+            # overrides from CURRENT in-memory state — after the turn and
+            # the pre-archive dispatch work, BEFORE archive+wipe. These are
+            # the authoritative values to reseed into the wiped JSONL;
+            # they are never re-read from the pre-wipe file (the wipe
+            # removes it). Presence semantics throughout: a key's existence
+            # is a deliberate operator choice even when the value equals
+            # the config default, so membership guards (never dict.get)
+            # decide. getattr(..., {}) keeps MagicMock agents
+            # (integration-style bots) safely override-free — a MagicMock
+            # .get() would return a truthy Mock, so only `in` is used.
+            _ov_models = getattr(self.agent, "_room_models", {})
+            _ov_effort = getattr(self, "_room_effort", {})
+            _ov_cache_ttl = getattr(self, "_room_cache_ttl", {})
+            _ov_timesense = getattr(self, "_room_timesense", {})
+            _ov_quiet = getattr(self.agent, "_room_quiet", {})
+            _reseed_overrides = []
+            if room_id in _ov_models:
+                # Raw value even when it equals the config default — never
+                # use get_model() to decide presence (it would fold the
+                # override away into the effective model).
+                _reseed_overrides.append(("model_override", _ov_models[room_id]))
+            if room_id in _ov_effort and _ov_effort[room_id]:
+                # Canonical event name only: a legacy-restored
+                # thinking_override value modernizes to effort_override here
+                # (an explicit 'off' detail is truthy and survives).
+                _reseed_overrides.append(("effort_override", _ov_effort[room_id]))
+            if (room_id in _ov_cache_ttl and _ov_cache_ttl[room_id]
+                    and _ov_cache_ttl[room_id] != "1h"):
+                # Never reseed the default TTL.
+                _reseed_overrides.append(
+                    ("cache_ttl_override", _ov_cache_ttl[room_id]))
+            if room_id in _ov_timesense and _ov_timesense[room_id]:
+                # Effectively true -> "on"; off/absent stay omitted.
+                _reseed_overrides.append(("timesense_override", "on"))
+            if room_id in _ov_quiet:
+                # Key membership, not truthiness: an explicit quiet-off is
+                # a deliberate override and must survive rotation.
+                _reseed_overrides.append(
+                    ("quiet_override", "on" if _ov_quiet[room_id] else "off"))
             archive_name = self.session_log.archive(room_id)
+            _phase = "archive_done"
             self.session_log.wipe(room_id)
+            _phase = "wipe_done"
             self.session_log.append(
                 role="system",
                 sender=self.config.user_id,
@@ -2771,7 +2857,24 @@ class MatrixBot:
                 event="umbral_reset",
                 detail=f"Context reset. Previous session archived to sessions/{archive_name}",
             )
+            # kdsn.370: reseed the explicit effective overrides AFTER the
+            # umbral_reset breadcrumb (which stays FIRST) so the next
+            # fresh-process activation restores them. The file was just
+            # wiped, so exactly one current entry per explicit kind exists
+            # after each rotation; repeated cycles are last-wins with no
+            # duplicates (the superseded entries live in the archives).
+            for _override_event, _override_detail in _reseed_overrides:
+                self.session_log.append(
+                    role="system",
+                    sender=self.config.user_id,
+                    room=room_id,
+                    event_id=None,
+                    event=_override_event,
+                    detail=_override_detail,
+                )
+            _phase = "reseed_done"
             self.agent.reset_room(room_id)
+            _phase = "reset_done"
             # Clear todo state for this room (session-scoped; umbral = new session)
             try:
                 from openalph.tools import _TODO_STATE
@@ -2779,23 +2882,111 @@ class MatrixBot:
             except Exception:
                 pass
             self._active_rooms.discard(room_id)
-            await self.send_notice(
-                room_id,
-                "🌑 Umbral turn concluded — context reset. "
-                "Agent will not remember session history above this point.",
-            )
-        except FileNotFoundError:
-            logger.warning("Umbral archive: no session file for %s — nothing to rotate", room_id)
-            await self.send_notice(room_id, "🌑 Umbral turn concluded (no session to archive)")
+            # kdsn.370 pass-2: the rotation is already DURABLE here
+            # (archive+wipe+reseed+reset all succeeded) — the completion
+            # notice is best-effort. Its failure must NOT stop umbral or
+            # claim the rotation/reseed failed; log it and return normally.
+            try:
+                await self.send_notice(
+                    room_id,
+                    "🌑 Umbral turn concluded — context reset. "
+                    "Agent will not remember session history above this point.",
+                )
+            except (OSError, RuntimeError) as e:
+                logger.warning(
+                    "Umbral completion notice failed for %s: %s — "
+                    "rotation already complete", room_id, e)
         except OSError as e:
-            # Archive failed — DO NOT wipe. Stop umbral. Alert operator.
-            logger.critical("Umbral archive failed for %s: %s — NOT wiping, stopping umbral", room_id, e)
-            await self.umbral.stop(room_id)
-            await self.send(
-                room_id,
-                f"🚨 **Umbral archive failed** — session preserved, umbral stopped. "
-                f"Manual intervention required. Error: {e}",
-            )
+            # kdsn.370 pass-2: failure handling is phase-scoped via the
+            # _phase discriminator above — each failure is reported
+            # according to the durable step that raised it. The legacy
+            # no-session FileNotFoundError branch is valid ONLY before
+            # archive() succeeded; post-archive FileNotFoundError is an
+            # OSError like any other and is dispatched here too.
+            if _phase == "archive":
+                if isinstance(e, FileNotFoundError):
+                    logger.warning("Umbral archive: no session file for %s — nothing to rotate", room_id)
+                    await self.send_notice(room_id, "🌑 Umbral turn concluded (no session to archive)")
+                else:
+                    # Archive failed — DO NOT wipe. Stop umbral. Alert operator.
+                    # (kdsn.370: pre-archive phase — behavior preserved exactly.)
+                    logger.critical("Umbral archive failed for %s: %s — NOT wiping, stopping umbral", room_id, e)
+                    _stop_msg = await self._umbral_failure_stop(room_id)
+                    await self._umbral_failure_send(
+                        room_id,
+                        f"🚨 **Umbral archive failed** — session preserved, {_stop_msg}. "
+                        f"Manual intervention required. Error: {e}",
+                    )
+            elif _phase == "archive_done":
+                # kdsn.370 pass-2: archive() SUCCEEDED but wipe() raised.
+                # The old context IS in sessions/<archive_name>; the active
+                # file's state is UNKNOWN — a wipe can truncate and then
+                # raise (e.g. a delayed close error), so never claim "not
+                # wiping" or "session preserved". Reset/discard are never
+                # reached. Stop umbral and route the operator to the archive.
+                logger.critical(
+                    "Umbral wipe failed for %s after archive to sessions/%s: %s — stopping umbral",
+                    room_id, archive_name, e)
+                _stop_msg = await self._umbral_failure_stop(room_id)
+                await self._umbral_failure_send(
+                    room_id,
+                    f"🚨 **Umbral wipe failed after archive** — this room's "
+                    f"context was archived to sessions/{archive_name}, but "
+                    f"wiping the active session failed; whether the active "
+                    f"session was actually wiped is uncertain. "
+                    f"{_stop_msg[0].upper()}{_stop_msg[1:]}. "
+                    f"Manual intervention required. Error: {e}",
+                )
+            elif _phase == "wipe_done":
+                # kdsn.370: the archive+wipe SUCCEEDED and a post-wipe
+                # append (umbral_reset breadcrumb or an override reseed)
+                # failed (OSError or FileNotFoundError — same phase either
+                # way). Truthful fail-stop: the old context is already
+                # in the archive and the active file is wiped, so the
+                # session was NOT preserved and nothing was "not wiped" —
+                # the alert says rotation is incomplete instead. Stop the
+                # umbral timer, skip agent.reset_room and the
+                # _active_rooms discard (in-memory settings and history
+                # are kept as-is), and route the operator to the archive.
+                logger.critical(
+                    "Umbral reseed append failed for %s after archive+wipe "
+                    "(archive %s): %s — rotation incomplete, stopping umbral",
+                    room_id, archive_name, e)
+                _stop_msg = await self._umbral_failure_stop(room_id)
+                await self._umbral_failure_send(
+                    room_id,
+                    f"🚨 **Umbral rotation incomplete after archive+wipe** — "
+                    f"this room's context was archived to sessions/{archive_name} "
+                    f"and the active session was wiped, but re-seeding the "
+                    f"post-rotation state failed. "
+                    f"{_stop_msg[0].upper()}{_stop_msg[1:]}; the agent's "
+                    f"current in-memory settings were kept. "
+                    f"Manual intervention required. Error: {e}",
+                )
+            else:
+                # kdsn.370 pass-2: _phase == "reseed_done" — the breadcrumb
+                # and ALL override appends are durable in the wiped file,
+                # but agent.reset_room raised. Report the actual failure
+                # (in-memory reset), not a reseed append failure; reset may
+                # be partial, so do NOT claim in-memory history/settings
+                # are wholly unchanged. Same failure-stop semantics as
+                # above, and the room stays active (discard not reached).
+                logger.critical(
+                    "Umbral in-memory reset failed for %s after archive+wipe "
+                    "(archive %s): %s — stopping umbral",
+                    room_id, archive_name, e)
+                _stop_msg = await self._umbral_failure_stop(room_id)
+                await self._umbral_failure_send(
+                    room_id,
+                    f"🚨 **Umbral in-memory reset failed after "
+                    f"archive+wipe** — this room's context was archived to "
+                    f"sessions/{archive_name} and the active session was "
+                    f"wiped and re-seeded durably, but resetting the "
+                    f"agent's in-memory history for this room failed; "
+                    f"in-memory state may be partially reset or stale. "
+                    f"{_stop_msg[0].upper()}{_stop_msg[1:]}. "
+                    f"Manual intervention required. Error: {e}",
+                )
 
     async def _activate_room(self, room_id: str, room_name: str = "", *,
                              trigger_event_id: str | None = None,

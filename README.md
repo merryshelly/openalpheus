@@ -232,6 +232,8 @@ See [INSTALL.md](INSTALL.md) for detailed post-bootstrap configuration.
 | `/stop` | Cancel current processing |
 | `/resume` | Re-enable after `/stop` |
 
+All overrides (`/model`, `/effort`, `/cache`, `/timesense`, `/subagentquiet`) are room-scoped, persisted to JSONL, and restored on session resume. Umbral archive+wipe reseeds explicit effective overrides into the new active JSONL — raw model aliases and explicit `off` states included, absent/default cache settings excluded — so they also survive later process restarts. Creating a genuinely new room starts with config defaults. A post-wipe reseed failure stops umbral and reports `Umbral rotation incomplete after archive+wipe` with the archive path; the older pre-wipe `Umbral archive failed` / no-wipe branch is a different failure mode.
+
 > **Client note:** Some Matrix clients intercept `/` commands for their own features. If a slash command isn't reaching the agent:
 >
 > | Client | How to send |

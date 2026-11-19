@@ -407,7 +407,7 @@ See "Fixing Orphaned Heartbeats" in the Heartbeat System section above.
 | `/heartbeat stop` | Stop heartbeat for this room |
 | `/steer <message>` | Inject a mid-turn steering note into the **active** turn (real-time steering). Logged + delivered to the agent at the next tool-call boundary as a user message. Requires an active turn; deposits without interrupting. |
 
-All overrides (`/model`, `/effort`, `/cache`) are room-scoped, persisted to JSONL, and restored on session resume. They self-clean when the session ends.
+All overrides (`/model`, `/effort`, `/cache`, `/timesense`, `/subagentquiet`) are room-scoped, persisted to JSONL, and restored on session resume. Umbral archive+wipe reseeds explicit effective overrides into the new active JSONL — raw model aliases and explicit `off` states included, absent/default cache settings excluded — so they also survive later process restarts. Creating a genuinely new room starts with config defaults. A post-wipe reseed failure stops umbral and reports `Umbral rotation incomplete after archive+wipe` with the archive path; the older pre-wipe `Umbral archive failed` / no-wipe branch is a different failure mode.
 
 ## Deep Reference
 
