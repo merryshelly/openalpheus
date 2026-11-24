@@ -993,14 +993,16 @@ _SAMPLING_PROFILES: list[tuple[str, SamplingProfile]] = [
     ("kimi-k2p6",  SamplingProfile(frequency_penalty=None, presence_penalty=None)),
     ("minimax-m3", SamplingProfile(temperature=1.0, top_p=0.95)),
     ("deepseek-v4-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
-    # macstudio local V4.1-Flash via ds4 (workspace-im7t.64): the DSV4.1
-    # family anti-collapse pin (temp 1.0 / top_p 0.95, penalties omitted),
-    # matching the hf:deepseek-ai/deepseek-v4.1-flash row. ds4's own server
-    # defaults are 1.0 / 1.0 / min_p 0.05 (ds4.h) and it honors top-level
-    # temperature/top_p/min_p/top_k; min_p + top_k are deliberately left to the
-    # server. The 2026-09-28 gate battery measured THROUGHPUT (sampling-
-    # insensitive), so it is no evidence against 0.95.
-    ("deepseek-v4.1-flash", SamplingProfile(temperature=1.0, top_p=0.95)),
+    # macstudio local V4.1-Flash via ds4 (workspace-im7t.64): penalties
+    # omitted; ds4's own server defaults are 1.0 / 1.0 / min_p 0.05 (ds4.h) and
+    # it honors top-level temperature/top_p/min_p/top_k; min_p + top_k are
+    # deliberately left to the server.
+    # lh3c.27 (SB 2026-11-24): the seat now serves the -1017 snapshot (ds4
+    # b3f5018 + antirez 1017 MXFP4), so it follows the 1017 card's top_p 1.0,
+    # same as the hf:...-1017 row above (kdsn.366) — was the 0.95 base-family
+    # pin. The base-V4.1 rollback artifact (ds4 #1090 base Q4) shares this
+    # row; the base card allows "0.95 or 1.0".
+    ("deepseek-v4.1-flash", SamplingProfile(temperature=1.0, top_p=1.0)),
     # GLM family pattern (kdsn.241.3): penalties pinned to omit; temp/top_p left
     # to vendor defaults, mirroring the hf:zai-org/glm-5.3-flash treatment.
     # ROLLBACK row (im7t.64): kept for the parked GLM/ds4 artifact.

@@ -214,19 +214,19 @@ class TestSamplingProfileTemperatureTopP:
 
 
 class TestMacStudioDs4SamplingProfiles:
-    """macstudio ds4 capacity tier (workspace-im7t.64): the LIVE seat is
-    DeepSeek-V4.1-Flash and takes the DSV4.1 family anti-collapse pin
-    (temp 1.0 / top_p 0.95, penalties omitted), matching the
-    hf:deepseek-ai/deepseek-v4.1-flash row. The parked GLM artifact keeps the
+    """macstudio ds4 capacity tier (workspace-im7t.64): the LIVE seat serves
+    DeepSeek-V4.1-Flash-1017 (ds4 b3f5018 + 1017 MXFP4, lh3c.27 2026-11-24) and
+    follows the 1017 card (temp 1.0 / top_p 1.0, penalties omitted), matching
+    the hf:deepseek-ai/deepseek-v4.1-flash-1017 row (kdsn.366). The parked GLM artifact keeps the
     GLM family pattern (penalties omitted, temp/top_p left to vendor defaults)
     and must NOT inherit the DeepSeek pins through fragment-matching accidents.
     First-match substring ordering is safe here: "deepseek-v4-flash" is not a
     substring of "deepseek-v4.1-flash" (dash vs dot)."""
 
-    def test_live_v41_gets_family_pin(self):
+    def test_live_v41_1017_gets_card_pin(self):
         prof = _sampling_profile("macstudio/deepseek-v4.1-flash")
         assert prof.temperature == 1.0
-        assert prof.top_p == 0.95
+        assert prof.top_p == 1.0
         assert prof.frequency_penalty is None
         assert prof.presence_penalty is None
 
